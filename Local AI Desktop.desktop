@@ -1,0 +1,14 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Local AI Desktop
+Name[ru]=Local AI Desktop
+Comment=Локальный AI-клиент
+Exec=/media/yaroslav/DATA/local-ai-desktop/run-local-ai-desktop.sh
+Path=/media/yaroslav/DATA/local-ai-desktop
+TryExec=/media/yaroslav/DATA/local-ai-desktop/node_modules/electron/dist/electron
+Icon=/media/yaroslav/DATA/local-ai-desktop/assets/fluent-bot-sparkle.svg
+Terminal=false
+Categories=Development;
+Keywords=AI;LLM;Ollama;local;
+StartupNotify=true

@@ -1,0 +1,12 @@
+import { FolderOpen, X } from 'lucide-react';
+import { useAppStore } from '../store/app-store';
+import { Hardware } from './Hardware';
+
+export function Toolbar() {
+  const { conversations, activeId, models, hardware, activeContextWindow, updateConversation } = useAppStore();
+  const chat = conversations.find((item) => item.id === activeId);
+  if (!chat) return null;
+  const chooseDirectory = async () => { const directory = await window.localAi.dialog.chooseDirectory(); if (directory) await updateConversation(chat.id, { workingDirectory: directory }); };
+  const contextLabel = `${Math.round((activeContextWindow ?? chat.contextWindow) / 1024)}K`;
+  return <header className="toolbar"><div className="toolbar-controls"><label className="control"><span>Модель</span><select value={chat.modelId ?? ''} onChange={(event) => void updateConversation(chat.id, { modelId: event.target.value || null })}><option value="">Выберите модель</option>{models.map((model) => <option value={model.id} key={model.id}>{model.name}</option>)}</select></label><label className="control"><span>Контекст · {contextLabel}</span><select value={chat.contextWindow} onChange={(event) => void updateConversation(chat.id, { contextWindow: Number(event.target.value) })}><option value={16_384}>16K</option><option value={32_768}>32K</option><option value={65_536}>64K</option><option value={131_072}>128K</option><option value={262_144}>256K</option></select></label><label className="control"><span>Глубина</span><select value={chat.analysisDepth} onChange={(event) => void updateConversation(chat.id, { analysisDepth: event.target.value as 'fast' | 'normal' | 'deep' })}><option value="fast">Быстро</option><option value="normal">Обычно</option><option value="deep">Глубоко</option></select></label><label className="control"><span>Режим</span><select value={chat.mode} onChange={(event) => void updateConversation(chat.id, { mode: event.target.value as 'chat' | 'agent' })}><option value="chat">Чат</option><option value="agent">Агент</option></select></label><div className="directory"><FolderOpen size={16} /><button onClick={() => void chooseDirectory()}>{chat.workingDirectory ?? 'Рабочая папка: не выбрана'}</button>{chat.workingDirectory && <button className="icon-button" aria-label="Убрать рабочую папку" onClick={() => void updateConversation(chat.id, { workingDirectory: null })}><X size={14} /></button>}</div></div><Hardware value={hardware} /></header>;
+}
