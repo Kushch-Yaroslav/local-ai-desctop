@@ -8,6 +8,8 @@ type State = {
   models: ModelInfo[];
   hardware: HardwareStats | null;
   isGenerating: boolean;
+  generationId: string | null;
+  generationState: 'idle' | 'thinking' | 'using-tool' | 'running-terminal' | 'generating' | 'stopping' | 'cancelled' | 'error';
   error: string | null;
   toolActivities: ToolActivity[];
   toolActivityCount: number;
@@ -21,11 +23,12 @@ type State = {
   deleteConversation: (id: string) => Promise<void>;
   refreshHardware: () => Promise<void>;
   sendMessage: (content: string) => Promise<void>;
+  editMessage: (message: ChatMessage, content: string) => Promise<boolean>;
   stop: () => Promise<void>;
-  handleStream: (event: { type: string; content?: string; message?: string; details?: string; activity?: ToolActivity; run?: AnalysisRun; progress?: AnalysisProgress; requested?: number; active?: number; supported?: number; conversationId: string }) => void;
+  handleStream: (event: { type: string; content?: string; message?: string; details?: string; activity?: ToolActivity; run?: AnalysisRun; progress?: AnalysisProgress; requested?: number; active?: number; supported?: number; used?: number; maximum?: number; conversationId: string; generationId: string; modelId?: string; assistant?: ChatMessage | null }) => void;
 };
 
-const assistantId = (conversationId: string) => `stream-${conversationId}`;
+const assistantId = (generationId: string) => `stream-${generationId}`;
 const now = () => new Date().toISOString();
 
 export const useAppStore = create<State>((set, get) => {
@@ -36,12 +39,12 @@ export const useAppStore = create<State>((set, get) => {
     if (pendingTokens.size === 0) return;
     const tokens = new Map(pendingTokens); pendingTokens.clear();
     set((state) => ({ messages: state.messages.map((message) => {
-      const token = tokens.get(message.conversationId);
-      return token && message.id === assistantId(message.conversationId) ? { ...message, content: message.content + token } : message;
+      const token = tokens.get(get().generationId ?? '');
+      return token && message.id === assistantId(get().generationId ?? '') ? { ...message, content: message.content + token } : message;
     }) }));
   };
   return {
-  conversations: [], activeId: null, messages: [], models: [], hardware: null, isGenerating: false, error: null, toolActivities: [], toolActivityCount: 0, activeContextWindow: null, analysisProgress: [], analysisRuns: [],
+  conversations: [], activeId: null, messages: [], models: [], hardware: null, isGenerating: false, generationId: null, generationState: 'idle', error: null, toolActivities: [], toolActivityCount: 0, activeContextWindow: null, analysisProgress: [], analysisRuns: [],
   initialize: async () => {
     const [conversations, models] = await Promise.all([window.localAi.conversations.list(), window.localAi.models.list()]);
     set({ conversations, models });
@@ -49,9 +52,10 @@ export const useAppStore = create<State>((set, get) => {
     else await get().createConversation();
     await get().refreshHardware();
   },
-  selectConversation: async (id) => { const [messages, analysisRuns] = await Promise.all([window.localAi.messages.list(id), window.localAi.analysis.list(id)]); const conversation = get().conversations.find((item) => item.id === id); set({ activeId: id, messages, analysisRuns, error: null, toolActivities: [], toolActivityCount: 0, activeContextWindow: conversation?.contextWindow ?? null, analysisProgress: [] }); },
+  selectConversation: async (id) => { if (get().activeId !== id && get().generationId) await get().stop(); const [messages, analysisRuns] = await Promise.all([window.localAi.messages.list(id), window.localAi.analysis.list(id)]); const conversation = get().conversations.find((item) => item.id === id); set({ activeId: id, messages, analysisRuns, isGenerating: false, generationId: null, generationState: 'idle', error: null, toolActivities: [], toolActivityCount: 0, activeContextWindow: conversation?.contextWindow ?? null, analysisProgress: [] }); },
   createConversation: async () => {
-    const conversation = await window.localAi.conversations.create();
+    const activeChat = get().conversations.find((chat) => chat.id === get().activeId);
+    const conversation = await window.localAi.conversations.create(activeChat?.modelId ?? get().models[0]?.id);
     set((state) => ({ conversations: [conversation, ...state.conversations] })); await get().selectConversation(conversation.id);
   },
   updateConversation: async (id, patch) => {
@@ -66,31 +70,51 @@ export const useAppStore = create<State>((set, get) => {
   },
   refreshHardware: async () => set({ hardware: await window.localAi.hardware.get() }),
   sendMessage: async (content) => {
+    if (get().generationId) await get().stop();
     const { activeId, conversations, messages, models } = get();
     if (!activeId || !content.trim()) return;
     const chat = conversations.find((item) => item.id === activeId); const model = chat?.modelId ?? models[0]?.id;
     if (!model) { set({ error: 'Нет доступных моделей. Запустите Ollama и загрузите модель.' }); return; }
     const user: ChatMessage = { id: crypto.randomUUID(), conversationId: activeId, role: 'user', content: content.trim(), createdAt: now() };
-    const streaming: ChatMessage = { id: assistantId(activeId), conversationId: activeId, role: 'assistant', content: '', createdAt: now() };
-    set({ messages: [...messages, user, streaming], isGenerating: true, error: null, toolActivities: [], toolActivityCount: 0, analysisProgress: [] });
+    const generationId = crypto.randomUUID(); const streaming: ChatMessage = { id: assistantId(generationId), conversationId: activeId, role: 'assistant', content: '', createdAt: now() };
+    set({ messages: [...messages, user, streaming], isGenerating: true, generationId, generationState: 'thinking', error: null, toolActivities: [], toolActivityCount: 0, analysisProgress: [] });
     if (!chat?.modelId) await get().updateConversation(activeId, { modelId: model });
     if (chat?.title === 'Новый чат') await get().updateConversation(activeId, { title: content.trim().slice(0, 56) });
-    try { await window.localAi.chat.send({ conversationId: activeId, model, messages: [...messages, user] }); }
-    catch (error) { set({ isGenerating: false, error: error instanceof Error ? error.message : 'Не удалось отправить сообщение' }); }
+    try { await window.localAi.chat.send({ conversationId: activeId, model, messages: [...messages, user], generationId, persistUserMessage: true }); }
+    catch (error) { set((state) => state.generationId === generationId ? { isGenerating: false, generationId: null, generationState: 'error', error: error instanceof Error ? error.message : 'Не удалось отправить сообщение', messages: state.messages.filter((message) => message.id !== assistantId(generationId)) } : {}); }
   },
-  stop: async () => { await window.localAi.chat.stop(); set({ isGenerating: false }); },
+  editMessage: async (message, content) => {
+    if (get().generationId) await get().stop();
+    let saved: ChatMessage[];
+    try { saved = await window.localAi.messages.edit(message.id, content, { conversationId: message.conversationId, content: message.content }); }
+    catch (error) { set({ error: error instanceof Error ? error.message : 'Не удалось сохранить изменение' }); return false; }
+    const activeId = get().activeId; const chat = get().conversations.find((item) => item.id === activeId); const model = chat?.modelId ?? get().models[0]?.id;
+    if (!activeId || !chat || !model) return false;
+    const generationId = crypto.randomUUID(); const streaming: ChatMessage = { id: assistantId(generationId), conversationId: activeId, role: 'assistant', content: '', createdAt: now() };
+    set({ messages: [...saved, streaming], isGenerating: true, generationId, generationState: 'thinking', error: null, toolActivities: [], toolActivityCount: 0, analysisProgress: [] });
+    try { await window.localAi.chat.send({ conversationId: activeId, model, messages: saved, generationId, persistUserMessage: false }); }
+    catch (error) { set((state) => state.generationId === generationId ? { isGenerating: false, generationId: null, generationState: 'error', error: error instanceof Error ? error.message : 'Не удалось перегенерировать ответ', messages: state.messages.filter((message) => message.id !== assistantId(generationId)) } : {}); }
+    return true;
+  },
+  stop: async () => { const { activeId, generationId } = get(); if (!activeId || !generationId) return; set({ generationState: 'stopping' }); await window.localAi.chat.stop(activeId, generationId); set((state) => state.generationId === generationId ? { isGenerating: false, generationId: null, generationState: 'cancelled', messages: state.messages.filter((message) => message.id !== assistantId(generationId)) } : {}); },
   handleStream: (event) => {
-    if (event.conversationId !== get().activeId) return;
+    if (event.type === 'context-usage' && typeof event.used === 'number') {
+      const used = event.used;
+      set((state) => ({ conversations: state.conversations.map((chat) => chat.id === event.conversationId ? { ...chat, contextTokens: used, contextModelId: event.modelId ?? chat.modelId } : chat) }));
+    }
+    if (event.conversationId !== get().activeId || event.generationId !== get().generationId) return;
     if (event.type === 'token') {
-      pendingTokens.set(event.conversationId, (pendingTokens.get(event.conversationId) ?? '') + (event.content ?? ''));
+      pendingTokens.set(event.generationId, (pendingTokens.get(event.generationId) ?? '') + (event.content ?? ''));
       if (animationFrame === null) animationFrame = window.requestAnimationFrame(flushTokens);
     }
-    if (event.type === 'tool' && event.activity) set((state) => ({ toolActivities: [...state.toolActivities, event.activity!].slice(-40), toolActivityCount: state.toolActivityCount + 1 }));
+    if (event.type === 'tool' && event.activity) set((state) => ({ generationState: event.activity!.label === 'Запуск terminal' ? 'running-terminal' : 'using-tool', toolActivities: [...state.toolActivities, event.activity!].slice(-40), toolActivityCount: state.toolActivityCount + 1 }));
     if (event.type === 'analysis-run' && event.run) set((state) => ({ analysisRuns: [...state.analysisRuns.filter((run) => run.id !== event.run!.id), event.run!] }));
     if (event.type === 'analysis' && event.progress) set({ analysisProgress: [event.progress] });
     if (event.type === 'context' && event.active) set({ activeContextWindow: event.active });
-    if (event.type === 'error') { flushTokens(); set({ isGenerating: false, error: event.details ? `${event.message}: ${event.details}` : event.message ?? 'Ошибка генерации' }); }
-    if (event.type === 'done') { flushTokens(); set((state) => ({ isGenerating: false, messages: state.messages.map((message) => message.id === assistantId(event.conversationId) ? { ...message, id: crypto.randomUUID() } : message) })); }
+    if (event.type === 'token') set({ generationState: 'generating' });
+    if (event.type === 'error') { flushTokens(); pendingTokens.delete(event.generationId); set((state) => ({ isGenerating: false, generationId: null, generationState: 'error', error: event.details ? `${event.message}: ${event.details}` : event.message ?? 'Ошибка генерации', messages: state.messages.filter((message) => message.id !== assistantId(event.generationId)) })); }
+    if (event.type === 'cancelled') { flushTokens(); pendingTokens.delete(event.generationId); set((state) => ({ isGenerating: false, generationId: null, generationState: 'cancelled', messages: state.messages.filter((message) => message.id !== assistantId(event.generationId)) })); }
+    if (event.type === 'done') { flushTokens(); set((state) => ({ isGenerating: false, generationId: null, generationState: 'idle', messages: state.messages.flatMap((message) => message.id === assistantId(event.generationId) ? (event.assistant ? [event.assistant] : []) : [message]) })); }
   },
 };
 });
