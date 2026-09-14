@@ -29,10 +29,10 @@ const signature = (call: ProjectToolCall): string => `${call.name}:${JSON.string
 function lowInformation(raw: string): boolean { try { const value = JSON.parse(raw) as Record<string, unknown>; return typeof value.error === 'string' || (Array.isArray(value.entries) && value.entries.length === 0) || (Array.isArray(value.matches) && value.matches.length === 0); } catch { return false; } }
 
 export class ProjectChatService {
-  constructor(private readonly backend: ToolCallingBackend, private readonly web: WebBrowserService, private readonly confirm: ConfirmAction) {}
+  constructor(private readonly backend: ToolCallingBackend, private readonly web: WebBrowserService) {}
 
-  async *stream(model: string, history: ChatMessage[], root: string, signal: AbortSignal, contextWindow: number, depth: AnalysisDepth, webMode: WebMode): AsyncIterable<StreamEvent> {
-    const engine = new AnalysisEngine(depth); const tools = await ReadonlyProjectTools.open(root, this.confirm);
+  async *stream(model: string, history: ChatMessage[], root: string, signal: AbortSignal, contextWindow: number, depth: AnalysisDepth, webMode: WebMode, confirm: ConfirmAction): AsyncIterable<StreamEvent> {
+    const engine = new AnalysisEngine(depth); const tools = await ReadonlyProjectTools.open(root, confirm);
     let webSession: WebBrowserSession | null = null;
     if (webMode === 'auto') {
       try { webSession = await this.web.openSession(); }
@@ -68,8 +68,9 @@ export class ProjectChatService {
         }
         completed.add(key); actions += 1;
         const isWebTool = webToolDefinitions.some((definition) => definition.function.name === call.name);
-        yield { type: 'tool', activity: { id: randomUUID(), ...(isWebTool ? activityForWebTool(call) : activityForTool(call)) } };
-        const result = isWebTool && webSession ? await webSession.execute(call) : await tools.execute(call, signal); engine.record(call.name, result);
+        const actionId = randomUUID();
+        yield { type: 'tool', activity: { id: actionId, ...(isWebTool ? activityForWebTool(call) : activityForTool(call)) } };
+        const result = isWebTool && webSession ? await webSession.execute(call) : await tools.execute(call, signal, actionId); engine.record(call.name, result);
         if (lowInformation(result)) { lowInfo += 1; if (lowInfo === 3) messages.push({ role: 'system', content: 'Последние действия дали мало новой информации. Сузь исследование или заверши ответ.' }); } else lowInfo = 0;
         messages.push({ role: 'tool', tool_name: call.name, content: result });
       }

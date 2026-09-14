@@ -2,6 +2,7 @@ import { execFile, spawn } from 'node:child_process';
 import { open, readdir, readFile, realpath, stat, unlink, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
+import type { RiskCategory } from '../../shared/types';
 
 const execFileAsync = promisify(execFile);
 const ignoredDirectories = new Set(['.git', 'node_modules', 'dist', 'build', '.next', '.cache', 'coverage']);
@@ -13,8 +14,10 @@ const maxChunkBytes = 128_000;
 
 export type ProjectToolCall = { name: string; arguments: Record<string, unknown> };
 export type ProjectToolDefinition = { type: 'function'; function: { name: string; description: string; parameters: Record<string, unknown> } };
-export type ConfirmationRequest = { title: string; detail: string };
-export type ConfirmAction = (request: ConfirmationRequest, signal: AbortSignal) => Promise<boolean>;
+export type ConfirmationRequest = { title: string; detail: string; category: RiskCategory; actionId: string };
+export type ApprovalResult = { approved: boolean; reason: 'user_rejected' | 'cancelled' | 'once' | 'session' };
+export type ConfirmAction = (request: ConfirmationRequest, signal: AbortSignal) => Promise<ApprovalResult>;
+export type TerminalPolicy = { kind: 'allow' | 'confirm' | 'block'; category?: RiskCategory };
 
 export const projectToolDefinitions: ProjectToolDefinition[] = [
   { type: 'function', function: { name: 'list_directory', description: 'Показывает дерево файлов выбранного проекта. Начни с корня; при has_more=true запроси следующую страницу с next_offset.', parameters: { type: 'object', properties: { path: { type: 'string', description: 'Относительный путь внутри проекта, по умолчанию корень.' }, depth: { type: 'integer', minimum: 1, maximum: 4 }, offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 250 } } } } },
@@ -58,7 +61,7 @@ export class ReadonlyProjectTools {
     return new ReadonlyProjectTools(resolved, confirm);
   }
 
-  async execute(call: ProjectToolCall, signal: AbortSignal): Promise<string> {
+  async execute(call: ProjectToolCall, signal: AbortSignal, actionId: string): Promise<string> {
     try {
       if (signal.aborted) return JSON.stringify({ error: 'Generation cancelled' });
       if (call.name === 'list_directory') return await this.listDirectory(this.text(call.arguments.path), this.number(call.arguments.depth, 2, 1, 4), this.number(call.arguments.offset, 0, 0, 100_000), this.pageSize(call.arguments));
@@ -68,10 +71,10 @@ export class ReadonlyProjectTools {
       if (call.name === 'inspect_package_json') return await this.readTextFile({ name: 'read_file', arguments: { path: 'package.json', max_bytes: maxChunkBytes } });
       if (call.name === 'git_status') return await this.gitStatus();
       if (call.name === 'git_diff') return await this.gitDiff();
-      if (call.name === 'apply_patch') return await this.applyPatch(this.requiredText(call.arguments.patch), signal);
+      if (call.name === 'apply_patch') return await this.applyPatch(this.requiredText(call.arguments.patch), signal, actionId);
       if (call.name === 'write_file' || call.name === 'create_file') return await this.createFile(this.requiredText(call.arguments.path), this.text(call.arguments.content), signal);
-      if (call.name === 'delete_file') return await this.deleteFile(this.requiredText(call.arguments.path), signal);
-      if (call.name === 'run_terminal') return await this.runTerminal(this.requiredText(call.arguments.command), this.number(call.arguments.timeout_ms, 60_000, 1_000, 120_000), signal);
+      if (call.name === 'delete_file') return await this.deleteFile(this.requiredText(call.arguments.path), signal, actionId);
+      if (call.name === 'run_terminal') return await this.runTerminal(this.requiredText(call.arguments.command), this.number(call.arguments.timeout_ms, 60_000, 1_000, 120_000), signal, actionId);
       return JSON.stringify({ error: `Неизвестный инструмент проекта: ${call.name}` });
     } catch (error) { return JSON.stringify({ error: error instanceof Error ? error.message : 'Ошибка чтения проекта' }); }
   }
@@ -172,15 +175,16 @@ export class ReadonlyProjectTools {
     return JSON.stringify({ path, created: true, bytes: Buffer.byteLength(content) });
   }
 
-  private async deleteFile(path: string, signal: AbortSignal): Promise<string> {
+  private async deleteFile(path: string, signal: AbortSignal, actionId: string): Promise<string> {
     const file = await this.resolveExisting(path); const info = await stat(file);
     if (!info.isFile()) return JSON.stringify({ error: 'Можно удалить только один файл, не каталог.' });
-    if (!await this.confirm({ title: 'Удалить файл?', detail: path }, signal)) return JSON.stringify({ cancelled: true, reason: 'Пользователь не подтвердил удаление файла.' });
+    const approval = await this.confirm({ title: 'Удалить файл?', detail: path, category: 'file_delete', actionId }, signal);
+    if (!approval.approved) return JSON.stringify({ approved: false, reason: approval.reason });
     if (signal.aborted) return JSON.stringify({ error: 'Generation cancelled' });
     await unlink(file); return JSON.stringify({ path, deleted: true });
   }
 
-  private async applyPatch(patch: string, signal: AbortSignal): Promise<string> {
+  private async applyPatch(patch: string, signal: AbortSignal, actionId: string): Promise<string> {
     const lines = patch.replace(/\r\n/g, '\n').split('\n');
     if (lines[0] !== '*** Begin Patch' || !lines.includes('*** End Patch')) return JSON.stringify({ error: 'Ожидается patch в формате *** Begin Patch ... *** End Patch.' });
     const changed: string[] = []; let index = 1;
@@ -196,7 +200,8 @@ export class ReadonlyProjectTools {
       }
       if (remove) {
         const file = await this.resolveExisting(remove[1]); const info = await stat(file); if (!info.isFile()) return JSON.stringify({ error: `Можно удалить только файл: ${remove[1]}` });
-        if (!await this.confirm({ title: 'Удалить файл?', detail: remove[1] }, signal)) return JSON.stringify({ cancelled: true, reason: 'Пользователь не подтвердил удаление файла.' });
+        const approval = await this.confirm({ title: 'Удалить файл?', detail: remove[1], category: 'file_delete', actionId }, signal);
+        if (!approval.approved) return JSON.stringify({ approved: false, reason: approval.reason });
         await unlink(file); changed.push(remove[1]); continue;
       }
       if (!update) return JSON.stringify({ error: `Неизвестная секция patch: ${header}` });
@@ -216,19 +221,30 @@ export class ReadonlyProjectTools {
     return JSON.stringify({ applied: true, files: changed });
   }
 
-  private terminalPolicy(command: string): 'allow' | 'confirm' | 'block' {
+  private terminalPolicy(command: string): TerminalPolicy {
     const value = command.trim(); const lower = value.toLowerCase();
-    if (!value || value.includes('\0')) return 'block';
-    if (/(^|\s)(sudo|su|reboot|shutdown|systemctl|apt|apt-get|snap)(\s|$)/.test(lower) || /\/etc\/|\.ssh|\.gnupg|\/proc\/|\/sys\//.test(lower) || /(^|\s)kill(\s|$)/.test(lower) || /(^|\s)cd\s|\.\.\//.test(lower)) return 'block';
-    if (/(^|\s)(rm|chmod|chown)(\s|$)|git\s+(reset\s+--hard|clean\b)|\b(npm|pnpm|yarn)\s+(install|add|remove|uninstall)\b|curl\b.*\||wget\b.*\.(sh|run|bin|appimage)\b|[;|&]|(^|[^<])>{1,2}/.test(lower)) return 'confirm';
-    if (/^(git\s+(status|diff)(\s|$)|npm\s+run\s+(lint|typecheck|test|build)(\s|$)|pnpm\s+(lint|typecheck|test|build)(\s|$)|yarn\s+(lint|typecheck|test|build)(\s|$)|nvidia-smi(\s|$)|(ls|find|rg|grep|cat|head|tail)(\s|$))/.test(lower)) return 'allow';
-    return 'confirm';
+    if (!value || value.includes('\0')) return { kind: 'block' };
+    if (/(^|\s)(sudo|su|reboot|shutdown|systemctl|apt|apt-get|snap)(\s|$)/.test(lower) || /\/etc\/|\.ssh|\.gnupg|\/proc\/|\/sys\//.test(lower) || /(^|\s)kill(\s|$)/.test(lower) || /(^|\s)cd\s|\.\.\//.test(lower)) return { kind: 'block' };
+    if (/^git\s+commit(\s|$)/.test(lower)) return { kind: 'confirm', category: 'git_commit' };
+    if (/^git\s+push(\s|$)/.test(lower)) return { kind: 'confirm', category: 'git_push' };
+    if (/^git\s+(reset\s+--hard|clean\b)/.test(lower)) return { kind: 'confirm', category: 'destructive_git' };
+    if (/\b(npm|pnpm|yarn)\s+(install|add)\b/.test(lower)) return { kind: 'confirm', category: 'package_install' };
+    if (/\b(npm|pnpm|yarn)\s+(remove|uninstall)\b/.test(lower)) return { kind: 'confirm', category: 'package_remove' };
+    if (/(^|\s)(chmod|chown)(\s|$)/.test(lower)) return { kind: 'confirm', category: 'chmod_chown' };
+    if (/(^|[^<])>{1,2}/.test(lower)) return { kind: 'confirm', category: 'shell_redirection' };
+    if (/[;|&]/.test(lower)) return { kind: 'confirm', category: 'shell_chaining' };
+    if (/(^|\s)rm(\s|$)|curl\b.*\||wget\b.*\.(sh|run|bin|appimage)\b/.test(lower)) return { kind: 'confirm', category: 'system_command' };
+    if (/^(git\s+(status|diff)(\s|$)|npm\s+run\s+(lint|typecheck|test|build)(\s|$)|pnpm\s+(lint|typecheck|test|build)(\s|$)|yarn\s+(lint|typecheck|test|build)(\s|$)|nvidia-smi(\s|$)|(ls|find|rg|grep|cat|head|tail)(\s|$))/.test(lower)) return { kind: 'allow' };
+    return { kind: 'confirm', category: 'system_command' };
   }
 
-  private async runTerminal(command: string, timeout: number, signal: AbortSignal): Promise<string> {
+  private async runTerminal(command: string, timeout: number, signal: AbortSignal, actionId: string): Promise<string> {
     const policy = this.terminalPolicy(command);
-    if (policy === 'block') return JSON.stringify({ error: 'Команда заблокирована terminal policy: она может выйти за project scope или изменить систему.' });
-    if (policy === 'confirm' && !await this.confirm({ title: 'Разрешить terminal command?', detail: command }, signal)) return JSON.stringify({ cancelled: true, reason: 'Пользователь не подтвердил terminal command.' });
+    if (policy.kind === 'block') return JSON.stringify({ error: 'Команда заблокирована terminal policy: она может выйти за project scope или изменить систему.' });
+    if (policy.kind === 'confirm') {
+      const approval = await this.confirm({ title: 'Разрешить terminal command?', detail: command, category: policy.category!, actionId }, signal);
+      if (!approval.approved) return JSON.stringify({ approved: false, reason: approval.reason });
+    }
     if (signal.aborted) return JSON.stringify({ error: 'Generation cancelled' });
     return new Promise((resolve) => {
       const child = spawn('/bin/bash', ['-lc', command], { cwd: this.root, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });

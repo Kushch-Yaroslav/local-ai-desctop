@@ -3,6 +3,15 @@ export type WebMode = 'off' | 'auto';
 export type BackendId = 'ollama' | 'llama-cpp';
 export type AnalysisDepth = 'fast' | 'normal' | 'enhanced' | 'deep';
 export type FinishReason = 'stop' | 'length' | 'cancelled' | 'error';
+export type RiskCategory = 'git_commit' | 'git_push' | 'destructive_git' | 'package_install' | 'package_remove' | 'file_delete' | 'chmod_chown' | 'shell_redirection' | 'shell_chaining' | 'system_command';
+export type ApprovalDecision = 'reject' | 'once' | 'session';
+export type ApprovalStatus = 'pending' | 'approved' | 'rejected' | 'session-approved';
+
+export interface ActionApproval {
+  approvalId: string;
+  category: RiskCategory;
+  status: ApprovalStatus;
+}
 
 export interface GenerationDiagnostics {
   generationId: string;
@@ -90,6 +99,7 @@ export interface ToolActivity {
   id: string;
   label: string;
   detail?: string;
+  approval?: ActionApproval;
 }
 
 export interface AnalysisRun {
@@ -112,6 +122,8 @@ export interface AnalysisProgress {
 export type StreamEvent =
   | { type: 'token'; content: string }
   | { type: 'tool'; activity: ToolActivity; runId?: string }
+  | { type: 'approval-request'; actionId: string; approval: ActionApproval }
+  | { type: 'approval-resolved'; actionId: string; approvalId: string; status: Exclude<ApprovalStatus, 'pending'> }
   | { type: 'analysis-run'; run: AnalysisRun }
   | { type: 'analysis'; progress: AnalysisProgress }
   | { type: 'context'; requested: number; active: number; supported?: number }
@@ -137,6 +149,7 @@ export interface LocalAiApi {
   chat: {
     send(request: ChatRequest): Promise<void>;
     stop(conversationId: string, generationId?: string): Promise<void>;
+    approve(request: { conversationId: string; generationId: string; approvalId: string; decision: ApprovalDecision }): Promise<boolean>;
     onStream(listener: (event: StreamEvent & { conversationId: string; generationId: string; modelId?: string }) => void): () => void;
   };
 }

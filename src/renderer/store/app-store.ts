@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { AnalysisProgress, AnalysisRun, ChatMessage, Conversation, FinishReason, GenerationDiagnostics, HardwareStats, ModelInfo, ToolActivity } from '../../shared/types';
+import type { ActionApproval, AnalysisProgress, AnalysisRun, ApprovalDecision, ApprovalStatus, ChatMessage, Conversation, FinishReason, GenerationDiagnostics, HardwareStats, ModelInfo, ToolActivity } from '../../shared/types';
 
 type State = {
   conversations: Conversation[];
@@ -9,7 +9,7 @@ type State = {
   hardware: HardwareStats | null;
   isGenerating: boolean;
   generationId: string | null;
-  generationState: 'idle' | 'thinking' | 'using-tool' | 'running-terminal' | 'generating' | 'stopping' | 'cancelled' | 'error';
+  generationState: 'idle' | 'thinking' | 'using-tool' | 'running-terminal' | 'waiting-for-approval' | 'generating' | 'stopping' | 'cancelled' | 'error';
   error: string | null;
   toolActivities: ToolActivity[];
   toolActivityCount: number;
@@ -18,6 +18,8 @@ type State = {
   analysisRuns: AnalysisRun[];
   lastFinishReason: FinishReason | null;
   performance: GenerationDiagnostics | null;
+  pendingApproval: { actionId: string; approval: ActionApproval } | null;
+  approvalSubmitting: boolean;
   initialize: () => Promise<void>;
   selectConversation: (id: string) => Promise<void>;
   createConversation: () => Promise<void>;
@@ -26,9 +28,10 @@ type State = {
   refreshHardware: () => Promise<void>;
   sendMessage: (content: string) => Promise<void>;
   continueGeneration: () => Promise<void>;
+  approveAction: (decision: ApprovalDecision) => Promise<void>;
   editMessage: (message: ChatMessage, content: string) => Promise<boolean>;
   stop: () => Promise<void>;
-  handleStream: (event: { type: string; content?: string; message?: string; details?: string; activity?: ToolActivity; run?: AnalysisRun; progress?: AnalysisProgress; requested?: number; active?: number; supported?: number; used?: number; maximum?: number; conversationId: string; generationId: string; modelId?: string; assistant?: ChatMessage | null; finishReason?: FinishReason; diagnostics?: Omit<GenerationDiagnostics, 'generationId' | 'conversationId' | 'createdAt'> }) => void;
+  handleStream: (event: { type: string; content?: string; message?: string; details?: string; activity?: ToolActivity; run?: AnalysisRun; progress?: AnalysisProgress; requested?: number; active?: number; supported?: number; used?: number; maximum?: number; conversationId: string; generationId: string; modelId?: string; assistant?: ChatMessage | null; finishReason?: FinishReason; diagnostics?: Omit<GenerationDiagnostics, 'generationId' | 'conversationId' | 'createdAt'>; actionId?: string; approval?: ActionApproval; approvalId?: string; status?: Exclude<ApprovalStatus, 'pending'> }) => void;
 };
 
 const assistantId = (generationId: string) => `stream-${generationId}`;
@@ -47,7 +50,7 @@ export const useAppStore = create<State>((set, get) => {
     }) }));
   };
   return {
-  conversations: [], activeId: null, messages: [], models: [], hardware: null, isGenerating: false, generationId: null, generationState: 'idle', error: null, toolActivities: [], toolActivityCount: 0, activeContextWindow: null, analysisProgress: [], analysisRuns: [], lastFinishReason: null, performance: null,
+  conversations: [], activeId: null, messages: [], models: [], hardware: null, isGenerating: false, generationId: null, generationState: 'idle', error: null, toolActivities: [], toolActivityCount: 0, activeContextWindow: null, analysisProgress: [], analysisRuns: [], lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false,
   initialize: async () => {
     const [conversations, models] = await Promise.all([window.localAi.conversations.list(), window.localAi.models.list()]);
     set({ conversations, models });
@@ -55,7 +58,7 @@ export const useAppStore = create<State>((set, get) => {
     else await get().createConversation();
     await get().refreshHardware();
   },
-  selectConversation: async (id) => { if (get().activeId !== id && get().generationId) await get().stop(); const [messages, analysisRuns] = await Promise.all([window.localAi.messages.list(id), window.localAi.analysis.list(id)]); const conversation = get().conversations.find((item) => item.id === id); set({ activeId: id, messages, analysisRuns, isGenerating: false, generationId: null, generationState: 'idle', error: null, toolActivities: [], toolActivityCount: 0, activeContextWindow: conversation?.contextWindow ?? null, analysisProgress: [], lastFinishReason: null, performance: null }); },
+  selectConversation: async (id) => { if (get().activeId !== id && get().generationId) await get().stop(); const [messages, analysisRuns] = await Promise.all([window.localAi.messages.list(id), window.localAi.analysis.list(id)]); const conversation = get().conversations.find((item) => item.id === id); set({ activeId: id, messages, analysisRuns, isGenerating: false, generationId: null, generationState: 'idle', error: null, toolActivities: [], toolActivityCount: 0, activeContextWindow: conversation?.contextWindow ?? null, analysisProgress: [], lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false }); },
   createConversation: async () => {
     const activeChat = get().conversations.find((chat) => chat.id === get().activeId);
     const conversation = await window.localAi.conversations.create(activeChat?.modelId ?? get().models[0]?.id);
@@ -80,7 +83,7 @@ export const useAppStore = create<State>((set, get) => {
     if (!model) { set({ error: 'Нет доступных моделей. Запустите Ollama и загрузите модель.' }); return; }
     const user: ChatMessage = { id: crypto.randomUUID(), conversationId: activeId, role: 'user', content: content.trim(), createdAt: now() };
     const generationId = crypto.randomUUID(); const streaming: ChatMessage = { id: assistantId(generationId), conversationId: activeId, role: 'assistant', content: '', createdAt: now() };
-    set({ messages: [...messages, user, streaming], isGenerating: true, generationId, generationState: 'thinking', error: null, toolActivities: [], toolActivityCount: 0, analysisProgress: [], lastFinishReason: null, performance: null });
+    set({ messages: [...messages, user, streaming], isGenerating: true, generationId, generationState: 'thinking', error: null, toolActivities: [], toolActivityCount: 0, analysisProgress: [], lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false });
     if (!chat?.modelId) await get().updateConversation(activeId, { modelId: model });
     if (chat?.title === 'Новый чат') await get().updateConversation(activeId, { title: content.trim().slice(0, 56) });
     try { await window.localAi.chat.send({ conversationId: activeId, model, messages: [...messages, user], generationId, persistUserMessage: true }); }
@@ -93,7 +96,7 @@ export const useAppStore = create<State>((set, get) => {
     if (!model) return;
     const generationId = crypto.randomUUID(); const streaming: ChatMessage = { id: assistantId(generationId), conversationId: activeId, role: 'assistant', content: '', createdAt: now() };
     const continuation: ChatMessage = { id: `continue-${generationId}`, conversationId: activeId, role: 'system', content: 'Продолжи предыдущий ответ с места остановки. Не повторяй уже сказанное; начни с следующей незавершённой мысли.', createdAt: now() };
-    set({ messages: [...messages, streaming], isGenerating: true, generationId, generationState: 'thinking', error: null, toolActivities: [], toolActivityCount: 0, analysisProgress: [], lastFinishReason: null, performance: null });
+    set({ messages: [...messages, streaming], isGenerating: true, generationId, generationState: 'thinking', error: null, toolActivities: [], toolActivityCount: 0, analysisProgress: [], lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false });
     try { await window.localAi.chat.send({ conversationId: activeId, model, messages: [...messages, continuation], generationId, persistUserMessage: false }); }
     catch (error) { set((state) => state.generationId === generationId ? { isGenerating: false, generationId: null, generationState: 'error', error: error instanceof Error ? error.message : 'Не удалось продолжить ответ', messages: state.messages.filter((message) => message.id !== assistantId(generationId)) } : {}); }
   },
@@ -105,12 +108,19 @@ export const useAppStore = create<State>((set, get) => {
     const activeId = get().activeId; const chat = get().conversations.find((item) => item.id === activeId); const model = chat?.modelId ?? get().models[0]?.id;
     if (!activeId || !chat || !model) return false;
     const generationId = crypto.randomUUID(); const streaming: ChatMessage = { id: assistantId(generationId), conversationId: activeId, role: 'assistant', content: '', createdAt: now() };
-    set({ messages: [...saved, streaming], isGenerating: true, generationId, generationState: 'thinking', error: null, toolActivities: [], toolActivityCount: 0, analysisProgress: [], lastFinishReason: null, performance: null });
+    set({ messages: [...saved, streaming], isGenerating: true, generationId, generationState: 'thinking', error: null, toolActivities: [], toolActivityCount: 0, analysisProgress: [], lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false });
     try { await window.localAi.chat.send({ conversationId: activeId, model, messages: saved, generationId, persistUserMessage: false }); }
     catch (error) { set((state) => state.generationId === generationId ? { isGenerating: false, generationId: null, generationState: 'error', error: error instanceof Error ? error.message : 'Не удалось перегенерировать ответ', messages: state.messages.filter((message) => message.id !== assistantId(generationId)) } : {}); }
     return true;
   },
-  stop: async () => { const { activeId, generationId } = get(); if (!activeId || !generationId) return; set({ generationState: 'stopping' }); await window.localAi.chat.stop(activeId, generationId); set((state) => state.generationId === generationId ? { isGenerating: false, generationId: null, generationState: 'cancelled', messages: state.messages.filter((message) => message.id !== assistantId(generationId)), performance: null } : {}); },
+  approveAction: async (decision) => {
+    const { activeId, generationId, pendingApproval, approvalSubmitting } = get();
+    if (!activeId || !generationId || !pendingApproval || approvalSubmitting) return;
+    set({ approvalSubmitting: true });
+    const accepted = await window.localAi.chat.approve({ conversationId: activeId, generationId, approvalId: pendingApproval.approval.approvalId, decision });
+    if (!accepted) set((state) => state.generationId === generationId ? { approvalSubmitting: false } : {});
+  },
+  stop: async () => { const { activeId, generationId } = get(); if (!activeId || !generationId) return; set({ generationState: 'stopping', pendingApproval: null, approvalSubmitting: false }); await window.localAi.chat.stop(activeId, generationId); set((state) => state.generationId === generationId ? { isGenerating: false, generationId: null, generationState: 'cancelled', messages: state.messages.filter((message) => message.id !== assistantId(generationId)), performance: null, pendingApproval: null, approvalSubmitting: false } : {}); },
   handleStream: (event) => {
     if (event.type === 'context-usage' && typeof event.used === 'number') {
       const used = event.used;
@@ -122,13 +132,15 @@ export const useAppStore = create<State>((set, get) => {
       if (animationFrame === null) animationFrame = window.requestAnimationFrame(flushTokens);
     }
     if (event.type === 'tool' && event.activity) set((state) => ({ generationState: event.activity!.label === 'Запуск terminal' ? 'running-terminal' : 'using-tool', toolActivities: [...state.toolActivities, event.activity!].slice(-40), toolActivityCount: state.toolActivityCount + 1 }));
+    if (event.type === 'approval-request' && event.actionId && event.approval) set((state) => ({ generationState: 'waiting-for-approval', pendingApproval: { actionId: event.actionId!, approval: event.approval! }, approvalSubmitting: false, toolActivities: state.toolActivities.map((activity) => activity.id === event.actionId ? { ...activity, approval: event.approval } : activity) }));
+    if (event.type === 'approval-resolved' && event.actionId && event.approvalId && event.status) set((state) => ({ generationState: state.generationState === 'waiting-for-approval' ? 'using-tool' : state.generationState, pendingApproval: state.pendingApproval?.approval.approvalId === event.approvalId ? null : state.pendingApproval, approvalSubmitting: false, toolActivities: state.toolActivities.map((activity) => activity.id === event.actionId ? { ...activity, approval: { approvalId: event.approvalId!, category: activity.approval?.category ?? 'system_command', status: event.status! } } : activity) }));
     if (event.type === 'analysis-run' && event.run) set((state) => ({ analysisRuns: [...state.analysisRuns.filter((run) => run.id !== event.run!.id), event.run!] }));
     if (event.type === 'analysis' && event.progress) set({ analysisProgress: [event.progress] });
     if (event.type === 'context' && event.active) set({ activeContextWindow: event.active });
     if (event.type === 'diagnostics' && event.diagnostics) set({ performance: { ...event.diagnostics, generationId: event.generationId, conversationId: event.conversationId, createdAt: now() } });
     if (event.type === 'token') set({ generationState: 'generating' });
-    if (event.type === 'error') { flushTokens(); pendingTokens.delete(event.generationId); set((state) => ({ isGenerating: false, generationId: null, generationState: 'error', error: event.details ? `${event.message}: ${event.details}` : event.message ?? 'Ошибка генерации', messages: state.messages.filter((message) => message.id !== assistantId(event.generationId)), lastFinishReason: null, performance: null })); }
-    if (event.type === 'cancelled') { flushTokens(); pendingTokens.delete(event.generationId); set((state) => ({ isGenerating: false, generationId: null, generationState: 'cancelled', messages: state.messages.filter((message) => message.id !== assistantId(event.generationId)), lastFinishReason: 'cancelled', performance: null })); }
+    if (event.type === 'error') { flushTokens(); pendingTokens.delete(event.generationId); set((state) => ({ isGenerating: false, generationId: null, generationState: 'error', error: event.details ? `${event.message}: ${event.details}` : event.message ?? 'Ошибка генерации', messages: state.messages.filter((message) => message.id !== assistantId(event.generationId)), lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false })); }
+    if (event.type === 'cancelled') { flushTokens(); pendingTokens.delete(event.generationId); set((state) => ({ isGenerating: false, generationId: null, generationState: 'cancelled', messages: state.messages.filter((message) => message.id !== assistantId(event.generationId)), lastFinishReason: 'cancelled', performance: null, pendingApproval: null, approvalSubmitting: false })); }
     if (event.type === 'done') { flushTokens(); set((state) => ({ isGenerating: false, generationId: null, generationState: 'idle', messages: state.messages.flatMap((message) => message.id === assistantId(event.generationId) ? (event.assistant ? [event.assistant] : []) : [message]), lastFinishReason: event.finishReason ?? 'stop' })); }
   },
 };

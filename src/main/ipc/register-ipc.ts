@@ -1,5 +1,6 @@
 import { BrowserWindow, dialog, ipcMain } from 'electron';
-import type { AnalysisRun, ChatRequest, Conversation } from '../../shared/types';
+import { randomUUID } from 'node:crypto';
+import type { AnalysisRun, ApprovalDecision, ApprovalStatus, ChatRequest, Conversation, RiskCategory } from '../../shared/types';
 import { Database } from '../services/database';
 import { getHardwareStats } from '../services/hardware';
 import { OllamaBackend } from '../backends/ollama-backend';
@@ -11,27 +12,54 @@ import { WebBrowserService } from '../web/web-tools';
 import { webToolDefinitions } from '../web/web-tools';
 import { WebChatService } from '../services/web-chat';
 import { capabilitySystemContext } from '../services/capabilities';
-import { projectToolDefinitions, type ConfirmAction } from '../tools/project-tools';
+import { projectToolDefinitions, type ApprovalResult, type ConfirmAction } from '../tools/project-tools';
 
 const database = new Database();
 const ollama = new OllamaBackend();
 const web = new WebBrowserService();
-const confirmAgentAction: ConfirmAction = async (request, signal) => {
-  if (signal.aborted) return false;
-  const options = { type: 'warning' as const, buttons: ['Разрешить', 'Отмена'], defaultId: 1, cancelId: 1, title: request.title, message: 'Agent запрашивает действие с повышенным риском', detail: request.detail, noLink: true };
-  const owner = BrowserWindow.getFocusedWindow(); const answer = (owner ? dialog.showMessageBox(owner, options) : dialog.showMessageBox(options)).then((result) => result.response === 0);
-  const cancelled = new Promise<boolean>((resolve) => signal.addEventListener('abort', () => resolve(false), { once: true }));
-  return (await Promise.race([answer, cancelled])) && !signal.aborted;
-};
-const projectChat = new ProjectChatService(ollama, web, confirmAgentAction);
+const projectChat = new ProjectChatService(ollama, web);
 const webChat = new WebChatService(ollama, web);
 type ActiveGeneration = { id: string; abort: AbortController; settled: Promise<void>; finish: () => void };
 const activeGenerations = new Map<string, ActiveGeneration>();
+type PendingApproval = { approvalId: string; conversationId: string; generation: ActiveGeneration; actionId: string; category: RiskCategory; root: string; resolve: (result: ApprovalResult) => void; settled: boolean; abort: () => void; emit: (payload: Record<string, unknown>) => void };
+const pendingApprovals = new Map<string, PendingApproval>();
+const sessionApprovals = new Map<string, { root: string; categories: Set<RiskCategory> }>();
+
+function settleApproval(pending: PendingApproval, result: ApprovalResult, status: Exclude<ApprovalStatus, 'pending'>): void {
+  if (pending.settled) return;
+  pending.settled = true;
+  pendingApprovals.delete(pending.approvalId);
+  pending.generation.abort.signal.removeEventListener('abort', pending.abort);
+  pending.resolve(result);
+  if (activeGenerations.get(pending.conversationId) === pending.generation && !pending.generation.abort.signal.aborted) {
+    pending.emit({ type: 'approval-resolved', conversationId: pending.conversationId, generationId: pending.generation.id, actionId: pending.actionId, approvalId: pending.approvalId, status });
+  }
+}
 
 async function cancelGeneration(conversationId: string, generationId?: string): Promise<void> {
   const active = activeGenerations.get(conversationId);
   if (!active || (generationId && active.id !== generationId)) return;
   active.abort.abort(); await active.settled;
+}
+
+function inlineConfirmation(event: Electron.IpcMainInvokeEvent, conversationId: string, generation: ActiveGeneration, root: string): ConfirmAction {
+  const emit = (payload: Record<string, unknown>) => event.sender.send('chat:stream', payload);
+  return async (request, signal) => {
+    if (signal.aborted || activeGenerations.get(conversationId) !== generation) return { approved: false, reason: 'cancelled' };
+    const session = sessionApprovals.get(conversationId);
+    if (session?.root === root && session.categories.has(request.category)) {
+      emit({ type: 'approval-resolved', conversationId, generationId: generation.id, actionId: request.actionId, approvalId: `session-${randomUUID()}`, status: 'session-approved' });
+      return { approved: true, reason: 'session' };
+    }
+    const approvalId = randomUUID();
+    return new Promise<ApprovalResult>((resolve) => {
+      const abort = () => settleApproval(pending, { approved: false, reason: 'cancelled' }, 'rejected');
+      const pending: PendingApproval = { approvalId, conversationId, generation, actionId: request.actionId, category: request.category, root, resolve, settled: false, abort, emit };
+      pendingApprovals.set(approvalId, pending);
+      signal.addEventListener('abort', abort, { once: true });
+      emit({ type: 'approval-request', conversationId, generationId: generation.id, actionId: request.actionId, approval: { approvalId, category: request.category, status: 'pending' } });
+    });
+  };
 }
 
 export function registerIpc(): void {
@@ -51,11 +79,12 @@ export function registerIpc(): void {
     const requestedContext = patch.contextWindow ?? current.contextWindow;
     const contextWindow = allowed.length && !allowed.includes(requestedContext) ? allowed.at(-1)! : requestedContext;
     const updated = database.updateConversation(id, { ...patch, contextWindow });
+    if (patch.workingDirectory !== undefined && patch.workingDirectory !== current.workingDirectory) sessionApprovals.delete(id);
     if (patch.modelId !== undefined && patch.modelId !== current.modelId) database.setContextUsage(id, null, null);
     if (patch.modelId !== undefined && patch.modelId !== current.modelId && current.modelId) void ollama.unloadModel(current.modelId);
     return database.getConversation(id) ?? updated;
   });
-  ipcMain.handle('conversations:delete', (_event, id: string) => database.deleteConversation(id));
+  ipcMain.handle('conversations:delete', (_event, id: string) => { sessionApprovals.delete(id); database.deleteConversation(id); });
   ipcMain.handle('messages:list', (_event, conversationId: string) => database.listMessages(conversationId));
   ipcMain.handle('messages:edit', async (_event, messageId: string, content: string, fallback?: { conversationId: string; content: string }) => {
     const message = database.getMessage(messageId) ?? (fallback ? database.findUserMessage(fallback.conversationId, fallback.content) : null); if (!message) throw new Error('Сообщение не найдено');
@@ -74,6 +103,19 @@ export function registerIpc(): void {
     return result.canceled ? null : result.filePaths[0] ?? null;
   });
   ipcMain.handle('chat:stop', async (_event, conversationId: string, generationId?: string) => { await cancelGeneration(conversationId, generationId); });
+  ipcMain.handle('chat:approve', (_event, request: { conversationId: string; generationId: string; approvalId: string; decision: ApprovalDecision }) => {
+    const pending = pendingApprovals.get(request.approvalId);
+    if (!['reject', 'once', 'session'].includes(request.decision) || !pending || pending.conversationId !== request.conversationId || pending.generation.id !== request.generationId || activeGenerations.get(request.conversationId) !== pending.generation || pending.generation.abort.signal.aborted) return false;
+    if (request.decision === 'session') {
+      const session = sessionApprovals.get(pending.conversationId);
+      const categories = session?.root === pending.root ? session.categories : new Set<RiskCategory>();
+      categories.add(pending.category);
+      sessionApprovals.set(pending.conversationId, { root: pending.root, categories });
+    }
+    const approved = request.decision !== 'reject';
+    settleApproval(pending, approved ? { approved: true, reason: request.decision === 'session' ? 'session' : 'once' } : { approved: false, reason: 'user_rejected' }, approved ? request.decision === 'session' ? 'session-approved' : 'approved' : 'rejected');
+    return true;
+  });
   ipcMain.handle('chat:send', async (event, request: ChatRequest) => {
     await cancelGeneration(request.conversationId);
     const abort = new AbortController(); let finish!: () => void;
@@ -100,7 +142,7 @@ export function registerIpc(): void {
       if (!current()) return;
       event.sender.send('chat:stream', { type: 'context', conversationId: request.conversationId, generationId: generation.id, ...context });
       const stream = agentRoot
-        ? projectChat.stream(request.model, request.messages, agentRoot, abort.signal, context.active, conversation.analysisDepth, conversation.webMode)
+        ? projectChat.stream(request.model, request.messages, agentRoot, abort.signal, context.active, conversation.analysisDepth, conversation.webMode, inlineConfirmation(event, request.conversationId, generation, agentRoot))
         : conversation.webMode === 'auto'
           ? webChat.stream(request.model, request.messages, abort.signal, context.active, conversation.analysisDepth)
           : ollama.streamChat(request.model, [{ id: `capability-${request.conversationId}`, conversationId: request.conversationId, role: 'system', content: capabilitySystemContext({ webAvailable: false }), createdAt: new Date().toISOString() }, ...request.messages], abort.signal, context.active, conversation.analysisDepth);

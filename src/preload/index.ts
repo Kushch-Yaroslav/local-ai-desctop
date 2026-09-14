@@ -17,6 +17,7 @@ const api: LocalAiApi = {
   chat: {
     send: (request) => ipcRenderer.invoke('chat:send', request),
     stop: (conversationId, generationId) => ipcRenderer.invoke('chat:stop', conversationId, generationId),
+    approve: (request) => ipcRenderer.invoke('chat:approve', request),
     onStream: (listener) => { const callback = (_: unknown, event: Parameters<typeof listener>[0]) => listener(event); ipcRenderer.on('chat:stream', callback); return () => ipcRenderer.removeListener('chat:stream', callback); },
   },
 };
