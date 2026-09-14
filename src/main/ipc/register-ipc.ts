@@ -13,12 +13,17 @@ import { webToolDefinitions } from '../web/web-tools';
 import { WebChatService } from '../services/web-chat';
 import { capabilitySystemContext } from '../services/capabilities';
 import { projectToolDefinitions, type ApprovalResult, type ConfirmAction } from '../tools/project-tools';
+import { AttachmentService } from '../services/attachment-service';
+import { AttachmentPipeline } from '../services/attachment-pipeline';
+import { readFile } from 'node:fs/promises';
 
 const database = new Database();
 const ollama = new OllamaBackend();
 const web = new WebBrowserService();
 const projectChat = new ProjectChatService(ollama, web);
 const webChat = new WebChatService(ollama, web);
+const attachments = new AttachmentService(database);
+const attachmentPipeline = new AttachmentPipeline(database, attachments, ollama);
 type ActiveGeneration = { id: string; abort: AbortController; settled: Promise<void>; finish: () => void };
 const activeGenerations = new Map<string, ActiveGeneration>();
 type PendingApproval = { approvalId: string; conversationId: string; generation: ActiveGeneration; actionId: string; category: RiskCategory; root: string; resolve: (result: ApprovalResult) => void; settled: boolean; abort: () => void; emit: (payload: Record<string, unknown>) => void };
@@ -84,11 +89,21 @@ export function registerIpc(): void {
     if (patch.modelId !== undefined && patch.modelId !== current.modelId && current.modelId) void ollama.unloadModel(current.modelId);
     return database.getConversation(id) ?? updated;
   });
-  ipcMain.handle('conversations:delete', (_event, id: string) => { sessionApprovals.delete(id); database.deleteConversation(id); });
+  ipcMain.handle('conversations:delete', async (_event, id: string) => { sessionApprovals.delete(id); await attachments.removeManagedFiles(database.deleteConversation(id)); });
   ipcMain.handle('messages:list', (_event, conversationId: string) => database.listMessages(conversationId));
   ipcMain.handle('messages:edit', async (_event, messageId: string, content: string, fallback?: { conversationId: string; content: string }) => {
     const message = database.getMessage(messageId) ?? (fallback ? database.findUserMessage(fallback.conversationId, fallback.content) : null); if (!message) throw new Error('Сообщение не найдено');
-    await cancelGeneration(message.conversationId); return database.editUserMessageAndTruncate(message.id, content);
+    const before = database.listAttachmentsForConversation(message.conversationId);
+    await cancelGeneration(message.conversationId); const edited = database.editUserMessageAndTruncate(message.id, content);
+    const kept = new Set(database.listAttachmentsForConversation(message.conversationId).map((attachment) => attachment.id));
+    await attachments.removeManagedFiles(before.filter((attachment) => !kept.has(attachment.id)));
+    return edited;
+  });
+  ipcMain.handle('attachments:import', (_event, input) => attachments.import(input));
+  ipcMain.handle('attachments:list', (_event, messageId: string) => database.listAttachments(messageId));
+  ipcMain.handle('attachments:dataUrl', async (_event, id: string) => {
+    const attachment = database.getAttachment(id); if (!attachment || attachment.kind !== 'image') return null;
+    const data = await readFile(attachment.storageRef); return `data:${attachment.mimeType};base64,${data.toString('base64')}`;
   });
   ipcMain.handle('analysis:list', (_event, conversationId: string) => database.listAnalysisRuns(conversationId));
   ipcMain.handle('models:list', async () => {
@@ -129,9 +144,31 @@ export function registerIpc(): void {
     const conversation = database.getConversation(request.conversationId);
     if (!conversation) throw new Error('Чат не найден');
     if (conversation.modelId && conversation.modelId !== request.model) throw new Error('Выбранная модель была изменена. Повторите отправку сообщения.');
+    if (user) database.addMessage(request.conversationId, 'user', user.content, user.id);
+    const emitAttachment = (chunk: import('../../shared/types').StreamEvent) => event.sender.send('chat:stream', { ...chunk, conversationId: request.conversationId, generationId: generation.id });
+    const attachmentIds = [...(request.attachmentIds ?? [])];
+    if (user) {
+      for (const input of request.attachments ?? []) {
+        if (input.messageId !== user.id) throw new Error('Вложение относится к другому сообщению');
+        try { const attachment = await attachments.import(input); attachmentIds.push(attachment.id); }
+        catch (error) { emitAttachment({ type: 'attachment', activity: { id: `attachment-${input.id ?? randomUUID()}`, label: input.filename, detail: `✕ ${error instanceof Error ? error.message : String(error)}`, status: 'error' } }); }
+      }
+    }
+    if (!current()) return;
+    // Ollama advertises capabilities with the installed tag. This governs routing
+    // for every image turn in the active history, rather than guessing from names.
+    const hasImages = database.listAttachmentsForConversation(request.conversationId).some((attachment) => attachment.kind === 'image');
+    const nativeVision = hasImages && await ollama.supportsVision(request.model, abort.signal);
+    const preprocessIds = nativeVision
+      ? attachmentIds
+      : [...new Set([...attachmentIds, ...database.listAttachmentsForConversation(request.conversationId)
+        .filter((attachment) => attachment.kind === 'image' && !attachment.visionAnalysis)
+        .map((attachment) => attachment.id)])];
+    log('attachment.vision-routing', { generationId: generation.id, modelId: request.model, hasImages, route: nativeVision ? 'native' : hasImages ? 'minicpm-fallback' : 'none' });
+    if (preprocessIds.length) await attachmentPipeline.preprocessCurrent(preprocessIds, abort.signal, emitAttachment, request.model, nativeVision);
+    if (!current()) return;
     await ollama.ensureModelAvailable(request.model);
     if (!current()) return;
-    if (user) database.addMessage(request.conversationId, 'user', user.content, user.id);
     let output = ''; let completed = false; let failed = false; let finishReason: 'stop' | 'length' = 'stop';
     const agentRoot = conversation.mode === 'agent' ? conversation.workingDirectory ?? paths.root : null;
     const enabledTools = agentRoot ? [...projectToolDefinitions.map((tool) => tool.function.name), ...(conversation.webMode === 'auto' ? webToolDefinitions.map((tool) => tool.function.name) : [])] : conversation.webMode === 'auto' ? webToolDefinitions.map((tool) => tool.function.name) : [];
@@ -141,11 +178,15 @@ export function registerIpc(): void {
       const context = await ollama.resolveContextWindow(request.model, conversation.contextWindow, abort.signal);
       if (!current()) return;
       event.sender.send('chat:stream', { type: 'context', conversationId: request.conversationId, generationId: generation.id, ...context });
+      // Image descriptions are excluded for native-vision requests: the original
+      // image payload is attached only to its owning user turn below.
+      let history = attachmentPipeline.buildContext(request.messages, !nativeVision);
+      if (nativeVision) history = await attachmentPipeline.prepareNativeImages(history, abort.signal);
       const stream = agentRoot
-        ? projectChat.stream(request.model, request.messages, agentRoot, abort.signal, context.active, conversation.analysisDepth, conversation.webMode, inlineConfirmation(event, request.conversationId, generation, agentRoot))
+        ? projectChat.stream(request.model, history, agentRoot, abort.signal, context.active, conversation.analysisDepth, conversation.webMode, inlineConfirmation(event, request.conversationId, generation, agentRoot))
         : conversation.webMode === 'auto'
-          ? webChat.stream(request.model, request.messages, abort.signal, context.active, conversation.analysisDepth)
-          : ollama.streamChat(request.model, [{ id: `capability-${request.conversationId}`, conversationId: request.conversationId, role: 'system', content: capabilitySystemContext({ webAvailable: false }), createdAt: new Date().toISOString() }, ...request.messages], abort.signal, context.active, conversation.analysisDepth);
+          ? webChat.stream(request.model, history, abort.signal, context.active, conversation.analysisDepth)
+          : ollama.streamChat(request.model, [{ id: `capability-${request.conversationId}`, conversationId: request.conversationId, role: 'system', content: capabilitySystemContext({ webAvailable: false }), createdAt: new Date().toISOString() }, ...history], abort.signal, context.active, conversation.analysisDepth);
       for await (const chunk of stream) {
         if (!current()) break;
         if (chunk.type === 'token') output += chunk.content;

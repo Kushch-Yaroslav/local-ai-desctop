@@ -6,6 +6,37 @@ export type FinishReason = 'stop' | 'length' | 'cancelled' | 'error';
 export type RiskCategory = 'git_commit' | 'git_push' | 'destructive_git' | 'package_install' | 'package_remove' | 'file_delete' | 'chmod_chown' | 'shell_redirection' | 'shell_chaining' | 'system_command';
 export type ApprovalDecision = 'reject' | 'once' | 'session';
 export type ApprovalStatus = 'pending' | 'approved' | 'rejected' | 'session-approved';
+export type AttachmentKind = 'image' | 'text' | 'document' | 'spreadsheet' | 'pdf';
+export type AttachmentStatus = 'pending' | 'processing' | 'ready' | 'error' | 'cancelled' | 'ocr_required';
+
+export interface Attachment {
+  id: string;
+  messageId: string;
+  index: number;
+  kind: AttachmentKind;
+  mimeType: string;
+  filename: string;
+  size: number;
+  storageRef: string;
+  status: AttachmentStatus;
+  extractedText?: string;
+  structuredData?: string;
+  visionAnalysis?: string;
+  error?: string;
+  metadata?: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AttachmentInput {
+  id?: string;
+  messageId: string;
+  index: number;
+  filename: string;
+  mimeType: string;
+  /** Bytes are copied to application-managed storage in Electron main, never executed. */
+  data: Uint8Array;
+}
 
 export interface ActionApproval {
   approvalId: string;
@@ -69,6 +100,9 @@ export interface ChatMessage {
   role: 'user' | 'assistant' | 'system';
   content: string;
   createdAt: string;
+  attachments?: Attachment[];
+  /** Ephemeral base64 image inputs for Ollama. These are rebuilt from managed attachment storage and are never persisted in SQLite. */
+  images?: string[];
 }
 
 export interface HardwareStats {
@@ -93,6 +127,8 @@ export interface ChatRequest {
   messages: ChatMessage[];
   generationId: string;
   persistUserMessage: boolean;
+  attachmentIds?: string[];
+  attachments?: AttachmentInput[];
 }
 
 export interface ToolActivity {
@@ -100,6 +136,8 @@ export interface ToolActivity {
   label: string;
   detail?: string;
   approval?: ActionApproval;
+  status?: AttachmentStatus;
+  attachment?: Attachment;
 }
 
 export interface AnalysisRun {
@@ -122,6 +160,7 @@ export interface AnalysisProgress {
 export type StreamEvent =
   | { type: 'token'; content: string }
   | { type: 'tool'; activity: ToolActivity; runId?: string }
+  | { type: 'attachment'; activity: ToolActivity }
   | { type: 'approval-request'; actionId: string; approval: ActionApproval }
   | { type: 'approval-resolved'; actionId: string; approvalId: string; status: Exclude<ApprovalStatus, 'pending'> }
   | { type: 'analysis-run'; run: AnalysisRun }
@@ -141,6 +180,11 @@ export interface LocalAiApi {
     delete(id: string): Promise<void>;
   };
   messages: { list(conversationId: string): Promise<ChatMessage[]>; edit(id: string, content: string, fallback?: Pick<ChatMessage, 'conversationId' | 'content'>): Promise<ChatMessage[]> };
+  attachments: {
+    import(input: AttachmentInput): Promise<Attachment>;
+    list(messageId: string): Promise<Attachment[]>;
+    dataUrl(id: string): Promise<string | null>;
+  };
   analysis: { list(conversationId: string): Promise<AnalysisRun[]> };
   models: { list(): Promise<ModelInfo[]> };
   settings: { get(): Promise<AppSettings> };

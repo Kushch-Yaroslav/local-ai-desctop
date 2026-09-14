@@ -12,11 +12,12 @@ export const paths = {
   userData: join(dataRoot, 'app-data'),
   cache: join(dataRoot, 'cache'),
   logs: join(dataRoot, 'logs'),
+  attachments: join(dataRoot, 'attachments'),
   database: join(dataRoot, 'sqlite', 'local-ai-desktop.db'),
   models: '/media/yaroslav/DATA/AI/models',
 };
 
 export function ensureAppDirectories(): void {
-  [paths.dataRoot, paths.userData, paths.cache, paths.logs, join(paths.dataRoot, 'sqlite')]
+  [paths.dataRoot, paths.userData, paths.cache, paths.logs, paths.attachments, join(paths.dataRoot, 'sqlite')]
     .forEach((directory) => mkdirSync(directory, { recursive: true }));
 }

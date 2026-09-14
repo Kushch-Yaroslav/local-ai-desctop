@@ -41,7 +41,7 @@ export class ProjectChatService {
     const closeWebOnAbort = () => { void webSession?.close(); };
     signal.addEventListener('abort', closeWebOnAbort, { once: true });
     const toolDefinitions = [...projectToolDefinitions, ...(webSession ? webToolDefinitions : [])];
-    const messages: ToolMessage[] = [{ role: 'system', content: `${capabilitySystemContext({ webAvailable: Boolean(webSession), projectRoot: root, projectWriteAvailable: true, terminalAvailable: true })} Не предполагай тип, технологию или предметную область проекта. ${engine.strategy()} Raw tool results являются доказательствами и остаются доступными для итогового ответа.` }, ...history.map(({ role, content }) => ({ role, content }))];
+    const messages: ToolMessage[] = [{ role: 'system', content: `${capabilitySystemContext({ webAvailable: Boolean(webSession), projectRoot: root, projectWriteAvailable: true, terminalAvailable: true })} Не предполагай тип, технологию или предметную область проекта. ${engine.strategy()} Raw tool results являются доказательствами и остаются доступными для итогового ответа.` }, ...history.map(({ role, content, images }) => ({ role, content, ...(images?.length ? { images } : {}) }))];
     let actions = 0; let repeats = 0; let lowInfo = 0; let warningSent = false; let researchFinished = false;
     const completed = new Set<string>();
     if (engine.isDeep) { log('deep.lifecycle', { phase: 'research.started', model, contextWindow }); yield { type: 'analysis', progress: { stage: 'reconnaissance', status: 'active' } }; }

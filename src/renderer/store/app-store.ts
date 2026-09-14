@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { ActionApproval, AnalysisProgress, AnalysisRun, ApprovalDecision, ApprovalStatus, ChatMessage, Conversation, FinishReason, GenerationDiagnostics, HardwareStats, ModelInfo, ToolActivity } from '../../shared/types';
+import type { ActionApproval, AnalysisProgress, AnalysisRun, Attachment, AttachmentStatus, ApprovalDecision, ApprovalStatus, ChatMessage, Conversation, FinishReason, GenerationDiagnostics, HardwareStats, ModelInfo, ToolActivity } from '../../shared/types';
 
 type State = {
   conversations: Conversation[];
@@ -26,16 +26,17 @@ type State = {
   updateConversation: (id: string, patch: Partial<Conversation>) => Promise<void>;
   deleteConversation: (id: string) => Promise<void>;
   refreshHardware: () => Promise<void>;
-  sendMessage: (content: string) => Promise<void>;
+  sendMessage: (content: string, files?: File[]) => Promise<void>;
   continueGeneration: () => Promise<void>;
   approveAction: (decision: ApprovalDecision) => Promise<void>;
   editMessage: (message: ChatMessage, content: string) => Promise<boolean>;
   stop: () => Promise<void>;
-  handleStream: (event: { type: string; content?: string; message?: string; details?: string; activity?: ToolActivity; run?: AnalysisRun; progress?: AnalysisProgress; requested?: number; active?: number; supported?: number; used?: number; maximum?: number; conversationId: string; generationId: string; modelId?: string; assistant?: ChatMessage | null; finishReason?: FinishReason; diagnostics?: Omit<GenerationDiagnostics, 'generationId' | 'conversationId' | 'createdAt'>; actionId?: string; approval?: ActionApproval; approvalId?: string; status?: Exclude<ApprovalStatus, 'pending'> }) => void;
+  handleStream: (event: { type: string; content?: string; message?: string; details?: string; activity?: ToolActivity; run?: AnalysisRun; progress?: AnalysisProgress; requested?: number; active?: number; supported?: number; used?: number; maximum?: number; conversationId: string; generationId: string; modelId?: string; assistant?: ChatMessage | null; finishReason?: FinishReason; diagnostics?: Omit<GenerationDiagnostics, 'generationId' | 'conversationId' | 'createdAt'>; actionId?: string; approval?: ActionApproval; approvalId?: string; status?: Exclude<ApprovalStatus, 'pending'> | AttachmentStatus }) => void;
 };
 
 const assistantId = (generationId: string) => `stream-${generationId}`;
 const now = () => new Date().toISOString();
+const isImageFile = (file: File): boolean => file.type.startsWith('image/') || /\.(png|jpe?g|webp)$/i.test(file.name);
 
 export const useAppStore = create<State>((set, get) => {
   const pendingTokens = new Map<string, string>();
@@ -75,18 +76,24 @@ export const useAppStore = create<State>((set, get) => {
     if (remaining[0]) await get().selectConversation(remaining[0].id); else await get().createConversation();
   },
   refreshHardware: async () => set({ hardware: await window.localAi.hardware.get() }),
-  sendMessage: async (content) => {
+  sendMessage: async (content, files = []) => {
     if (get().generationId) await get().stop();
     const { activeId, conversations, messages, models } = get();
-    if (!activeId || !content.trim()) return;
+    if (!activeId || (!content.trim() && files.length === 0)) return;
     const chat = conversations.find((item) => item.id === activeId); const model = chat?.modelId ?? models[0]?.id;
     if (!model) { set({ error: 'Нет доступных моделей. Запустите Ollama и загрузите модель.' }); return; }
-    const user: ChatMessage = { id: crypto.randomUUID(), conversationId: activeId, role: 'user', content: content.trim(), createdAt: now() };
+    const userId = crypto.randomUUID();
+    let imageIndex = 0;
+    const attached: Attachment[] = files.map((file, index) => { const isImage = isImageFile(file); return { id: crypto.randomUUID(), messageId: userId, index, kind: isImage ? 'image' : file.name.endsWith('.pdf') ? 'pdf' : /\.(xlsx|xls)$/i.test(file.name) ? 'spreadsheet' : file.name.endsWith('.docx') ? 'document' : 'text', mimeType: file.type || 'application/octet-stream', filename: file.name, size: file.size, storageRef: '', status: 'pending', metadata: isImage ? { imageNumber: ++imageIndex } : undefined, createdAt: now(), updatedAt: now() }; });
+    const user: ChatMessage = { id: userId, conversationId: activeId, role: 'user', content: content.trim() || 'Вложения', createdAt: now(), attachments: attached };
     const generationId = crypto.randomUUID(); const streaming: ChatMessage = { id: assistantId(generationId), conversationId: activeId, role: 'assistant', content: '', createdAt: now() };
     set({ messages: [...messages, user, streaming], isGenerating: true, generationId, generationState: 'thinking', error: null, toolActivities: [], toolActivityCount: 0, analysisProgress: [], lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false });
     if (!chat?.modelId) await get().updateConversation(activeId, { modelId: model });
     if (chat?.title === 'Новый чат') await get().updateConversation(activeId, { title: content.trim().slice(0, 56) });
-    try { await window.localAi.chat.send({ conversationId: activeId, model, messages: [...messages, user], generationId, persistUserMessage: true }); }
+    try {
+      const attachmentInputs = await Promise.all(files.map(async (file, index) => ({ id: attached[index].id, messageId: user.id, index: attached[index].index, filename: file.name, mimeType: file.type, data: new Uint8Array(await file.arrayBuffer()) })));
+      await window.localAi.chat.send({ conversationId: activeId, model, messages: [...messages, user], generationId, persistUserMessage: true, attachments: attachmentInputs });
+    }
     catch (error) { set((state) => state.generationId === generationId ? { isGenerating: false, generationId: null, generationState: 'error', error: error instanceof Error ? error.message : 'Не удалось отправить сообщение', messages: state.messages.filter((message) => message.id !== assistantId(generationId)) } : {}); }
   },
   continueGeneration: async () => {
@@ -131,9 +138,17 @@ export const useAppStore = create<State>((set, get) => {
       pendingTokens.set(event.generationId, (pendingTokens.get(event.generationId) ?? '') + (event.content ?? ''));
       if (animationFrame === null) animationFrame = window.requestAnimationFrame(flushTokens);
     }
-    if (event.type === 'tool' && event.activity) set((state) => ({ generationState: event.activity!.label === 'Запуск terminal' ? 'running-terminal' : 'using-tool', toolActivities: [...state.toolActivities, event.activity!].slice(-40), toolActivityCount: state.toolActivityCount + 1 }));
+    if ((event.type === 'tool' || event.type === 'attachment') && event.activity) set((state) => {
+      const exists = state.toolActivities.some((activity) => activity.id === event.activity!.id);
+      const attachmentId = event.activity!.id.startsWith('attachment-') ? event.activity!.id.slice('attachment-'.length) : null;
+      return {
+        generationState: event.type === 'attachment' && event.activity!.status === 'processing' ? 'using-tool' : event.activity!.label === 'Запуск terminal' ? 'running-terminal' : 'using-tool',
+        toolActivities: [...state.toolActivities.filter((activity) => activity.id !== event.activity!.id), event.activity!].slice(-40), toolActivityCount: exists ? state.toolActivityCount : state.toolActivityCount + 1,
+        messages: attachmentId ? state.messages.map((message) => ({ ...message, attachments: message.attachments?.map((attachment) => attachment.id === attachmentId ? event.activity!.attachment ?? { ...attachment, status: event.activity!.status ?? attachment.status, error: event.activity!.status === 'error' ? event.activity!.detail : attachment.error, updatedAt: now() } : attachment) })) : state.messages,
+      };
+    });
     if (event.type === 'approval-request' && event.actionId && event.approval) set((state) => ({ generationState: 'waiting-for-approval', pendingApproval: { actionId: event.actionId!, approval: event.approval! }, approvalSubmitting: false, toolActivities: state.toolActivities.map((activity) => activity.id === event.actionId ? { ...activity, approval: event.approval } : activity) }));
-    if (event.type === 'approval-resolved' && event.actionId && event.approvalId && event.status) set((state) => ({ generationState: state.generationState === 'waiting-for-approval' ? 'using-tool' : state.generationState, pendingApproval: state.pendingApproval?.approval.approvalId === event.approvalId ? null : state.pendingApproval, approvalSubmitting: false, toolActivities: state.toolActivities.map((activity) => activity.id === event.actionId ? { ...activity, approval: { approvalId: event.approvalId!, category: activity.approval?.category ?? 'system_command', status: event.status! } } : activity) }));
+    if (event.type === 'approval-resolved' && event.actionId && event.approvalId && event.status) { const approvalStatus = event.status as Exclude<ApprovalStatus, 'pending'>; set((state) => ({ generationState: state.generationState === 'waiting-for-approval' ? 'using-tool' : state.generationState, pendingApproval: state.pendingApproval?.approval.approvalId === event.approvalId ? null : state.pendingApproval, approvalSubmitting: false, toolActivities: state.toolActivities.map((activity) => activity.id === event.actionId ? { ...activity, approval: { approvalId: event.approvalId!, category: activity.approval?.category ?? 'system_command', status: approvalStatus } } : activity) })); }
     if (event.type === 'analysis-run' && event.run) set((state) => ({ analysisRuns: [...state.analysisRuns.filter((run) => run.id !== event.run!.id), event.run!] }));
     if (event.type === 'analysis' && event.progress) set({ analysisProgress: [event.progress] });
     if (event.type === 'context' && event.active) set({ activeContextWindow: event.active });

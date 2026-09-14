@@ -4,6 +4,8 @@ export type ToolCall = { function: { name: string; arguments: Record<string, unk
 export type InferenceDiagnostics = Omit<GenerationDiagnostics, 'generationId' | 'conversationId' | 'createdAt' | 'agentStepCount' | 'finishReason'>;
 export type ToolMessage = {
   role: 'system' | 'user' | 'assistant' | 'tool'; content: string; tool_calls?: ToolCall[]; tool_name?: string;
+  /** Ephemeral base64 image inputs for Ollama; never a persisted chat field. */
+  images?: string[];
   prompt_eval_count?: number; finish_reason?: FinishReason; inference?: InferenceDiagnostics;
 };
 

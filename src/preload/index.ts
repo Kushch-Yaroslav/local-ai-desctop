@@ -9,6 +9,11 @@ const api: LocalAiApi = {
     delete: (id) => ipcRenderer.invoke('conversations:delete', id),
   },
   messages: { list: (conversationId) => ipcRenderer.invoke('messages:list', conversationId), edit: (id, content, fallback) => ipcRenderer.invoke('messages:edit', id, content, fallback) },
+  attachments: {
+    import: (input) => ipcRenderer.invoke('attachments:import', input),
+    list: (messageId) => ipcRenderer.invoke('attachments:list', messageId),
+    dataUrl: (id) => ipcRenderer.invoke('attachments:dataUrl', id),
+  },
   analysis: { list: (conversationId) => ipcRenderer.invoke('analysis:list', conversationId) },
   models: { list: () => ipcRenderer.invoke('models:list') },
   settings: { get: () => ipcRenderer.invoke('settings:get') },

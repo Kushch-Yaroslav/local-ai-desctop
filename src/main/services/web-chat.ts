@@ -37,7 +37,7 @@ export class WebChatService {
     }
     const closeOnAbort = () => { void session.close(); };
     signal.addEventListener('abort', closeOnAbort, { once: true });
-    const messages: ToolMessage[] = [{ role: 'system', content: capabilitySystemContext({ webAvailable: true }) }, ...history.map(({ role, content }) => ({ role, content }))];
+    const messages: ToolMessage[] = [{ role: 'system', content: capabilitySystemContext({ webAvailable: true }) }, ...history.map(({ role, content, images }) => ({ role, content, ...(images?.length ? { images } : {}) }))];
     try {
       for (let actionCount = 0; !signal.aborted && actionCount < maxWebActions; actionCount += 1) {
         const response = await this.backend.chatWithTools(model, messages, webToolDefinitions, signal, contextWindow, depth);

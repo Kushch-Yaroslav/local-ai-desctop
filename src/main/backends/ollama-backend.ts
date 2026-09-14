@@ -2,18 +2,20 @@ import type { AnalysisDepth, ChatMessage, FinishReason, ModelInfo, StreamEvent }
 import type { InferenceDiagnostics, LlmBackend, ToolCallingBackend, ToolMessage } from './types';
 import { getModelProfile, inferenceSettings, modelInfo, modelRegistry, requestedMaxOutputTokens } from '../models/model-registry';
 import { log } from '../services/logger';
+import { configuredVisionModelId } from '../config/vision-model';
 
-type OllamaTags = { models?: Array<{ name: string; size: number }> };
+type OllamaTags = { models?: Array<{ name: string; model?: string; size: number; capabilities?: string[]; details?: { family?: string; families?: string[] } }> };
 type OllamaMetrics = { prompt_eval_count?: number; prompt_eval_duration?: number; eval_count?: number; eval_duration?: number };
 type OllamaChunk = { message?: { content?: string }; done?: boolean; done_reason?: string; error?: string } & OllamaMetrics;
 
 type OllamaToolResponse = { message?: ToolMessage; error?: string; done_reason?: string } & OllamaMetrics;
 type OllamaShowResponse = { model_info?: Record<string, unknown>; parameters?: string };
+type OllamaRunningModels = { models?: Array<{ name: string; model?: string }> };
 
 export type ContextWindow = { requested: number; active: number; supported?: number };
 
 export class OllamaBackend implements LlmBackend, ToolCallingBackend {
-  constructor(private readonly baseUrl = 'http://127.0.0.1:11434') {}
+  constructor(private readonly baseUrl = 'http://127.0.0.1:11434', private readonly visionModelId = configuredVisionModelId()) {}
 
   async getModels(): Promise<ModelInfo[]> {
     const response = await fetch(`${this.baseUrl}/api/tags`);
@@ -43,6 +45,15 @@ export class OllamaBackend implements LlmBackend, ToolCallingBackend {
     catch (error) { return { available: false, message: error instanceof Error ? error.message : String(error) }; }
   }
 
+  /** Uses the runtime's advertised capability, never a model-name heuristic. */
+  async supportsVision(model: string, signal?: AbortSignal): Promise<boolean> {
+    const response = await fetch(`${this.baseUrl}/api/tags`, { signal });
+    if (!response.ok) throw new Error(`Ollama вернул HTTP ${response.status}`);
+    const data = await response.json() as OllamaTags;
+    const installed = (data.models ?? []).find((candidate) => candidate.name === model || candidate.model === model);
+    return installed?.capabilities?.includes('vision') === true;
+  }
+
   async resolveContextWindow(model: string, requested: number, signal: AbortSignal): Promise<ContextWindow> {
     const profile = getModelProfile(model);
     if (!profile) throw new Error('Выбранная модель отсутствует в реестре приложения');
@@ -70,8 +81,47 @@ export class OllamaBackend implements LlmBackend, ToolCallingBackend {
     if (!models.find((candidate) => candidate.id === model)?.installed) throw new Error(`Модель ${profile.displayName} не установлена. Проверьте DATA-диск и загрузите её через Ollama.`);
   }
 
+  /** Only returns an installed configured/exact MiniCPM-V 4.5 tag; this app never pulls models implicitly. */
+  async findInstalledVisionModel(): Promise<string | null> {
+    const response = await fetch(`${this.baseUrl}/api/tags`);
+    if (!response.ok) throw new Error(`Ollama вернул HTTP ${response.status}`);
+    const data = await response.json() as OllamaTags;
+    const installed = data.models ?? [];
+    const isRequiredVisionModel = (candidate: NonNullable<OllamaTags['models']>[number]) => {
+      const name = (candidate.name ?? candidate.model ?? '').toLowerCase();
+      const families = [candidate.details?.family, ...(candidate.details?.families ?? [])].filter(Boolean).join(' ').toLowerCase();
+      return (name.includes('minicpm') || families.includes('minicpm')) && (name.includes('4.5') || families.includes('4.5'));
+    };
+    if (this.visionModelId) return installed.some((candidate) => (candidate.name === this.visionModelId || candidate.model === this.visionModelId) && isRequiredVisionModel(candidate)) ? this.visionModelId : null;
+    const match = installed.find(isRequiredVisionModel);
+    return match?.name ?? null;
+  }
+
+  async isModelLoaded(model: string): Promise<boolean> {
+    try {
+      const response = await fetch(`${this.baseUrl}/api/ps`);
+      if (!response.ok) return false;
+      const data = await response.json() as OllamaRunningModels;
+      return (data.models ?? []).some((candidate) => candidate.name === model || candidate.model === model);
+    } catch { return false; }
+  }
+
+  async analyzeImageWithVision(model: string, image: Buffer, signal: AbortSignal): Promise<string> {
+    const response = await fetch(`${this.baseUrl}/api/chat`, {
+      method: 'POST', signal, headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model, stream: false, keep_alive: '10m', think: false,
+        messages: [{ role: 'user', content: 'Analyze this user-provided image. Do not answer conversationally. Return a precise structured report with headings: Summary, Visible text, UI/layout, Tables/code/errors, Objects/elements, Important details, Uncertainty. Transcribe only text you can actually read; explicitly mark uncertain details. This report will be passed to another local model.', images: [image.toString('base64')] }],
+        options: { num_ctx: 8192, temperature: 0.1 },
+      }),
+    });
+    const data = await response.json() as OllamaToolResponse;
+    if (!response.ok || data.error) throw this.readableError(`Vision worker error: ${data.error ?? `HTTP ${response.status}`}`);
+    const content = data.message?.content?.trim(); if (!content) throw new Error('Vision worker returned an empty analysis');
+    return content;
+  }
+
   async unloadModel(model: string): Promise<void> {
-    if (!getModelProfile(model)) return;
     try {
       await fetch(`${this.baseUrl}/api/generate`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model, keep_alive: 0 }) });
     } catch { /* The next inference will still let Ollama reclaim memory when necessary. */ }
@@ -93,7 +143,7 @@ export class OllamaBackend implements LlmBackend, ToolCallingBackend {
   private async inputTokens(model: string, messages: Array<ChatMessage | ToolMessage>, tools: unknown[] | undefined, contextWindow: number, signal: AbortSignal): Promise<number> {
     const ollamaMessages = messages.map((message) => {
       const tool = message as ToolMessage;
-      return { role: message.role, content: message.content, ...(tool.tool_calls ? { tool_calls: tool.tool_calls } : {}), ...(tool.tool_name ? { tool_name: tool.tool_name } : {}) };
+      return { role: message.role, content: message.content, ...(tool.images?.length ? { images: tool.images } : {}), ...(tool.tool_calls ? { tool_calls: tool.tool_calls } : {}), ...(tool.tool_name ? { tool_name: tool.tool_name } : {}) };
     });
     try {
       const response = await fetch(`${this.baseUrl}/api/chat`, {
@@ -169,7 +219,7 @@ export class OllamaBackend implements LlmBackend, ToolCallingBackend {
       response = await fetch(`${this.baseUrl}/api/chat`, {
         method: 'POST', signal,
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ model, stream: true, messages: messages.map(({ role, content }) => ({ role, content })), think: settings.think, options: settings.options }),
+        body: JSON.stringify({ model, stream: true, messages: messages.map(({ role, content, images }) => ({ role, content, ...(images?.length ? { images } : {}) })), think: settings.think, options: settings.options }),
       });
     } catch (error) {
       if (signal.aborted) return;

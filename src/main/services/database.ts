@@ -1,6 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
-import type { AnalysisDepth, AnalysisRun, ChatMessage, ChatMode, Conversation, GenerationDiagnostics, ToolActivity, WebMode } from '../../shared/types';
+import type { AnalysisDepth, AnalysisRun, Attachment, AttachmentKind, AttachmentStatus, ChatMessage, ChatMode, Conversation, GenerationDiagnostics, ToolActivity, WebMode } from '../../shared/types';
 import { paths } from './paths';
 
 type ConversationRow = {
@@ -12,6 +12,7 @@ type ConversationRow = {
   created_at: string; updated_at: string;
 };
 type MessageRow = { id: string; conversation_id: string; role: ChatMessage['role']; content: string; created_at: string };
+type AttachmentRow = { id: string; message_id: string; position: number; kind: AttachmentKind; mime_type: string; filename: string; size: number; storage_ref: string; status: AttachmentStatus; extracted_text: string | null; structured_data: string | null; vision_analysis: string | null; error: string | null; metadata: string | null; created_at: string; updated_at: string };
 type AnalysisRunRow = { id: string; conversation_id: string; assistant_message_id: string | null; depth: AnalysisDepth; status: AnalysisRun['status']; action_count: number; created_at: string; completed_at: string | null };
 type AnalysisActionRow = { id: string; run_id: string; label: string; detail: string | null; position: number };
 
@@ -19,8 +20,18 @@ const mapConversation = (row: ConversationRow): Conversation => ({
   id: row.id, title: row.title, modelId: row.model_id, mode: row.mode,
   workingDirectory: row.working_directory, contextWindow: row.context_window ?? 32_768, analysisDepth: row.analysis_depth ?? 'normal', contextTokens: row.context_tokens ?? null, contextModelId: row.context_model_id ?? null, webMode: row.web_mode ?? 'auto', createdAt: row.created_at, updatedAt: row.updated_at,
 });
-const mapMessage = (row: MessageRow): ChatMessage => ({
+const mapAttachment = (row: AttachmentRow): Attachment => ({
+  id: row.id, messageId: row.message_id, index: row.position, kind: row.kind, mimeType: row.mime_type, filename: row.filename, size: row.size, storageRef: row.storage_ref, status: row.status,
+  extractedText: row.extracted_text ?? undefined, structuredData: row.structured_data ?? undefined, visionAnalysis: row.vision_analysis ?? undefined, error: row.error ?? undefined,
+  metadata: parseAttachmentMetadata(row.metadata), createdAt: row.created_at, updatedAt: row.updated_at,
+});
+function parseAttachmentMetadata(value: string | null): Record<string, unknown> | undefined {
+  if (!value) return undefined;
+  try { const parsed = JSON.parse(value); return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : undefined; } catch { return undefined; }
+}
+const mapMessage = (row: MessageRow, attachments?: Attachment[]): ChatMessage => ({
   id: row.id, conversationId: row.conversation_id, role: row.role, content: row.content, createdAt: row.created_at,
+  attachments,
 });
 const mapRun = (row: AnalysisRunRow, actions: AnalysisActionRow[]): AnalysisRun => ({ id: row.id, conversationId: row.conversation_id, assistantMessageId: row.assistant_message_id, depth: row.depth, status: row.status, actionCount: row.action_count, actions: actions.map((action) => ({ id: action.id, label: action.label, detail: action.detail ?? undefined })), createdAt: row.created_at, completedAt: row.completed_at });
 
@@ -39,6 +50,14 @@ export class Database {
         role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL
       ) STRICT;
       CREATE INDEX IF NOT EXISTS messages_conversation_idx ON messages(conversation_id, created_at);
+      CREATE TABLE IF NOT EXISTS attachments (
+        id TEXT PRIMARY KEY, message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+        position INTEGER NOT NULL, kind TEXT NOT NULL, mime_type TEXT NOT NULL, filename TEXT NOT NULL,
+        size INTEGER NOT NULL, storage_ref TEXT NOT NULL, status TEXT NOT NULL,
+        extracted_text TEXT, structured_data TEXT, vision_analysis TEXT, error TEXT, metadata TEXT,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      ) STRICT;
+      CREATE INDEX IF NOT EXISTS attachments_message_idx ON attachments(message_id, position);
       CREATE TABLE IF NOT EXISTS analysis_runs (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, assistant_message_id TEXT, depth TEXT NOT NULL, status TEXT NOT NULL, action_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, completed_at TEXT) STRICT;
       CREATE TABLE IF NOT EXISTS analysis_actions (id TEXT PRIMARY KEY, run_id TEXT NOT NULL, label TEXT NOT NULL, detail TEXT, position INTEGER NOT NULL) STRICT;
       CREATE INDEX IF NOT EXISTS analysis_runs_conversation_idx ON analysis_runs(conversation_id, created_at);
@@ -96,13 +115,16 @@ export class Database {
     return next;
   }
 
-  deleteConversation(id: string): void {
+  deleteConversation(id: string): Attachment[] {
+    const attachments = this.listAttachmentsForConversation(id);
     const runs = this.db.prepare('SELECT id FROM analysis_runs WHERE conversation_id=?').all(id) as unknown as Array<{ id: string }>;
     for (const run of runs) this.db.prepare('DELETE FROM analysis_actions WHERE run_id=?').run(run.id);
     this.db.prepare('DELETE FROM analysis_runs WHERE conversation_id=?').run(id);
     this.db.prepare('DELETE FROM generation_diagnostics WHERE conversation_id=?').run(id);
+    this.db.prepare('DELETE FROM attachments WHERE message_id IN (SELECT id FROM messages WHERE conversation_id=?)').run(id);
     this.db.prepare('DELETE FROM messages WHERE conversation_id=?').run(id);
     this.db.prepare('DELETE FROM conversations WHERE id=?').run(id);
+    return attachments;
   }
 
   getConversation(id: string): Conversation | null {
@@ -111,17 +133,17 @@ export class Database {
   }
 
   listMessages(conversationId: string): ChatMessage[] {
-    return (this.db.prepare('SELECT * FROM messages WHERE conversation_id=? ORDER BY created_at ASC').all(conversationId) as unknown as MessageRow[]).map(mapMessage);
+    return (this.db.prepare('SELECT * FROM messages WHERE conversation_id=? ORDER BY created_at ASC').all(conversationId) as unknown as MessageRow[]).map((row) => mapMessage(row, this.listAttachments(row.id)));
   }
 
   getMessage(id: string): ChatMessage | null {
     const row = this.db.prepare('SELECT * FROM messages WHERE id=?').get(id) as unknown as MessageRow | undefined;
-    return row ? mapMessage(row) : null;
+    return row ? mapMessage(row, this.listAttachments(row.id)) : null;
   }
 
   findUserMessage(conversationId: string, content: string): ChatMessage | null {
     const row = this.db.prepare("SELECT * FROM messages WHERE conversation_id=? AND role='user' AND content=? ORDER BY rowid DESC LIMIT 1").get(conversationId, content) as unknown as MessageRow | undefined;
-    return row ? mapMessage(row) : null;
+    return row ? mapMessage(row, this.listAttachments(row.id)) : null;
   }
 
   addMessage(conversationId: string, role: ChatMessage['role'], content: string, id: string = randomUUID()): ChatMessage {
@@ -129,6 +151,36 @@ export class Database {
     this.db.prepare('INSERT INTO messages VALUES (?, ?, ?, ?, ?)').run(message.id, message.conversationId, message.role, message.content, message.createdAt);
     this.db.prepare('UPDATE conversations SET updated_at=? WHERE id=?').run(message.createdAt, conversationId);
     return message;
+  }
+
+  createAttachment(input: Omit<Attachment, 'createdAt' | 'updatedAt' | 'status'> & { status?: AttachmentStatus }): Attachment {
+    const now = new Date().toISOString();
+    const status = input.status ?? 'pending';
+    this.db.prepare(`INSERT INTO attachments (id, message_id, position, kind, mime_type, filename, size, storage_ref, status, extracted_text, structured_data, vision_analysis, error, metadata, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(input.id, input.messageId, input.index, input.kind, input.mimeType, input.filename, input.size, input.storageRef, status, input.extractedText ?? null, input.structuredData ?? null, input.visionAnalysis ?? null, input.error ?? null, input.metadata ? JSON.stringify(input.metadata) : null, now, now);
+    return this.getAttachment(input.id)!;
+  }
+
+  getAttachment(id: string): Attachment | null {
+    const row = this.db.prepare('SELECT * FROM attachments WHERE id=?').get(id) as unknown as AttachmentRow | undefined;
+    return row ? mapAttachment(row) : null;
+  }
+
+  listAttachments(messageId: string): Attachment[] {
+    return (this.db.prepare('SELECT * FROM attachments WHERE message_id=? ORDER BY position ASC').all(messageId) as unknown as AttachmentRow[]).map(mapAttachment);
+  }
+
+  listAttachmentsForConversation(conversationId: string): Attachment[] {
+    return (this.db.prepare('SELECT attachments.* FROM attachments JOIN messages ON messages.id=attachments.message_id WHERE messages.conversation_id=? ORDER BY messages.rowid ASC, attachments.position ASC').all(conversationId) as unknown as AttachmentRow[]).map(mapAttachment);
+  }
+
+  updateAttachment(id: string, patch: Partial<Pick<Attachment, 'status' | 'extractedText' | 'structuredData' | 'visionAnalysis' | 'error' | 'metadata'>>): Attachment | null {
+    const current = this.getAttachment(id); if (!current) return null;
+    const next = { ...current, ...patch };
+    this.db.prepare('UPDATE attachments SET status=?, extracted_text=?, structured_data=?, vision_analysis=?, error=?, metadata=?, updated_at=? WHERE id=?')
+      .run(next.status, next.extractedText ?? null, next.structuredData ?? null, next.visionAnalysis ?? null, next.error ?? null, next.metadata ? JSON.stringify(next.metadata) : null, new Date().toISOString(), id);
+    return this.getAttachment(id);
   }
 
   editUserMessageAndTruncate(messageId: string, content: string): ChatMessage[] {
@@ -146,6 +198,7 @@ export class Database {
         for (const run of runIds) this.db.prepare('DELETE FROM analysis_actions WHERE run_id=?').run(run.id);
         if (runIds.length) this.db.prepare(`DELETE FROM analysis_runs WHERE id IN (${runIds.map(() => '?').join(',')})`).run(...runIds.map((run) => run.id));
       }
+      this.db.prepare('DELETE FROM attachments WHERE message_id IN (SELECT id FROM messages WHERE conversation_id=? AND rowid>?)').run(target.conversation_id, target.rowid);
       this.db.prepare('DELETE FROM messages WHERE conversation_id=? AND rowid>?').run(target.conversation_id, target.rowid);
       this.db.prepare('UPDATE conversations SET updated_at=? WHERE id=?').run(new Date().toISOString(), target.conversation_id);
       this.db.exec('COMMIT'); return this.listMessages(target.conversation_id);
