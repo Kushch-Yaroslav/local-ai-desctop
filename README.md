@@ -31,6 +31,7 @@ env NPM_CONFIG_CACHE="$PWD/local-cache/npm" npm start
 - Переключатель «Чат / Агент»: в агентском режиме с рабочей папкой доступны чтение и поиск файлов, `apply_patch`, создание файлов, git inspection и контролируемый terminal. Диагностические команды запускаются сразу; рискованные получают явное подтверждение в приложении.
 - Каждая генерация имеет собственный ID и AbortController. Stop отменяет inference, web-session, agent loop и terminal process group; запоздалые события старой генерации игнорируются. Пользовательские сообщения можно редактировать: downstream история удаляется и ответ создаётся заново.
 - Обновление RAM и показателей NVIDIA через лёгкий опрос `nvidia-smi` каждые две секунды. Когда драйвер или `nvidia-smi` недоступны, остаётся мониторинг RAM и понятный статус GPU.
+- Верхняя панель разделяет вторичный runtime monitoring (RAM, VRAM, GPU и скорость generation) и основные controls. Скорость ответа после завершения берётся из `eval_count / eval_duration` Ollama; tooltip показывает доступные prompt/eval counters и TTFT. Во время streaming приложение не оценивает tokens по символам и ждёт authoritative runtime metric.
 - Изолированный Electron renderer: `contextIsolation`, отключённый `nodeIntegration`, типизированный preload IPC. Доступ к SQLite, выбору папки, процессам и мониторингу остаётся в main process.
 
 ## Локальные модели
@@ -41,7 +42,7 @@ env NPM_CONFIG_CACHE="$PWD/local-cache/npm" npm start
 | GLM-4.7-Flash | `glm-4.7-flash:q4_K_M` | Q4_K_M | 16K, 32K, 64K, 128K |
 | gpt-oss-20b | `gpt-oss:20b` | нативные MXFP4 MoE-веса и BF16-тензоры | 16K, 32K, 64K, 128K |
 
-Контекст передаётся Ollama на каждый запрос как `num_ctx`. «Быстро», «Обычно» и «Глубоко» переводятся в model-specific thinking mode и ограниченный `num_predict`, поэтому настройка влияет на inference, а не только на UI. При переключении модели клиент просит Ollama выгрузить предыдущую модель.
+Контекст передаётся Ollama на каждый запрос как `num_ctx`. Пресеты «Быстрый», «Обычный», «Повышенный» и «Глубокий» задают верхние границы `num_predict` в 4K, 8K, 16K и 32K соответственно; модель может закончить ответ раньше. Перед каждым inference приложение делает однотокенный preflight через Ollama и получает фактический `prompt_eval_count`, затем ограничивает output реально доступным остатком context window. Qwen и gpt-oss сопоставляют четыре UI-пресета с low/medium/high thinking, а GLM оставляет thinking выключенным только для «Быстрого». Для каждой генерации SQLite сохраняет применённый reasoning preset, запрошенный и effective output, context/input tokens, число agent steps и finish reason. При `length` интерфейс показывает «Продолжить ответ». Agent budget составляет 100 действий на один generationId.
 
 ## Web-доступ
 

@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import type { AnalysisDepth, ChatMessage, StreamEvent, WebMode } from '../../shared/types';
-import type { ToolCall, ToolCallingBackend, ToolMessage } from '../backends/types';
+import type { AnalysisDepth, ChatMessage, FinishReason, StreamEvent, WebMode } from '../../shared/types';
+import type { InferenceDiagnostics, ToolCall, ToolCallingBackend, ToolMessage } from '../backends/types';
 import { AnalysisEngine } from './analysis-engine';
 import { log } from './logger';
 import { ReadonlyProjectTools, activityForTool, projectToolDefinitions, type ConfirmAction, type ProjectToolCall } from '../tools/project-tools';
@@ -90,12 +90,12 @@ export class ProjectChatService {
       if (!content) throw new Error('Ollama вернул пустой итоговый ответ');
       if (engine.isDeep) log('deep.lifecycle', { phase: 'final-synthesis.finished', responseChars: content.length });
       if (typeof response.prompt_eval_count === 'number') yield { type: 'context-usage', used: response.prompt_eval_count, maximum: contextWindow };
-      yield* this.emit(content, engine, signal);
+      yield* this.emit(content, engine, signal, response.inference, actions, response.finish_reason);
     } catch (error) {
       const details = error instanceof Error ? error.message : String(error);
       const timedOut = details.includes('timed out');
       if (engine.isDeep) log('deep.lifecycle', { phase: timedOut ? 'final-synthesis.timeout' : 'final-synthesis.error', message: details, fallback: Boolean(fallback) });
-      if (fallback.trim()) { yield* this.emit(fallback, engine, signal); return; }
+      if (fallback.trim()) { yield* this.emit(fallback, engine, signal, undefined, actions, 'stop'); return; }
       yield { type: 'error', message: 'Не удалось сформировать итоговый ответ', details };
     }
   }
@@ -113,9 +113,10 @@ export class ProjectChatService {
     } finally { clearTimeout(timer); if (rejectTimeout) clearTimeout(rejectTimeout); }
   }
 
-  private async *emit(content: string, engine: AnalysisEngine, signal: AbortSignal): AsyncIterable<StreamEvent> {
+  private async *emit(content: string, engine: AnalysisEngine, signal: AbortSignal, inference: InferenceDiagnostics | undefined, actions: number, finishReason: FinishReason | undefined): AsyncIterable<StreamEvent> {
     if (engine.isDeep) log('deep.lifecycle', { phase: 'response.emitted', responseChars: content.length });
     for (const token of chunkText(content)) { if (signal.aborted) return; yield { type: 'token', content: token }; }
-    yield { type: 'done' };
+    if (inference) yield { type: 'diagnostics', diagnostics: { ...inference, agentStepCount: actions, finishReason: finishReason ?? 'stop' } };
+    yield { type: 'done', finishReason: finishReason ?? 'stop' };
   }
 }

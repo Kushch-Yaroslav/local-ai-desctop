@@ -1,6 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
-import type { AnalysisDepth, AnalysisRun, ChatMessage, ChatMode, Conversation, ToolActivity, WebMode } from '../../shared/types';
+import type { AnalysisDepth, AnalysisRun, ChatMessage, ChatMode, Conversation, GenerationDiagnostics, ToolActivity, WebMode } from '../../shared/types';
 import { paths } from './paths';
 
 type ConversationRow = {
@@ -43,12 +43,28 @@ export class Database {
       CREATE TABLE IF NOT EXISTS analysis_actions (id TEXT PRIMARY KEY, run_id TEXT NOT NULL, label TEXT NOT NULL, detail TEXT, position INTEGER NOT NULL) STRICT;
       CREATE INDEX IF NOT EXISTS analysis_runs_conversation_idx ON analysis_runs(conversation_id, created_at);
       CREATE INDEX IF NOT EXISTS analysis_actions_run_idx ON analysis_actions(run_id, position);
+      CREATE TABLE IF NOT EXISTS generation_diagnostics (
+        generation_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, reasoning_preset TEXT NOT NULL,
+        requested_max_output_tokens INTEGER NOT NULL, effective_max_output_tokens INTEGER NOT NULL,
+        context_limit INTEGER NOT NULL, input_tokens INTEGER NOT NULL, agent_step_count INTEGER NOT NULL,
+        finish_reason TEXT NOT NULL, prompt_eval_count INTEGER, prompt_eval_duration INTEGER,
+        eval_count INTEGER, eval_duration INTEGER, tokens_per_second REAL, prompt_tokens_per_second REAL,
+        time_to_first_token_ms REAL, created_at TEXT NOT NULL
+      ) STRICT;
+      CREATE INDEX IF NOT EXISTS generation_diagnostics_conversation_idx ON generation_diagnostics(conversation_id, created_at DESC);
     `);
     try { this.db.exec('ALTER TABLE conversations ADD COLUMN context_window INTEGER NOT NULL DEFAULT 32768'); } catch { /* Existing databases already have this column. */ }
     try { this.db.exec("ALTER TABLE conversations ADD COLUMN analysis_depth TEXT NOT NULL DEFAULT 'normal'"); } catch { /* Existing databases already have this column. */ }
     try { this.db.exec('ALTER TABLE conversations ADD COLUMN context_tokens INTEGER'); } catch { /* Existing databases already have this column. */ }
     try { this.db.exec('ALTER TABLE conversations ADD COLUMN context_model_id TEXT'); } catch { /* Existing databases already have this column. */ }
     try { this.db.exec("ALTER TABLE conversations ADD COLUMN web_mode TEXT NOT NULL DEFAULT 'auto'"); } catch { /* Existing databases already have this column. */ }
+    try { this.db.exec('ALTER TABLE generation_diagnostics ADD COLUMN prompt_eval_count INTEGER'); } catch { /* Existing databases already have this column. */ }
+    try { this.db.exec('ALTER TABLE generation_diagnostics ADD COLUMN prompt_eval_duration INTEGER'); } catch { /* Existing databases already have this column. */ }
+    try { this.db.exec('ALTER TABLE generation_diagnostics ADD COLUMN eval_count INTEGER'); } catch { /* Existing databases already have this column. */ }
+    try { this.db.exec('ALTER TABLE generation_diagnostics ADD COLUMN eval_duration INTEGER'); } catch { /* Existing databases already have this column. */ }
+    try { this.db.exec('ALTER TABLE generation_diagnostics ADD COLUMN tokens_per_second REAL'); } catch { /* Existing databases already have this column. */ }
+    try { this.db.exec('ALTER TABLE generation_diagnostics ADD COLUMN prompt_tokens_per_second REAL'); } catch { /* Existing databases already have this column. */ }
+    try { this.db.exec('ALTER TABLE generation_diagnostics ADD COLUMN time_to_first_token_ms REAL'); } catch { /* Existing databases already have this column. */ }
     // A removed model must not remain selected in persisted chats.
     this.db.prepare("UPDATE conversations SET model_id=NULL WHERE model_id='qwen3-coder:30b'").run();
   }
@@ -69,7 +85,8 @@ export class Database {
     if (!current) throw new Error('Чат не найден');
     const next = { ...current, ...patch, updatedAt: new Date().toISOString() };
     const contextWindow = [16_384, 32_768, 65_536, 131_072, 262_144].includes(next.contextWindow) ? next.contextWindow : 32_768;
-    const analysisDepth: AnalysisDepth = ['fast', 'normal', 'deep'].includes(next.analysisDepth) ? next.analysisDepth : 'normal';
+    // Existing fast/normal/deep values remain valid; enhanced is additive and needs no data rewrite.
+    const analysisDepth: AnalysisDepth = ['fast', 'normal', 'enhanced', 'deep'].includes(next.analysisDepth) ? next.analysisDepth : 'normal';
     const webMode: WebMode = next.webMode === 'off' ? 'off' : 'auto';
     this.db.prepare('UPDATE conversations SET title=?, model_id=?, mode=?, working_directory=?, context_window=?, analysis_depth=?, web_mode=?, updated_at=? WHERE id=?')
       .run(next.title, next.modelId, next.mode, next.workingDirectory, contextWindow, analysisDepth, webMode, next.updatedAt, id);
@@ -83,6 +100,7 @@ export class Database {
     const runs = this.db.prepare('SELECT id FROM analysis_runs WHERE conversation_id=?').all(id) as unknown as Array<{ id: string }>;
     for (const run of runs) this.db.prepare('DELETE FROM analysis_actions WHERE run_id=?').run(run.id);
     this.db.prepare('DELETE FROM analysis_runs WHERE conversation_id=?').run(id);
+    this.db.prepare('DELETE FROM generation_diagnostics WHERE conversation_id=?').run(id);
     this.db.prepare('DELETE FROM messages WHERE conversation_id=?').run(id);
     this.db.prepare('DELETE FROM conversations WHERE id=?').run(id);
   }
@@ -137,6 +155,13 @@ export class Database {
   setContextUsage(conversationId: string, modelId: string | null, tokens: number | null): Conversation | null {
     this.db.prepare('UPDATE conversations SET context_tokens=?, context_model_id=? WHERE id=?').run(tokens, modelId, conversationId);
     return this.getConversation(conversationId);
+  }
+
+  saveGenerationDiagnostics(diagnostics: GenerationDiagnostics): void {
+    this.db.prepare(`INSERT OR REPLACE INTO generation_diagnostics
+      (generation_id, conversation_id, reasoning_preset, requested_max_output_tokens, effective_max_output_tokens, context_limit, input_tokens, agent_step_count, finish_reason, prompt_eval_count, prompt_eval_duration, eval_count, eval_duration, tokens_per_second, prompt_tokens_per_second, time_to_first_token_ms, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(diagnostics.generationId, diagnostics.conversationId, diagnostics.reasoningPreset, diagnostics.requestedMaxOutputTokens, diagnostics.effectiveMaxOutputTokens, diagnostics.contextLimit, diagnostics.inputTokens, diagnostics.agentStepCount, diagnostics.finishReason, diagnostics.promptEvalCount ?? null, diagnostics.promptEvalDuration ?? null, diagnostics.evalCount ?? null, diagnostics.evalDuration ?? null, diagnostics.tokensPerSecond ?? null, diagnostics.promptTokensPerSecond ?? null, diagnostics.timeToFirstTokenMs ?? null, diagnostics.createdAt);
   }
 
   createAnalysisRun(conversationId: string, depth: AnalysisDepth): AnalysisRun {

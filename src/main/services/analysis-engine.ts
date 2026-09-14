@@ -13,7 +13,8 @@ export type ProjectMap = {
 
 const emptyMap = (): ProjectMap => ({ discoveredAreas: [], inspectedAreas: [], importantResources: [], relationships: [], findings: [], unresolvedQuestions: [], evidence: [], coverage: 'не оценено' });
 
-const safetyBudget = 50;
+/** A generation-scoped ceiling. A new AnalysisEngine is created for every generation. */
+export const MAX_AGENT_STEPS_PER_GENERATION = 100;
 
 const addUnique = (target: string[], values: unknown, maximum: number): void => {
   if (!Array.isArray(values)) return;
@@ -29,12 +30,13 @@ export class AnalysisEngine {
 
   constructor(readonly depth: AnalysisDepth) {}
 
-  get budget(): number { return safetyBudget; }
+  get budget(): number { return MAX_AGENT_STEPS_PER_GENERATION; }
   get isDeep(): boolean { return this.depth === 'deep'; }
 
   strategy(): string {
     if (this.depth === 'fast') return 'Быстро: выбери только наиболее информативные ресурсы для конкретного вопроса. Останавливайся, когда есть достаточно доказательств для полезного ответа; не составляй широкий обзор без необходимости.';
     if (this.depth === 'normal') return 'Обычно: исследуй основные релевантные области, проследи важные связи и сверь выводы по нескольким источникам. Заверши, когда ответ хорошо подтверждён и основные пробелы закрыты.';
+    if (this.depth === 'enhanced') return 'Повышенно: последовательно исследуй релевантные области и связи, проверяй важные выводы несколькими источниками и устраняй существенные пробелы, но заверши работу, как только ответ достаточно доказан.';
     return 'Глубоко: сначала широко сориентируйся, затем построй и уточняй карту проекта, исследуй важные связи и нераскрытые крупные области, проверяй слабые выводы и пробелы. Заверши только когда существенные для вопроса части имеют доказательства, а неопределённость низка или явно указана. Перед синтезом сверь каждый явно запрошенный пользователем аспект с собранными данными; дай конкретные выводы и связи, а не заменяй их общим перечислением технологий. Стадии — ориентир, а не фиксированная последовательность или квота вызовов.';
   }
 

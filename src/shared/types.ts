@@ -1,7 +1,29 @@
 export type ChatMode = 'chat' | 'agent';
 export type WebMode = 'off' | 'auto';
 export type BackendId = 'ollama' | 'llama-cpp';
-export type AnalysisDepth = 'fast' | 'normal' | 'deep';
+export type AnalysisDepth = 'fast' | 'normal' | 'enhanced' | 'deep';
+export type FinishReason = 'stop' | 'length' | 'cancelled' | 'error';
+
+export interface GenerationDiagnostics {
+  generationId: string;
+  conversationId: string;
+  reasoningPreset: AnalysisDepth;
+  requestedMaxOutputTokens: number;
+  effectiveMaxOutputTokens: number;
+  contextLimit: number;
+  inputTokens: number;
+  agentStepCount: number;
+  finishReason: FinishReason;
+  /** Ollama reports durations in nanoseconds and counts only generated completion tokens in evalCount. */
+  promptEvalCount?: number;
+  promptEvalDuration?: number;
+  evalCount?: number;
+  evalDuration?: number;
+  tokensPerSecond?: number;
+  promptTokensPerSecond?: number;
+  timeToFirstTokenMs?: number;
+  createdAt: string;
+}
 
 export interface ModelInfo {
   id: string;
@@ -94,7 +116,8 @@ export type StreamEvent =
   | { type: 'analysis'; progress: AnalysisProgress }
   | { type: 'context'; requested: number; active: number; supported?: number }
   | { type: 'context-usage'; used: number; maximum: number }
-  | { type: 'done'; assistant?: ChatMessage | null }
+  | { type: 'diagnostics'; diagnostics: Omit<GenerationDiagnostics, 'generationId' | 'conversationId' | 'createdAt'> }
+  | { type: 'done'; assistant?: ChatMessage | null; finishReason?: FinishReason }
   | { type: 'cancelled' }
   | { type: 'error'; message: string; details?: string };
 

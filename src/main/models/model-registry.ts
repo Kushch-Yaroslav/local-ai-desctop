@@ -51,21 +51,34 @@ export type InferenceSettings = {
   depth: AnalysisDepth;
 };
 
-/** Maps one UI depth control to the native thinking protocol plus a bounded output budget. */
-export function inferenceSettings(profile: ModelProfile, settings: InferenceSettings): { think: boolean | string; options: Record<string, number> } {
-  const base = { num_ctx: Math.min(settings.contextWindow, profile.maxContext) };
+export const outputBudgetByReasoningPreset: Record<AnalysisDepth, number> = {
+  fast: 4_096,
+  normal: 8_192,
+  enhanced: 16_384,
+  deep: 32_768,
+};
+
+export function requestedMaxOutputTokens(depth: AnalysisDepth): number {
+  return outputBudgetByReasoningPreset[depth];
+}
+
+/** Maps one UI depth control to the native thinking protocol. Output length is applied separately per request. */
+export function inferenceSettings(profile: ModelProfile, settings: InferenceSettings, effectiveMaxOutputTokens = requestedMaxOutputTokens(settings.depth)): { think: boolean | string; options: Record<string, number> } {
+  const base = { num_ctx: Math.min(settings.contextWindow, profile.maxContext), num_predict: effectiveMaxOutputTokens };
   if (profile.id.startsWith('qwen3.8:')) {
-    if (settings.depth === 'fast') return { think: 'low', options: { ...base, num_predict: 1_024 } };
-    if (settings.depth === 'deep') return { think: 'high', options: { ...base, num_predict: 4_096 } };
-    return { think: 'medium', options: { ...base, num_predict: 2_048 } };
+    if (settings.depth === 'fast') return { think: 'low', options: base };
+    if (settings.depth === 'normal') return { think: 'medium', options: base };
+    // Qwen exposes three native levels. Both higher UI levels use its high reasoning mode.
+    return { think: 'high', options: base };
   }
   if (profile.id.startsWith('gpt-oss:')) {
-    if (settings.depth === 'fast') return { think: 'low', options: { ...base, num_predict: 1_024 } };
-    if (settings.depth === 'deep') return { think: 'high', options: { ...base, num_predict: 4_096 } };
-    return { think: 'medium', options: { ...base, num_predict: 2_048 } };
+    if (settings.depth === 'fast') return { think: 'low', options: base };
+    if (settings.depth === 'normal') return { think: 'medium', options: base };
+    // gpt-oss likewise has low/medium/high rather than four distinct native levels.
+    return { think: 'high', options: base };
   }
-  // GLM exposes thinking as a boolean. The output ceilings make the three levels materially distinct without unbounded generation.
-  if (settings.depth === 'fast') return { think: false, options: { ...base, num_predict: 1_024, temperature: 0.7 } };
-  if (settings.depth === 'deep') return { think: true, options: { ...base, num_predict: 4_096, temperature: 0.9 } };
-  return { think: true, options: { ...base, num_predict: 2_048, temperature: 1 } };
+  // GLM exposes thinking as a boolean. Fast remains off; the other presets retain thinking.
+  if (settings.depth === 'fast') return { think: false, options: { ...base, temperature: 0.7 } };
+  if (settings.depth === 'normal') return { think: true, options: { ...base, temperature: 1 } };
+  return { think: true, options: { ...base, temperature: 0.9 } };
 }

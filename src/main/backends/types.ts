@@ -1,7 +1,11 @@
-import type { AnalysisDepth, ChatMessage, ModelInfo, StreamEvent } from '../../shared/types';
+import type { AnalysisDepth, ChatMessage, FinishReason, GenerationDiagnostics, ModelInfo, StreamEvent } from '../../shared/types';
 
 export type ToolCall = { function: { name: string; arguments: Record<string, unknown> | string } };
-export type ToolMessage = { role: 'system' | 'user' | 'assistant' | 'tool'; content: string; tool_calls?: ToolCall[]; tool_name?: string; prompt_eval_count?: number };
+export type InferenceDiagnostics = Omit<GenerationDiagnostics, 'generationId' | 'conversationId' | 'createdAt' | 'agentStepCount' | 'finishReason'>;
+export type ToolMessage = {
+  role: 'system' | 'user' | 'assistant' | 'tool'; content: string; tool_calls?: ToolCall[]; tool_name?: string;
+  prompt_eval_count?: number; finish_reason?: FinishReason; inference?: InferenceDiagnostics;
+};
 
 /** Contract shared by Ollama now and llama.cpp when its server adapter is added. */
 export interface ToolCallingBackend {

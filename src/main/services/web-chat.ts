@@ -46,7 +46,8 @@ export class WebChatService {
         if (calls.length === 0) {
           if (typeof response.prompt_eval_count === 'number') yield { type: 'context-usage', used: response.prompt_eval_count, maximum: contextWindow };
           for (const token of chunks(response.content ?? '')) { if (signal.aborted) return; yield { type: 'token', content: token }; }
-          yield { type: 'done' }; return;
+          if (response.inference) yield { type: 'diagnostics', diagnostics: { ...response.inference, agentStepCount: 0, finishReason: response.finish_reason ?? 'stop' } };
+          yield { type: 'done', finishReason: response.finish_reason ?? 'stop' }; return;
         }
         for (const call of calls) {
           if (signal.aborted) return;
@@ -62,7 +63,8 @@ export class WebChatService {
       const response = await this.backend.chatWithTools(model, messages, undefined, signal, contextWindow, depth);
       if (typeof response.prompt_eval_count === 'number') yield { type: 'context-usage', used: response.prompt_eval_count, maximum: contextWindow };
       for (const token of chunks(response.content ?? '')) { if (signal.aborted) return; yield { type: 'token', content: token }; }
-      yield { type: 'done' };
+      if (response.inference) yield { type: 'diagnostics', diagnostics: { ...response.inference, agentStepCount: 0, finishReason: response.finish_reason ?? 'stop' } };
+      yield { type: 'done', finishReason: response.finish_reason ?? 'stop' };
     } catch (error) {
       if (!signal.aborted) yield { type: 'error', message: 'Не удалось выполнить web-запрос', details: error instanceof Error ? error.message : String(error) };
     } finally { signal.removeEventListener('abort', closeOnAbort); await session.close(); }

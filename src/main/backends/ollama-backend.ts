@@ -1,11 +1,13 @@
-import type { AnalysisDepth, ChatMessage, ModelInfo, StreamEvent } from '../../shared/types';
-import type { LlmBackend, ToolCallingBackend, ToolMessage } from './types';
-import { getModelProfile, inferenceSettings, modelInfo, modelRegistry } from '../models/model-registry';
+import type { AnalysisDepth, ChatMessage, FinishReason, ModelInfo, StreamEvent } from '../../shared/types';
+import type { InferenceDiagnostics, LlmBackend, ToolCallingBackend, ToolMessage } from './types';
+import { getModelProfile, inferenceSettings, modelInfo, modelRegistry, requestedMaxOutputTokens } from '../models/model-registry';
+import { log } from '../services/logger';
 
 type OllamaTags = { models?: Array<{ name: string; size: number }> };
-type OllamaChunk = { message?: { content?: string }; done?: boolean; error?: string; prompt_eval_count?: number };
+type OllamaMetrics = { prompt_eval_count?: number; prompt_eval_duration?: number; eval_count?: number; eval_duration?: number };
+type OllamaChunk = { message?: { content?: string }; done?: boolean; done_reason?: string; error?: string } & OllamaMetrics;
 
-type OllamaToolResponse = { message?: ToolMessage; error?: string; prompt_eval_count?: number };
+type OllamaToolResponse = { message?: ToolMessage; error?: string; done_reason?: string } & OllamaMetrics;
 type OllamaShowResponse = { model_info?: Record<string, unknown>; parameters?: string };
 
 export type ContextWindow = { requested: number; active: number; supported?: number };
@@ -75,15 +77,64 @@ export class OllamaBackend implements LlmBackend, ToolCallingBackend {
     } catch { /* The next inference will still let Ollama reclaim memory when necessary. */ }
   }
 
-  private requestOptions(model: string, contextWindow: number, depth: AnalysisDepth): { think: boolean | string; options: Record<string, number> } {
+  private async requestOptions(model: string, messages: Array<ChatMessage | ToolMessage>, tools: unknown[] | undefined, contextWindow: number, depth: AnalysisDepth, signal: AbortSignal): Promise<{ think: boolean | string; options: Record<string, number>; diagnostics: InferenceDiagnostics }> {
     const profile = getModelProfile(model);
     if (!profile) throw new Error('Выбранная модель отсутствует в реестре приложения');
-    return inferenceSettings(profile, { contextWindow, depth });
+    const inputTokens = await this.inputTokens(model, messages, tools, contextWindow, signal);
+    const requested = requestedMaxOutputTokens(depth);
+    const effective = Math.min(requested, Math.max(0, contextWindow - inputTokens));
+    if (effective < 1) throw new Error('Контекстное окно заполнено. Уменьшите историю или выберите больший контекст, затем продолжите ответ.');
+    const diagnostics: InferenceDiagnostics = { reasoningPreset: depth, requestedMaxOutputTokens: requested, effectiveMaxOutputTokens: effective, contextLimit: contextWindow, inputTokens };
+    log('inference.options', diagnostics);
+    return { ...inferenceSettings(profile, { contextWindow, depth }, effective), diagnostics };
+  }
+
+  /** A one-token preflight gives the same chat-template/token count that Ollama will use for the actual request. */
+  private async inputTokens(model: string, messages: Array<ChatMessage | ToolMessage>, tools: unknown[] | undefined, contextWindow: number, signal: AbortSignal): Promise<number> {
+    const ollamaMessages = messages.map((message) => {
+      const tool = message as ToolMessage;
+      return { role: message.role, content: message.content, ...(tool.tool_calls ? { tool_calls: tool.tool_calls } : {}), ...(tool.tool_name ? { tool_name: tool.tool_name } : {}) };
+    });
+    try {
+      const response = await fetch(`${this.baseUrl}/api/chat`, {
+        method: 'POST', signal, headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model, stream: false, messages: ollamaMessages, ...(tools ? { tools } : {}), think: false, options: { num_ctx: contextWindow, num_predict: 1 } }),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json() as OllamaToolResponse;
+      if (typeof data.prompt_eval_count !== 'number') throw new Error('Ollama did not return prompt_eval_count');
+      return data.prompt_eval_count;
+    } catch (error) {
+      if (signal.aborted) throw error;
+      const prompt = ollamaMessages.map((message) => `<|${message.role}|>\n${message.content}\n`).join('');
+      // Older runtimes may reject the preflight; use a deliberately high estimate rather than overflow the context.
+      const conservative = Math.ceil(prompt.length / 2) + 256 + messages.length * 16;
+      log('inference.preflight.fallback', { model, message: error instanceof Error ? error.message : String(error), inputTokens: conservative });
+      return conservative;
+    }
+  }
+
+  private finishReason(reason: string | undefined): FinishReason { return reason === 'length' ? 'length' : 'stop'; }
+
+  private withPerformance(diagnostics: InferenceDiagnostics, metrics: OllamaMetrics, timeToFirstTokenMs?: number): InferenceDiagnostics {
+    const rate = (count: number | undefined, duration: number | undefined): number | undefined => count !== undefined && duration !== undefined && duration > 0 ? count / (duration / 1_000_000_000) : undefined;
+    return {
+      ...diagnostics,
+      inputTokens: metrics.prompt_eval_count ?? diagnostics.inputTokens,
+      ...(metrics.prompt_eval_count !== undefined ? { promptEvalCount: metrics.prompt_eval_count } : {}),
+      ...(metrics.prompt_eval_duration !== undefined ? { promptEvalDuration: metrics.prompt_eval_duration } : {}),
+      ...(metrics.eval_count !== undefined ? { evalCount: metrics.eval_count } : {}),
+      ...(metrics.eval_duration !== undefined ? { evalDuration: metrics.eval_duration } : {}),
+      ...(rate(metrics.eval_count, metrics.eval_duration) !== undefined ? { tokensPerSecond: rate(metrics.eval_count, metrics.eval_duration) } : {}),
+      ...(rate(metrics.prompt_eval_count, metrics.prompt_eval_duration) !== undefined ? { promptTokensPerSecond: rate(metrics.prompt_eval_count, metrics.prompt_eval_duration) } : {}),
+      ...(timeToFirstTokenMs !== undefined ? { timeToFirstTokenMs } : {}),
+    };
   }
 
   private readableError(error: unknown): Error {
     const detail = error instanceof Error ? error.message : String(error);
     const lower = detail.toLowerCase();
+    if (lower.includes('контекстное окно заполнено')) return new Error(detail);
     if (lower.includes('not found')) return new Error('Модель не найдена. Проверьте, что DATA-диск подключён и модель полностью установлена.');
     if (lower.includes('cuda') && (lower.includes('memory') || lower.includes('oom'))) return new Error('Недостаточно VRAM для выбранного контекста. Выберите меньший размер контекста или дождитесь выгрузки предыдущей модели.');
     if (lower.includes('context') || lower.includes('num_ctx')) return new Error('Выбранный размер контекста не поддерживается этой моделью.');
@@ -93,25 +144,32 @@ export class OllamaBackend implements LlmBackend, ToolCallingBackend {
   async chatWithTools(model: string, messages: ToolMessage[], tools: unknown[] | undefined, signal: AbortSignal, contextWindow: number, depth: AnalysisDepth): Promise<ToolMessage> {
     let response: Response;
     try {
+      const settings = await this.requestOptions(model, messages, tools, contextWindow, depth, signal);
       response = await fetch(`${this.baseUrl}/api/chat`, {
         method: 'POST', signal, headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ model, stream: false, messages, ...(tools ? { tools } : {}), ...this.requestOptions(model, contextWindow, depth) }),
+        body: JSON.stringify({ model, stream: false, messages, ...(tools ? { tools } : {}), think: settings.think, options: settings.options }),
       });
+      const data = await response.json() as OllamaToolResponse;
+      if (!response.ok) throw this.readableError(`Ollama вернул HTTP ${response.status}: ${data.error ?? ''}`);
+      if (data.error) throw new Error(data.error);
+      if (!data.message) throw new Error('Ollama вернул пустой ответ');
+      return { ...data.message, prompt_eval_count: data.prompt_eval_count, finish_reason: this.finishReason(data.done_reason), inference: this.withPerformance(settings.diagnostics, data) };
     } catch (error) { throw this.readableError(error); }
-    if (!response.ok) throw this.readableError(`Ollama вернул HTTP ${response.status}: ${await response.text()}`);
-    const data = await response.json() as OllamaToolResponse;
-    if (data.error) throw new Error(data.error);
-    if (!data.message) throw new Error('Ollama вернул пустой ответ');
-    return { ...data.message, prompt_eval_count: data.prompt_eval_count };
   }
 
   async *streamChat(model: string, messages: ChatMessage[], signal: AbortSignal, contextWindow = 32_768, depth: AnalysisDepth = 'normal'): AsyncIterable<StreamEvent> {
     let response: Response;
+    let diagnostics: InferenceDiagnostics;
+    let inferenceStartedAt = 0;
+    let timeToFirstTokenMs: number | undefined;
     try {
+      const settings = await this.requestOptions(model, messages, undefined, contextWindow, depth, signal);
+      diagnostics = settings.diagnostics;
+      inferenceStartedAt = performance.now();
       response = await fetch(`${this.baseUrl}/api/chat`, {
         method: 'POST', signal,
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ model, stream: true, messages: messages.map(({ role, content }) => ({ role, content })), ...this.requestOptions(model, contextWindow, depth) }),
+        body: JSON.stringify({ model, stream: true, messages: messages.map(({ role, content }) => ({ role, content })), think: settings.think, options: settings.options }),
       });
     } catch (error) {
       if (signal.aborted) return;
@@ -133,10 +191,14 @@ export class OllamaBackend implements LlmBackend, ToolCallingBackend {
           if (!line.trim()) continue;
           const item = JSON.parse(line) as OllamaChunk;
           if (item.error) { yield { type: 'error', message: 'Ошибка Ollama', details: item.error }; return; }
-          if (item.message?.content) yield { type: 'token', content: item.message.content };
+          if (item.message?.content) {
+            if (timeToFirstTokenMs === undefined) timeToFirstTokenMs = performance.now() - inferenceStartedAt;
+            yield { type: 'token', content: item.message.content };
+          }
           if (item.done) {
             if (typeof item.prompt_eval_count === 'number') yield { type: 'context-usage', used: item.prompt_eval_count, maximum: contextWindow };
-            yield { type: 'done' }; return;
+            yield { type: 'diagnostics', diagnostics: { ...this.withPerformance(diagnostics, item, timeToFirstTokenMs), agentStepCount: 0, finishReason: this.finishReason(item.done_reason) } };
+            yield { type: 'done', finishReason: this.finishReason(item.done_reason) }; return;
           }
         }
         if (done) break;

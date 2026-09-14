@@ -82,18 +82,18 @@ export function registerIpc(): void {
     const current = () => activeGenerations.get(request.conversationId) === generation && !abort.signal.aborted;
     let run: AnalysisRun | null = null;
     try {
-    const user = request.messages.at(-1);
-    if (!user || user.role !== 'user') throw new Error('Неверное сообщение');
+    const user = request.persistUserMessage ? request.messages.at(-1) : null;
+    if (request.persistUserMessage && (!user || user.role !== 'user')) throw new Error('Неверное сообщение');
     const conversation = database.getConversation(request.conversationId);
     if (!conversation) throw new Error('Чат не найден');
     if (conversation.modelId && conversation.modelId !== request.model) throw new Error('Выбранная модель была изменена. Повторите отправку сообщения.');
     await ollama.ensureModelAvailable(request.model);
     if (!current()) return;
-    if (request.persistUserMessage) database.addMessage(request.conversationId, 'user', user.content, user.id);
-    let output = ''; let completed = false; let failed = false;
+    if (user) database.addMessage(request.conversationId, 'user', user.content, user.id);
+    let output = ''; let completed = false; let failed = false; let finishReason: 'stop' | 'length' = 'stop';
     const agentRoot = conversation.mode === 'agent' ? conversation.workingDirectory ?? paths.root : null;
     const enabledTools = agentRoot ? [...projectToolDefinitions.map((tool) => tool.function.name), ...(conversation.webMode === 'auto' ? webToolDefinitions.map((tool) => tool.function.name) : [])] : conversation.webMode === 'auto' ? webToolDefinitions.map((tool) => tool.function.name) : [];
-    log('generation.snapshot', { generationId: generation.id, chatId: request.conversationId, mode: conversation.mode, workingDirectory: conversation.workingDirectory, resolvedWorkingDirectory: agentRoot, webMode: conversation.webMode, modelId: request.model, contextSize: conversation.contextWindow, reasoningLevel: conversation.analysisDepth, enabledTools });
+    log('generation.snapshot', { generationId: generation.id, chatId: request.conversationId, mode: conversation.mode, workingDirectory: conversation.workingDirectory, resolvedWorkingDirectory: agentRoot, webMode: conversation.webMode, modelId: request.model, contextSize: conversation.contextWindow, reasoningPreset: conversation.analysisDepth, enabledTools });
     run = agentRoot ? database.createAnalysisRun(request.conversationId, conversation.analysisDepth) : null;
     if (run && current()) event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run });
       const context = await ollama.resolveContextWindow(request.model, conversation.contextWindow, abort.signal);
@@ -112,7 +112,14 @@ export function registerIpc(): void {
           event.sender.send('chat:stream', { ...chunk, conversationId: request.conversationId, generationId: generation.id, modelId: request.model });
           continue;
         }
-        if (chunk.type === 'done') { completed = true; continue; }
+        if (chunk.type === 'diagnostics') {
+          const diagnostics = { ...chunk.diagnostics, generationId: generation.id, conversationId: request.conversationId, createdAt: new Date().toISOString() };
+          database.saveGenerationDiagnostics(diagnostics);
+          log('generation.diagnostics', diagnostics);
+          event.sender.send('chat:stream', { type: 'diagnostics', conversationId: request.conversationId, generationId: generation.id, diagnostics });
+          continue;
+        }
+        if (chunk.type === 'done') { completed = true; finishReason = chunk.finishReason === 'length' ? 'length' : 'stop'; continue; }
         if (chunk.type === 'error') failed = true;
         if (run && chunk.type === 'tool') {
           const updated = database.addAnalysisAction(run.id, chunk.activity);
@@ -124,7 +131,7 @@ export function registerIpc(): void {
       if (failed || !completed) { if (run) event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run: database.finishAnalysisRun(run.id, 'error', null) }); return; }
       const assistant = output ? database.addMessage(request.conversationId, 'assistant', output) : null;
       if (run) event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run: database.finishAnalysisRun(run.id, 'completed', assistant?.id ?? null) });
-      event.sender.send('chat:stream', { type: 'done', conversationId: request.conversationId, generationId: generation.id, assistant });
+      event.sender.send('chat:stream', { type: 'done', conversationId: request.conversationId, generationId: generation.id, assistant, finishReason });
     } catch (error) {
       if (run) { const finished = database.finishAnalysisRun(run.id, abort.signal.aborted ? 'cancelled' : 'error', null); if (current()) event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run: finished }); }
       if (current()) event.sender.send('chat:stream', { type: 'error', conversationId: request.conversationId, generationId: generation.id, message: 'Не удалось выполнить запрос', details: error instanceof Error ? error.message : String(error) });
