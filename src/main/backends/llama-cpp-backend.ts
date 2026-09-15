@@ -2,12 +2,19 @@ import type { AnalysisDepth, ChatMessage, FinishReason, ModelInfo, StreamEvent }
 import type { InferenceDiagnostics, LlmBackend, ToolCallingBackend, ToolMessage } from './types';
 import { contextPresetsFor, getModelProfile, modelInfo, requestedMaxOutputTokens } from '../models/model-registry';
 import type { ContextWindow } from './ollama-backend';
+import { log } from '../services/logger';
 
 type Choice = { finish_reason?: string | null; message?: { content?: string | null; reasoning_content?: string | null; tool_calls?: Array<{ function?: { name?: string; arguments?: string } }> }; delta?: { content?: string | null } };
 type ChatResponse = { choices?: Choice[]; usage?: { prompt_tokens?: number; completion_tokens?: number }; timings?: { prompt_ms?: number; predicted_ms?: number; prompt_per_second?: number; predicted_per_second?: number } };
 type ModelsResponse = { data?: Array<{ meta?: { n_ctx?: number; size?: number } }> };
 const qwenModel = 'qwen3.8:27b-q4_K_M';
-const reasoningEffort: Record<AnalysisDepth, string> = { fast: 'low', normal: 'medium', enhanced: 'high', deep: 'high' };
+// Qwen3.8's bundled llama.cpp chat template accepts low, medium and xhigh.
+const reasoningEffort: Record<AnalysisDepth, string> = { fast: 'low', normal: 'medium', enhanced: 'xhigh', deep: 'xhigh' };
+type RequestDiagnostics = { endpoint: string; status: number; serverError?: string; userMessage?: string; backend: 'llama-cpp'; model: string; contextSize: number; requestedMaxOutput: number; effectiveMaxOutput: number; messageCount: number; toolCount: number; hasImages: boolean; estimatedPromptTokens: number };
+
+export class LlamaCppRequestError extends Error {
+  constructor(readonly request: RequestDiagnostics) { super(`llama.cpp отклонил запрос (HTTP ${request.status})${request.userMessage ? `: ${request.userMessage}` : ''}`); this.name = 'LlamaCppRequestError'; }
+}
 
 /** Adapter for the launcher-managed, OpenAI-compatible llama-server. */
 export class LlamaCppBackend implements LlmBackend, ToolCallingBackend {
@@ -47,8 +54,19 @@ export class LlamaCppBackend implements LlmBackend, ToolCallingBackend {
     return messages.map((message) => {
       const tool = message as ToolMessage;
       if (tool.images?.length) return { role: message.role, content: [{ type: 'text', text: message.content }, ...tool.images.map((image) => ({ type: 'image_url', image_url: { url: image.startsWith('data:') ? image : `data:image/png;base64,${image}` } }))] };
-      return { role: message.role, content: message.content, ...(tool.tool_calls ? { tool_calls: tool.tool_calls } : {}), ...(tool.tool_name ? { name: tool.tool_name } : {}) };
+      return { role: message.role, content: message.content, ...(tool.tool_calls ? { tool_calls: tool.tool_calls.map((call) => ({ type: 'function', ...call })) } : {}), ...(tool.tool_name ? { name: tool.tool_name } : {}) };
     });
+  }
+  private requestDiagnostics(model: string, messages: Array<ChatMessage | ToolMessage>, tools: unknown[] | undefined, contextWindow: number, depth: AnalysisDepth, budget: { inputTokens: number; maxTokens: number }, status: number, endpoint: string, serverError?: string): RequestDiagnostics {
+    const userMessage = serverError?.match(/Error:\s*(?:Jinja Exception:\s*)?([^\n]+)/)?.[1]?.slice(0, 240) || serverError?.slice(0, 240);
+    return { endpoint, status, ...(serverError ? { serverError } : {}), ...(userMessage ? { userMessage } : {}), backend: 'llama-cpp', model, contextSize: contextWindow, requestedMaxOutput: requestedMaxOutputTokens(depth), effectiveMaxOutput: budget.maxTokens, messageCount: messages.length, toolCount: tools?.length ?? 0, hasImages: messages.some((message) => Boolean(message.images?.length)), estimatedPromptTokens: budget.inputTokens };
+  }
+  private async failedRequest(model: string, messages: Array<ChatMessage | ToolMessage>, tools: unknown[] | undefined, contextWindow: number, depth: AnalysisDepth, budget: { inputTokens: number; maxTokens: number }, response: Response, endpoint: string): Promise<never> {
+    const body = await response.text().catch(() => ''); let serverError = '';
+    try { const parsed = JSON.parse(body) as { error?: { message?: unknown } }; serverError = typeof parsed.error?.message === 'string' ? parsed.error.message : body; } catch { serverError = body; }
+    serverError = serverError.replace(/\s+/g, ' ').trim().slice(0, 500);
+    const request = this.requestDiagnostics(model, messages, tools, contextWindow, depth, budget, response.status, endpoint, serverError || undefined);
+    log('llama-cpp.request.failed', request); throw new LlamaCppRequestError(request);
   }
   private diagnostics(depth: AnalysisDepth, contextLimit: number, inputTokens: number, data?: ChatResponse): InferenceDiagnostics {
     const t = data?.timings;
@@ -57,18 +75,21 @@ export class LlamaCppBackend implements LlmBackend, ToolCallingBackend {
   async chatWithTools(model: string, messages: ToolMessage[], tools: unknown[] | undefined, signal: AbortSignal, contextWindow: number, depth: AnalysisDepth): Promise<ToolMessage> {
     await this.ensureModelAvailable(model); const budget = this.budget(messages, contextWindow, depth);
     let response: Response;
-    try { response = await fetch(this.url('/v1/chat/completions'), { method: 'POST', signal, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model, messages: this.messages(messages), ...(tools ? { tools, tool_choice: 'auto' } : {}), max_tokens: budget.maxTokens, reasoning_effort: reasoningEffort[depth], stream: false }) }); }
+    const endpoint = '/v1/chat/completions';
+    try { response = await fetch(this.url(endpoint), { method: 'POST', signal, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model, messages: this.messages(messages), ...(tools ? { tools, tool_choice: 'auto' } : {}), max_tokens: budget.maxTokens, reasoning_effort: reasoningEffort[depth], stream: false }) }); }
     catch (error) { throw new Error(`llama.cpp inference connection failed: ${error instanceof Error ? error.message : String(error)}`); }
+    if (!response.ok) return this.failedRequest(model, messages, tools, contextWindow, depth, budget, response, endpoint);
     const data = await response.json().catch(() => null) as ChatResponse | null;
-    if (!response.ok || !data) throw new Error(`llama.cpp вернул HTTP ${response.status}`);
+    if (!data) throw new Error('llama.cpp вернул некорректный JSON-ответ');
     const choice = data.choices?.[0]; if (!choice?.message) throw new Error('llama.cpp вернул ответ без assistant message');
     return { role: 'assistant', content: choice.message.content ?? '', thinking: choice.message.reasoning_content ?? undefined, tool_calls: (choice.message.tool_calls ?? []).flatMap((call) => call.function?.name ? [{ function: { name: call.function.name, arguments: call.function.arguments ?? '{}' } }] : []), finish_reason: finishReason(choice.finish_reason), prompt_eval_count: data.usage?.prompt_tokens, inference: this.diagnostics(depth, contextWindow, budget.inputTokens, data) };
   }
   async *streamChat(model: string, messages: ChatMessage[], signal: AbortSignal, contextWindow = 32_768, depth: AnalysisDepth = 'normal'): AsyncIterable<StreamEvent> {
     try {
       await this.ensureModelAvailable(model); const budget = this.budget(messages, contextWindow, depth);
-      const response = await fetch(this.url('/v1/chat/completions'), { method: 'POST', signal, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model, messages: this.messages(messages), max_tokens: budget.maxTokens, reasoning_effort: reasoningEffort[depth], stream: true, stream_options: { include_usage: true } }) });
-      if (!response.ok || !response.body) { yield { type: 'error', message: 'llama.cpp не смог начать генерацию', details: `HTTP ${response.status}` }; return; }
+      const endpoint = '/v1/chat/completions'; const response = await fetch(this.url(endpoint), { method: 'POST', signal, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model, messages: this.messages(messages), max_tokens: budget.maxTokens, reasoning_effort: reasoningEffort[depth], stream: true, stream_options: { include_usage: true } }) });
+      if (!response.ok) await this.failedRequest(model, messages, undefined, contextWindow, depth, budget, response, endpoint);
+      if (!response.body) { yield { type: 'error', message: 'llama.cpp не смог начать генерацию', details: 'llama.cpp не вернул тело stream-ответа' }; return; }
       const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = '';
       try {
         while (!signal.aborted) {
