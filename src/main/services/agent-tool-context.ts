@@ -12,7 +12,7 @@ type InvalidatedRead = { reason: string; step: number; path: string; fingerprint
 export type ToolContextStats = { size: number; budget: number; compacted: number; peakSize: number; activeReads: number; suspectedReadLoops: number; invalidatedReads: number };
 export type ReadDiagnostic = {
   path: string; range: string; fingerprint: string; readCount: number; sameContentAlreadyRead: boolean; previousResultActive: boolean; previousResultCompacted: boolean; previousCompactionReason?: string;
-  previousResultInvalidated: boolean; previousInvalidationReason?: string; repeatedReadLoopSuspected: boolean; pinned: boolean; relationship: ReadRelationship; coveredByRange?: string;
+  previousResultInvalidated: boolean; previousInvalidationReason?: string; unchanged?: boolean; requested_range_already_available?: boolean; repeatedReadLoopSuspected: boolean; pinned: boolean; relationship: ReadRelationship; coveredByRange?: string;
 };
 export type ToolContextUpdate = { stats: ToolContextStats; read?: ReadDiagnostic; invalidation?: { reason: string; reads: number } };
 
@@ -76,8 +76,8 @@ export class AgentToolContext {
         if (previous.compacted) {
           previous.message.content = previous.raw; previous.compacted = false; previous.compactReason = undefined;
           message.content = JSON.stringify({ status: 'restored_cached_read', path: prior.path, range: prior.range, fingerprint: prior.fingerprint, content_available_in_active_context: true, read_count: prior.readCount, repeated_read_loop_suspected: prior.loopSuspected });
-        } else message.content = JSON.stringify({ status: 'unchanged', path: prior.path, range: prior.range, fingerprint: prior.fingerprint, message: 'This exact file range is unchanged and its content is already present in the active working context.', read_count: prior.readCount, repeated_read_loop_suspected: prior.loopSuspected });
-        diagnostic = { path: prior.path, range: prior.range, fingerprint: prior.fingerprint, readCount: prior.readCount, sameContentAlreadyRead: true, previousResultActive: !wasCompacted, previousResultCompacted: wasCompacted, previousCompactionReason: reason, previousResultInvalidated: false, repeatedReadLoopSuspected: prior.loopSuspected, pinned: true, relationship: 'exact_duplicate' };
+        } else message.content = JSON.stringify({ status: 'unchanged', unchanged: true, requested_range_already_available: true, path: prior.path, range: prior.range, fingerprint: prior.fingerprint, message: 'This unchanged range is already available in the current generation context. Use the existing result unless a different range or refreshed file state is required.', read_count: prior.readCount, repeated_read_loop_suspected: prior.loopSuspected });
+        diagnostic = { path: prior.path, range: prior.range, fingerprint: prior.fingerprint, readCount: prior.readCount, sameContentAlreadyRead: true, previousResultActive: !wasCompacted, previousResultCompacted: wasCompacted, previousCompactionReason: reason, previousResultInvalidated: false, ...(!wasCompacted ? { unchanged: true, requested_range_already_available: true } : {}), repeatedReadLoopSuspected: prior.loopSuspected, pinned: true, relationship: 'exact_duplicate' };
       } else {
         const coverage = this.coverage(read);
         entry.read = read; this.reads.set(read.key, entry); this.invalidated.delete(read.key);

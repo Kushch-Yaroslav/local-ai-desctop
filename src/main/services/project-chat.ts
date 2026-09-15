@@ -40,14 +40,57 @@ function lineRange(value: Record<string, unknown>): string | undefined {
 }
 type StagnationStats = {
   explorationActions: number; broadExplorationActions: number; targetedExplorationActions: number; repeatedExplorationActions: number; mutationActions: number; verificationActions: number;
-  exactDuplicateReads: number; coveredReads: number; overlappingReads: number; newInformationReads: number; stepsSinceLastNewInformation: number; stepsSinceLastMutation: number; stagnationSuspected: boolean;
+  exactDuplicateReads: number; coveredReads: number; overlappingReads: number; newInformationReads: number; meaningfulSourceDiscoveries: number; stepsSinceLastNewInformation: number; stepsSinceLastMeaningfulSourceInformation: number; stepsSinceLastMutation: number;
+  codingChangeTask: boolean; interventionLevel: number; stagnationSuspected: boolean;
 };
+type StagnationIntervention = 'first' | 'second' | 'stalled';
+type StagnationUpdate = { stats: StagnationStats; intervention?: StagnationIntervention };
+
+const mutationTools = new Set(['apply_patch', 'write_file', 'create_file', 'delete_file']);
+const verificationTools = new Set(['git_status', 'git_diff', 'run_terminal']);
+const explorationTools = new Set(['read_file', 'inspect_package_json', 'search_text', 'find_files', 'search_files', 'list_directory', 'web_search', 'web_open']);
+const codingChangeLanguage = /(?:\b(?:add|change|create|edit|feature|fix|implement|improve|refactor|remove|update|bug)\b|исправ|реализ|добав|измен|редакт|созда|удал|улучш|рефактор|фич)/i;
+const sourcePath = (call: ProjectToolCall, read?: ReadDiagnostic): string => read?.path ?? (typeof call.arguments.path === 'string' ? call.arguments.path.replace(/\\/g, '/').replace(/^\.\//, '') : '');
+const lowValuePathSegment = new Set(['.git', '.next', '.cache', '.venv', '__pycache__', 'build', 'coverage', 'dist', 'generated', 'node_modules', 'out', 'target', 'vendor', 'venv']);
+const meaningfulExtension = /\.(?:[cm]?[jt]sx?|py|rs|go|java|kt|kts|swift|rb|php|cs|c(?:pp|xx)?|h(?:pp)?|css|s[ac]ss|less|html?|vue|svelte|json|ya?ml|toml|ini|cfg)$/i;
+const meaningfulBasename = /^(?:dockerfile|makefile|cmakelists\.txt|cargo\.toml|go\.mod|go\.sum|package\.json|pnpm-lock\.yaml|yarn\.lock|composer\.json|pyproject\.toml|requirements(?:-[\w.-]+)?\.txt|setup\.cfg)$/i;
+const meaningfulSource = (path: string): boolean => {
+  const normalized = path.replace(/\\/g, '/').replace(/^\.\//, '');
+  if (!normalized || normalized.split('/').some((segment) => lowValuePathSegment.has(segment.toLowerCase()))) return false;
+  const basename = normalized.split('/').at(-1) ?? '';
+  return meaningfulExtension.test(basename) || meaningfulBasename.test(basename) || /\.(?:test|spec)\.[cm]?[jt]sx?$/i.test(basename);
+};
+const resultPaths = (raw: string): string[] => {
+  const value = resultObject(raw); if (!Array.isArray(value.matches)) return [];
+  return value.matches.flatMap((match) => typeof match === 'string' ? [match] : match && typeof match === 'object' && typeof (match as { path?: unknown }).path === 'string' ? [(match as { path: string }).path] : []);
+};
+const firstStagnationGuidance = 'Релевантные области проекта уже изучены, а последние действия повторяют известный контекст. Перед новым исследованием назови один конкретный неразрешённый вопрос и используй только узкий поиск или диапазон чтения для него. Если такого вопроса нет, перейди к запрошенному изменению, затем выполни сфокусированную проверку. Не перечитывай неизменённые доступные диапазоны только ради уверенности.';
+const secondStagnationGuidance = 'Исследование всё ещё не продвигается после предыдущей подсказки, а реализации нет. Не выполняй широкий обзор проекта и не перечитывай целиком неизменённые файлы. Изучай только узкую конкретную зависимость; иначе внеси запрошенное изменение, проверь его и заверши работу.';
+
 class AgentStagnation {
-  private readonly stats: StagnationStats = { explorationActions: 0, broadExplorationActions: 0, targetedExplorationActions: 0, repeatedExplorationActions: 0, mutationActions: 0, verificationActions: 0, exactDuplicateReads: 0, coveredReads: 0, overlappingReads: 0, newInformationReads: 0, stepsSinceLastNewInformation: 0, stepsSinceLastMutation: 0, stagnationSuspected: false };
-  record(call: ProjectToolCall, read: ReadDiagnostic | undefined, action: number): StagnationStats {
-    const mutation = ['apply_patch', 'write_file', 'create_file', 'delete_file'].includes(call.name);
-    const verification = ['git_status', 'git_diff', 'run_terminal'].includes(call.name);
-    const exploration = ['read_file', 'inspect_package_json', 'search_text', 'find_files', 'search_files', 'list_directory', 'web_search', 'web_open'].includes(call.name);
+  private readonly codingChangeTask: boolean;
+  private readonly stats: StagnationStats;
+  private interventionLevel = 0;
+  private interventionStep = 0;
+  private interventionRepeatedReads = 0;
+  private interventionMeaningfulDiscoveries = 0;
+  private readonly meaningfulResources = new Set<string>();
+
+  constructor(history: ChatMessage[]) {
+    this.codingChangeTask = history.some((message) => message.role === 'user' && codingChangeLanguage.test(message.content));
+    this.stats = { explorationActions: 0, broadExplorationActions: 0, targetedExplorationActions: 0, repeatedExplorationActions: 0, mutationActions: 0, verificationActions: 0, exactDuplicateReads: 0, coveredReads: 0, overlappingReads: 0, newInformationReads: 0, meaningfulSourceDiscoveries: 0, stepsSinceLastNewInformation: 0, stepsSinceLastMeaningfulSourceInformation: 0, stepsSinceLastMutation: 0, codingChangeTask: this.codingChangeTask, interventionLevel: 0, stagnationSuspected: false };
+  }
+
+  record(call: ProjectToolCall, read: ReadDiagnostic | undefined, raw: string, action: number): StagnationUpdate {
+    const mutation = mutationTools.has(call.name);
+    const verification = verificationTools.has(call.name);
+    const exploration = explorationTools.has(call.name);
+    const newRead = read?.relationship === 'new';
+    const discovered = new Set<string>();
+    if (newRead && meaningfulSource(sourcePath(call, read))) discovered.add(sourcePath(call, read));
+    if ((call.name === 'search_text' || call.name === 'find_files' || call.name === 'search_files') && !lowInformation(raw)) for (const path of resultPaths(raw)) if (meaningfulSource(path)) discovered.add(path);
+    const meaningfulDiscovery = [...discovered].some((path) => !this.meaningfulResources.has(path));
+    for (const path of discovered) this.meaningfulResources.add(path);
     if (mutation) { this.stats.mutationActions += 1; this.stats.stepsSinceLastMutation = 0; } else this.stats.stepsSinceLastMutation += 1;
     if (verification) this.stats.verificationActions += 1;
     if (exploration) {
@@ -56,13 +99,42 @@ class AgentStagnation {
       else if (read?.relationship === 'covered') { this.stats.coveredReads += 1; this.stats.repeatedExplorationActions += 1; }
       else if (read?.relationship === 'overlap') { this.stats.overlappingReads += 1; this.stats.repeatedExplorationActions += 1; }
       else if (call.name === 'read_file' || call.name === 'inspect_package_json') {
-        this.stats.newInformationReads += 1; this.stats.targetedExplorationActions += 1; this.stats.stepsSinceLastNewInformation = 0;
+        this.stats.targetedExplorationActions += 1;
+        if (newRead) { this.stats.newInformationReads += 1; this.stats.stepsSinceLastNewInformation = 0; }
       } else if (call.name === 'search_text' || call.name === 'find_files' || call.name === 'search_files') this.stats.targetedExplorationActions += 1;
       else this.stats.broadExplorationActions += 1;
     }
     if (!read || read.relationship !== 'new') this.stats.stepsSinceLastNewInformation += 1;
-    this.stats.stagnationSuspected = this.stats.mutationActions === 0 && this.stats.explorationActions >= 20 && this.stats.stepsSinceLastNewInformation >= 12 && this.stats.stepsSinceLastMutation >= 20;
-    return { ...this.stats, stepsSinceLastMutation: this.stats.mutationActions ? this.stats.stepsSinceLastMutation : action };
+    if (meaningfulDiscovery) { this.stats.meaningfulSourceDiscoveries += 1; this.stats.stepsSinceLastMeaningfulSourceInformation = 0; } else this.stats.stepsSinceLastMeaningfulSourceInformation += 1;
+    if (mutation) this.resetEpisode();
+    const repeatedSignal = this.stats.repeatedExplorationActions >= 3;
+    const broadLowYieldSignal = this.stats.broadExplorationActions >= 4 && this.stats.stepsSinceLastMeaningfulSourceInformation >= 6;
+    const staleMeaningfulSourceSignal = this.stats.stepsSinceLastMeaningfulSourceInformation >= 8;
+    this.stats.stagnationSuspected = this.codingChangeTask && this.stats.mutationActions === 0 && this.stats.explorationActions >= 18 && this.stats.meaningfulSourceDiscoveries >= 5 && (repeatedSignal || broadLowYieldSignal || staleMeaningfulSourceSignal);
+    const intervention = this.nextIntervention(action);
+    this.stats.interventionLevel = this.interventionLevel;
+    return { stats: { ...this.stats, stepsSinceLastMutation: this.stats.mutationActions ? this.stats.stepsSinceLastMutation : action }, ...(intervention ? { intervention } : {}) };
+  }
+
+  private resetEpisode(): void {
+    this.interventionLevel = 0; this.interventionStep = 0; this.interventionRepeatedReads = 0; this.interventionMeaningfulDiscoveries = this.stats.meaningfulSourceDiscoveries;
+  }
+
+  private nextIntervention(action: number): StagnationIntervention | undefined {
+    if (!this.stats.stagnationSuspected) return undefined;
+    if (this.interventionLevel === 0) return this.startIntervention('first', action);
+    const actionsSinceIntervention = action - this.interventionStep;
+    const duplicateReadsSinceIntervention = this.stats.repeatedExplorationActions - this.interventionRepeatedReads;
+    const meaningfulDiscoveriesSinceIntervention = this.stats.meaningfulSourceDiscoveries - this.interventionMeaningfulDiscoveries;
+    const recurring = actionsSinceIntervention >= (this.interventionLevel === 1 ? 8 : 6)
+      && (duplicateReadsSinceIntervention >= 3 || (meaningfulDiscoveriesSinceIntervention === 0 && this.stats.stepsSinceLastMeaningfulSourceInformation >= 6));
+    if (!recurring) return undefined;
+    return this.interventionLevel === 1 ? this.startIntervention('second', action) : this.startIntervention('stalled', action);
+  }
+
+  private startIntervention(kind: StagnationIntervention, action: number): StagnationIntervention {
+    this.interventionLevel += 1; this.interventionStep = action; this.interventionRepeatedReads = this.stats.repeatedExplorationActions; this.interventionMeaningfulDiscoveries = this.stats.meaningfulSourceDiscoveries;
+    return kind;
   }
 }
 function completedActivity(activity: ToolActivity, call: ProjectToolCall, raw: string, durationMs: number, context?: { read?: ReadDiagnostic }): ToolActivity {
@@ -73,7 +145,7 @@ function completedActivity(activity: ToolActivity, call: ProjectToolCall, raw: s
     const path = typeof value.path === 'string' ? value.path : typeof call.arguments.path === 'string' ? call.arguments.path : 'package.json';
     const range = lineRange(value);
     detail = range ? `${path} · ${range}` : `${path} · весь файл`;
-    for (const key of ['fingerprint', 'status', 'readCount', 'sameContentAlreadyRead', 'previousResultActive', 'previousResultCompacted', 'previousResultInvalidated', 'previousInvalidationReason', 'relationship', 'coveredByRange', 'pinned', 'repeatedReadLoopSuspected'] as const) {
+    for (const key of ['fingerprint', 'status', 'unchanged', 'requested_range_already_available', 'readCount', 'sameContentAlreadyRead', 'previousResultActive', 'previousResultCompacted', 'previousResultInvalidated', 'previousInvalidationReason', 'relationship', 'coveredByRange', 'pinned', 'repeatedReadLoopSuspected'] as const) {
       if (key === 'status') { if (typeof value.status === 'string') metadata.status = value.status; continue; }
       const field = value[key] ?? context?.read?.[key];
       if (typeof field === 'string' || typeof field === 'number' || typeof field === 'boolean') metadata[key] = field;
@@ -119,12 +191,12 @@ export class ProjectChatService {
     const closeWebOnAbort = () => { void webSession?.close(); };
     signal.addEventListener('abort', closeWebOnAbort, { once: true });
     const toolDefinitions = [...projectToolDefinitions, ...(webSession ? webToolDefinitions : [])];
-    const messages: ToolMessage[] = [{ role: 'system', content: `${capabilitySystemContext({ webAvailable: Boolean(webSession), projectRoot: root, projectWriteAvailable: true, terminalAvailable: true })} Не предполагай тип, технологию или предметную область проекта. ${engine.strategy()} Результаты инструментов могут быть детерминированно сокращены ради контекстного бюджета; для полного содержания файла снова вызови read_file с конкретным диапазоном.` }, ...agentHistory(history)];
+    const messages: ToolMessage[] = [{ role: 'system', content: `${capabilitySystemContext({ webAvailable: Boolean(webSession), projectRoot: root, projectWriteAvailable: true, terminalAvailable: true })} Не предполагай тип, технологию или предметную область проекта. ${engine.strategy()} Рабочий цикл для задач изменения кода: Explore → Implement → Verify → Finalize. Сначала найди только нужные места и зависимости; когда поведение и точки изменения понятны, переходи к минимальной реализации, а не продолжай широкое исследование ради дополнительной уверенности. Перед повторным чтением неизменённого файла назови конкретный неразрешённый вопрос и предпочти узкий диапазон. После изменения выполни сфокусированную проверку и заверши ответ. Для явно исследовательской задачи изменение файла не требуется. Используй report_progress редко и только при переходе между изучением, реализацией и проверкой; это короткий пользовательский статус, не рассуждение. Результаты инструментов могут быть детерминированно сокращены ради контекстного бюджета; для полного содержания файла снова вызови read_file с конкретным диапазоном.` }, ...agentHistory(history)];
     const toolContext = new AgentToolContext(contextWindow);
     let actions = 0; let progressReports = 0; let repeats = 0; let lowInfo = 0; let warningSent = false; let researchFinished = false;
     const progressMessages = new Set<string>();
     const completed = new Set<string>();
-    const stagnation = new AgentStagnation();
+    const stagnation = new AgentStagnation(history);
     if (engine.isDeep) { log('deep.lifecycle', { phase: 'research.started', model, contextWindow }); yield { type: 'analysis', progress: { stage: 'reconnaissance', status: 'active' } }; }
     try { while (!signal.aborted) {
       const remaining = engine.budget - actions;
@@ -140,6 +212,8 @@ export class ProjectChatService {
         return;
       }
       let lowInformationNotice = false;
+      let stagnationIntervention: StagnationIntervention | undefined;
+      let latestStagnationStats: StagnationStats | undefined;
       for (const call of calls) {
         if (signal.aborted || actions >= engine.budget) break;
         if (call.name === 'report_progress') {
@@ -175,13 +249,27 @@ export class ProjectChatService {
         const stats = contextUpdate.stats;
         if (contextUpdate.read) log('agent.read.diagnostics', { ...runtime, agentStep: actions, normalizedPath: contextUpdate.read.path, requestedRange: contextUpdate.read.range, fileFingerprint: contextUpdate.read.fingerprint, readCount: contextUpdate.read.readCount, sameContentAlreadyRead: contextUpdate.read.sameContentAlreadyRead, relationship: contextUpdate.read.relationship, coveredByRange: contextUpdate.read.coveredByRange, previousResultActive: contextUpdate.read.previousResultActive, previousResultCompacted: contextUpdate.read.previousResultCompacted, previousCompactionReason: contextUpdate.read.previousCompactionReason, previousResultInvalidated: contextUpdate.read.previousResultInvalidated, previousInvalidationReason: contextUpdate.read.previousInvalidationReason, repeatedReadLoopSuspected: contextUpdate.read.repeatedReadLoopSuspected, pinned: contextUpdate.read.pinned, activeToolResultContextSize: stats.size, contextBudget: stats.budget, peakActiveToolResultContextSize: stats.peakSize });
         if (contextUpdate.invalidation) log('agent.read.cache.invalidated', { ...runtime, agentStep: actions, tool: call.name, ...contextUpdate.invalidation, totalInvalidatedReads: stats.invalidatedReads });
-        log('agent.stagnation.diagnostics', { ...runtime, agentStep: actions, ...stagnation.record(call, contextUpdate.read, actions) });
+        const stagnationUpdate = stagnation.record(call, contextUpdate.read, result, actions);
+        latestStagnationStats = stagnationUpdate.stats;
+        if (mutationTools.has(call.name)) stagnationIntervention = undefined;
+        log('agent.stagnation.diagnostics', { ...runtime, agentStep: actions, ...stagnationUpdate.stats });
+        if (stagnationUpdate.intervention) {
+          stagnationIntervention = stagnationUpdate.intervention;
+          log('agent.stagnation.intervention', { ...runtime, agentStep: actions, level: stagnationUpdate.intervention, ...stagnationUpdate.stats });
+        }
         if (stats.compacted) log('agent.context.compacted', { ...runtime, agentStep: actions, tool: call.name, toolResultContextSize: stats.size, toolResultContextBudget: stats.budget, compactedResults: stats.compacted });
         const finishedActivity = completedActivity(activity, call, result, Date.now() - startedAt, contextUpdate);
         const contextResult = resultObject(toolMessage.content);
         if (typeof contextResult.status === 'string') finishedActivity.metadata = { ...finishedActivity.metadata, status: contextResult.status };
         yield { type: 'tool', activity: finishedActivity };
       }
+      if (stagnationIntervention === 'stalled') {
+        log('agent.stalled.exploration', { ...runtime, actions, ...latestStagnationStats });
+        yield { type: 'error', message: 'Агент остановился: исследование не продвигается', details: 'agent_stalled_exploration: после двух подсказок не появились реализация или новая существенная информация.' };
+        return;
+      }
+      if (stagnationIntervention === 'first') messages.push(runtimeNotice('stagnation_guidance', firstStagnationGuidance));
+      if (stagnationIntervention === 'second') messages.push(runtimeNotice('stagnation_guard', secondStagnationGuidance));
       if (lowInformationNotice) messages.push(runtimeNotice('low_information', 'Последние действия дали мало новой информации. Сузь исследование или заверши ответ.'));
     } } catch (error) {
       if (signal.aborted) return;

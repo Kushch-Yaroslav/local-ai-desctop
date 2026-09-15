@@ -1,7 +1,7 @@
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import type { StreamEvent } from '../../shared/types';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import type { ToolMessage } from '../backends/types';
 import { OllamaRequestError } from '../backends/ollama-errors';
 import { AgentToolContext } from './agent-tool-context';
@@ -14,9 +14,9 @@ function assert(value: unknown, message: string): asserts value { if (!value) th
 const confirm = async () => ({ approved: false as const, reason: 'cancelled' as const });
 const history = [{ id: 'user', conversationId: 'chat', role: 'user' as const, content: 'Make the change', createdAt: new Date().toISOString() }];
 
-async function eventsFor(service: ProjectChatService, root: string, signal = new AbortController().signal): Promise<StreamEvent[]> {
+async function eventsFor(service: ProjectChatService, root: string, signal = new AbortController().signal, messages = history): Promise<StreamEvent[]> {
   const events: StreamEvent[] = [];
-  for await (const event of service.stream('test-model', history, root, signal, 16_384, 'fast', 'off', confirm)) events.push(event);
+  for await (const event of service.stream('test-model', messages, root, signal, 16_384, 'fast', 'off', confirm)) events.push(event);
   return events;
 }
 
@@ -99,6 +99,7 @@ export async function runProjectChatRegression(): Promise<void> {
     const repeated: ToolMessage = { role: 'tool', tool_name: 'read_file', content: first.content };
     const repeatUpdate = working.add('read_file', { path: 'src/A.ts' }, repeated, 2);
     assert(repeated.content.includes('"status":"unchanged"'), 'unchanged repeat did not return a compact valid tool acknowledgement');
+    assert(repeated.content.includes('"requested_range_already_available":true'), 'unchanged repeat did not tell the model that the requested range remains available');
     assert(repeatUpdate.read?.relationship === 'exact_duplicate', 'same path/range/fingerprint was not diagnosed as an exact duplicate');
     assert(first.content.includes('A'.repeat(100)), 'active repeated read did not keep content available to the model');
     const coveredRange: ToolMessage = { role: 'tool', tool_name: 'read_file', content: JSON.stringify({ path: 'src/A.ts', fingerprint: '10:1', byte_start: 1, byte_end: 100, content: 'covered range' }) };
@@ -158,12 +159,17 @@ export async function runProjectChatRegression(): Promise<void> {
         { function: { name: 'read_file', arguments: { path: 'paged.ts', start_line: 1, end_line: 2 } } },
         { function: { name: 'read_file', arguments: { path: 'paged.ts', start_line: 3, end_line: 3 } } },
       ] };
+      if (activityCalls === 2) return { role: 'assistant' as const, content: '', tool_calls: [
+        { function: { name: 'report_progress', arguments: { message: 'Перехожу к изменениям' } } },
+        { function: { name: 'write_file', arguments: { path: 'phase-change.ts', content: 'export const changed = true;\n' } } },
+      ] };
       return { role: 'assistant' as const, content: 'Готово.', finish_reason: 'stop' as const };
     } }, new WebBrowserService());
     const activityEvents = await eventsFor(activityAgent, root);
     const activities = activityEvents.filter((event): event is Extract<StreamEvent, { type: 'tool' }> => event.type === 'tool').map((event) => event.activity);
-    assert(activities.filter((activity) => activity.kind === 'progress').length === 1, 'progress event was not emitted separately');
-    assert(activities.filter((activity) => activity.kind !== 'progress' && activity.state === 'completed').length === 2, 'progress consumed a normal Agent action or read completion was absent');
+    assert(activities.filter((activity) => activity.kind === 'progress').length === 2, 'phase progress events were not emitted separately');
+    assert(activities.filter((activity) => activity.kind !== 'progress' && activity.state === 'completed').length === 3, 'progress consumed a normal Agent action or a completed phase action was absent');
+    assert(activities.filter((activity) => activity.kind === 'progress').map((activity) => activity.label).join(' / ') === 'Изучаю текущую реализацию / Перехожу к изменениям', 'phase progress did not preserve safe user-visible transitions');
     const pageDetails = activities.filter((activity) => activity.kind === 'file_read' && activity.state === 'completed').map((activity) => activity.detail);
     assert(pageDetails.includes('paged.ts · строки 1–2') && pageDetails.includes('paged.ts · строка 3'), 'consecutive file pagination did not retain actual ranges');
     assert(MAX_AGENT_STEPS_PER_GENERATION === 100, 'progress changed the Agent action limit');
@@ -186,6 +192,125 @@ export async function runProjectChatRegression(): Promise<void> {
     } }, new WebBrowserService());
     const spamEvents = await eventsFor(spamSafeAgent, root);
     assert(spamEvents.filter((event) => event.type === 'tool' && event.activity.kind === 'progress').length === 12, 'progress report rate limit was not bounded');
+
+    const toolReply = (name: string, argumentsObject: Record<string, unknown>) => ({ role: 'assistant' as const, content: '', tool_calls: [{ function: { name, arguments: argumentsObject } }] });
+    const stagnationContexts = (snapshots: ToolMessage[][], kind: string): ToolMessage[] => [...new Map(snapshots.flat().filter((message) => message.role === 'user' && message.content.startsWith(`<runtime_context kind="${kind}"`)).map((message) => [message.content, message])).values()];
+    const writeFixture = async (paths: string[], source: (path: string, index: number) => string): Promise<void> => {
+      await Promise.all(paths.map(async (path, index) => {
+        await mkdir(join(root, dirname(path)), { recursive: true });
+        await writeFile(join(root, path), source(path, index), 'utf8');
+      }));
+    };
+    const reactPaths = Array.from({ length: 24 }, (_, index) => {
+      const folder = ['app', 'components', 'lib'][index % 3];
+      return `${folder}/implementation-${index + 1}.${folder === 'components' ? 'tsx' : 'ts'}`;
+    });
+    await writeFixture(reactPaths, (_path, index) => `export const implementation${index + 1} = ${index + 1};\n`);
+
+    let usefulCalls = 0;
+    const usefulSnapshots: ToolMessage[][] = [];
+    const usefulExploration = new ProjectChatService({ chatWithTools: async (_model: string, messages: ToolMessage[]) => {
+      usefulCalls += 1; usefulSnapshots.push(messages.map((message) => ({ ...message })));
+      if (usefulCalls <= 22) return toolReply('read_file', { path: reactPaths[usefulCalls - 1] });
+      return { role: 'assistant' as const, content: 'Useful exploration complete.', finish_reason: 'stop' as const };
+    } }, new WebBrowserService());
+    const usefulEvents = await eventsFor(usefulExploration, root);
+    assert(!usefulEvents.some((event) => event.type === 'error'), 'many unique implementation reads were treated as stagnation');
+    assert(stagnationContexts(usefulSnapshots, 'stagnation_guidance').length === 0, 'useful unique exploration received a premature stagnation intervention');
+
+    let recoveryCalls = 0;
+    const recoverySnapshots: ToolMessage[][] = [];
+    const recoveryAgent = new ProjectChatService({ chatWithTools: async (_model: string, messages: ToolMessage[]) => {
+      recoveryCalls += 1; recoverySnapshots.push(messages.map((message) => ({ ...message })));
+      if (recoveryCalls <= 15) return toolReply('read_file', { path: reactPaths[recoveryCalls - 1] });
+      if (recoveryCalls <= 18) return toolReply('read_file', { path: reactPaths[0] });
+      if (recoveryCalls === 19) return toolReply('read_file', { path: reactPaths[15] });
+      if (recoveryCalls <= 23) return toolReply('search_text', { query: `focused-${recoveryCalls}` });
+      if (recoveryCalls === 24) return toolReply('write_file', { path: 'implemented.ts', content: 'export const done = true;\n' });
+      if (recoveryCalls === 25) return toolReply('git_status', {});
+      return { role: 'assistant' as const, content: 'Implemented and verified.', finish_reason: 'stop' as const };
+    } }, new WebBrowserService());
+    const recoveryEvents = await eventsFor(recoveryAgent, root);
+    assert(stagnationContexts(recoverySnapshots, 'stagnation_guidance').length === 1, 'first stagnation episode did not add exactly one runtime intervention');
+    assert(stagnationContexts(recoverySnapshots, 'stagnation_guard').length === 0, 'useful targeted exploration followed by mutation escalated stagnation');
+    assert(!recoveryEvents.some((event) => event.type === 'error'), 'mutation and verification did not reset stagnation');
+
+    let secondGuardCalls = 0;
+    const secondGuardSnapshots: ToolMessage[][] = [];
+    const secondGuardAgent = new ProjectChatService({ chatWithTools: async (_model: string, messages: ToolMessage[]) => {
+      secondGuardCalls += 1; secondGuardSnapshots.push(messages.map((message) => ({ ...message })));
+      if (secondGuardCalls <= 15) return toolReply('read_file', { path: reactPaths[secondGuardCalls - 1] });
+      if (secondGuardCalls <= 18) return toolReply('read_file', { path: reactPaths[0] });
+      if (secondGuardCalls <= 26) return toolReply('search_text', { query: `unresolved-${secondGuardCalls}` });
+      if (secondGuardCalls === 27) return toolReply('write_file', { path: 'implemented-after-guard.ts', content: 'export const guarded = true;\n' });
+      return { role: 'assistant' as const, content: 'Guarded implementation complete.', finish_reason: 'stop' as const };
+    } }, new WebBrowserService());
+    const secondGuardEvents = await eventsFor(secondGuardAgent, root);
+    assert(stagnationContexts(secondGuardSnapshots, 'stagnation_guidance').length === 1, 'first intervention was missing before the second guard');
+    assert(stagnationContexts(secondGuardSnapshots, 'stagnation_guard').length === 1, 'second stagnation episode did not add a stronger runtime guard');
+    assert(!secondGuardEvents.some((event) => event.type === 'error'), 'second guard forced a mutation or failure before the agent could recover');
+    assert(secondGuardSnapshots.every((messages) => !validateLlamaMessageSequence(messages)), 'stagnation runtime notices inserted a mid-history system message');
+
+    let stalledCalls = 0;
+    const stalledSnapshots: ToolMessage[][] = [];
+    const stalledAgent = new ProjectChatService({ chatWithTools: async (_model: string, messages: ToolMessage[]) => {
+      stalledCalls += 1; stalledSnapshots.push(messages.map((message) => ({ ...message })));
+      if (stalledCalls <= 15) return toolReply('read_file', { path: reactPaths[stalledCalls - 1] });
+      if (stalledCalls <= 18) return toolReply('read_file', { path: reactPaths[0] });
+      if (stalledCalls <= 26) return toolReply('search_text', { query: `unresolved-stalled-${stalledCalls}` });
+      return toolReply('read_file', { path: reactPaths[0] });
+    } }, new WebBrowserService());
+    const stalledEvents = await eventsFor(stalledAgent, root);
+    assert(stalledEvents.some((event) => event.type === 'error' && event.details?.includes('agent_stalled_exploration')), 'persistent exploration did not end with a controlled stalled-agent outcome');
+    assert(stalledCalls < MAX_AGENT_STEPS_PER_GENERATION, 'stalled exploration reached the global 100-action ceiling');
+    assert(stagnationContexts(stalledSnapshots, 'stagnation_guidance').length === 1 && stagnationContexts(stalledSnapshots, 'stagnation_guard').length === 1, 'stalled-agent outcome skipped its bounded interventions');
+
+    let researchCalls = 0;
+    const researchSnapshots: ToolMessage[][] = [];
+    const researchAgent = new ProjectChatService({ chatWithTools: async (_model: string, messages: ToolMessage[]) => {
+      researchCalls += 1; researchSnapshots.push(messages.map((message) => ({ ...message })));
+      if (researchCalls <= 15) return toolReply('read_file', { path: reactPaths[researchCalls - 1] });
+      if (researchCalls <= 20) return toolReply('read_file', { path: reactPaths[0] });
+      return { role: 'assistant' as const, content: 'Architecture summary.', finish_reason: 'stop' as const };
+    } }, new WebBrowserService());
+    const researchHistory = [{ ...history[0], content: 'Опиши архитектуру и связи в этом проекте.' }];
+    const researchEvents = await eventsFor(researchAgent, root, new AbortController().signal, researchHistory);
+    assert(!researchEvents.some((event) => event.type === 'error'), 'read-only research task was treated as a failed coding task');
+    assert(stagnationContexts(researchSnapshots, 'stagnation_guidance').length === 0, 'read-only research task was pushed toward a mutation');
+
+    const nonJavaScriptPaths = Array.from({ length: 18 }, (_, index) => {
+      const extension = ['py', 'go', 'rs'][index % 3];
+      const folder = ['backend', 'server', 'packages/core'][index % 3];
+      return `${folder}/module-${index + 1}.${extension}`;
+    });
+    await writeFixture(nonJavaScriptPaths, (path, index) => path.endsWith('.py') ? `VALUE_${index + 1} = ${index + 1}\n` : path.endsWith('.go') ? `package server\nconst Value${index + 1} = ${index + 1}\n` : `pub const VALUE_${index + 1}: usize = ${index + 1};\n`);
+    let nonJavaScriptCalls = 0;
+    const nonJavaScriptSnapshots: ToolMessage[][] = [];
+    const nonJavaScriptAgent = new ProjectChatService({ chatWithTools: async (_model: string, messages: ToolMessage[]) => {
+      nonJavaScriptCalls += 1; nonJavaScriptSnapshots.push(messages.map((message) => ({ ...message })));
+      if (nonJavaScriptCalls <= 15) return toolReply('read_file', { path: nonJavaScriptPaths[nonJavaScriptCalls - 1] });
+      if (nonJavaScriptCalls <= 18) return toolReply('read_file', { path: nonJavaScriptPaths[0] });
+      if (nonJavaScriptCalls === 19) return toolReply('write_file', { path: 'implemented-non-js.txt', content: 'done\n' });
+      return { role: 'assistant' as const, content: 'Non-JavaScript implementation complete.', finish_reason: 'stop' as const };
+    } }, new WebBrowserService());
+    const nonJavaScriptEvents = await eventsFor(nonJavaScriptAgent, root);
+    assert(stagnationContexts(nonJavaScriptSnapshots, 'stagnation_guidance').length === 1, 'Python, Go, and Rust source discovery was not recognized generically');
+    assert(!nonJavaScriptEvents.some((event) => event.type === 'error'), 'non-JavaScript project recovery was treated as stalled');
+
+    const rootSourcePaths = Array.from({ length: 18 }, (_, index) => `worker-${index + 1}.go`);
+    await writeFixture(rootSourcePaths, (_path, index) => `package main\nconst Worker${index + 1} = ${index + 1}\n`);
+    let rootSourceCalls = 0;
+    const rootSourceSnapshots: ToolMessage[][] = [];
+    const rootSourceAgent = new ProjectChatService({ chatWithTools: async (_model: string, messages: ToolMessage[]) => {
+      rootSourceCalls += 1; rootSourceSnapshots.push(messages.map((message) => ({ ...message })));
+      if (rootSourceCalls <= 15) return toolReply('read_file', { path: rootSourcePaths[rootSourceCalls - 1] });
+      if (rootSourceCalls <= 18) return toolReply('read_file', { path: rootSourcePaths[0] });
+      if (rootSourceCalls === 19) return toolReply('write_file', { path: 'implemented-at-root.txt', content: 'done\n' });
+      return { role: 'assistant' as const, content: 'Root-source implementation complete.', finish_reason: 'stop' as const };
+    } }, new WebBrowserService());
+    const rootSourceEvents = await eventsFor(rootSourceAgent, root);
+    assert(stagnationContexts(rootSourceSnapshots, 'stagnation_guidance').length === 1, 'source files at the repository root were not recognized');
+    assert(!rootSourceEvents.some((event) => event.type === 'error'), 'root-source project recovery was treated as stalled');
 
     let longCalls = 0;
     const longSnapshots: ToolMessage[][] = [];
