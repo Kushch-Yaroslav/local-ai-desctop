@@ -15,8 +15,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 export NPM_CONFIG_CACHE="$APP_DIR/local-cache/npm"
 export XDG_CACHE_HOME="$APP_DIR/runtime/cache"
 export XDG_CONFIG_HOME="$APP_DIR/runtime/app-data"
-# Internal-only vision worker. An explicit caller value can still override this tag.
-export LOCAL_AI_VISION_MODEL="${LOCAL_AI_VISION_MODEL:-minicpm-v4.5:q4_K_M}"
+export LOCAL_AI_BACKEND="ollama"
 
 unset LOCAL_AI_DEV_SERVER_URL
 unset VITE_DEV_SERVER_URL

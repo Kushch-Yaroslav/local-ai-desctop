@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { ActionApproval, AnalysisProgress, AnalysisRun, Attachment, AttachmentStatus, ApprovalDecision, ApprovalStatus, ChatMessage, Conversation, FinishReason, GenerationDiagnostics, HardwareStats, ModelInfo, ToolActivity } from '../../shared/types';
+import type { ActionApproval, AnalysisProgress, AnalysisRun, AppSettings, Attachment, AttachmentStatus, ApprovalDecision, ApprovalStatus, ChatMessage, Conversation, FinishReason, GenerationDiagnostics, HardwareStats, ModelInfo, ToolActivity } from '../../shared/types';
 
 type State = {
   conversations: Conversation[];
@@ -7,6 +7,7 @@ type State = {
   messages: ChatMessage[];
   models: ModelInfo[];
   hardware: HardwareStats | null;
+  settings: AppSettings | null;
   isGenerating: boolean;
   generationId: string | null;
   generationState: 'idle' | 'thinking' | 'using-tool' | 'running-terminal' | 'waiting-for-approval' | 'generating' | 'stopping' | 'cancelled' | 'error';
@@ -51,10 +52,10 @@ export const useAppStore = create<State>((set, get) => {
     }) }));
   };
   return {
-  conversations: [], activeId: null, messages: [], models: [], hardware: null, isGenerating: false, generationId: null, generationState: 'idle', error: null, toolActivities: [], toolActivityCount: 0, activeContextWindow: null, analysisProgress: [], analysisRuns: [], lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false,
+  conversations: [], activeId: null, messages: [], models: [], hardware: null, settings: null, isGenerating: false, generationId: null, generationState: 'idle', error: null, toolActivities: [], toolActivityCount: 0, activeContextWindow: null, analysisProgress: [], analysisRuns: [], lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false,
   initialize: async () => {
-    const [conversations, models] = await Promise.all([window.localAi.conversations.list(), window.localAi.models.list()]);
-    set({ conversations, models });
+    const [conversations, models, settings] = await Promise.all([window.localAi.conversations.list(), window.localAi.models.list(), window.localAi.settings.get()]);
+    set({ conversations, models, settings });
     if (conversations[0]) await get().selectConversation(conversations[0].id);
     else await get().createConversation();
     await get().refreshHardware();

@@ -16,7 +16,6 @@ export type ModelProfile = {
 /** The only local models exposed by the desktop client. Tags are pinned to the requested precisions. */
 export const modelRegistry: readonly ModelProfile[] = [
   { id: 'qwen3.8:27b-q4_K_M', displayName: 'Qwen3.8-27B', shortName: 'Qwen3.8', quantization: 'Q4_K_M', maxContext: 262_144, supportsTools: true, supportsThinking: true },
-  { id: 'glm-4.7-flash:q4_K_M', displayName: 'GLM-4.7-Flash', shortName: 'GLM-4.7', quantization: 'Q4_K_M', maxContext: 202_752, supportsTools: true, supportsThinking: true },
   // The official gpt-oss build keeps its native MXFP4 MoE weights and BF16 tensors; it is not a re-quantized Q4 build.
   { id: 'gpt-oss:20b', displayName: 'gpt-oss-20b', shortName: 'GPT-OSS', quantization: 'MXFP4 / BF16', maxContext: 131_072, supportsTools: true, supportsThinking: true },
 ];
@@ -77,8 +76,5 @@ export function inferenceSettings(profile: ModelProfile, settings: InferenceSett
     // gpt-oss likewise has low/medium/high rather than four distinct native levels.
     return { think: 'high', options: base };
   }
-  // GLM exposes thinking as a boolean. Fast remains off; the other presets retain thinking.
-  if (settings.depth === 'fast') return { think: false, options: { ...base, temperature: 0.7 } };
-  if (settings.depth === 'normal') return { think: true, options: { ...base, temperature: 1 } };
-  return { think: true, options: { ...base, temperature: 0.9 } };
+  return { think: false, options: base };
 }

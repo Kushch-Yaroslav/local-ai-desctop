@@ -1,7 +1,6 @@
 import { Database } from './database';
 import { AttachmentService, MAX_EXTRACTED_CHARACTERS, MAX_IMAGES_PER_MESSAGE, attachmentDisplayName } from './attachment-service';
 import { AttachmentPipeline, MAX_ATTACHMENT_CONTEXT_CHARACTERS } from './attachment-pipeline';
-import type { OllamaBackend } from '../backends/ollama-backend';
 import { ProjectChatService } from './project-chat';
 import { WebBrowserService } from '../web/web-tools';
 import type { ToolMessage } from '../backends/types';
@@ -32,29 +31,20 @@ export async function runAttachmentPipelineRegression(): Promise<void> {
       assert(processed.extractedText?.includes('[Attachment partially included]'), 'per-attachment cap marker is missing');
       assert((processed.extractedText?.length ?? 0) > MAX_EXTRACTED_CHARACTERS, 'per-attachment cap marker was not persisted');
     }
-    const fakeOllama = { findInstalledVisionModel: async () => null, isModelLoaded: async () => false, unloadModel: async () => undefined } as unknown as OllamaBackend;
-    const pipeline = new AttachmentPipeline(database, service, fakeOllama);
+    const pipeline = new AttachmentPipeline(database, service);
     const history = database.listMessages(chat.id); const contextualized = pipeline.buildContext(history);
     const attachmentBlock = contextualized.find((item) => item.id === `attachments-${turn.id}`);
     assert(attachmentBlock && attachmentBlock.content.length <= MAX_ATTACHMENT_CONTEXT_CHARACTERS, 'total per-turn context cap exceeded');
     const attachmentIndex = contextualized.findIndex((item) => item.id === `attachments-${turn.id}`);
     assert(attachmentIndex >= 0 && contextualized[attachmentIndex + 1]?.id === turn.id, 'attachment context is not directly before its user turn');
 
-    // A model that advertises vision must never invoke the MiniCPM fallback or
-    // receive the same image again as a textual system block.
+    // Native vision binds the original image only to its owning user turn.
     const nativeTurn = database.addMessage(chat.id, 'user', 'Inspect Image 1 natively');
     const nativeImage = await service.import({ messageId: nativeTurn.id, index: 0, filename: 'native.png', mimeType: 'image/png', data: png });
-    let fallbackCalls = 0;
-    const nativeOllama = {
-      findInstalledVisionModel: async () => { fallbackCalls += 1; return 'configured-minicpm-v-4.5'; },
-      isModelLoaded: async () => false,
-      unloadModel: async () => undefined,
-      analyzeImageWithVision: async () => { fallbackCalls += 1; return 'must not be called'; },
-    } as unknown as OllamaBackend;
-    const nativePipeline = new AttachmentPipeline(database, service, nativeOllama);
-    await nativePipeline.preprocessCurrent([nativeImage.id], new AbortController().signal, () => undefined, 'qwen3.8:27b-q4_K_M', true);
+    const nativePipeline = new AttachmentPipeline(database, service);
+    await nativePipeline.preprocessCurrent([nativeImage.id], new AbortController().signal, () => undefined, true);
     const nativeStored = database.getAttachment(nativeImage.id)!;
-    assert(nativeStored.status === 'ready' && !nativeStored.visionAnalysis && fallbackCalls === 0, 'native vision incorrectly invoked MiniCPM');
+    assert(nativeStored.status === 'ready' && !nativeStored.visionAnalysis, 'native vision did not preserve the original image');
     const nativeOnlyHistory = await nativePipeline.prepareNativeImages(nativePipeline.buildContext([nativeTurn], false), new AbortController().signal);
     assert(nativeOnlyHistory.length === 1 && nativeOnlyHistory[0].images?.length === 1, 'native image was not attached to its user turn');
     assert(!nativeOnlyHistory.some((entry) => entry.role === 'system' && entry.content.includes('Image 1')), 'native image was duplicated into attachment text context');
@@ -75,30 +65,13 @@ export async function runAttachmentPipelineRegression(): Promise<void> {
     assert(mixedDocumentBlock?.content.includes('Attachment: 0.txt'), 'documents were lost when native vision is active');
     assert(!mixedDocumentBlock?.content.includes('Image 1'), 'image descriptions leaked into native mixed attachment context');
 
-    // Text-only routing retains the MiniCPM textual fallback.
-    const fallbackTurn = database.addMessage(chat.id, 'user', 'Use fallback');
-    const fallbackImage = await service.import({ messageId: fallbackTurn.id, index: 0, filename: 'fallback.png', mimeType: 'image/png', data: png });
-    let analyses = 0;
-    const fallbackOllama = {
-      findInstalledVisionModel: async () => 'configured-minicpm-v-4.5', isModelLoaded: async () => false, unloadModel: async () => undefined,
-      analyzeImageWithVision: async () => { analyses += 1; return 'Summary: fallback result'; },
-    } as unknown as OllamaBackend;
-    await new AttachmentPipeline(database, service, fallbackOllama).preprocessCurrent([fallbackImage.id], new AbortController().signal, () => undefined, 'glm-4.7-flash:q4_K_M', false);
-    assert(analyses === 1 && database.getAttachment(fallbackImage.id)?.visionAnalysis === 'Summary: fallback result', 'text-only model did not use MiniCPM fallback');
-
-    const cancelledMessage = database.addMessage(chat.id, 'user', 'Stop vision'); const cancelled = await service.import({ messageId: cancelledMessage.id, index: 0, filename: 'cancel.png', mimeType: 'image/png', data: png });
-    let resolveVision!: (value: string) => void;
-    const lateVision = new Promise<string>((resolve) => { resolveVision = resolve; });
-    const calls: string[] = [];
-    const visionOllama = {
-      findInstalledVisionModel: async () => 'configured-minicpm-v-4.5', isModelLoaded: async (model: string) => model === 'qwen3.8:27b-q4_K_M' && !calls.includes('unload:qwen3.8:27b-q4_K_M'),
-      unloadModel: async (model: string) => { calls.push(`unload:${model}`); }, analyzeImageWithVision: async () => lateVision,
-    } as unknown as OllamaBackend;
-    const cancelPipeline = new AttachmentPipeline(database, service, visionOllama); const controller = new AbortController();
-    const pending = cancelPipeline.preprocessCurrent([cancelled.id], controller.signal, () => undefined, 'qwen3.8:27b-q4_K_M'); controller.abort(); resolveVision('late vision result must never persist'); await pending;
-    const cancelledStored = database.getAttachment(cancelled.id)!;
-    assert(cancelledStored.status === 'cancelled' && !cancelledStored.visionAnalysis, 'stale vision result was persisted after Stop');
-    assert(calls[0] === 'unload:qwen3.8:27b-q4_K_M' && calls.includes('unload:configured-minicpm-v-4.5'), 'main → vision VRAM lifecycle did not unload both models');
+    // A text-only model is a controlled unsupported state; there is no hidden
+    // second model or unload/reload routing any more.
+    const unsupportedTurn = database.addMessage(chat.id, 'user', 'Unsupported image');
+    const unsupportedImage = await service.import({ messageId: unsupportedTurn.id, index: 0, filename: 'unsupported.png', mimeType: 'image/png', data: png });
+    await new AttachmentPipeline(database, service).preprocessCurrent([unsupportedImage.id], new AbortController().signal, () => undefined, false);
+    const unsupportedStored = database.getAttachment(unsupportedImage.id)!;
+    assert(unsupportedStored.status === 'error' && unsupportedStored.error?.includes('не поддерживает'), 'unsupported image did not produce a controlled error');
     console.log('attachment-pipeline regression: ok');
   } finally { await service.removeManagedFiles(database.deleteConversation(chat.id)); }
 }

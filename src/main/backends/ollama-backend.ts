@@ -2,7 +2,6 @@ import type { AnalysisDepth, ChatMessage, FinishReason, ModelInfo, StreamEvent }
 import type { InferenceDiagnostics, LlmBackend, ToolCallingBackend, ToolMessage } from './types';
 import { getModelProfile, inferenceSettings, modelInfo, modelRegistry, requestedMaxOutputTokens } from '../models/model-registry';
 import { log } from '../services/logger';
-import { configuredVisionModelId } from '../config/vision-model';
 import { OllamaRequestError, classifyOllamaError, ollamaErrorDiagnostics } from './ollama-errors';
 
 type OllamaTags = { models?: Array<{ name: string; model?: string; size: number; capabilities?: string[]; details?: { family?: string; families?: string[] } }> };
@@ -16,7 +15,7 @@ type OllamaRunningModels = { models?: Array<{ name: string; model?: string }> };
 export type ContextWindow = { requested: number; active: number; supported?: number };
 
 export class OllamaBackend implements LlmBackend, ToolCallingBackend {
-  constructor(private readonly baseUrl = 'http://127.0.0.1:11434', private readonly visionModelId = configuredVisionModelId()) {}
+  constructor(private readonly baseUrl = 'http://127.0.0.1:11434') {}
 
   async getModels(): Promise<ModelInfo[]> {
     const response = await fetch(`${this.baseUrl}/api/tags`);
@@ -82,22 +81,6 @@ export class OllamaBackend implements LlmBackend, ToolCallingBackend {
     if (!models.find((candidate) => candidate.id === model)?.installed) throw new Error(`Модель ${profile.displayName} не установлена. Проверьте DATA-диск и загрузите её через Ollama.`);
   }
 
-  /** Only returns an installed configured/exact MiniCPM-V 4.5 tag; this app never pulls models implicitly. */
-  async findInstalledVisionModel(): Promise<string | null> {
-    const response = await fetch(`${this.baseUrl}/api/tags`);
-    if (!response.ok) throw new Error(`Ollama вернул HTTP ${response.status}`);
-    const data = await response.json() as OllamaTags;
-    const installed = data.models ?? [];
-    const isRequiredVisionModel = (candidate: NonNullable<OllamaTags['models']>[number]) => {
-      const name = (candidate.name ?? candidate.model ?? '').toLowerCase();
-      const families = [candidate.details?.family, ...(candidate.details?.families ?? [])].filter(Boolean).join(' ').toLowerCase();
-      return (name.includes('minicpm') || families.includes('minicpm')) && (name.includes('4.5') || families.includes('4.5'));
-    };
-    if (this.visionModelId) return installed.some((candidate) => (candidate.name === this.visionModelId || candidate.model === this.visionModelId) && isRequiredVisionModel(candidate)) ? this.visionModelId : null;
-    const match = installed.find(isRequiredVisionModel);
-    return match?.name ?? null;
-  }
-
   async isModelLoaded(model: string): Promise<boolean> {
     try {
       const response = await fetch(`${this.baseUrl}/api/ps`);
@@ -105,21 +88,6 @@ export class OllamaBackend implements LlmBackend, ToolCallingBackend {
       const data = await response.json() as OllamaRunningModels;
       return (data.models ?? []).some((candidate) => candidate.name === model || candidate.model === model);
     } catch { return false; }
-  }
-
-  async analyzeImageWithVision(model: string, image: Buffer, signal: AbortSignal): Promise<string> {
-    const response = await fetch(`${this.baseUrl}/api/chat`, {
-      method: 'POST', signal, headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        model, stream: false, keep_alive: '10m', think: false,
-        messages: [{ role: 'user', content: 'Analyze this user-provided image. Do not answer conversationally. Return a precise structured report with headings: Summary, Visible text, UI/layout, Tables/code/errors, Objects/elements, Important details, Uncertainty. Transcribe only text you can actually read; explicitly mark uncertain details. This report will be passed to another local model.', images: [image.toString('base64')] }],
-        options: { num_ctx: 8192, temperature: 0.1 },
-      }),
-    });
-    const data = await response.json() as OllamaToolResponse;
-    if (!response.ok || data.error) throw this.readableError(`Vision worker error: ${data.error ?? `HTTP ${response.status}`}`);
-    const content = data.message?.content?.trim(); if (!content) throw new Error('Vision worker returned an empty analysis');
-    return content;
   }
 
   async unloadModel(model: string): Promise<void> {

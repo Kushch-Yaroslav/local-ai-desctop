@@ -4,6 +4,7 @@ import type { AnalysisRun, ApprovalDecision, ApprovalStatus, ChatRequest, Conver
 import { Database } from '../services/database';
 import { getHardwareStats } from '../services/hardware';
 import { OllamaBackend } from '../backends/ollama-backend';
+import { LlamaCppBackend } from '../backends/llama-cpp-backend';
 import { ProjectChatService } from '../services/project-chat';
 import { paths } from '../services/paths';
 import { log } from '../services/logger';
@@ -19,12 +20,15 @@ import { readFile } from 'node:fs/promises';
 import { ollamaErrorDiagnostics } from '../backends/ollama-errors';
 
 const database = new Database();
+const selectedBackend = process.env.LOCAL_AI_BACKEND === 'llama-cpp' ? 'llama-cpp' : 'ollama';
 const ollama = new OllamaBackend();
+const llamaCpp = new LlamaCppBackend(process.env.LOCAL_AI_LLAMA_CPP_URL ?? 'http://127.0.0.1:8081', 65_536, process.env.LOCAL_AI_LLAMA_CPP_VISION === '1');
+const backend = selectedBackend === 'llama-cpp' ? llamaCpp : ollama;
 const web = new WebBrowserService();
-const projectChat = new ProjectChatService(ollama, web);
-const webChat = new WebChatService(ollama, web);
+const projectChat = new ProjectChatService(backend, web);
+const webChat = new WebChatService(backend, web);
 const attachments = new AttachmentService(database);
-const attachmentPipeline = new AttachmentPipeline(database, attachments, ollama);
+const attachmentPipeline = new AttachmentPipeline(database, attachments);
 type ActiveGeneration = { id: string; abort: AbortController; settled: Promise<void>; finish: () => void };
 const activeGenerations = new Map<string, ActiveGeneration>();
 type PendingApproval = { approvalId: string; conversationId: string; generation: ActiveGeneration; actionId: string; category: RiskCategory; root: string; resolve: (result: ApprovalResult) => void; settled: boolean; abort: () => void; emit: (payload: Record<string, unknown>) => void };
@@ -87,7 +91,7 @@ export function registerIpc(): void {
     const updated = database.updateConversation(id, { ...patch, contextWindow });
     if (patch.workingDirectory !== undefined && patch.workingDirectory !== current.workingDirectory) sessionApprovals.delete(id);
     if (patch.modelId !== undefined && patch.modelId !== current.modelId) database.setContextUsage(id, null, null);
-    if (patch.modelId !== undefined && patch.modelId !== current.modelId && current.modelId) void ollama.unloadModel(current.modelId);
+    if (selectedBackend === 'ollama' && patch.modelId !== undefined && patch.modelId !== current.modelId && current.modelId) void ollama.unloadModel(current.modelId);
     return database.getConversation(id) ?? updated;
   });
   ipcMain.handle('conversations:delete', async (_event, id: string) => { sessionApprovals.delete(id); await attachments.removeManagedFiles(database.deleteConversation(id)); });
@@ -108,10 +112,10 @@ export function registerIpc(): void {
   });
   ipcMain.handle('analysis:list', (_event, conversationId: string) => database.listAnalysisRuns(conversationId));
   ipcMain.handle('models:list', async () => {
-    try { return await ollama.getModels(); }
-    catch (error) { log('ollama.models.failed', error instanceof Error ? { message: error.message } : undefined); return []; }
+    try { return await backend.getModels(); }
+    catch (error) { log('backend.models.failed', { backend: selectedBackend, message: error instanceof Error ? error.message : String(error) }); return []; }
   });
-  ipcMain.handle('settings:get', () => ({ selectedBackend: 'ollama', ollamaUrl: 'http://127.0.0.1:11434', llamaServerPath: null, modelsPath: paths.models }));
+  ipcMain.handle('settings:get', () => ({ selectedBackend, ollamaUrl: 'http://127.0.0.1:11434', llamaServerPath: selectedBackend === 'llama-cpp' ? process.env.LOCAL_AI_LLAMA_SERVER_PATH ?? null : null, modelsPath: paths.models }));
   ipcMain.handle('hardware:get', getHardwareStats);
   ipcMain.handle('dialog:chooseDirectory', async () => {
     const window = BrowserWindow.getFocusedWindow();
@@ -159,16 +163,12 @@ export function registerIpc(): void {
     // Ollama advertises capabilities with the installed tag. This governs routing
     // for every image turn in the active history, rather than guessing from names.
     const hasImages = database.listAttachmentsForConversation(request.conversationId).some((attachment) => attachment.kind === 'image');
-    const nativeVision = hasImages && await ollama.supportsVision(request.model, abort.signal);
-    const preprocessIds = nativeVision
-      ? attachmentIds
-      : [...new Set([...attachmentIds, ...database.listAttachmentsForConversation(request.conversationId)
-        .filter((attachment) => attachment.kind === 'image' && !attachment.visionAnalysis)
-        .map((attachment) => attachment.id)])];
-    log('attachment.vision-routing', { generationId: generation.id, modelId: request.model, hasImages, route: nativeVision ? 'native' : hasImages ? 'minicpm-fallback' : 'none' });
-    if (preprocessIds.length) await attachmentPipeline.preprocessCurrent(preprocessIds, abort.signal, emitAttachment, request.model, nativeVision);
+    const nativeVision = hasImages && await backend.supportsVision(request.model, abort.signal);
+    const preprocessIds = hasImages ? [...new Set([...attachmentIds, ...database.listAttachmentsForConversation(request.conversationId).filter((attachment) => attachment.kind === 'image' && !attachment.visionAnalysis).map((attachment) => attachment.id)])] : attachmentIds;
+    log('attachment.vision-routing', { generationId: generation.id, modelId: request.model, hasImages, route: nativeVision ? 'native' : hasImages ? 'unsupported' : 'none' });
+    if (preprocessIds.length) await attachmentPipeline.preprocessCurrent(preprocessIds, abort.signal, emitAttachment, nativeVision);
     if (!current()) return;
-    await ollama.ensureModelAvailable(request.model);
+    await backend.ensureModelAvailable(request.model);
     if (!current()) return;
     let output = ''; let completed = false; let failed = false; let finishReason: 'stop' | 'length' = 'stop';
     const agentRoot = conversation.mode === 'agent' ? conversation.workingDirectory ?? paths.root : null;
@@ -176,7 +176,7 @@ export function registerIpc(): void {
     log('generation.snapshot', { generationId: generation.id, chatId: request.conversationId, mode: conversation.mode, workingDirectory: conversation.workingDirectory, resolvedWorkingDirectory: agentRoot, webMode: conversation.webMode, modelId: request.model, contextSize: conversation.contextWindow, reasoningPreset: conversation.analysisDepth, enabledTools });
     run = agentRoot ? database.createAnalysisRun(request.conversationId, conversation.analysisDepth) : null;
     if (run && current()) event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run });
-      const context = await ollama.resolveContextWindow(request.model, conversation.contextWindow, abort.signal);
+      const context = await backend.resolveContextWindow(request.model, conversation.contextWindow, abort.signal);
       if (!current()) return;
       event.sender.send('chat:stream', { type: 'context', conversationId: request.conversationId, generationId: generation.id, ...context });
       // Image descriptions are excluded for native-vision requests: the original
@@ -187,7 +187,7 @@ export function registerIpc(): void {
         ? projectChat.stream(request.model, history, agentRoot, abort.signal, context.active, conversation.analysisDepth, conversation.webMode, inlineConfirmation(event, request.conversationId, generation, agentRoot), { generationId: generation.id, conversationId: request.conversationId })
         : conversation.webMode === 'auto'
           ? webChat.stream(request.model, history, abort.signal, context.active, conversation.analysisDepth)
-          : ollama.streamChat(request.model, [{ id: `capability-${request.conversationId}`, conversationId: request.conversationId, role: 'system', content: capabilitySystemContext({ webAvailable: false }), createdAt: new Date().toISOString() }, ...history], abort.signal, context.active, conversation.analysisDepth);
+          : backend.streamChat(request.model, [{ id: `capability-${request.conversationId}`, conversationId: request.conversationId, role: 'system', content: capabilitySystemContext({ webAvailable: false }), createdAt: new Date().toISOString() }, ...history], abort.signal, context.active, conversation.analysisDepth);
       for await (const chunk of stream) {
         if (!current()) break;
         if (chunk.type === 'token') output += chunk.content;

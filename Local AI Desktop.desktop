@@ -1,9 +1,9 @@
 [Desktop Entry]
 Version=1.0
 Type=Application
-Name=Local AI Desktop
-Name[ru]=Local AI Desktop
-Comment=Локальный AI-клиент
+Name=Local AI Desktop — Ollama
+Name[ru]=Local AI Desktop — Ollama
+Comment=Локальный AI-клиент через Ollama
 Exec=/media/yaroslav/DATA/local-ai-desktop/run-local-ai-desktop.sh
 Path=/media/yaroslav/DATA/local-ai-desktop
 TryExec=/media/yaroslav/DATA/local-ai-desktop/node_modules/electron/dist/electron

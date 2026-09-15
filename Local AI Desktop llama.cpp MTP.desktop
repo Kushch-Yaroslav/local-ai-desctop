@@ -1,0 +1,14 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Local AI Desktop — llama.cpp MTP
+Name[ru]=Local AI Desktop — llama.cpp MTP
+Comment=Локальный AI-клиент через llama.cpp с Multi-Token Prediction
+Exec=/media/yaroslav/DATA/local-ai-desktop/run-local-ai-desktop-llama-cpp-mtp.sh
+Path=/media/yaroslav/DATA/local-ai-desktop
+TryExec=/media/yaroslav/DATA/local-ai-desktop/run-local-ai-desktop-llama-cpp-mtp.sh
+Icon=/media/yaroslav/DATA/local-ai-desktop/assets/fluent-bot-sparkle-cyan.png
+Terminal=false
+Categories=Development;
+Keywords=AI;LLM;llama.cpp;MTP;local;
+StartupNotify=true

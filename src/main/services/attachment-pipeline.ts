@@ -1,8 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import type { Attachment, ChatMessage, StreamEvent, ToolActivity } from '../../shared/types';
-import { OllamaBackend } from '../backends/ollama-backend';
-import { VISION_MODEL_LABEL } from '../config/vision-model';
-import { AttachmentService, attachmentDisplayName, clipAttachmentText } from './attachment-service';
+import { AttachmentService, attachmentDisplayName } from './attachment-service';
 import { Database } from './database';
 
 type Emit = (event: StreamEvent) => void;
@@ -15,14 +13,13 @@ function activity(attachment: Attachment, detail: string): ToolActivity {
 
 /** The stage between persisting a user message and starting its normal chat/agent inference. */
 export class AttachmentPipeline {
-  constructor(private readonly database: Database, private readonly attachments: AttachmentService, private readonly ollama: OllamaBackend) {}
+  constructor(private readonly database: Database, private readonly attachments: AttachmentService) {}
 
   /**
    * Documents are always extracted locally. Images use the selected model's native
-   * vision input when advertised by Ollama; otherwise the internal worker supplies
-   * a textual fallback.
+   * vision input when the selected backend advertises it. There is no fallback model.
    */
-  async preprocessCurrent(attachmentIds: string[], signal: AbortSignal, emit: Emit, mainModel?: string, useNativeVision = false): Promise<void> {
+  async preprocessCurrent(attachmentIds: string[], signal: AbortSignal, emit: Emit, useNativeVision = false): Promise<void> {
     const current = attachmentIds.map((id) => this.database.getAttachment(id)).filter((item): item is Attachment => Boolean(item));
     const documentAttachments = current.filter((item) => item.kind !== 'image');
     for (const initial of documentAttachments) {
@@ -39,46 +36,13 @@ export class AttachmentPipeline {
         const processing = this.database.updateAttachment(initial.id, { status: 'processing', error: undefined })!;
         emit({ type: 'attachment', activity: activity(processing, 'Анализ…') });
         // The original binary is intentionally kept for the selected model. Do not
-        // synthesize a second textual description or touch the MiniCPM worker here.
+        // synthesize a second textual description or route to a separate model here.
         const ready = this.database.updateAttachment(processing.id, { status: 'ready', visionAnalysis: undefined, metadata: { ...(processing.metadata ?? {}), nativeVision: true } })!;
         emit({ type: 'attachment', activity: activity(ready, '✓ Передано модели') });
       }
       return;
     }
-    let model: string | null = null;
-    try { model = await this.ollama.findInstalledVisionModel(); }
-    catch { model = null; }
-    if (!model) {
-      for (const image of images) { const failed = this.database.updateAttachment(image.id, { status: 'error', error: `Для анализа изображений требуется ${VISION_MODEL_LABEL}.` })!; emit({ type: 'attachment', activity: activity(failed, `✕ Требуется ${VISION_MODEL_LABEL}`) }); }
-      return;
-    }
-    if (mainModel && mainModel !== model && await this.ollama.isModelLoaded(mainModel)) {
-      emit({ type: 'attachment', activity: { id: 'attachment-vram-release', label: 'Подготовка vision worker', detail: `Освобождаю VRAM: ${mainModel}`, status: 'processing' } });
-      await this.ollama.unloadModel(mainModel);
-      if (await this.ollama.isModelLoaded(mainModel)) {
-        for (const image of images) { const failed = this.database.updateAttachment(image.id, { status: 'error', error: `Не удалось освободить VRAM для ${VISION_MODEL_LABEL}.` })!; emit({ type: 'attachment', activity: activity(failed, '✕ Vision worker не запущен: основная модель всё ещё загружена') }); }
-        return;
-      }
-    }
-    try {
-      for (const initial of images) {
-        if (signal.aborted) { this.markCancelled(images); return; }
-        const processing = this.database.updateAttachment(initial.id, { status: 'processing', error: undefined })!;
-        emit({ type: 'attachment', activity: activity(processing, 'Анализ…') });
-        try {
-          const analysis = await this.ollama.analyzeImageWithVision(model, await readFile(processing.storageRef), signal);
-          if (signal.aborted) { const cancelled = this.database.updateAttachment(processing.id, { status: 'cancelled', error: 'Обработка отменена' })!; emit({ type: 'attachment', activity: activity(cancelled, 'Отменено') }); return; }
-          const limited = clipAttachmentText(analysis);
-          const ready = this.database.updateAttachment(processing.id, { status: 'ready', visionAnalysis: limited.text, metadata: { ...(processing.metadata ?? {}), truncated: limited.truncated, originalVisionCharacters: analysis.length } })!;
-          emit({ type: 'attachment', activity: activity(ready, '✓ Распознано') });
-        } catch (error) {
-          const cancelled = signal.aborted;
-          const failed = this.database.updateAttachment(processing.id, { status: cancelled ? 'cancelled' : 'error', error: cancelled ? 'Обработка отменена' : error instanceof Error ? error.message : String(error) })!;
-          emit({ type: 'attachment', activity: activity(failed, cancelled ? 'Отменено' : '✕ Не удалось распознать') });
-          if (cancelled) return;
-        }
-      }
-    } finally { await this.ollama.unloadModel(model); }
+    for (const image of images) { const failed = this.database.updateAttachment(image.id, { status: 'error', error: 'Выбранная модель не поддерживает изображения.' })!; emit({ type: 'attachment', activity: activity(failed, '✕ Модель не поддерживает изображения') }); }
   }
 
   /** Insert a temporary block directly before its owning user turn; never into global capability context. */
