@@ -3,10 +3,11 @@ import type { InferenceDiagnostics, LlmBackend, ToolCallingBackend, ToolMessage 
 import { getModelProfile, inferenceSettings, modelInfo, modelRegistry, requestedMaxOutputTokens } from '../models/model-registry';
 import { log } from '../services/logger';
 import { configuredVisionModelId } from '../config/vision-model';
+import { OllamaRequestError, classifyOllamaError, ollamaErrorDiagnostics } from './ollama-errors';
 
 type OllamaTags = { models?: Array<{ name: string; model?: string; size: number; capabilities?: string[]; details?: { family?: string; families?: string[] } }> };
 type OllamaMetrics = { prompt_eval_count?: number; prompt_eval_duration?: number; eval_count?: number; eval_duration?: number };
-type OllamaChunk = { message?: { content?: string }; done?: boolean; done_reason?: string; error?: string } & OllamaMetrics;
+type OllamaChunk = { message?: { content?: string; thinking?: string }; done?: boolean; done_reason?: string; error?: string } & OllamaMetrics;
 
 type OllamaToolResponse = { message?: ToolMessage; error?: string; done_reason?: string } & OllamaMetrics;
 type OllamaShowResponse = { model_info?: Record<string, unknown>; parameters?: string };
@@ -133,7 +134,7 @@ export class OllamaBackend implements LlmBackend, ToolCallingBackend {
     const inputTokens = await this.inputTokens(model, messages, tools, contextWindow, signal);
     const requested = requestedMaxOutputTokens(depth);
     const effective = Math.min(requested, Math.max(0, contextWindow - inputTokens));
-    if (effective < 1) throw new Error('Контекстное окно заполнено. Уменьшите историю или выберите больший контекст, затем продолжите ответ.');
+    if (effective < 1) throw new OllamaRequestError('context_exhausted', 'Контекстное окно заполнено. Уменьшите историю или выберите больший контекст, затем продолжите ответ.', { causeDetail: `input_tokens=${inputTokens}; context_limit=${contextWindow}` });
     const diagnostics: InferenceDiagnostics = { reasoningPreset: depth, requestedMaxOutputTokens: requested, effectiveMaxOutputTokens: effective, contextLimit: contextWindow, inputTokens };
     log('inference.options', diagnostics);
     return { ...inferenceSettings(profile, { contextWindow, depth }, effective), diagnostics };
@@ -155,7 +156,7 @@ export class OllamaBackend implements LlmBackend, ToolCallingBackend {
       if (typeof data.prompt_eval_count !== 'number') throw new Error('Ollama did not return prompt_eval_count');
       return data.prompt_eval_count;
     } catch (error) {
-      if (signal.aborted) throw error;
+      if (signal.aborted) throw classifyOllamaError(error, signal);
       const prompt = ollamaMessages.map((message) => `<|${message.role}|>\n${message.content}\n`).join('');
       // Older runtimes may reject the preflight; use a deliberately high estimate rather than overflow the context.
       const conservative = Math.ceil(prompt.length / 2) + 256 + messages.length * 16;
@@ -181,14 +182,15 @@ export class OllamaBackend implements LlmBackend, ToolCallingBackend {
     };
   }
 
-  private readableError(error: unknown): Error {
-    const detail = error instanceof Error ? error.message : String(error);
+  private readableError(error: unknown, signal?: AbortSignal): OllamaRequestError {
+    const classified = classifyOllamaError(error, signal);
+    if (classified.kind !== 'internal') return classified;
+    const detail = classified.message;
     const lower = detail.toLowerCase();
-    if (lower.includes('контекстное окно заполнено')) return new Error(detail);
-    if (lower.includes('not found')) return new Error('Модель не найдена. Проверьте, что DATA-диск подключён и модель полностью установлена.');
-    if (lower.includes('cuda') && (lower.includes('memory') || lower.includes('oom'))) return new Error('Недостаточно VRAM для выбранного контекста. Выберите меньший размер контекста или дождитесь выгрузки предыдущей модели.');
-    if (lower.includes('context') || lower.includes('num_ctx')) return new Error('Выбранный размер контекста не поддерживается этой моделью.');
-    return new Error(detail);
+    if (lower.includes('not found')) return new OllamaRequestError('process_failure', 'Модель не найдена. Проверьте, что DATA-диск подключён и модель полностью установлена.', { causeDetail: detail });
+    if (lower.includes('cuda') && (lower.includes('memory') || lower.includes('oom'))) return new OllamaRequestError('process_failure', 'Недостаточно VRAM для выбранного контекста. Выберите меньший размер контекста или дождитесь выгрузки предыдущей модели.', { causeDetail: detail });
+    if (lower.includes('context') || lower.includes('num_ctx')) return new OllamaRequestError('context_exhausted', 'Выбранный размер контекста не поддерживается этой моделью.', { causeDetail: detail });
+    return classified;
   }
 
   async chatWithTools(model: string, messages: ToolMessage[], tools: unknown[] | undefined, signal: AbortSignal, contextWindow: number, depth: AnalysisDepth): Promise<ToolMessage> {
@@ -199,12 +201,21 @@ export class OllamaBackend implements LlmBackend, ToolCallingBackend {
         method: 'POST', signal, headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ model, stream: false, messages, ...(tools ? { tools } : {}), think: settings.think, options: settings.options }),
       });
-      const data = await response.json() as OllamaToolResponse;
-      if (!response.ok) throw this.readableError(`Ollama вернул HTTP ${response.status}: ${data.error ?? ''}`);
-      if (data.error) throw new Error(data.error);
-      if (!data.message) throw new Error('Ollama вернул пустой ответ');
+      let data: OllamaToolResponse;
+      try { data = await response.json() as OllamaToolResponse; }
+      catch (error) { throw new OllamaRequestError('malformed_response', 'Ollama вернул неполный или некорректный JSON-ответ', { retryable: true, status: response.status, causeDetail: error instanceof Error ? error.message : String(error) }); }
+      if (!response.ok) {
+        const retryable = response.status === 408 || response.status === 429 || response.status >= 500;
+        throw new OllamaRequestError(response.status >= 500 ? 'process_failure' : 'http_error', `Ollama вернул HTTP ${response.status}: ${data.error ?? ''}`.trim(), { retryable, status: response.status, causeDetail: data.error });
+      }
+      if (data.error) throw this.readableError(data.error, signal);
+      if (!data.message) throw new OllamaRequestError('empty_response', 'Ollama вернул ответ без поля message', { causeDetail: JSON.stringify({ done_reason: data.done_reason, prompt_eval_count: data.prompt_eval_count }) });
       return { ...data.message, prompt_eval_count: data.prompt_eval_count, finish_reason: this.finishReason(data.done_reason), inference: this.withPerformance(settings.diagnostics, data) };
-    } catch (error) { throw this.readableError(error); }
+    } catch (error) {
+      const classified = this.readableError(error, signal);
+      log('ollama.chat.failed', { model, contextWindow, ...ollamaErrorDiagnostics(classified) });
+      throw classified;
+    }
   }
 
   async *streamChat(model: string, messages: ChatMessage[], signal: AbortSignal, contextWindow = 32_768, depth: AnalysisDepth = 'normal'): AsyncIterable<StreamEvent> {
@@ -223,15 +234,20 @@ export class OllamaBackend implements LlmBackend, ToolCallingBackend {
       });
     } catch (error) {
       if (signal.aborted) return;
-      yield { type: 'error', message: 'Не удалось подключиться к Ollama', details: this.readableError(error).message };
+      const classified = this.readableError(error, signal);
+      log('ollama.stream.start.failed', { model, contextWindow, ...ollamaErrorDiagnostics(classified) });
+      yield { type: 'error', message: 'Не удалось подключиться к Ollama', details: classified.message };
       return;
     }
     if (!response.ok || !response.body) {
-      yield { type: 'error', message: 'Ollama не смог начать генерацию', details: this.readableError(`HTTP ${response.status}: ${await response.text()}`).message };
+      const classified = this.readableError(`HTTP ${response.status}: ${await response.text()}`, signal);
+      log('ollama.stream.http.failed', { model, contextWindow, ...ollamaErrorDiagnostics(classified) });
+      yield { type: 'error', message: 'Ollama не смог начать генерацию', details: classified.message };
       return;
     }
     const reader = response.body.getReader();
     const decoder = new TextDecoder(); let buffer = '';
+    let completed = false;
     try {
       while (!signal.aborted) {
         const { done, value } = await reader.read();
@@ -246,6 +262,7 @@ export class OllamaBackend implements LlmBackend, ToolCallingBackend {
             yield { type: 'token', content: item.message.content };
           }
           if (item.done) {
+            completed = true;
             if (typeof item.prompt_eval_count === 'number') yield { type: 'context-usage', used: item.prompt_eval_count, maximum: contextWindow };
             yield { type: 'diagnostics', diagnostics: { ...this.withPerformance(diagnostics, item, timeToFirstTokenMs), agentStepCount: 0, finishReason: this.finishReason(item.done_reason) } };
             yield { type: 'done', finishReason: this.finishReason(item.done_reason) }; return;
@@ -253,8 +270,17 @@ export class OllamaBackend implements LlmBackend, ToolCallingBackend {
         }
         if (done) break;
       }
+      if (!signal.aborted && !completed) {
+        const error = new OllamaRequestError('stream_interrupted', 'Поток Ollama завершился без итогового сообщения', { retryable: true, causeDetail: 'response body ended before done=true' });
+        log('ollama.stream.incomplete', { model, contextWindow, ...ollamaErrorDiagnostics(error) });
+        yield { type: 'error', message: 'Генерация прервана из-за ошибки', details: error.message };
+      }
     } catch (error) {
-      if (!signal.aborted) yield { type: 'error', message: 'Генерация прервана из-за ошибки', details: error instanceof Error ? error.message : String(error) };
+      if (!signal.aborted) {
+        const classified = this.readableError(error, signal);
+        log('ollama.stream.failed', { model, contextWindow, ...ollamaErrorDiagnostics(classified) });
+        yield { type: 'error', message: 'Генерация прервана из-за ошибки', details: classified.message };
+      }
     } finally { reader.releaseLock(); }
   }
 }

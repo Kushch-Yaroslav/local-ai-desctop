@@ -16,6 +16,7 @@ import { projectToolDefinitions, type ApprovalResult, type ConfirmAction } from 
 import { AttachmentService } from '../services/attachment-service';
 import { AttachmentPipeline } from '../services/attachment-pipeline';
 import { readFile } from 'node:fs/promises';
+import { ollamaErrorDiagnostics } from '../backends/ollama-errors';
 
 const database = new Database();
 const ollama = new OllamaBackend();
@@ -183,7 +184,7 @@ export function registerIpc(): void {
       let history = attachmentPipeline.buildContext(request.messages, !nativeVision);
       if (nativeVision) history = await attachmentPipeline.prepareNativeImages(history, abort.signal);
       const stream = agentRoot
-        ? projectChat.stream(request.model, history, agentRoot, abort.signal, context.active, conversation.analysisDepth, conversation.webMode, inlineConfirmation(event, request.conversationId, generation, agentRoot))
+        ? projectChat.stream(request.model, history, agentRoot, abort.signal, context.active, conversation.analysisDepth, conversation.webMode, inlineConfirmation(event, request.conversationId, generation, agentRoot), { generationId: generation.id, conversationId: request.conversationId })
         : conversation.webMode === 'auto'
           ? webChat.stream(request.model, history, abort.signal, context.active, conversation.analysisDepth)
           : ollama.streamChat(request.model, [{ id: `capability-${request.conversationId}`, conversationId: request.conversationId, role: 'system', content: capabilitySystemContext({ webAvailable: false }), createdAt: new Date().toISOString() }, ...history], abort.signal, context.active, conversation.analysisDepth);
@@ -216,6 +217,7 @@ export function registerIpc(): void {
       if (run) event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run: database.finishAnalysisRun(run.id, 'completed', assistant?.id ?? null) });
       event.sender.send('chat:stream', { type: 'done', conversationId: request.conversationId, generationId: generation.id, assistant, finishReason });
     } catch (error) {
+      log('generation.failed', { generationId: generation.id, conversationId: request.conversationId, model: request.model, ...ollamaErrorDiagnostics(error) });
       if (run) { const finished = database.finishAnalysisRun(run.id, abort.signal.aborted ? 'cancelled' : 'error', null); if (current()) event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run: finished }); }
       if (current()) event.sender.send('chat:stream', { type: 'error', conversationId: request.conversationId, generationId: generation.id, message: 'Не удалось выполнить запрос', details: error instanceof Error ? error.message : String(error) });
     } finally {

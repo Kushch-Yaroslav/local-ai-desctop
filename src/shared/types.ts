@@ -62,6 +62,12 @@ export interface GenerationDiagnostics {
   tokensPerSecond?: number;
   promptTokensPerSecond?: number;
   timeToFirstTokenMs?: number;
+  /** Agent-only runtime diagnostics; persisted logs retain the full per-attempt detail. */
+  ollamaRequestAttempt?: number;
+  ollamaRetryCount?: number;
+  toolResultContextSize?: number;
+  toolResultContextBudget?: number;
+  toolResultCompacted?: number;
   createdAt: string;
 }
 

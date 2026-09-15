@@ -6,7 +6,7 @@ export type ToolMessage = {
   role: 'system' | 'user' | 'assistant' | 'tool'; content: string; tool_calls?: ToolCall[]; tool_name?: string;
   /** Ephemeral base64 image inputs for Ollama; never a persisted chat field. */
   images?: string[];
-  prompt_eval_count?: number; finish_reason?: FinishReason; inference?: InferenceDiagnostics;
+  prompt_eval_count?: number; finish_reason?: FinishReason; inference?: InferenceDiagnostics; thinking?: string;
 };
 
 /** Contract shared by Ollama now and llama.cpp when its server adapter is added. */
