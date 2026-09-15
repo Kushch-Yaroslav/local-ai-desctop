@@ -38,6 +38,33 @@ function lineRange(value: Record<string, unknown>): string | undefined {
   if (typeof value.byte_start === 'number') return typeof value.byte_end === 'number' ? `байты ${value.byte_start}–${value.byte_end}` : `с байта ${value.byte_start}`;
   return undefined;
 }
+type StagnationStats = {
+  explorationActions: number; broadExplorationActions: number; targetedExplorationActions: number; repeatedExplorationActions: number; mutationActions: number; verificationActions: number;
+  exactDuplicateReads: number; coveredReads: number; overlappingReads: number; newInformationReads: number; stepsSinceLastNewInformation: number; stepsSinceLastMutation: number; stagnationSuspected: boolean;
+};
+class AgentStagnation {
+  private readonly stats: StagnationStats = { explorationActions: 0, broadExplorationActions: 0, targetedExplorationActions: 0, repeatedExplorationActions: 0, mutationActions: 0, verificationActions: 0, exactDuplicateReads: 0, coveredReads: 0, overlappingReads: 0, newInformationReads: 0, stepsSinceLastNewInformation: 0, stepsSinceLastMutation: 0, stagnationSuspected: false };
+  record(call: ProjectToolCall, read: ReadDiagnostic | undefined, action: number): StagnationStats {
+    const mutation = ['apply_patch', 'write_file', 'create_file', 'delete_file'].includes(call.name);
+    const verification = ['git_status', 'git_diff', 'run_terminal'].includes(call.name);
+    const exploration = ['read_file', 'inspect_package_json', 'search_text', 'find_files', 'search_files', 'list_directory', 'web_search', 'web_open'].includes(call.name);
+    if (mutation) { this.stats.mutationActions += 1; this.stats.stepsSinceLastMutation = 0; } else this.stats.stepsSinceLastMutation += 1;
+    if (verification) this.stats.verificationActions += 1;
+    if (exploration) {
+      this.stats.explorationActions += 1;
+      if (read?.relationship === 'exact_duplicate') { this.stats.exactDuplicateReads += 1; this.stats.repeatedExplorationActions += 1; }
+      else if (read?.relationship === 'covered') { this.stats.coveredReads += 1; this.stats.repeatedExplorationActions += 1; }
+      else if (read?.relationship === 'overlap') { this.stats.overlappingReads += 1; this.stats.repeatedExplorationActions += 1; }
+      else if (call.name === 'read_file' || call.name === 'inspect_package_json') {
+        this.stats.newInformationReads += 1; this.stats.targetedExplorationActions += 1; this.stats.stepsSinceLastNewInformation = 0;
+      } else if (call.name === 'search_text' || call.name === 'find_files' || call.name === 'search_files') this.stats.targetedExplorationActions += 1;
+      else this.stats.broadExplorationActions += 1;
+    }
+    if (!read || read.relationship !== 'new') this.stats.stepsSinceLastNewInformation += 1;
+    this.stats.stagnationSuspected = this.stats.mutationActions === 0 && this.stats.explorationActions >= 20 && this.stats.stepsSinceLastNewInformation >= 12 && this.stats.stepsSinceLastMutation >= 20;
+    return { ...this.stats, stepsSinceLastMutation: this.stats.mutationActions ? this.stats.stepsSinceLastMutation : action };
+  }
+}
 function completedActivity(activity: ToolActivity, call: ProjectToolCall, raw: string, durationMs: number, context?: { read?: ReadDiagnostic }): ToolActivity {
   const value = resultObject(raw); const error = typeof value.error === 'string';
   const metadata: Record<string, string | number | boolean | null> = { duration_ms: durationMs };
@@ -46,7 +73,7 @@ function completedActivity(activity: ToolActivity, call: ProjectToolCall, raw: s
     const path = typeof value.path === 'string' ? value.path : typeof call.arguments.path === 'string' ? call.arguments.path : 'package.json';
     const range = lineRange(value);
     detail = range ? `${path} · ${range}` : `${path} · весь файл`;
-    for (const key of ['fingerprint', 'status', 'readCount', 'sameContentAlreadyRead', 'previousResultActive', 'previousResultCompacted', 'pinned', 'repeatedReadLoopSuspected'] as const) {
+    for (const key of ['fingerprint', 'status', 'readCount', 'sameContentAlreadyRead', 'previousResultActive', 'previousResultCompacted', 'previousResultInvalidated', 'previousInvalidationReason', 'relationship', 'coveredByRange', 'pinned', 'repeatedReadLoopSuspected'] as const) {
       if (key === 'status') { if (typeof value.status === 'string') metadata.status = value.status; continue; }
       const field = value[key] ?? context?.read?.[key];
       if (typeof field === 'string' || typeof field === 'number' || typeof field === 'boolean') metadata[key] = field;
@@ -97,6 +124,7 @@ export class ProjectChatService {
     let actions = 0; let progressReports = 0; let repeats = 0; let lowInfo = 0; let warningSent = false; let researchFinished = false;
     const progressMessages = new Set<string>();
     const completed = new Set<string>();
+    const stagnation = new AgentStagnation();
     if (engine.isDeep) { log('deep.lifecycle', { phase: 'research.started', model, contextWindow }); yield { type: 'analysis', progress: { stage: 'reconnaissance', status: 'active' } }; }
     try { while (!signal.aborted) {
       const remaining = engine.budget - actions;
@@ -145,7 +173,9 @@ export class ProjectChatService {
         if (lowInformation(result)) { lowInfo += 1; if (lowInfo === 3) lowInformationNotice = true; } else lowInfo = 0;
         const contextUpdate = toolContext.add(call.name, call.arguments, toolMessage, actions);
         const stats = contextUpdate.stats;
-        if (contextUpdate.read) log('agent.read.diagnostics', { ...runtime, agentStep: actions, normalizedPath: contextUpdate.read.path, requestedRange: contextUpdate.read.range, fileFingerprint: contextUpdate.read.fingerprint, readCount: contextUpdate.read.readCount, sameContentAlreadyRead: contextUpdate.read.sameContentAlreadyRead, previousResultActive: contextUpdate.read.previousResultActive, previousResultCompacted: contextUpdate.read.previousResultCompacted, previousCompactionReason: contextUpdate.read.previousCompactionReason, repeatedReadLoopSuspected: contextUpdate.read.repeatedReadLoopSuspected, pinned: contextUpdate.read.pinned, activeToolResultContextSize: stats.size, contextBudget: stats.budget, peakActiveToolResultContextSize: stats.peakSize });
+        if (contextUpdate.read) log('agent.read.diagnostics', { ...runtime, agentStep: actions, normalizedPath: contextUpdate.read.path, requestedRange: contextUpdate.read.range, fileFingerprint: contextUpdate.read.fingerprint, readCount: contextUpdate.read.readCount, sameContentAlreadyRead: contextUpdate.read.sameContentAlreadyRead, relationship: contextUpdate.read.relationship, coveredByRange: contextUpdate.read.coveredByRange, previousResultActive: contextUpdate.read.previousResultActive, previousResultCompacted: contextUpdate.read.previousResultCompacted, previousCompactionReason: contextUpdate.read.previousCompactionReason, previousResultInvalidated: contextUpdate.read.previousResultInvalidated, previousInvalidationReason: contextUpdate.read.previousInvalidationReason, repeatedReadLoopSuspected: contextUpdate.read.repeatedReadLoopSuspected, pinned: contextUpdate.read.pinned, activeToolResultContextSize: stats.size, contextBudget: stats.budget, peakActiveToolResultContextSize: stats.peakSize });
+        if (contextUpdate.invalidation) log('agent.read.cache.invalidated', { ...runtime, agentStep: actions, tool: call.name, ...contextUpdate.invalidation, totalInvalidatedReads: stats.invalidatedReads });
+        log('agent.stagnation.diagnostics', { ...runtime, agentStep: actions, ...stagnation.record(call, contextUpdate.read, actions) });
         if (stats.compacted) log('agent.context.compacted', { ...runtime, agentStep: actions, tool: call.name, toolResultContextSize: stats.size, toolResultContextBudget: stats.budget, compactedResults: stats.compacted });
         const finishedActivity = completedActivity(activity, call, result, Date.now() - startedAt, contextUpdate);
         const contextResult = resultObject(toolMessage.content);

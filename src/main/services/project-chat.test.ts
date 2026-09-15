@@ -99,7 +99,16 @@ export async function runProjectChatRegression(): Promise<void> {
     const repeated: ToolMessage = { role: 'tool', tool_name: 'read_file', content: first.content };
     const repeatUpdate = working.add('read_file', { path: 'src/A.ts' }, repeated, 2);
     assert(repeated.content.includes('"status":"unchanged"'), 'unchanged repeat did not return a compact valid tool acknowledgement');
+    assert(repeatUpdate.read?.relationship === 'exact_duplicate', 'same path/range/fingerprint was not diagnosed as an exact duplicate');
     assert(first.content.includes('A'.repeat(100)), 'active repeated read did not keep content available to the model');
+    const coveredRange: ToolMessage = { role: 'tool', tool_name: 'read_file', content: JSON.stringify({ path: 'src/A.ts', fingerprint: '10:1', byte_start: 1, byte_end: 100, content: 'covered range' }) };
+    assert(working.add('read_file', { path: 'src/A.ts', offset: 1 }, coveredRange, 3).read?.relationship === 'covered', 'fully covered byte range was treated as unrelated new information');
+    const fullRangeContext = new AgentToolContext(12_000);
+    fullRangeContext.add('read_file', { path: 'src/full.ts' }, { role: 'tool', tool_name: 'read_file', content: JSON.stringify({ path: 'src/full.ts', fingerprint: '1:1', size_bytes: 100, byte_start: 0, byte_end: 100, content: 'full file' }) }, 1);
+    const coveredLineRange: ToolMessage = { role: 'tool', tool_name: 'read_file', content: JSON.stringify({ path: 'src/full.ts', fingerprint: '1:1', start_line: 1, end_line: 2, content: 'covered lines' }) };
+    assert(fullRangeContext.add('read_file', { path: 'src/full.ts', start_line: 1, end_line: 2 }, coveredLineRange, 2).read?.relationship === 'covered', 'full byte read did not cover a later line-range diagnostic');
+    const overlappingRange: ToolMessage = { role: 'tool', tool_name: 'read_file', content: JSON.stringify({ path: 'src/A.ts', fingerprint: '10:1', byte_start: 80, byte_end: 120, content: 'overlapping range' }) };
+    assert(working.add('read_file', { path: 'src/A.ts', offset: 80 }, overlappingRange, 3).read?.relationship === 'overlap', 'partially overlapping byte range was not diagnosed');
     const rangeTwo: ToolMessage = { role: 'tool', tool_name: 'read_file', content: JSON.stringify({ path: 'src/A.ts', fingerprint: '10:1', byte_start: 100, byte_end: 200, content: 'second range' }) };
     assert(!working.add('read_file', { path: 'src/A.ts', offset: 100 }, rangeTwo, 3).read?.sameContentAlreadyRead, 'different ranges were treated as the same read');
     const third: ToolMessage = { role: 'tool', tool_name: 'read_file', content: JSON.stringify({ path: 'src/A.ts', fingerprint: '10:1', byte_start: 0, byte_end: 100, content: 'A'.repeat(6_000) }) };
@@ -122,6 +131,23 @@ export async function runProjectChatRegression(): Promise<void> {
     const fresh: ToolMessage = { role: 'tool', tool_name: 'read_file', content: JSON.stringify({ path: 'src/A.ts', fingerprint: '11:2', byte_start: 0, byte_end: 100, content: 'fresh content' }) };
     assert(!working.add('read_file', { path: 'src/A.ts' }, fresh, 6).read?.sameContentAlreadyRead && fresh.content.includes('fresh content'), 'mutation did not invalidate cached file content');
     assert(repeatUpdate.stats.size <= repeatUpdate.stats.budget, 'repeat cache made context unbounded');
+
+    const terminalContext = new AgentToolContext(12_000);
+    const terminalRead: ToolMessage = { role: 'tool', tool_name: 'read_file', content: JSON.stringify({ path: 'src/terminal.ts', fingerprint: '1:1', byte_start: 0, byte_end: 20, content: 'before terminal' }) };
+    terminalContext.add('read_file', { path: 'src/terminal.ts' }, terminalRead, 1);
+    terminalContext.add('run_terminal', { command: 'node --version && node -e "const { DatabaseSync } = require(\'node:sqlite\'); console.log(\'sqlite ok\', typeof DatabaseSync)"' }, { role: 'tool', tool_name: 'run_terminal', content: JSON.stringify({ exit_code: 0 }) }, 2);
+    const afterReadOnlyTerminal: ToolMessage = { role: 'tool', tool_name: 'read_file', content: JSON.stringify({ path: 'src/terminal.ts', fingerprint: '1:1', byte_start: 0, byte_end: 20, content: 'before terminal' }) };
+    assert(terminalContext.add('read_file', { path: 'src/terminal.ts' }, afterReadOnlyTerminal, 3).read?.sameContentAlreadyRead, 'read-only terminal command invalidated a generation-local read');
+    terminalContext.add('run_terminal', { command: 'command -v node node22 nodejs 2>/dev/null; ls ~/.nvm/versions/node 2>/dev/null; echo "---nvm---"; command -v nvm 2>/dev/null; echo "---engines---"; node -e "console.log(require(\'./package.json\').engines || \'no engines\'); console.log(\'scripts\', JSON.stringify(Object.keys(require(\'./package.json\').scripts)))"' }, { role: 'tool', tool_name: 'run_terminal', content: JSON.stringify({ exit_code: 0 }) }, 3);
+    const afterRedirectedReadOnlyTerminal: ToolMessage = { role: 'tool', tool_name: 'read_file', content: JSON.stringify({ path: 'src/terminal.ts', fingerprint: '1:1', byte_start: 0, byte_end: 20, content: 'before terminal' }) };
+    assert(terminalContext.add('read_file', { path: 'src/terminal.ts' }, afterRedirectedReadOnlyTerminal, 3).read?.sameContentAlreadyRead, 'read-only terminal stderr suppression invalidated a generation-local read');
+    terminalContext.add('run_terminal', { command: 'printf changed > src/terminal.ts' }, { role: 'tool', tool_name: 'run_terminal', content: JSON.stringify({ exit_code: 0 }) }, 4);
+    const afterMutatingTerminal: ToolMessage = { role: 'tool', tool_name: 'read_file', content: JSON.stringify({ path: 'src/terminal.ts', fingerprint: '1:1', byte_start: 0, byte_end: 20, content: 'after terminal' }) };
+    const terminalInvalidated = terminalContext.add('read_file', { path: 'src/terminal.ts' }, afterMutatingTerminal, 5).read;
+    assert(!terminalInvalidated?.sameContentAlreadyRead && terminalInvalidated?.previousResultInvalidated && terminalInvalidated.previousInvalidationReason === 'terminal_may_have_mutated_files', 'mutating terminal command did not invalidate the cache with a reason');
+    const newGenerationContext = new AgentToolContext(12_000);
+    const newGenerationRead: ToolMessage = { role: 'tool', tool_name: 'read_file', content: JSON.stringify({ path: 'src/terminal.ts', fingerprint: '1:1', byte_start: 0, byte_end: 20, content: 'new generation' }) };
+    assert(!newGenerationContext.add('read_file', { path: 'src/terminal.ts' }, newGenerationRead, 1).read?.sameContentAlreadyRead, 'read cache leaked across generations');
 
     await writeFile(join(root, 'paged.ts'), 'first\nsecond\nthird\n', 'utf8');
     let activityCalls = 0;
