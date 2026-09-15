@@ -3,9 +3,19 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 
+function extractText(node: React.ReactNode): string {
+  if (node == null || typeof node === 'boolean') return '';
+  if (typeof node === 'string' || typeof node === 'number') return String(node);
+  if (Array.isArray(node)) return node.map(extractText).join('');
+  if (typeof node === 'object' && 'props' in (node as any)) {
+    return extractText((node as any).props?.children);
+  }
+  return '';
+}
+
 function CodeBlock({ children, className }: { children?: React.ReactNode; className?: string }) {
   const [copied, setCopied] = useState(false);
-  const text = String(children).replace(/\n$/, '');
+  const text = extractText(children).replace(/\n$/, '');
   const language = className?.replace('language-', '') ?? 'код';
   const copy = async () => { await navigator.clipboard.writeText(text); setCopied(true); window.setTimeout(() => setCopied(false), 1500); };
   return <div className="code-block"><div className="code-title"><span>{language}</span><button onClick={copy}>{copied ? 'Скопировано' : 'Копировать'}</button></div><pre><code className={className}>{children}</code></pre></div>;
