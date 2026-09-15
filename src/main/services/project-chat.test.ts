@@ -81,14 +81,34 @@ export async function runProjectChatRegression(): Promise<void> {
     const context = new AgentToolContext(16_384);
     const previous: ToolMessage[] = [];
     for (let index = 0; index < 8; index += 1) {
-      const message: ToolMessage = { role: 'tool', tool_name: 'read_file', content: JSON.stringify({ path: `src/${index}.ts`, start_line: 1, end_line: 300, content: String(index).repeat(7_000) }) };
+      const message: ToolMessage = { role: 'tool', tool_name: 'read_file', content: JSON.stringify({ path: `src/${index}.ts`, fingerprint: `v${index}`, start_line: 1, end_line: 300, content: String(index).repeat(7_000) }) };
       previous.push(message); context.add('read_file', { path: `src/${index}.ts`, start_line: 1, end_line: 300 }, message);
     }
     assert(context.stats().size <= context.stats().budget, 'large read_file results grew active Agent context past its budget');
     assert(previous.some((message) => message.content.includes('context_compacted')), 'old read_file result was not compacted deterministically');
-    const reread: ToolMessage = { role: 'tool', tool_name: 'read_file', content: JSON.stringify({ path: 'src/0.ts', start_line: 301, end_line: 320, content: 're-read specific range' }) };
+    const reread: ToolMessage = { role: 'tool', tool_name: 'read_file', content: JSON.stringify({ path: 'src/0.ts', fingerprint: 'v0', start_line: 301, end_line: 320, content: 're-read specific range' }) };
     context.add('read_file', { path: 'src/0.ts', start_line: 301, end_line: 320 }, reread);
     assert(reread.content.includes('re-read specific range'), 'a compacted file could not be read again with a specific range');
+
+    const working = new AgentToolContext(12_000);
+    const first: ToolMessage = { role: 'tool', tool_name: 'read_file', content: JSON.stringify({ path: 'src/A.ts', fingerprint: '10:1', byte_start: 0, byte_end: 100, content: 'A'.repeat(6_000) }) };
+    working.add('read_file', { path: 'src/A.ts' }, first, 1);
+    const repeated: ToolMessage = { role: 'tool', tool_name: 'read_file', content: first.content };
+    const repeatUpdate = working.add('read_file', { path: 'src/A.ts' }, repeated, 2);
+    assert(repeated.content.includes('cached_read'), 'unchanged repeat created another full tool history entry');
+    assert(first.content.includes('A'.repeat(100)), 'active repeated read did not keep content available to the model');
+    const rangeTwo: ToolMessage = { role: 'tool', tool_name: 'read_file', content: JSON.stringify({ path: 'src/A.ts', fingerprint: '10:1', byte_start: 100, byte_end: 200, content: 'second range' }) };
+    assert(!working.add('read_file', { path: 'src/A.ts', offset: 100 }, rangeTwo, 3).read?.sameContentAlreadyRead, 'different ranges were treated as the same read');
+    const third: ToolMessage = { role: 'tool', tool_name: 'read_file', content: JSON.stringify({ path: 'src/A.ts', fingerprint: '10:1', byte_start: 0, byte_end: 100, content: 'A'.repeat(6_000) }) };
+    assert(working.add('read_file', { path: 'src/A.ts' }, third, 4).read?.repeatedReadLoopSuspected, 'repeated unchanged read loop was not diagnosed');
+    const laterResult: ToolMessage = { role: 'tool', tool_name: 'search_text', content: JSON.stringify({ matches: ['x'.repeat(10_000)] }) };
+    working.add('search_text', { query: 'x' }, laterResult, 20);
+    assert(working.stats().size <= working.stats().budget, 'expired working-set read pin allowed context growth past its budget');
+    const mutation: ToolMessage = { role: 'tool', tool_name: 'apply_patch', content: JSON.stringify({ applied: true, files: ['src/A.ts'] }) };
+    working.add('apply_patch', {}, mutation, 5);
+    const fresh: ToolMessage = { role: 'tool', tool_name: 'read_file', content: JSON.stringify({ path: 'src/A.ts', fingerprint: '11:2', byte_start: 0, byte_end: 100, content: 'fresh content' }) };
+    assert(!working.add('read_file', { path: 'src/A.ts' }, fresh, 6).read?.sameContentAlreadyRead && fresh.content.includes('fresh content'), 'mutation did not invalidate cached file content');
+    assert(repeatUpdate.stats.size <= repeatUpdate.stats.budget, 'repeat cache made context unbounded');
     assert(MAX_AGENT_STEPS_PER_GENERATION === 100, 'existing Agent action limit changed');
   } finally {
     await rm(root, { recursive: true, force: true });

@@ -67,7 +67,9 @@ export class ProjectChatService {
       for (const call of calls) {
         if (signal.aborted || actions >= engine.budget) break;
         const key = signature(call);
-        if (completed.has(key)) {
+        // Re-reading is valid after mutations, for another range, and for verification.
+        // The context manager deduplicates unchanged same-range reads without hiding content.
+        if (completed.has(key) && call.name !== 'read_file') {
           repeats += 1; messages.push({ role: 'tool', tool_name: call.name, content: JSON.stringify({ warning: 'Идентичный вызов уже выполнен. Смени стратегию или заверши исследование.' }) });
           if (repeats >= 3) { researchFinished = true; yield* this.synthesize(model, messages, engine, signal, contextWindow, '', actions, toolContext.stats(), runtime); return; }
           continue;
@@ -80,7 +82,9 @@ export class ProjectChatService {
         if (lowInformation(result)) { lowInfo += 1; if (lowInfo === 3) messages.push({ role: 'system', content: 'Последние действия дали мало новой информации. Сузь исследование или заверши ответ.' }); } else lowInfo = 0;
         const toolMessage: ToolMessage = { role: 'tool', tool_name: call.name, content: result };
         messages.push(toolMessage);
-        const stats = toolContext.add(call.name, call.arguments, toolMessage);
+        const contextUpdate = toolContext.add(call.name, call.arguments, toolMessage, actions);
+        const stats = contextUpdate.stats;
+        if (contextUpdate.read) log('agent.read.diagnostics', { ...runtime, agentStep: actions, normalizedPath: contextUpdate.read.path, requestedRange: contextUpdate.read.range, fileFingerprint: contextUpdate.read.fingerprint, readCount: contextUpdate.read.readCount, sameContentAlreadyRead: contextUpdate.read.sameContentAlreadyRead, previousResultActive: contextUpdate.read.previousResultActive, previousResultCompacted: contextUpdate.read.previousResultCompacted, previousCompactionReason: contextUpdate.read.previousCompactionReason, repeatedReadLoopSuspected: contextUpdate.read.repeatedReadLoopSuspected, pinned: contextUpdate.read.pinned, activeToolResultContextSize: stats.size, contextBudget: stats.budget, peakActiveToolResultContextSize: stats.peakSize });
         if (stats.compacted) log('agent.context.compacted', { ...runtime, agentStep: actions, tool: call.name, toolResultContextSize: stats.size, toolResultContextBudget: stats.budget, compactedResults: stats.compacted });
       }
     } } catch (error) {

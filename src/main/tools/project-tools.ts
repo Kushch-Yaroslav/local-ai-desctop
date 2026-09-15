@@ -24,7 +24,7 @@ export const projectToolDefinitions: ProjectToolDefinition[] = [
   { type: 'function', function: { name: 'find_files', description: 'Ищет имена файлов и папок внутри выбранного проекта. Результат постраничный.', parameters: { type: 'object', properties: { query: { type: 'string' }, offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 250 } }, required: ['query'] } } },
   { type: 'function', function: { name: 'search_files', description: 'Ищет файлы и папки по имени внутри выбранного проекта. Псевдоним find_files.', parameters: { type: 'object', properties: { query: { type: 'string' }, offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 250 } }, required: ['query'] } } },
   { type: 'function', function: { name: 'search_text', description: 'Ищет текст в текстовых файлах выбранного проекта. Результат постраничный; сузь path при широком поиске.', parameters: { type: 'object', properties: { query: { type: 'string' }, path: { type: 'string', description: 'Необязательная относительная папка или файл.' }, offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 250 } }, required: ['query'] } } },
-  { type: 'function', function: { name: 'read_file', description: 'Читает текстовый файл. По умолчанию возвращает байтовый блок; при has_more=true запроси следующий с next_offset. Для небольших файлов можно указать start_line/end_line.', parameters: { type: 'object', properties: { path: { type: 'string' }, offset: { type: 'integer', minimum: 0 }, max_bytes: { type: 'integer', minimum: 1, maximum: 128000 }, start_line: { type: 'integer', minimum: 1 }, end_line: { type: 'integer', minimum: 1 } }, required: ['path'] } } },
+  { type: 'function', function: { name: 'read_file', description: 'Читает текстовый файл. Сначала используй search_text, затем read_file с start_line/end_line для нужного фрагмента большого файла. Без диапазона возвращается байтовый блок с has_more/next_offset; для небольших файлов полный read допустим.', parameters: { type: 'object', properties: { path: { type: 'string' }, offset: { type: 'integer', minimum: 0 }, max_bytes: { type: 'integer', minimum: 1, maximum: 128000 }, start_line: { type: 'integer', minimum: 1 }, end_line: { type: 'integer', minimum: 1 } }, required: ['path'] } } },
   { type: 'function', function: { name: 'inspect_package_json', description: 'Читает package.json в корне выбранного проекта, если он есть.', parameters: { type: 'object', properties: {} } } },
   { type: 'function', function: { name: 'git_status', description: 'Показывает read-only статус Git выбранного проекта.', parameters: { type: 'object', properties: {} } } },
   { type: 'function', function: { name: 'git_diff', description: 'Показывает read-only git diff выбранного проекта.', parameters: { type: 'object', properties: {} } } },
@@ -145,7 +145,7 @@ export class ReadonlyProjectTools {
       const endLine = this.number(call.arguments.end_line, startLine + 399, startLine, startLine + 799);
       const content = await readFile(file, 'utf8'); if (content.includes('\0')) throw new Error('Двоичные файлы не читаются');
       const lines = content.split(/\r?\n/); const from = Math.min(startLine, Math.max(lines.length, 1)); const to = Math.min(endLine, lines.length);
-      return JSON.stringify({ path: relative(this.root, file), size_bytes: info.size, start_line: from, end_line: to, content: lines.slice(from - 1, to).join('\n'), has_more: to < lines.length, next_start_line: to < lines.length ? to + 1 : null });
+      return JSON.stringify({ path: relative(this.root, file), size_bytes: info.size, fingerprint: `${info.size}:${Math.floor(info.mtimeMs)}`, start_line: from, end_line: to, content: lines.slice(from - 1, to).join('\n'), has_more: to < lines.length, next_start_line: to < lines.length ? to + 1 : null });
     }
     const offset = this.number(call.arguments.offset, 0, 0, info.size); const maxBytes = this.number(call.arguments.max_bytes, defaultChunkBytes, 1, maxChunkBytes);
     const handle = await open(file, 'r');
@@ -153,7 +153,7 @@ export class ReadonlyProjectTools {
       const buffer = Buffer.alloc(Math.min(maxBytes, info.size - offset)); const { bytesRead } = await handle.read(buffer, 0, buffer.length, offset);
       const content = buffer.subarray(0, bytesRead).toString('utf8'); if (content.includes('\0')) throw new Error('Двоичные файлы не читаются');
       const end = offset + bytesRead;
-      return JSON.stringify({ path: relative(this.root, file), size_bytes: info.size, byte_start: offset, byte_end: end, content, has_more: end < info.size, next_offset: end < info.size ? end : null });
+      return JSON.stringify({ path: relative(this.root, file), size_bytes: info.size, fingerprint: `${info.size}:${Math.floor(info.mtimeMs)}`, byte_start: offset, byte_end: end, content, has_more: end < info.size, next_offset: end < info.size ? end : null });
     } finally { await handle.close(); }
   }
 
