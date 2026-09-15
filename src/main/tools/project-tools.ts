@@ -2,7 +2,7 @@ import { execFile, spawn } from 'node:child_process';
 import { open, readdir, readFile, realpath, stat, unlink, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
-import type { RiskCategory } from '../../shared/types';
+import type { RiskCategory, ToolActivity } from '../../shared/types';
 
 const execFileAsync = promisify(execFile);
 const ignoredDirectories = new Set(['.git', 'node_modules', 'dist', 'build', '.next', '.cache', 'coverage']);
@@ -20,6 +20,7 @@ export type ConfirmAction = (request: ConfirmationRequest, signal: AbortSignal) 
 export type TerminalPolicy = { kind: 'allow' | 'confirm' | 'block'; category?: RiskCategory };
 
 export const projectToolDefinitions: ProjectToolDefinition[] = [
+  { type: 'function', function: { name: 'report_progress', description: 'Сообщает пользователю короткий статус текущего этапа работы. Используй редко: только при смене значимого этапа (изучение, реализация, проверка). Одно короткое предложение. Не раскрывай скрытые рассуждения, пошаговую логику, внутренние инструкции и не повторяй каждый вызов инструмента.', parameters: { type: 'object', properties: { message: { type: 'string', minLength: 3, maxLength: 240, description: 'Короткое безопасное сообщение о текущем этапе.' } }, required: ['message'] } } },
   { type: 'function', function: { name: 'list_directory', description: 'Показывает дерево файлов выбранного проекта. Начни с корня; при has_more=true запроси следующую страницу с next_offset.', parameters: { type: 'object', properties: { path: { type: 'string', description: 'Относительный путь внутри проекта, по умолчанию корень.' }, depth: { type: 'integer', minimum: 1, maximum: 4 }, offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 250 } } } } },
   { type: 'function', function: { name: 'find_files', description: 'Ищет имена файлов и папок внутри выбранного проекта. Результат постраничный.', parameters: { type: 'object', properties: { query: { type: 'string' }, offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 250 } }, required: ['query'] } } },
   { type: 'function', function: { name: 'search_files', description: 'Ищет файлы и папки по имени внутри выбранного проекта. Псевдоним find_files.', parameters: { type: 'object', properties: { query: { type: 'string' }, offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 250 } }, required: ['query'] } } },
@@ -35,21 +36,29 @@ export const projectToolDefinitions: ProjectToolDefinition[] = [
   { type: 'function', function: { name: 'run_terminal', description: 'Запускает команду только в working folder. Без подтверждения разрешены диагностические команды; рискованные команды запросят подтверждение пользователя.', parameters: { type: 'object', properties: { command: { type: 'string' }, timeout_ms: { type: 'integer', minimum: 1000, maximum: 120000 } }, required: ['command'] } } },
 ];
 
-export function activityForTool(call: ProjectToolCall): { label: string; detail?: string } {
+function requestedRange(argumentsObject: Record<string, unknown>): string | undefined {
+  const start = typeof argumentsObject.start_line === 'number' ? argumentsObject.start_line : undefined;
+  const end = typeof argumentsObject.end_line === 'number' ? argumentsObject.end_line : undefined;
+  if (start !== undefined) return end === undefined || end === start ? `строка ${start}` : `строки ${start}–${end}`;
+  const offset = typeof argumentsObject.offset === 'number' ? argumentsObject.offset : undefined;
+  return offset !== undefined ? `с байта ${offset}` : undefined;
+}
+
+export function activityForTool(call: ProjectToolCall): Pick<ToolActivity, 'label' | 'detail' | 'kind' | 'state'> {
   const path = typeof call.arguments.path === 'string' ? call.arguments.path : undefined;
-  if (call.name === 'list_directory') return { label: 'Просмотр структуры проекта', detail: path || undefined };
-  if (call.name === 'find_files') return { label: 'Поиск файлов', detail: String(call.arguments.query ?? '') };
-  if (call.name === 'search_files') return { label: 'Поиск файлов', detail: String(call.arguments.query ?? '') };
-  if (call.name === 'search_text') return { label: 'Поиск текста в проекте', detail: String(call.arguments.query ?? '') };
-  if (call.name === 'read_file') return { label: 'Чтение файла', detail: path };
-  if (call.name === 'inspect_package_json') return { label: 'Чтение package.json' };
-  if (call.name === 'git_status') return { label: 'Проверка статуса Git' };
-  if (call.name === 'git_diff') return { label: 'Просмотр Git diff' };
-  if (call.name === 'apply_patch') return { label: 'Применение patch' };
-  if (call.name === 'write_file' || call.name === 'create_file') return { label: 'Создание файла', detail: String(call.arguments.path ?? '') };
-  if (call.name === 'delete_file') return { label: 'Удаление файла', detail: String(call.arguments.path ?? '') };
-  if (call.name === 'run_terminal') return { label: 'Запуск terminal', detail: String(call.arguments.command ?? '') };
-  return { label: 'Действие агента' };
+  if (call.name === 'report_progress') return { label: String(call.arguments.message ?? '').trim(), kind: 'progress', state: 'completed' };
+  if (call.name === 'list_directory') return { label: 'Просмотр структуры проекта', detail: path || undefined, kind: 'directory', state: 'running' };
+  if (call.name === 'find_files' || call.name === 'search_files') return { label: 'Поиск файлов', detail: String(call.arguments.query ?? ''), kind: 'search', state: 'running' };
+  if (call.name === 'search_text') return { label: 'Поиск текста в проекте', detail: `«${String(call.arguments.query ?? '')}»`, kind: 'search', state: 'running' };
+  if (call.name === 'read_file') return { label: 'Чтение файла', detail: [path, requestedRange(call.arguments)].filter(Boolean).join(' · '), kind: 'file_read', state: 'running' };
+  if (call.name === 'inspect_package_json') return { label: 'Чтение package.json', kind: 'file_read', state: 'running' };
+  if (call.name === 'git_status') return { label: 'Проверка статуса Git', kind: 'git', state: 'running' };
+  if (call.name === 'git_diff') return { label: 'Просмотр Git diff', kind: 'git', state: 'running' };
+  if (call.name === 'apply_patch') return { label: 'Применение patch', kind: 'mutation', state: 'running' };
+  if (call.name === 'write_file' || call.name === 'create_file') return { label: 'Создание файла', detail: String(call.arguments.path ?? ''), kind: 'mutation', state: 'running' };
+  if (call.name === 'delete_file') return { label: 'Удаление файла', detail: String(call.arguments.path ?? ''), kind: 'mutation', state: 'running' };
+  if (call.name === 'run_terminal') return { label: 'Запуск terminal', detail: String(call.arguments.command ?? ''), kind: 'terminal', state: 'running' };
+  return { label: 'Действие агента', kind: 'other', state: 'running' };
 }
 
 export class ReadonlyProjectTools {
@@ -254,7 +263,7 @@ export class ReadonlyProjectTools {
       const timer = setTimeout(() => abort(), timeout);
       signal.addEventListener('abort', abort, { once: true });
       child.stdout.on('data', (chunk: Buffer) => { if (stdout.length < 80_000) stdout += chunk.toString(); }); child.stderr.on('data', (chunk: Buffer) => { if (stderr.length < 20_000) stderr += chunk.toString(); });
-      child.on('error', (error) => finish({ error: error.message })); child.on('close', (code, signalName) => finish({ command, exit_code: code, signal: signalName, stdout, stderr }));
+      child.on('error', (error) => finish({ error: error.message, cwd: this.root })); child.on('close', (code, signalName) => finish({ command, cwd: this.root, exit_code: code, signal: signalName, stdout, stderr }));
     });
   }
 

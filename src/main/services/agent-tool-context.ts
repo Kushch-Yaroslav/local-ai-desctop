@@ -30,8 +30,10 @@ export class AgentToolContext {
       if (previous?.read) {
         const prior = previous.read; const wasCompacted = previous.compacted; const reason = previous.compactReason; prior.readCount += 1; prior.lastReadStep = step; prior.pinUntil = Math.max(prior.pinUntil, step + pinSteps);
         if (step - prior.firstReadStep <= loopWindowSteps && prior.readCount >= 3) prior.loopSuspected = true;
-        if (previous.compacted) { previous.message.content = previous.raw; previous.compacted = false; previous.compactReason = undefined; }
-        message.content = JSON.stringify({ cached_read: true, path: prior.path, range: prior.range, fingerprint: prior.fingerprint, content_available_in_active_context: true, read_count: prior.readCount, repeated_read_loop_suspected: prior.loopSuspected });
+        if (previous.compacted) {
+          previous.message.content = previous.raw; previous.compacted = false; previous.compactReason = undefined;
+          message.content = JSON.stringify({ status: 'restored_cached_read', path: prior.path, range: prior.range, fingerprint: prior.fingerprint, content_available_in_active_context: true, read_count: prior.readCount, repeated_read_loop_suspected: prior.loopSuspected });
+        } else message.content = JSON.stringify({ status: 'unchanged', path: prior.path, range: prior.range, fingerprint: prior.fingerprint, message: 'This exact file range is unchanged and its content is already present in the active working context.', read_count: prior.readCount, repeated_read_loop_suspected: prior.loopSuspected });
         diagnostic = { path: prior.path, range: prior.range, fingerprint: prior.fingerprint, readCount: prior.readCount, sameContentAlreadyRead: true, previousResultActive: !wasCompacted, previousResultCompacted: wasCompacted, previousCompactionReason: reason, repeatedReadLoopSuspected: prior.loopSuspected, pinned: true };
       } else { entry.read = read; this.reads.set(read.key, entry); diagnostic = { path: read.path, range: read.range, fingerprint: read.fingerprint, readCount: 1, sameContentAlreadyRead: false, previousResultActive: false, previousResultCompacted: false, repeatedReadLoopSuspected: false, pinned: false }; }
     }

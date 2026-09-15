@@ -144,7 +144,7 @@ export const useAppStore = create<State>((set, get) => {
       const attachmentId = event.activity!.id.startsWith('attachment-') ? event.activity!.id.slice('attachment-'.length) : null;
       return {
         generationState: event.type === 'attachment' && event.activity!.status === 'processing' ? 'using-tool' : event.activity!.label === 'Запуск terminal' ? 'running-terminal' : 'using-tool',
-        toolActivities: [...state.toolActivities.filter((activity) => activity.id !== event.activity!.id), event.activity!].slice(-40), toolActivityCount: exists ? state.toolActivityCount : state.toolActivityCount + 1,
+        toolActivities: [...state.toolActivities.filter((activity) => activity.id !== event.activity!.id), event.activity!].slice(-100), toolActivityCount: exists || event.activity!.kind === 'progress' ? state.toolActivityCount : state.toolActivityCount + 1,
         messages: attachmentId ? state.messages.map((message) => ({ ...message, attachments: message.attachments?.map((attachment) => attachment.id === attachmentId ? event.activity!.attachment ?? { ...attachment, status: event.activity!.status ?? attachment.status, error: event.activity!.status === 'error' ? event.activity!.detail : attachment.error, updatedAt: now() } : attachment) })) : state.messages,
       };
     });

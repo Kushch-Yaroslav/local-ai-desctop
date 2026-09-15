@@ -1,20 +1,18 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { AlertCircle, Bot, Check, Pencil, X } from 'lucide-react';
+import { AlertCircle, Bot, Check, ChevronRight, CircleDot, Pencil, X } from 'lucide-react';
 import { Sidebar } from './components/Sidebar';
 import { Toolbar } from './components/Toolbar';
 import { Composer } from './components/Composer';
 import { Markdown } from './components/Markdown';
 import { useAppStore } from './store/app-store';
-import type { ApprovalDecision, Attachment, ToolActivity } from '../shared/types';
+import type { AnalysisRun, ApprovalDecision, Attachment, ToolActivity } from '../shared/types';
 
 function GenerationIndicator({ state }: { state: string }) {
-  const label = state === 'waiting-for-approval' ? 'Ожидает подтверждения' : state === 'using-tool' ? 'Обрабатываю вложения или использую инструмент' : state === 'running-terminal' ? 'Запускаю terminal' : state === 'stopping' ? 'Останавливаю' : state === 'generating' ? 'Пишу ответ' : 'Думаю';
+  const label = state === 'waiting-for-approval' ? 'Ожидает подтверждения' : state === 'using-tool' ? 'Использую инструмент' : state === 'running-terminal' ? 'Запускаю terminal' : state === 'stopping' ? 'Останавливаю' : state === 'generating' ? 'Пишу ответ' : 'Думаю';
   return <div className="generation-indicator" role="status" aria-label={label}><span className="generation-orb" /><span>{label}</span><i /><i /><i /></div>;
 }
 
-function MessageAttachments({ attachments }: { attachments: Attachment[] }) {
-  return <div className="message-attachments">{attachments.map((attachment) => <MessageAttachment key={attachment.id} attachment={attachment} />)}</div>;
-}
+function MessageAttachments({ attachments }: { attachments: Attachment[] }) { return <div className="message-attachments">{attachments.map((attachment) => <MessageAttachment key={attachment.id} attachment={attachment} />)}</div>; }
 function MessageAttachment({ attachment }: { attachment: Attachment }) {
   const [url, setUrl] = useState<string | null>(null);
   useEffect(() => { if (attachment.kind !== 'image' || !attachment.storageRef) return; void window.localAi.attachments.dataUrl(attachment.id).then(setUrl); }, [attachment.id, attachment.kind, attachment.storageRef]);
@@ -25,24 +23,51 @@ function MessageAttachment({ attachment }: { attachment: Attachment }) {
 }
 
 function ToolActivityItem({ activity, onApproval, approvalSubmitting = false }: { activity: ToolActivity; onApproval?: (decision: ApprovalDecision) => void; approvalSubmitting?: boolean }) {
+  const [detailsOpen, setDetailsOpen] = useState(false);
   const approval = activity.approval;
-  const status = approval?.status === 'approved' ? '✓ Разрешено' : approval?.status === 'session-approved' ? '✓ Разрешено правилом сессии' : approval?.status === 'rejected' ? '✕ Отклонено пользователем' : null;
-  return <div className="tool-action"><p className="tool-action-row"><i /><span className="tool-action-label">{activity.label}</span>{activity.detail && <small className="tool-action-detail">{activity.detail}</small>}</p>{approval?.status === 'pending' && onApproval && <div className="tool-approval"><strong>Требуется подтверждение</strong><div><button disabled={approvalSubmitting} onClick={() => onApproval('reject')}>Отклонить</button><button disabled={approvalSubmitting} onClick={() => onApproval('once')}>Разрешить</button><button disabled={approvalSubmitting} onClick={() => onApproval('session')}>Всегда разрешать в этой сессии</button></div></div>}{status && <small className={`tool-approval-status ${approval?.status}`}>{status}</small>}</div>;
+  const approvalStatus = approval?.status === 'approved' ? '✓ Разрешено' : approval?.status === 'session-approved' ? '✓ Разрешено правилом сессии' : approval?.status === 'rejected' ? '✕ Отклонено пользователем' : null;
+  const icon = activity.kind === 'progress' ? <CircleDot size={13} /> : activity.kind === 'file_read' || activity.kind === 'directory' ? '↳' : activity.kind === 'search' ? '⌕' : activity.kind === 'terminal' ? '$' : activity.kind === 'mutation' ? '✎' : activity.kind === 'git' ? '⌁' : '•';
+  const hasDetails = Boolean((activity.metadata && Object.keys(activity.metadata).length) || activity.output);
+  return <div className={`tool-action ${activity.kind === 'progress' ? 'progress' : ''} ${activity.state ?? ''}`}>
+    <p className="tool-action-row"><i>{icon}</i><span className="tool-action-label">{activity.label}</span>{activity.detail && <small className="tool-action-detail">{activity.detail}</small>}{activity.state === 'error' && <small className="tool-action-error">Ошибка</small>}</p>
+    {hasDetails && <details className="tool-action-details" open={detailsOpen} onToggle={(event) => setDetailsOpen((event.target as HTMLDetailsElement).open)}><summary>Детали</summary>{detailsOpen && <div>{activity.metadata && Object.entries(activity.metadata).map(([key, value]) => <p key={key}><span>{key}</span>{String(value)}</p>)}{activity.output && <pre>{activity.output}</pre>}</div>}</details>}
+    {approval?.status === 'pending' && onApproval && <div className="tool-approval"><strong>Требуется подтверждение</strong><div><button disabled={approvalSubmitting} onClick={() => onApproval('reject')}>Отклонить</button><button disabled={approvalSubmitting} onClick={() => onApproval('once')}>Разрешить</button><button disabled={approvalSubmitting} onClick={() => onApproval('session')}>Всегда разрешать в этой сессии</button></div></div>}
+    {approvalStatus && <small className={`tool-approval-status ${approval?.status}`}>{approvalStatus}</small>}
+  </div>;
+}
+
+function durationLabel(start: string, end: string | null): string | null {
+  if (!end) return null;
+  const seconds = Math.max(0, Math.round((new Date(end).getTime() - new Date(start).getTime()) / 1000));
+  return seconds >= 60 ? `${Math.floor(seconds / 60)}м ${seconds % 60}с` : `${seconds}с`;
+}
+function ActivityTrace({ activities, actionCount, status, createdAt, completedAt, active, onApproval, approvalSubmitting }: { activities: ToolActivity[]; actionCount: number; status: 'running' | 'completed' | 'error' | 'cancelled'; createdAt?: string; completedAt?: string | null; active: boolean; onApproval?: (decision: ApprovalDecision) => void; approvalSubmitting?: boolean }) {
+  const [expanded, setExpanded] = useState(active); const wasActive = useRef(active);
+  useEffect(() => { if (wasActive.current && !active) setExpanded(false); wasActive.current = active; }, [active]);
+  const latestProgress = [...activities].reverse().find((activity) => activity.kind === 'progress')?.label;
+  const stateLabel = status === 'completed' ? 'завершено' : status === 'cancelled' ? 'остановлено' : status === 'error' ? 'ошибка' : latestProgress ? `${latestProgress}…` : 'Работа агента';
+  const duration = createdAt ? durationLabel(createdAt, completedAt ?? null) : null;
+  return <details className="tool-activity activity-trace" open={expanded} onToggle={(event) => setExpanded((event.target as HTMLDetailsElement).open)}><summary><ChevronRight size={15} /><strong>{active && latestProgress ? latestProgress : 'Работа агента'}</strong><span>· {actionCount} действий{duration ? ` · ${duration}` : ''}{!active ? ` · ${stateLabel}` : ''}</span></summary><div>{activities.map((activity) => <ToolActivityItem key={activity.id} activity={activity} onApproval={onApproval} approvalSubmitting={approvalSubmitting} />)}</div></details>;
 }
 
 export function App() {
-  const { initialize, refreshHardware, handleStream, activeId, conversations, messages, error, isGenerating, generationState, toolActivities, toolActivityCount, analysisProgress, analysisRuns, editMessage, continueGeneration, lastFinishReason, approveAction, approvalSubmitting } = useAppStore();
+  const { initialize, refreshHardware, handleStream, activeId, conversations, messages, error, isGenerating, generationState, toolActivities, toolActivityCount, analysisRuns, editMessage, continueGeneration, lastFinishReason, approveAction, approvalSubmitting } = useAppStore();
   const endRef = useRef<HTMLDivElement>(null); const conversationRef = useRef<HTMLElement>(null); const followStream = useRef(true);
   const [editingId, setEditingId] = useState<string | null>(null); const [editingText, setEditingText] = useState('');
   const active = conversations.find((item) => item.id === activeId);
   useEffect(() => { void initialize(); const timer = window.setInterval(() => void refreshHardware(), 2_000); const unlisten = window.localAi.chat.onStream(handleStream); return () => { window.clearInterval(timer); unlisten(); }; }, [initialize, refreshHardware, handleStream]);
   useLayoutEffect(() => { followStream.current = true; }, [activeId]);
-  useLayoutEffect(() => {
-    const conversation = conversationRef.current;
-    if (!conversation || !followStream.current) return;
-    conversation.scrollTo({ top: conversation.scrollHeight, behavior: isGenerating ? 'auto' : 'smooth' });
-  }, [messages, isGenerating]);
+  useLayoutEffect(() => { const conversation = conversationRef.current; if (!conversation || !followStream.current) return; conversation.scrollTo({ top: conversation.scrollHeight, behavior: isGenerating ? 'auto' : 'smooth' }); }, [messages, isGenerating, toolActivities]);
   const updateFollowState = () => { const element = conversationRef.current; if (element) followStream.current = element.scrollHeight - element.scrollTop - element.clientHeight < 96; };
-  const stageLabels = { reconnaissance: 'Изучение структуры', 'project-map': 'Построение карты проекта', prioritization: 'Выбор важных частей', investigation: 'Исследование важных частей', coverage: 'Проверка покрытия', synthesis: 'Подготовка ответа' };
-  return <div className="app-shell"><Sidebar /><main className="main"><Toolbar /><section ref={conversationRef} onScroll={updateFollowState} className="conversation">{active?.mode === 'agent' && <div className="agent-notice"><Bot size={17} /> Агент использует {active.workingDirectory ? 'выбранную рабочую папку' : 'папку приложения по умолчанию'} и может запускать контролируемые terminal-команды{active.webMode === 'auto' ? ', а также использовать изолированный web.' : '.'}</div>}{messages.length === 0 && <div className="welcome"><Bot size={34} /><h1>Чем могу помочь?</h1><p>Выберите одну из локальных моделей и начните разговор.</p></div>}{messages.map((message) => <article className={`message ${message.role} ${message.id.startsWith('stream-') && isGenerating ? 'is-generating' : ''}`} key={message.id}><div className="message-content">{editingId === message.id ? <div className="message-editor"><textarea value={editingText} onChange={(event) => setEditingText(event.target.value)} autoFocus /><button aria-label="Сохранить" onClick={() => { void (async () => { if (await editMessage(message, editingText)) setEditingId(null); })(); }}><Check size={15} /></button><button aria-label="Отмена" onClick={() => setEditingId(null)}><X size={15} /></button></div> : <>{message.attachments?.length ? <MessageAttachments attachments={message.attachments} /> : null}{message.content ? <Markdown>{message.content}</Markdown> : message.role === 'assistant' && isGenerating ? <GenerationIndicator state={generationState} /> : null}{message.role === 'user' && <button className="message-edit" title="Редактировать" aria-label="Редактировать сообщение" onClick={() => { setEditingId(message.id); setEditingText(message.content); }}><Pencil size={14} /></button>}</>}{message.role === 'assistant' && analysisRuns.filter((run) => run.assistantMessageId === message.id).map((run) => <details className="tool-activity persisted-analysis" key={run.id}><summary>Анализ проекта · {run.actionCount} действий <span>{run.depth === 'fast' ? 'Быстрый' : run.depth === 'enhanced' ? 'Повышенный' : run.depth === 'deep' ? 'Глубокий' : 'Обычный'} · {run.status === 'completed' ? 'готово' : run.status}</span></summary><div>{run.actions.map((activity) => <ToolActivityItem key={activity.id} activity={activity} />)}</div></details>)}</div></article>)}{lastFinishReason === 'length' && !isGenerating && <button className="continue-button" onClick={() => void continueGeneration()}>Продолжить ответ</button>}{analysisProgress.length > 0 && <div className="analysis-progress"><strong>Глубокий анализ · {toolActivityCount} действий</strong>{analysisProgress.map((progress) => <p key={progress.stage} className={progress.status}>{stageLabels[progress.stage]} {progress.status === 'complete' ? '✓' : '…'}</p>)}</div>}{toolActivities.length > 0 && <details className="tool-activity" open={isGenerating}><summary>Действия агента <span>· {toolActivityCount} действий</span></summary><div>{toolActivities.map((activity) => <ToolActivityItem key={activity.id} activity={activity} onApproval={(decision) => void approveAction(decision)} approvalSubmitting={approvalSubmitting} />)}</div></details>}{error && <div className="error"><AlertCircle size={18} /><div><strong>Не удалось выполнить запрос</strong><br />{error}</div></div>}<div ref={endRef} /></section><Composer /></main></div>;
+  const runFor = (run: AnalysisRun) => <ActivityTrace key={run.id} activities={run.actions} actionCount={run.actionCount} status={run.status} createdAt={run.createdAt} completedAt={run.completedAt} active={false} />;
+  return <div className="app-shell"><Sidebar /><main className="main"><Toolbar /><section ref={conversationRef} onScroll={updateFollowState} className="conversation">
+    {active?.mode === 'agent' && <div className="agent-notice"><Bot size={17} /> Агент использует {active.workingDirectory ? 'выбранную рабочую папку' : 'папку приложения по умолчанию'} и может запускать контролируемые terminal-команды{active.webMode === 'auto' ? ', а также использовать изолированный web.' : '.'}</div>}
+    {messages.length === 0 && <div className="welcome"><Bot size={34} /><h1>Чем могу помочь?</h1><p>Выберите одну из локальных моделей и начните разговор.</p></div>}
+    {messages.map((message) => <article className={`message ${message.role} ${message.id.startsWith('stream-') && isGenerating ? 'is-generating' : ''}`} key={message.id}><div className="message-content">{editingId === message.id ? <div className="message-editor"><textarea value={editingText} onChange={(event) => setEditingText(event.target.value)} autoFocus /><button aria-label="Сохранить" onClick={() => { void (async () => { if (await editMessage(message, editingText)) setEditingId(null); })(); }}><Check size={15} /></button><button aria-label="Отмена" onClick={() => setEditingId(null)}><X size={15} /></button></div> : <>{message.attachments?.length ? <MessageAttachments attachments={message.attachments} /> : null}{message.content ? <Markdown>{message.content}</Markdown> : message.role === 'assistant' && isGenerating ? <GenerationIndicator state={generationState} /> : null}{message.role === 'user' && <button className="message-edit" title="Редактировать" aria-label="Редактировать сообщение" onClick={() => { setEditingId(message.id); setEditingText(message.content); }}><Pencil size={14} /></button>}</>}{message.role === 'assistant' && analysisRuns.filter((run) => run.assistantMessageId === message.id).map(runFor)}</div></article>)}
+    {lastFinishReason === 'length' && !isGenerating && <button className="continue-button" onClick={() => void continueGeneration()}>Продолжить ответ</button>}
+    {isGenerating && toolActivities.length > 0 && <ActivityTrace activities={toolActivities} actionCount={toolActivityCount} status="running" active onApproval={(decision) => void approveAction(decision)} approvalSubmitting={approvalSubmitting} />}
+    {!isGenerating && toolActivities.length > 0 && (generationState === 'cancelled' || generationState === 'error') && <ActivityTrace activities={toolActivities} actionCount={toolActivityCount} status={generationState} active={false} onApproval={(decision) => void approveAction(decision)} approvalSubmitting={approvalSubmitting} />}
+    {!isGenerating && analysisRuns.filter((run) => !run.assistantMessageId).map(runFor)}
+    {error && <div className="error"><AlertCircle size={18} /><div><strong>Не удалось выполнить запрос</strong><br />{error}</div></div>}<div ref={endRef} />
+  </section><Composer /></main></div>;
 }

@@ -14,7 +14,7 @@ type ConversationRow = {
 type MessageRow = { id: string; conversation_id: string; role: ChatMessage['role']; content: string; created_at: string };
 type AttachmentRow = { id: string; message_id: string; position: number; kind: AttachmentKind; mime_type: string; filename: string; size: number; storage_ref: string; status: AttachmentStatus; extracted_text: string | null; structured_data: string | null; vision_analysis: string | null; error: string | null; metadata: string | null; created_at: string; updated_at: string };
 type AnalysisRunRow = { id: string; conversation_id: string; assistant_message_id: string | null; depth: AnalysisDepth; status: AnalysisRun['status']; action_count: number; created_at: string; completed_at: string | null };
-type AnalysisActionRow = { id: string; run_id: string; label: string; detail: string | null; position: number };
+type AnalysisActionRow = { id: string; run_id: string; label: string; detail: string | null; data: string | null; position: number };
 
 const mapConversation = (row: ConversationRow): Conversation => ({
   id: row.id, title: row.title, modelId: row.model_id, mode: row.mode,
@@ -33,7 +33,11 @@ const mapMessage = (row: MessageRow, attachments?: Attachment[]): ChatMessage =>
   id: row.id, conversationId: row.conversation_id, role: row.role, content: row.content, createdAt: row.created_at,
   attachments,
 });
-const mapRun = (row: AnalysisRunRow, actions: AnalysisActionRow[]): AnalysisRun => ({ id: row.id, conversationId: row.conversation_id, assistantMessageId: row.assistant_message_id, depth: row.depth, status: row.status, actionCount: row.action_count, actions: actions.map((action) => ({ id: action.id, label: action.label, detail: action.detail ?? undefined })), createdAt: row.created_at, completedAt: row.completed_at });
+const mapRun = (row: AnalysisRunRow, actions: AnalysisActionRow[]): AnalysisRun => ({ id: row.id, conversationId: row.conversation_id, assistantMessageId: row.assistant_message_id, depth: row.depth, status: row.status, actionCount: row.action_count, actions: actions.map((action) => {
+  let stored: Partial<ToolActivity> = {};
+  try { stored = action.data ? JSON.parse(action.data) as Partial<ToolActivity> : {}; } catch { /* Older or corrupt telemetry remains readable. */ }
+  return { ...stored, id: action.id, label: action.label, detail: action.detail ?? undefined };
+}), createdAt: row.created_at, completedAt: row.completed_at });
 
 export class Database {
   private readonly db = new DatabaseSync(paths.database);
@@ -59,7 +63,7 @@ export class Database {
       ) STRICT;
       CREATE INDEX IF NOT EXISTS attachments_message_idx ON attachments(message_id, position);
       CREATE TABLE IF NOT EXISTS analysis_runs (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, assistant_message_id TEXT, depth TEXT NOT NULL, status TEXT NOT NULL, action_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, completed_at TEXT) STRICT;
-      CREATE TABLE IF NOT EXISTS analysis_actions (id TEXT PRIMARY KEY, run_id TEXT NOT NULL, label TEXT NOT NULL, detail TEXT, position INTEGER NOT NULL) STRICT;
+      CREATE TABLE IF NOT EXISTS analysis_actions (id TEXT PRIMARY KEY, run_id TEXT NOT NULL, label TEXT NOT NULL, detail TEXT, data TEXT, position INTEGER NOT NULL) STRICT;
       CREATE INDEX IF NOT EXISTS analysis_runs_conversation_idx ON analysis_runs(conversation_id, created_at);
       CREATE INDEX IF NOT EXISTS analysis_actions_run_idx ON analysis_actions(run_id, position);
       CREATE TABLE IF NOT EXISTS generation_diagnostics (
@@ -84,6 +88,7 @@ export class Database {
     try { this.db.exec('ALTER TABLE generation_diagnostics ADD COLUMN tokens_per_second REAL'); } catch { /* Existing databases already have this column. */ }
     try { this.db.exec('ALTER TABLE generation_diagnostics ADD COLUMN prompt_tokens_per_second REAL'); } catch { /* Existing databases already have this column. */ }
     try { this.db.exec('ALTER TABLE generation_diagnostics ADD COLUMN time_to_first_token_ms REAL'); } catch { /* Existing databases already have this column. */ }
+    try { this.db.exec('ALTER TABLE analysis_actions ADD COLUMN data TEXT'); } catch { /* Existing databases already have this column. */ }
     // A removed model must not remain selected in persisted chats.
     this.db.prepare("UPDATE conversations SET model_id=NULL WHERE model_id='qwen3-coder:30b'").run();
   }
@@ -224,9 +229,14 @@ export class Database {
   }
 
   addAnalysisAction(runId: string, activity: ToolActivity): AnalysisRun {
-    const position = (this.db.prepare('SELECT action_count FROM analysis_runs WHERE id=?').get(runId) as { action_count: number }).action_count;
-    this.db.prepare('INSERT INTO analysis_actions VALUES (?, ?, ?, ?, ?)').run(activity.id, runId, activity.label, activity.detail ?? null, position);
-    this.db.prepare('UPDATE analysis_runs SET action_count=action_count+1 WHERE id=?').run(runId);
+    const existing = this.db.prepare('SELECT id FROM analysis_actions WHERE id=? AND run_id=?').get(activity.id, runId) as { id: string } | undefined;
+    const position = (this.db.prepare('SELECT COALESCE(MAX(position), -1) AS position FROM analysis_actions WHERE run_id=?').get(runId) as { position: number }).position + 1;
+    const data = JSON.stringify({ ...activity, approval: undefined, attachment: undefined });
+    if (existing) this.db.prepare('UPDATE analysis_actions SET label=?, detail=?, data=? WHERE id=? AND run_id=?').run(activity.label, activity.detail ?? null, data, activity.id, runId);
+    else {
+      this.db.prepare('INSERT INTO analysis_actions (id, run_id, label, detail, data, position) VALUES (?, ?, ?, ?, ?, ?)').run(activity.id, runId, activity.label, activity.detail ?? null, data, position);
+      if (activity.kind !== 'progress') this.db.prepare('UPDATE analysis_runs SET action_count=action_count+1 WHERE id=?').run(runId);
+    }
     return this.getAnalysisRun(runId)!;
   }
 

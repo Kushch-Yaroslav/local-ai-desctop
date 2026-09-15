@@ -141,6 +141,14 @@ export interface ToolActivity {
   id: string;
   label: string;
   detail?: string;
+  /** User-visible execution category. Missing means a record saved by an older app version. */
+  kind?: 'progress' | 'file_read' | 'search' | 'directory' | 'terminal' | 'mutation' | 'git' | 'web' | 'other';
+  /** Lifecycle of an action. Progress events are informational and never consume the Agent action budget. */
+  state?: 'running' | 'completed' | 'error';
+  /** Compact, user-facing fields shown only when this activity is expanded. */
+  metadata?: Record<string, string | number | boolean | null>;
+  /** Bounded command output or error text, rendered lazily when details are expanded. */
+  output?: string;
   approval?: ActionApproval;
   status?: AttachmentStatus;
   attachment?: Attachment;

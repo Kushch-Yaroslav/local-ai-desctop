@@ -16,6 +16,23 @@ export class LlamaCppRequestError extends Error {
   constructor(readonly request: RequestDiagnostics) { super(`llama.cpp отклонил запрос (HTTP ${request.status})${request.userMessage ? `: ${request.userMessage}` : ''}`); this.name = 'LlamaCppRequestError'; }
 }
 
+/** Validates chronological OpenAI tool history without reordering it for a chat template. */
+export function validateLlamaMessageSequence(messages: ToolMessage[]): string | undefined {
+  let seenNonSystem = false; const pendingTools: string[] = [];
+  for (const [index, message] of messages.entries()) {
+    if (message.role === 'system') { if (seenNonSystem) return `system message at index ${index} follows conversation history`; continue; }
+    seenNonSystem = true;
+    if (message.role === 'tool') {
+      const toolIndex = pendingTools.indexOf(message.tool_name ?? '');
+      if (toolIndex < 0) return `tool result at index ${index} has no preceding matching tool call`;
+      pendingTools.splice(toolIndex, 1); continue;
+    }
+    if (pendingTools.length) return `message at index ${index} appears before ${pendingTools.length} tool result(s)`;
+    if (message.role === 'assistant' && message.tool_calls?.length) pendingTools.push(...message.tool_calls.map((call) => call.function.name));
+  }
+  return pendingTools.length ? `${pendingTools.length} tool call(s) lack a result` : undefined;
+}
+
 /** Adapter for the launcher-managed, OpenAI-compatible llama-server. */
 export class LlamaCppBackend implements LlmBackend, ToolCallingBackend {
   constructor(private readonly baseUrl = 'http://127.0.0.1:8081', private readonly contextLimit = 65_536, private readonly visionEnabled = true) {}
@@ -74,6 +91,8 @@ export class LlamaCppBackend implements LlmBackend, ToolCallingBackend {
   }
   async chatWithTools(model: string, messages: ToolMessage[], tools: unknown[] | undefined, signal: AbortSignal, contextWindow: number, depth: AnalysisDepth): Promise<ToolMessage> {
     await this.ensureModelAvailable(model); const budget = this.budget(messages, contextWindow, depth);
+    const sequenceError = validateLlamaMessageSequence(messages);
+    if (sequenceError) { log('llama-cpp.request.invalid', { backend: 'llama-cpp', model, endpoint: '/v1/chat/completions', sequenceError, messages: messages.map((message, index) => ({ index, role: message.role, toolName: message.tool_name, toolCallCount: message.tool_calls?.length ?? 0 })) }); throw new Error(`Некорректная последовательность Agent сообщений: ${sequenceError}`); }
     let response: Response;
     const endpoint = '/v1/chat/completions';
     try { response = await fetch(this.url(endpoint), { method: 'POST', signal, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model, messages: this.messages(messages), ...(tools ? { tools, tool_choice: 'auto' } : {}), max_tokens: budget.maxTokens, reasoning_effort: reasoningEffort[depth], stream: false }) }); }
