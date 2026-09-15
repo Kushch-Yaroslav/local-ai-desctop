@@ -1,0 +1,102 @@
+import assert from 'node:assert/strict';
+import { createServer, type Server } from 'node:http';
+import { once } from 'node:events';
+import { LlamaCppBackend, LlamaCppContextExhaustedError, LlamaCppRequestError } from './llama-cpp-backend';
+import type { ToolMessage } from './types';
+
+const model = 'qwen3.8:27b-q4_K_M';
+type Scenario = { tokenCounts?: number[]; lastTokenCount?: number; tokenCountStatus?: number; chatStatus?: number; requestBodies: Array<Record<string, unknown>>; countBodies: Array<Record<string, unknown>> };
+
+async function readBody(request: AsyncIterable<Uint8Array>): Promise<Record<string, unknown>> {
+  const chunks: Uint8Array[] = [];
+  for await (const chunk of request) chunks.push(chunk);
+  return JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>;
+}
+function reply(response: { writeHead(status: number, headers?: Record<string, string>): void; end(body?: string): void }, status: number, body: unknown): void {
+  response.writeHead(status, { 'content-type': 'application/json' }); response.end(JSON.stringify(body));
+}
+async function startServer(scenario: Scenario): Promise<{ server: Server; url: string }> {
+  const server = createServer(async (request, response) => {
+    const path = new URL(request.url ?? '/', 'http://127.0.0.1').pathname;
+    if (path === '/health') { reply(response, 200, { status: 'ok' }); return; }
+    const body = await readBody(request);
+    if (path === '/v1/chat/completions/input_tokens') {
+      scenario.countBodies.push(body);
+      if (scenario.tokenCountStatus) { reply(response, scenario.tokenCountStatus, { error: { message: 'not supported' } }); return; }
+      const inputTokens = scenario.tokenCounts?.shift() ?? 1_000; scenario.lastTokenCount = inputTokens;
+      reply(response, 200, { object: 'response.input_tokens', input_tokens: inputTokens }); return;
+    }
+    if (path === '/v1/chat/completions') {
+      scenario.requestBodies.push(body);
+      if (scenario.chatStatus) { reply(response, scenario.chatStatus, { error: { message: 'context length exceeded by server' } }); return; }
+      reply(response, 200, { choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }], usage: { prompt_tokens: scenario.lastTokenCount ?? 1_000, completion_tokens: 1 } }); return;
+    }
+    reply(response, 404, { error: { message: 'not found' } });
+  });
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  const address = server.address(); assert(address && typeof address !== 'string');
+  return { server, url: `http://127.0.0.1:${address.port}` };
+}
+async function stop(server: Server): Promise<void> { server.close(); await once(server, 'close'); }
+
+const baseMessages = (content = 'hello'): ToolMessage[] => [{ role: 'system', content: 'system instructions' }, { role: 'user', content }];
+const toolSchema = [{ type: 'function', function: { name: 'read_file', description: 'read a project file', parameters: { type: 'object', properties: { path: { type: 'string' } } } } }];
+const call = (backend: LlamaCppBackend, messages: ToolMessage[], tools: unknown[] | undefined = toolSchema) => backend.chatWithTools(model, messages, tools, new AbortController().signal, 65_536, 'enhanced');
+
+export async function runLlamaCppBackendRegression(): Promise<void> {
+  {
+    const scenario: Scenario = { tokenCounts: [33_458], requestBodies: [], countBodies: [] }; const { server, url } = await startServer(scenario);
+    try {
+      const response = await call(new LlamaCppBackend(url), baseMessages('x'.repeat(134_599)));
+      assert.equal(response.inference?.inputTokens, 33_458, 'exact llama.cpp count was not used');
+      assert.equal(response.inference?.effectiveMaxOutputTokens, 16_384, 'false-positive estimate reduced enhanced output');
+      assert.equal(scenario.requestBodies.length, 1, 'exact ~33K request was rejected before inference');
+      assert.equal(scenario.requestBodies[0].max_tokens, 16_384);
+      assert.equal((scenario.countBodies[0].tools as unknown[])?.length, 1, 'token count request omitted tool schema');
+    } finally { await stop(server); }
+  }
+  {
+    const scenario: Scenario = { tokenCounts: [50_000], requestBodies: [], countBodies: [] }; const { server, url } = await startServer(scenario);
+    try {
+      const response = await call(new LlamaCppBackend(url), baseMessages());
+      assert.equal(response.inference?.effectiveMaxOutputTokens, 15_024, 'output was not clamped to exact remaining context');
+      assert.equal(scenario.requestBodies[0].max_tokens, 15_024);
+    } finally { await stop(server); }
+  }
+  {
+    const scenario: Scenario = { tokenCounts: [65_536], requestBodies: [], countBodies: [] }; const { server, url } = await startServer(scenario);
+    try {
+      await assert.rejects(call(new LlamaCppBackend(url), baseMessages()), LlamaCppContextExhaustedError);
+      assert.equal(scenario.requestBodies.length, 0, 'confirmed exhausted prompt reached inference');
+    } finally { await stop(server); }
+  }
+  {
+    const scenario: Scenario = { tokenCounts: [30_000], chatStatus: 400, requestBodies: [], countBodies: [] }; const { server, url } = await startServer(scenario);
+    try {
+      await assert.rejects(call(new LlamaCppBackend(url), baseMessages()), (error: unknown) => error instanceof LlamaCppRequestError && error.request.contextClassification === 'backend_context_rejected');
+    } finally { await stop(server); }
+  }
+  {
+    const scenario: Scenario = { tokenCounts: [33_000, 34_000], requestBodies: [], countBodies: [] }; const { server, url } = await startServer(scenario);
+    try {
+      const backend = new LlamaCppBackend(url);
+      await call(backend, baseMessages('first Agent request'));
+      const next: ToolMessage[] = [...baseMessages('first Agent request'), { role: 'assistant', content: '', tool_calls: [{ function: { name: 'read_file', arguments: { path: 'src/A.ts' } } }] }, { role: 'tool', tool_name: 'read_file', content: JSON.stringify({ path: 'src/A.ts', content: 'small result' }) }];
+      const response = await call(backend, next);
+      assert.equal(response.inference?.inputTokens, 34_000, 'second request did not retain backend-authoritative token count');
+      assert.equal(scenario.requestBodies.length, 2, 'appended Agent history was not sent');
+    } finally { await stop(server); }
+  }
+  {
+    const scenario: Scenario = { tokenCountStatus: 404, requestBodies: [], countBodies: [] }; const { server, url } = await startServer(scenario);
+    try {
+      const messages = [...baseMessages('x'.repeat(134_599)), { role: 'assistant' as const, content: '', tool_calls: [{ function: { name: 'report_progress', arguments: { message: 'Проверяю тесты' } } }] }, { role: 'tool' as const, tool_name: 'report_progress', content: JSON.stringify({ reported: true }) }];
+      await call(new LlamaCppBackend(url), messages);
+      assert.equal(scenario.requestBodies.length, 1, 'rough estimate hard-rejected when exact endpoint was unavailable');
+      const serialized = JSON.stringify(scenario.countBodies[0] ?? scenario.requestBodies[0]);
+      assert(!serialized.includes('activity-trace-only') && !serialized.includes('raw-cache-only'), 'activity telemetry or raw cache leaked into the inference request');
+    } finally { await stop(server); }
+  }
+}
+
+if (require.main === module) void runLlamaCppBackendRegression().catch((error: unknown) => { console.error(error); process.exitCode = 1; });
