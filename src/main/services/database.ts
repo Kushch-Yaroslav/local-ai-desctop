@@ -231,7 +231,7 @@ export class Database {
   addAnalysisAction(runId: string, activity: ToolActivity): AnalysisRun {
     const existing = this.db.prepare('SELECT id FROM analysis_actions WHERE id=? AND run_id=?').get(activity.id, runId) as { id: string } | undefined;
     const position = (this.db.prepare('SELECT COALESCE(MAX(position), -1) AS position FROM analysis_actions WHERE run_id=?').get(runId) as { position: number }).position + 1;
-    const data = JSON.stringify({ ...activity, approval: undefined, attachment: undefined });
+    const data = JSON.stringify({ ...activity, approval: undefined, attachment: undefined, plan: undefined });
     if (existing) this.db.prepare('UPDATE analysis_actions SET label=?, detail=?, data=? WHERE id=? AND run_id=?').run(activity.label, activity.detail ?? null, data, activity.id, runId);
     else {
       this.db.prepare('INSERT INTO analysis_actions (id, run_id, label, detail, data, position) VALUES (?, ?, ?, ?, ?, ?)').run(activity.id, runId, activity.label, activity.detail ?? null, data, position);

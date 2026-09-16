@@ -18,6 +18,9 @@ import { AttachmentService } from '../services/attachment-service';
 import { AttachmentPipeline } from '../services/attachment-pipeline';
 import { readFile } from 'node:fs/promises';
 import { ollamaErrorDiagnostics } from '../backends/ollama-errors';
+import { saveGenerationDiagnosticsBestEffort } from '../services/generation-diagnostics';
+import { taskNotesToolDefinition } from '../services/task-notes';
+import { agentPlanToolDefinition } from '../services/agent-plan';
 
 const database = new Database();
 const selectedBackend = process.env.LOCAL_AI_BACKEND === 'llama-cpp' ? 'llama-cpp' : 'ollama';
@@ -172,7 +175,7 @@ export function registerIpc(): void {
     if (!current()) return;
     let output = ''; let completed = false; let failed = false; let finishReason: 'stop' | 'length' = 'stop';
     const agentRoot = conversation.mode === 'agent' ? conversation.workingDirectory ?? paths.root : null;
-    const enabledTools = agentRoot ? [...projectToolDefinitions.map((tool) => tool.function.name), ...(conversation.webMode === 'auto' ? webToolDefinitions.map((tool) => tool.function.name) : [])] : conversation.webMode === 'auto' ? webToolDefinitions.map((tool) => tool.function.name) : [];
+    const enabledTools = agentRoot ? [taskNotesToolDefinition.function.name, agentPlanToolDefinition.function.name, ...projectToolDefinitions.map((tool) => tool.function.name), ...(conversation.webMode === 'auto' ? webToolDefinitions.map((tool) => tool.function.name) : [])] : conversation.webMode === 'auto' ? webToolDefinitions.map((tool) => tool.function.name) : [];
     log('generation.snapshot', { generationId: generation.id, chatId: request.conversationId, mode: conversation.mode, workingDirectory: conversation.workingDirectory, resolvedWorkingDirectory: agentRoot, webMode: conversation.webMode, modelId: request.model, contextSize: conversation.contextWindow, reasoningPreset: conversation.analysisDepth, enabledTools });
     run = agentRoot ? database.createAnalysisRun(request.conversationId, conversation.analysisDepth) : null;
     if (run && current()) event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run });
@@ -198,7 +201,7 @@ export function registerIpc(): void {
         }
         if (chunk.type === 'diagnostics') {
           const diagnostics = { ...chunk.diagnostics, generationId: generation.id, conversationId: request.conversationId, createdAt: new Date().toISOString() };
-          database.saveGenerationDiagnostics(diagnostics);
+          saveGenerationDiagnosticsBestEffort((value) => database.saveGenerationDiagnostics(value), diagnostics);
           log('generation.diagnostics', diagnostics);
           event.sender.send('chat:stream', { type: 'diagnostics', conversationId: request.conversationId, generationId: generation.id, diagnostics });
           continue;

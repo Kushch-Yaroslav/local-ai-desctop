@@ -1,5 +1,5 @@
 import type { AnalysisDepth, ChatMessage, FinishReason, ModelInfo, StreamEvent } from '../../shared/types';
-import type { InferenceDiagnostics, LlmBackend, ToolCallingBackend, ToolMessage } from './types';
+import { wholeNanoseconds, type InferenceDiagnostics, type LlmBackend, type ToolCallingBackend, type ToolMessage } from './types';
 import { contextPresetsFor, getModelProfile, modelInfo, requestedMaxOutputTokens } from '../models/model-registry';
 import type { ContextWindow } from './ollama-backend';
 import { log } from '../services/logger';
@@ -148,7 +148,9 @@ export class LlamaCppBackend implements LlmBackend, ToolCallingBackend {
   }
   private diagnostics(depth: AnalysisDepth, contextLimit: number, budget: Budget, data?: ChatResponse): InferenceDiagnostics {
     const t = data?.timings;
-    return { reasoningPreset: depth, requestedMaxOutputTokens: budget.requestedMaxTokens, effectiveMaxOutputTokens: budget.maxTokens, contextLimit, inputTokens: data?.usage?.prompt_tokens ?? budget.inputTokens, ...(data?.usage?.prompt_tokens !== undefined ? { promptEvalCount: data.usage.prompt_tokens } : {}), ...(t?.prompt_ms !== undefined ? { promptEvalDuration: t.prompt_ms * 1_000_000 } : {}), ...(data?.usage?.completion_tokens !== undefined ? { evalCount: data.usage.completion_tokens } : {}), ...(t?.predicted_ms !== undefined ? { evalDuration: t.predicted_ms * 1_000_000 } : {}), ...(t?.predicted_per_second !== undefined ? { tokensPerSecond: t.predicted_per_second } : {}), ...(t?.prompt_per_second !== undefined ? { promptTokensPerSecond: t.prompt_per_second } : {}) };
+    const promptEvalDuration = wholeNanoseconds(t?.prompt_ms === undefined ? undefined : t.prompt_ms * 1_000_000);
+    const evalDuration = wholeNanoseconds(t?.predicted_ms === undefined ? undefined : t.predicted_ms * 1_000_000);
+    return { reasoningPreset: depth, requestedMaxOutputTokens: budget.requestedMaxTokens, effectiveMaxOutputTokens: budget.maxTokens, contextLimit, inputTokens: data?.usage?.prompt_tokens ?? budget.inputTokens, ...(data?.usage?.prompt_tokens !== undefined ? { promptEvalCount: data.usage.prompt_tokens } : {}), ...(promptEvalDuration !== undefined ? { promptEvalDuration } : {}), ...(data?.usage?.completion_tokens !== undefined ? { evalCount: data.usage.completion_tokens } : {}), ...(evalDuration !== undefined ? { evalDuration } : {}), ...(t?.predicted_per_second !== undefined ? { tokensPerSecond: t.predicted_per_second } : {}), ...(t?.prompt_per_second !== undefined ? { promptTokensPerSecond: t.prompt_per_second } : {}) };
   }
   private recordCalibration(budget: Budget, contextLimit: number, data: ChatResponse | null): void {
     const actualPromptEvalCount = data?.usage?.prompt_tokens;

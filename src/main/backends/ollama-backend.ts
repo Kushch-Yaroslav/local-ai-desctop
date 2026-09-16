@@ -1,5 +1,5 @@
 import type { AnalysisDepth, ChatMessage, FinishReason, ModelInfo, StreamEvent } from '../../shared/types';
-import type { InferenceDiagnostics, LlmBackend, ToolCallingBackend, ToolMessage } from './types';
+import { wholeNanoseconds, type InferenceDiagnostics, type LlmBackend, type ToolCallingBackend, type ToolMessage } from './types';
 import { getModelProfile, inferenceSettings, modelInfo, modelRegistry, requestedMaxOutputTokens } from '../models/model-registry';
 import { log } from '../services/logger';
 import { OllamaRequestError, classifyOllamaError, ollamaErrorDiagnostics } from './ollama-errors';
@@ -136,16 +136,18 @@ export class OllamaBackend implements LlmBackend, ToolCallingBackend {
   private finishReason(reason: string | undefined): FinishReason { return reason === 'length' ? 'length' : 'stop'; }
 
   private withPerformance(diagnostics: InferenceDiagnostics, metrics: OllamaMetrics, timeToFirstTokenMs?: number): InferenceDiagnostics {
+    const promptEvalDuration = wholeNanoseconds(metrics.prompt_eval_duration);
+    const evalDuration = wholeNanoseconds(metrics.eval_duration);
     const rate = (count: number | undefined, duration: number | undefined): number | undefined => count !== undefined && duration !== undefined && duration > 0 ? count / (duration / 1_000_000_000) : undefined;
     return {
       ...diagnostics,
       inputTokens: metrics.prompt_eval_count ?? diagnostics.inputTokens,
       ...(metrics.prompt_eval_count !== undefined ? { promptEvalCount: metrics.prompt_eval_count } : {}),
-      ...(metrics.prompt_eval_duration !== undefined ? { promptEvalDuration: metrics.prompt_eval_duration } : {}),
+      ...(promptEvalDuration !== undefined ? { promptEvalDuration } : {}),
       ...(metrics.eval_count !== undefined ? { evalCount: metrics.eval_count } : {}),
-      ...(metrics.eval_duration !== undefined ? { evalDuration: metrics.eval_duration } : {}),
-      ...(rate(metrics.eval_count, metrics.eval_duration) !== undefined ? { tokensPerSecond: rate(metrics.eval_count, metrics.eval_duration) } : {}),
-      ...(rate(metrics.prompt_eval_count, metrics.prompt_eval_duration) !== undefined ? { promptTokensPerSecond: rate(metrics.prompt_eval_count, metrics.prompt_eval_duration) } : {}),
+      ...(evalDuration !== undefined ? { evalDuration } : {}),
+      ...(rate(metrics.eval_count, evalDuration) !== undefined ? { tokensPerSecond: rate(metrics.eval_count, evalDuration) } : {}),
+      ...(rate(metrics.prompt_eval_count, promptEvalDuration) !== undefined ? { promptTokensPerSecond: rate(metrics.prompt_eval_count, promptEvalDuration) } : {}),
       ...(timeToFirstTokenMs !== undefined ? { timeToFirstTokenMs } : {}),
     };
   }

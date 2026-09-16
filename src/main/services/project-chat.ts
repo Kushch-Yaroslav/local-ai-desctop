@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { AnalysisDepth, ChatMessage, FinishReason, StreamEvent, ToolActivity, WebMode } from '../../shared/types';
+import type { AgentPlan, AnalysisDepth, ChatMessage, FinishReason, StreamEvent, ToolActivity, WebMode } from '../../shared/types';
 import type { InferenceDiagnostics, ToolCall, ToolCallingBackend, ToolMessage } from '../backends/types';
 import { AnalysisEngine } from './analysis-engine';
 import { log } from './logger';
@@ -8,6 +8,8 @@ import { capabilitySystemContext } from './capabilities';
 import { WebBrowserService, type WebBrowserSession, activityForWebTool, webToolDefinitions } from '../web/web-tools';
 import { AgentToolContext, type ReadDiagnostic, type ToolContextStats } from './agent-tool-context';
 import { OllamaRequestError, ollamaErrorDiagnostics } from '../backends/ollama-errors';
+import { isTaskNotesCall, TaskNotes, taskNotesToolDefinition } from './task-notes';
+import { agentPlanToolDefinition, AgentPlanState, isAgentPlanCall } from './agent-plan';
 
 const finalizationThreshold = 5;
 const finalSynthesisTimeoutMs = 120_000;
@@ -33,6 +35,10 @@ const chunkText = (content: string): string[] => content.match(/[\s\S]{1,96}/g) 
 const signature = (call: ProjectToolCall): string => `${call.name}:${JSON.stringify(Object.entries(call.arguments).sort(([a], [b]) => a.localeCompare(b)))}`;
 function lowInformation(raw: string): boolean { try { const value = JSON.parse(raw) as Record<string, unknown>; return typeof value.error === 'string' || (Array.isArray(value.entries) && value.entries.length === 0) || (Array.isArray(value.matches) && value.matches.length === 0); } catch { return false; } }
 function resultObject(raw: string): Record<string, unknown> { try { const value = JSON.parse(raw); return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}; } catch { return {}; } }
+function planSnapshot(value: Record<string, unknown>): AgentPlan | undefined {
+  const plan = value.plan;
+  return plan && typeof plan === 'object' && !Array.isArray(plan) && Array.isArray((plan as { steps?: unknown }).steps) ? plan as AgentPlan : undefined;
+}
 function lineRange(value: Record<string, unknown>): string | undefined {
   if (typeof value.start_line === 'number') return typeof value.end_line === 'number' && value.end_line !== value.start_line ? `строки ${value.start_line}–${value.end_line}` : `строка ${value.start_line}`;
   if (typeof value.byte_start === 'number') return typeof value.byte_end === 'number' ? `байты ${value.byte_start}–${value.byte_end}` : `с байта ${value.byte_start}`;
@@ -66,6 +72,7 @@ const resultPaths = (raw: string): string[] => {
 };
 const firstStagnationGuidance = 'Релевантные области проекта уже изучены, а последние действия повторяют известный контекст. Перед новым исследованием назови один конкретный неразрешённый вопрос и используй только узкий поиск или диапазон чтения для него. Если такого вопроса нет, перейди к запрошенному изменению, затем выполни сфокусированную проверку. Не перечитывай неизменённые доступные диапазоны только ради уверенности.';
 const secondStagnationGuidance = 'Исследование всё ещё не продвигается после предыдущей подсказки, а реализации нет. Не выполняй широкий обзор проекта и не перечитывай целиком неизменённые файлы. Изучай только узкую конкретную зависимость; иначе внеси запрошенное изменение, проверь его и заверши работу.';
+const plannedStagnationGuidance = 'У тебя уже есть Plan. Сначала сверяйся с task_plan и Task Notes: отметь завершённое исследование, зафиксируй существенные факты в notes и определи один минимально необходимый следующий шаг. Если исследование закрыто, переведи следующий шаг плана в in_progress и переходи к реализации или проверке, а не продолжай широкий поиск.';
 
 class AgentStagnation {
   private readonly codingChangeTask: boolean;
@@ -162,6 +169,13 @@ function completedActivity(activity: ToolActivity, call: ProjectToolCall, raw: s
   } else if (call.name === 'apply_patch' || call.name === 'write_file' || call.name === 'create_file' || call.name === 'delete_file') {
     const paths = Array.isArray(value.files) ? value.files.filter((item): item is string => typeof item === 'string') : typeof value.path === 'string' ? [value.path] : [];
     if (paths.length) detail = paths.join(' · ');
+  } else if (call.name === 'task_plan') {
+    detail = call.arguments.action === 'create' ? 'План создан' : call.arguments.action === 'update' ? 'План обновлён' : 'План прочитан';
+    const plan = planSnapshot(value);
+    if (plan) {
+      metadata.steps = plan.steps.length;
+      metadata.completed_steps = plan.steps.filter((step) => step.status === 'completed').length;
+    }
   }
   const output = call.name === 'run_terminal' ? [typeof value.stdout === 'string' ? value.stdout : '', typeof value.stderr === 'string' ? value.stderr : ''].filter(Boolean).join('\n').slice(0, 12_000)
     : call.name === 'search_text' || call.name === 'find_files' || call.name === 'search_files' || call.name === 'list_directory' ? JSON.stringify(value.matches ?? value.entries ?? [], null, 2).slice(0, 12_000)
@@ -190,9 +204,11 @@ export class ProjectChatService {
     }
     const closeWebOnAbort = () => { void webSession?.close(); };
     signal.addEventListener('abort', closeWebOnAbort, { once: true });
-    const toolDefinitions = [...projectToolDefinitions, ...(webSession ? webToolDefinitions : [])];
-    const messages: ToolMessage[] = [{ role: 'system', content: `${capabilitySystemContext({ webAvailable: Boolean(webSession), projectRoot: root, projectWriteAvailable: true, terminalAvailable: true })} Не предполагай тип, технологию или предметную область проекта. ${engine.strategy()} Рабочий цикл для задач изменения кода: Explore → Implement → Verify → Finalize. Сначала найди только нужные места и зависимости; когда поведение и точки изменения понятны, переходи к минимальной реализации, а не продолжай широкое исследование ради дополнительной уверенности. Перед повторным чтением неизменённого файла назови конкретный неразрешённый вопрос и предпочти узкий диапазон. После изменения выполни сфокусированную проверку и заверши ответ. Для явно исследовательской задачи изменение файла не требуется. Используй report_progress редко и только при переходе между изучением, реализацией и проверкой; это короткий пользовательский статус, не рассуждение. Результаты инструментов могут быть детерминированно сокращены ради контекстного бюджета; для полного содержания файла снова вызови read_file с конкретным диапазоном.` }, ...agentHistory(history)];
+    const toolDefinitions = [taskNotesToolDefinition, agentPlanToolDefinition, ...projectToolDefinitions, ...(webSession ? webToolDefinitions : [])];
+    const messages: ToolMessage[] = [{ role: 'system', content: `${capabilitySystemContext({ webAvailable: Boolean(webSession), projectRoot: root, projectWriteAvailable: true, terminalAvailable: true })} Не предполагай тип, технологию или предметную область проекта. ${engine.strategy()} Рабочий цикл для задач изменения кода: Explore → Implement → Verify → Finalize. Сначала найди только нужные места и зависимости; когда поведение и точки изменения понятны, переходи к минимальной реализации, а не продолжай широкое исследование ради дополнительной уверенности. Перед повторным чтением неизменённого файла назови конкретный неразрешённый вопрос и предпочти узкий диапазон. В сложных или длинных задачах используй Task Notes: фиксируй существенные находки и перед повторным чтением уже исследованных файлов сначала сверяйся с notes. Planning через task_plan доступен для задач с несколькими этапами, исследованием нескольких частей проекта или существенной проверкой; простые задачи не требуют плана. Plan хранит этапы, а Task Notes — факты и решения. После исследования обновляй статусы Plan и переходи к реализации, не продолжай бесконечное чтение. Не обновляй notes или Plan после каждого вызова инструмента. После изменения выполни сфокусированную проверку и заверши ответ. Для явно исследовательской задачи изменение файла не требуется. Используй report_progress редко и только при переходе между изучением, реализацией и проверкой; это короткий пользовательский статус, не рассуждение. Результаты инструментов могут быть детерминированно сокращены ради контекстного бюджета; для полного содержания файла снова вызови read_file с конкретным диапазоном.` }, ...agentHistory(history)];
     const toolContext = new AgentToolContext(contextWindow);
+    const taskNotes = new TaskNotes();
+    const plan = new AgentPlanState();
     let actions = 0; let progressReports = 0; let repeats = 0; let lowInfo = 0; let warningSent = false; let researchFinished = false;
     const progressMessages = new Set<string>();
     const completed = new Set<string>();
@@ -230,7 +246,7 @@ export class ProjectChatService {
         const key = signature(call);
         // Re-reading is valid after mutations, for another range, and for verification.
         // The context manager deduplicates unchanged same-range reads without hiding content.
-        if (completed.has(key) && call.name !== 'read_file') {
+        if (completed.has(key) && call.name !== 'read_file' && !isTaskNotesCall(call) && !isAgentPlanCall(call)) {
           repeats += 1; messages.push({ role: 'tool', tool_name: call.name, content: JSON.stringify({ warning: 'Идентичный вызов уже выполнен. Смени стратегию или заверши исследование.' }) });
           if (repeats >= 3) { researchFinished = true; yield* this.synthesize(model, messages, engine, signal, contextWindow, '', actions, toolContext.stats(), runtime); return; }
           continue;
@@ -241,7 +257,7 @@ export class ProjectChatService {
         const activity: ToolActivity = { id: actionId, ...(isWebTool ? { ...activityForWebTool(call), kind: 'web' as const, state: 'running' as const } : activityForTool(call)) };
         yield { type: 'tool', activity };
         const startedAt = Date.now();
-        const result = isWebTool && webSession ? await webSession.execute(call) : await tools.execute(call, signal, actionId); engine.record(call.name, result);
+        const result = isTaskNotesCall(call) ? taskNotes.execute(call) : isAgentPlanCall(call) ? plan.execute(call) : isWebTool && webSession ? await webSession.execute(call) : await tools.execute(call, signal, actionId); engine.record(call.name, result);
         const toolMessage: ToolMessage = { role: 'tool', tool_name: call.name, content: result };
         messages.push(toolMessage);
         if (lowInformation(result)) { lowInfo += 1; if (lowInfo === 3) lowInformationNotice = true; } else lowInfo = 0;
@@ -260,6 +276,10 @@ export class ProjectChatService {
         if (stats.compacted) log('agent.context.compacted', { ...runtime, agentStep: actions, tool: call.name, toolResultContextSize: stats.size, toolResultContextBudget: stats.budget, compactedResults: stats.compacted });
         const finishedActivity = completedActivity(activity, call, result, Date.now() - startedAt, contextUpdate);
         const contextResult = resultObject(toolMessage.content);
+        if (isAgentPlanCall(call)) {
+          const snapshot = planSnapshot(contextResult);
+          if (snapshot && typeof contextResult.error !== 'string') finishedActivity.plan = snapshot;
+        }
         if (typeof contextResult.status === 'string') finishedActivity.metadata = { ...finishedActivity.metadata, status: contextResult.status };
         yield { type: 'tool', activity: finishedActivity };
       }
@@ -268,7 +288,7 @@ export class ProjectChatService {
         yield { type: 'error', message: 'Агент остановился: исследование не продвигается', details: 'agent_stalled_exploration: после двух подсказок не появились реализация или новая существенная информация.' };
         return;
       }
-      if (stagnationIntervention === 'first') messages.push(runtimeNotice('stagnation_guidance', firstStagnationGuidance));
+      if (stagnationIntervention === 'first') messages.push(runtimeNotice(plan.hasPlan ? 'stagnation_plan_guidance' : 'stagnation_guidance', plan.hasPlan ? plannedStagnationGuidance : firstStagnationGuidance));
       if (stagnationIntervention === 'second') messages.push(runtimeNotice('stagnation_guard', secondStagnationGuidance));
       if (lowInformationNotice) messages.push(runtimeNotice('low_information', 'Последние действия дали мало новой информации. Сузь исследование или заверши ответ.'));
     } } catch (error) {

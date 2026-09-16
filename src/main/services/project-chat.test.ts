@@ -41,6 +41,7 @@ export async function runProjectChatRegression(): Promise<void> {
     assert(await readFile(join(root, 'once.txt'), 'utf8') === 'written once', 'mutating tool was re-executed after inference retry');
     assert(snapshots[2].filter((message) => message.role === 'tool' && message.tool_name === 'write_file').length === 1, 'retry lost the completed tool result');
     assert(events.some((event) => event.type === 'token' && event.content.includes('Final response.')), 'tool-call turn without text was treated as an empty final response');
+    assert(!events.some((event) => event.type === 'tool' && event.activity.kind === 'planning'), 'simple Agent run created a plan without requesting one');
 
     let repeatedCalls = 0;
     const repeatedlyFailing = new ProjectChatService({ chatWithTools: async () => {
@@ -194,6 +195,57 @@ export async function runProjectChatRegression(): Promise<void> {
     assert(spamEvents.filter((event) => event.type === 'tool' && event.activity.kind === 'progress').length === 12, 'progress report rate limit was not bounded');
 
     const toolReply = (name: string, argumentsObject: Record<string, unknown>) => ({ role: 'assistant' as const, content: '', tool_calls: [{ function: { name, arguments: argumentsObject } }] });
+    let noteCalls = 0;
+    const noteSnapshots: ToolMessage[][] = [];
+    const notesAgent = new ProjectChatService({ chatWithTools: async (_model: string, messages: ToolMessage[]) => {
+      noteCalls += 1; noteSnapshots.push(messages.map((message) => ({ ...message })));
+      if (noteCalls === 1) return toolReply('task_notes', { action: 'update', notes: 'Цель: исправить diagnostics.\nНаходка: src/main/backends/llama-cpp-backend.ts переводит ms в ns.\nСледующий шаг: добавить округление.' });
+      if (noteCalls === 2) return toolReply('task_notes', { action: 'read' });
+      return { role: 'assistant' as const, content: 'Notes used.', finish_reason: 'stop' as const };
+    } }, new WebBrowserService());
+    const noteEvents = await eventsFor(notesAgent, root);
+    assert(noteEvents.some((event) => event.type === 'token' && event.content.includes('Notes used.')), 'Task Notes interrupted normal Agent completion');
+    const noteResults = noteSnapshots[2].filter((message) => message.role === 'tool' && message.tool_name === 'task_notes');
+    assert(noteResults.at(-1)?.content.includes('src/main/backends/llama-cpp-backend.ts'), 'Task Notes were not available later in the same Agent run');
+    let freshCalls = 0;
+    const freshSnapshots: ToolMessage[][] = [];
+    const freshAgent = new ProjectChatService({ chatWithTools: async (_model: string, messages: ToolMessage[]) => {
+      freshSnapshots.push(messages.map((message) => ({ ...message })));
+      return freshCalls++ === 0 ? toolReply('task_notes', { action: 'read' }) : { role: 'assistant' as const, content: 'Fresh notes.', finish_reason: 'stop' as const };
+    } }, new WebBrowserService());
+    await eventsFor(freshAgent, root);
+    const freshReadResult = freshSnapshots[1].find((message) => message.role === 'tool' && message.tool_name === 'task_notes')?.content ?? '';
+    assert(freshReadResult.includes('"empty":true'), 'Task Notes leaked into a new independent Agent run');
+    let planCalls = 0;
+    const planSnapshots: ToolMessage[][] = [];
+    const plannedAgent = new ProjectChatService({ chatWithTools: async (_model: string, messages: ToolMessage[]) => {
+      planCalls += 1; planSnapshots.push(messages.map((message) => ({ ...message })));
+      if (planCalls === 1) return toolReply('task_plan', { action: 'create', steps: [
+        { id: 'flow', label: 'Найти существующий flow', status: 'in_progress' },
+        { id: 'cancel', label: 'Проверить cancellation', status: 'pending' },
+        { id: 'verify', label: 'Запустить проверки', status: 'pending' },
+      ] });
+      if (planCalls === 2) return toolReply('task_plan', { action: 'update', step_id: 'cancel', status: 'completed' });
+      if (planCalls === 3) return toolReply('task_plan', { action: 'update', step_id: 'flow', status: 'completed' });
+      if (planCalls === 4) return toolReply('task_plan', { action: 'update', step_id: 'cancel', status: 'in_progress' });
+      if (planCalls === 5) return toolReply('task_plan', { action: 'update', step_id: 'cancel', status: 'completed' });
+      return { role: 'assistant' as const, content: 'Plan complete.', finish_reason: 'stop' as const };
+    } }, new WebBrowserService());
+    const planEvents = await eventsFor(plannedAgent, root);
+    const planActivities = planEvents.filter((event): event is Extract<StreamEvent, { type: 'tool' }> => event.type === 'tool' && event.activity.kind === 'planning');
+    assert(planActivities.some((event) => event.activity.state === 'error' && event.activity.detail?.includes('План обновлён')), 'invalid Plan status transition was not rejected as a tool error');
+    const finalPlan = planActivities.filter((event) => event.activity.state === 'completed').at(-1)?.activity.plan;
+    assert(finalPlan?.steps.map((step) => `${step.id}:${step.status}`).join(',') === 'flow:completed,cancel:completed,verify:pending', 'Plan creation or status transitions lost their structured state');
+    assert(planSnapshots[5].filter((message) => message.role === 'tool' && message.tool_name === 'task_plan').at(-1)?.content.includes('cancel'), 'Plan state was not available later in the same Agent run');
+    let freshPlanCalls = 0;
+    const freshPlanSnapshots: ToolMessage[][] = [];
+    const freshPlanAgent = new ProjectChatService({ chatWithTools: async (_model: string, messages: ToolMessage[]) => {
+      freshPlanSnapshots.push(messages.map((message) => ({ ...message })));
+      return freshPlanCalls++ === 0 ? toolReply('task_plan', { action: 'read' }) : { role: 'assistant' as const, content: 'No prior plan.', finish_reason: 'stop' as const };
+    } }, new WebBrowserService());
+    await eventsFor(freshPlanAgent, root);
+    const freshPlanRead = freshPlanSnapshots[1].find((message) => message.role === 'tool' && message.tool_name === 'task_plan')?.content ?? '';
+    assert(freshPlanRead.includes('"plan":null') && freshPlanRead.includes('"empty":true'), 'Plan leaked into a new independent Agent run');
     const stagnationContexts = (snapshots: ToolMessage[][], kind: string): ToolMessage[] => [...new Map(snapshots.flat().filter((message) => message.role === 'user' && message.content.startsWith(`<runtime_context kind="${kind}"`)).map((message) => [message.content, message])).values()];
     const writeFixture = async (paths: string[], source: (path: string, index: number) => string): Promise<void> => {
       await Promise.all(paths.map(async (path, index) => {
@@ -264,6 +316,21 @@ export async function runProjectChatRegression(): Promise<void> {
     assert(stalledEvents.some((event) => event.type === 'error' && event.details?.includes('agent_stalled_exploration')), 'persistent exploration did not end with a controlled stalled-agent outcome');
     assert(stalledCalls < MAX_AGENT_STEPS_PER_GENERATION, 'stalled exploration reached the global 100-action ceiling');
     assert(stagnationContexts(stalledSnapshots, 'stagnation_guidance').length === 1 && stagnationContexts(stalledSnapshots, 'stagnation_guard').length === 1, 'stalled-agent outcome skipped its bounded interventions');
+
+    let plannedStalledCalls = 0;
+    const plannedStalledSnapshots: ToolMessage[][] = [];
+    const plannedStalledAgent = new ProjectChatService({ chatWithTools: async (_model: string, messages: ToolMessage[]) => {
+      plannedStalledCalls += 1; plannedStalledSnapshots.push(messages.map((message) => ({ ...message })));
+      if (plannedStalledCalls === 1) return toolReply('task_notes', { action: 'update', notes: 'Цель: проверить flow. Следующий шаг: завершить исследование и начать реализацию.' });
+      if (plannedStalledCalls === 2) return toolReply('task_plan', { action: 'create', steps: [{ id: 'research', label: 'Исследовать текущий flow', status: 'in_progress' }, { id: 'implement', label: 'Реализовать изменение', status: 'pending' }] });
+      if (plannedStalledCalls <= 17) return toolReply('read_file', { path: reactPaths[plannedStalledCalls - 3] });
+      if (plannedStalledCalls <= 20) return toolReply('read_file', { path: reactPaths[0] });
+      return { role: 'assistant' as const, content: 'Stopped broad exploration.', finish_reason: 'stop' as const };
+    } }, new WebBrowserService());
+    const plannedStalledEvents = await eventsFor(plannedStalledAgent, root);
+    const planReminder = stagnationContexts(plannedStalledSnapshots, 'stagnation_plan_guidance');
+    assert(planReminder.length === 1 && planReminder[0].content.includes('Task Notes') && planReminder[0].content.includes('минимально необходимый следующий шаг'), 'stalled exploration with a Plan did not receive the Plan + Task Notes reminder');
+    assert(!plannedStalledEvents.some((event) => event.type === 'error'), 'Plan-aware stagnation reminder changed the existing hard-limit behavior');
 
     let researchCalls = 0;
     const researchSnapshots: ToolMessage[][] = [];

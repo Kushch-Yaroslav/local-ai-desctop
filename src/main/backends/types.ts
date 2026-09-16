@@ -2,6 +2,13 @@ import type { AnalysisDepth, ChatMessage, FinishReason, GenerationDiagnostics, M
 
 export type ToolCall = { function: { name: string; arguments: Record<string, unknown> | string } };
 export type InferenceDiagnostics = Omit<GenerationDiagnostics, 'generationId' | 'conversationId' | 'createdAt' | 'agentStepCount' | 'finishReason'>;
+
+/** SQLite diagnostics columns use INTEGER nanoseconds, so backend timing values are canonicalized here. */
+export function wholeNanoseconds(value: number | undefined): number | undefined {
+  if (value === undefined || !Number.isFinite(value) || value < 0) return undefined;
+  const rounded = Math.round(value);
+  return Number.isSafeInteger(rounded) ? rounded : undefined;
+}
 export type ToolMessage = {
   role: 'system' | 'user' | 'assistant' | 'tool'; content: string; tool_calls?: ToolCall[]; tool_name?: string;
   /** Ephemeral base64 image inputs for Ollama; never a persisted chat field. */

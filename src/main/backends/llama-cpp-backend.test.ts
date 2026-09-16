@@ -5,7 +5,7 @@ import { LlamaCppBackend, LlamaCppContextExhaustedError, LlamaCppRequestError } 
 import type { ToolMessage } from './types';
 
 const model = 'qwen3.8:27b-q4_K_M';
-type Scenario = { tokenCounts?: number[]; lastTokenCount?: number; tokenCountStatus?: number; chatStatus?: number; requestBodies: Array<Record<string, unknown>>; countBodies: Array<Record<string, unknown>> };
+type Scenario = { tokenCounts?: number[]; lastTokenCount?: number; tokenCountStatus?: number; chatStatus?: number; timings?: { prompt_ms?: number; predicted_ms?: number }; requestBodies: Array<Record<string, unknown>>; countBodies: Array<Record<string, unknown>> };
 
 async function readBody(request: AsyncIterable<Uint8Array>): Promise<Record<string, unknown>> {
   const chunks: Uint8Array[] = [];
@@ -29,7 +29,7 @@ async function startServer(scenario: Scenario): Promise<{ server: Server; url: s
     if (path === '/v1/chat/completions') {
       scenario.requestBodies.push(body);
       if (scenario.chatStatus) { reply(response, scenario.chatStatus, { error: { message: 'context length exceeded by server' } }); return; }
-      reply(response, 200, { choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }], usage: { prompt_tokens: scenario.lastTokenCount ?? 1_000, completion_tokens: 1 } }); return;
+      reply(response, 200, { choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }], usage: { prompt_tokens: scenario.lastTokenCount ?? 1_000, completion_tokens: 1 }, ...(scenario.timings ? { timings: scenario.timings } : {}) }); return;
     }
     reply(response, 404, { error: { message: 'not found' } });
   });
@@ -44,6 +44,14 @@ const toolSchema = [{ type: 'function', function: { name: 'read_file', descripti
 const call = (backend: LlamaCppBackend, messages: ToolMessage[], tools: unknown[] | undefined = toolSchema) => backend.chatWithTools(model, messages, tools, new AbortController().signal, 65_536, 'enhanced');
 
 export async function runLlamaCppBackendRegression(): Promise<void> {
+  {
+    const scenario: Scenario = { tokenCounts: [1_000], timings: { prompt_ms: 12.3456789, predicted_ms: 0.0012345 }, requestBodies: [], countBodies: [] }; const { server, url } = await startServer(scenario);
+    try {
+      const response = await call(new LlamaCppBackend(url), baseMessages());
+      assert.equal(response.inference?.promptEvalDuration, 12_345_679, 'fractional llama.cpp milliseconds were not rounded to integral nanoseconds');
+      assert.equal(response.inference?.evalDuration, 1_235, 'completion duration was not normalized to an SQLite INTEGER nanosecond value');
+    } finally { await stop(server); }
+  }
   {
     const scenario: Scenario = { tokenCounts: [33_458], requestBodies: [], countBodies: [] }; const { server, url } = await startServer(scenario);
     try {

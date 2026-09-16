@@ -47,6 +47,8 @@ function requestedRange(argumentsObject: Record<string, unknown>): string | unde
 export function activityForTool(call: ProjectToolCall): Pick<ToolActivity, 'label' | 'detail' | 'kind' | 'state'> {
   const path = typeof call.arguments.path === 'string' ? call.arguments.path : undefined;
   if (call.name === 'report_progress') return { label: String(call.arguments.message ?? '').trim(), kind: 'progress', state: 'completed' };
+  if (call.name === 'task_notes') return { label: call.arguments.action === 'read' ? 'Чтение Task Notes' : 'Обновление Task Notes', kind: 'other', state: 'running' };
+  if (call.name === 'task_plan') return { label: 'Планирование', kind: 'planning', state: 'running' };
   if (call.name === 'list_directory') return { label: 'Просмотр структуры проекта', detail: path || undefined, kind: 'directory', state: 'running' };
   if (call.name === 'find_files' || call.name === 'search_files') return { label: 'Поиск файлов', detail: String(call.arguments.query ?? ''), kind: 'search', state: 'running' };
   if (call.name === 'search_text') return { label: 'Поиск текста в проекте', detail: `«${String(call.arguments.query ?? '')}»`, kind: 'search', state: 'running' };

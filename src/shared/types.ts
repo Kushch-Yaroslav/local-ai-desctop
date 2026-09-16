@@ -54,7 +54,7 @@ export interface GenerationDiagnostics {
   inputTokens: number;
   agentStepCount: number;
   finishReason: FinishReason;
-  /** Ollama reports durations in nanoseconds and counts only generated completion tokens in evalCount. */
+  /** All duration values are whole nanoseconds. Ollama reports them natively; llama.cpp milliseconds are converted and rounded. evalCount contains generated completion tokens only. */
   promptEvalCount?: number;
   promptEvalDuration?: number;
   evalCount?: number;
@@ -142,7 +142,7 @@ export interface ToolActivity {
   label: string;
   detail?: string;
   /** User-visible execution category. Missing means a record saved by an older app version. */
-  kind?: 'progress' | 'file_read' | 'search' | 'directory' | 'terminal' | 'mutation' | 'git' | 'web' | 'other';
+  kind?: 'progress' | 'planning' | 'file_read' | 'search' | 'directory' | 'terminal' | 'mutation' | 'git' | 'web' | 'other';
   /** Lifecycle of an action. Progress events are informational and never consume the Agent action budget. */
   state?: 'running' | 'completed' | 'error';
   /** Compact, user-facing fields shown only when this activity is expanded. */
@@ -152,7 +152,13 @@ export interface ToolActivity {
   approval?: ActionApproval;
   status?: AttachmentStatus;
   attachment?: Attachment;
+  /** Ephemeral current-run plan snapshot. Database persistence deliberately strips this field. */
+  plan?: AgentPlan;
 }
+
+export type AgentPlanStepStatus = 'pending' | 'in_progress' | 'completed';
+export interface AgentPlanStep { id: string; label: string; status: AgentPlanStepStatus; }
+export interface AgentPlan { steps: AgentPlanStep[]; }
 
 export interface AnalysisRun {
   id: string;
