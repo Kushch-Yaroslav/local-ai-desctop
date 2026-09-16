@@ -31,6 +31,10 @@ function parseInlineToolCalls(content: string): ProjectToolCall[] {
   }
   return calls;
 }
+/** Removes inline tool-call markup so it never leaks into the assistant message text. */
+function stripInlineToolCalls(content: string): string {
+  return content.replace(/<function=[a-z_]+>[\s\S]*?<\/function>/g, '').replace(/\s{2,}/g, ' ').trim();
+}
 const chunkText = (content: string): string[] => content.match(/[\s\S]{1,96}/g) ?? [];
 const signature = (call: ProjectToolCall): string => `${call.name}:${JSON.stringify(Object.entries(call.arguments).sort(([a], [b]) => a.localeCompare(b)))}`;
 function lowInformation(raw: string): boolean { try { const value = JSON.parse(raw) as Record<string, unknown>; return typeof value.error === 'string' || (Array.isArray(value.entries) && value.entries.length === 0) || (Array.isArray(value.matches) && value.matches.length === 0); } catch { return false; } }
@@ -219,12 +223,14 @@ export class ProjectChatService {
       if (remaining <= 0) { yield* this.synthesize(model, messages, engine, signal, contextWindow, '', actions, toolContext.stats(), runtime); return; }
       if (remaining <= finalizationThreshold && !warningSent) { messages.push(runtimeNotice('action_budget', 'Осталось мало вызовов. Закрой только наиболее важные пробелы и заверши исследование.')); warningSent = true; }
       const response = await this.inference(model, messages, toolDefinitions, signal, contextWindow, depth, actions, toolContext.stats(), runtime);
-      const calls = response.tool_calls?.length ? response.tool_calls.map(parseCall) : parseInlineToolCalls(response.content ?? '');
-      messages.push({ role: 'assistant', content: response.content ?? '', tool_calls: response.tool_calls });
+      const rawContent = response.content ?? '';
+      const calls = response.tool_calls?.length ? response.tool_calls.map(parseCall) : parseInlineToolCalls(rawContent);
+      const assistantContent = calls.length ? stripInlineToolCalls(rawContent) : rawContent;
+      messages.push({ role: 'assistant', content: assistantContent, tool_calls: response.tool_calls });
       if (calls.length === 0) {
         researchFinished = true;
         if (engine.isDeep) log('deep.lifecycle', { phase: 'research.finished', actions });
-        yield* this.synthesize(model, messages, engine, signal, contextWindow, response.content ?? '', actions, toolContext.stats(), runtime);
+        yield* this.synthesize(model, messages, engine, signal, contextWindow, assistantContent, actions, toolContext.stats(), runtime);
         return;
       }
       let lowInformationNotice = false;

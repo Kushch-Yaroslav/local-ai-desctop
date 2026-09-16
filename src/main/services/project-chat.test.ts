@@ -43,6 +43,16 @@ export async function runProjectChatRegression(): Promise<void> {
     assert(events.some((event) => event.type === 'token' && event.content.includes('Final response.')), 'tool-call turn without text was treated as an empty final response');
     assert(!events.some((event) => event.type === 'tool' && event.activity.kind === 'planning'), 'simple Agent run created a plan without requesting one');
 
+    let inlineCalls = 0;
+    const inlineAgent = new ProjectChatService({ chatWithTools: async () => {
+      inlineCalls += 1;
+      if (inlineCalls === 1) return { role: 'assistant' as const, content: 'Сначала закоммичу изменения.\n<tool_call>\n<function=run_terminal>\n<parameter=command>\ngit commit -m "fix"\n</parameter>\n</function>\n</tool_call>\nГотово.', tool_calls: undefined };
+      return { role: 'assistant' as const, content: 'Готово.', finish_reason: 'stop' as const };
+    } }, new WebBrowserService());
+    const inlineEvents = await eventsFor(inlineAgent, root);
+    const inlineTokens = inlineEvents.filter((event) => event.type === 'token').map((event) => (event as { content: string }).content).join('');
+    assert(!inlineTokens.includes('<function=') && !inlineTokens.includes('<parameter='), 'raw inline tool-call markup leaked into the assistant message');
+
     let repeatedCalls = 0;
     const repeatedlyFailing = new ProjectChatService({ chatWithTools: async () => {
       repeatedCalls += 1;
