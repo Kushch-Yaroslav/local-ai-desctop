@@ -236,16 +236,16 @@ export async function runProjectChatRegression(): Promise<void> {
         { id: 'verify', label: 'Запустить проверки', status: 'pending' },
       ] });
       if (planCalls === 2) return toolReply('task_plan', { action: 'update', step_id: 'cancel', status: 'completed' });
-      if (planCalls === 3) return toolReply('task_plan', { action: 'update', step_id: 'flow', status: 'completed' });
-      if (planCalls === 4) return toolReply('task_plan', { action: 'update', step_id: 'cancel', status: 'in_progress' });
-      if (planCalls === 5) return toolReply('task_plan', { action: 'update', step_id: 'cancel', status: 'completed' });
+      if (planCalls === 3) return toolReply('task_plan', { action: 'update', step_id: 'cancel', status: 'in_progress' });
+      if (planCalls === 4) return toolReply('task_plan', { action: 'update', step_id: 'flow', status: 'completed' });
+      if (planCalls === 5) return toolReply('task_plan', { action: 'update', step_id: 'verify', status: 'completed' });
       return { role: 'assistant' as const, content: 'Plan complete.', finish_reason: 'stop' as const };
     } }, new WebBrowserService());
     const planEvents = await eventsFor(plannedAgent, root);
     const planActivities = planEvents.filter((event): event is Extract<StreamEvent, { type: 'tool' }> => event.type === 'tool' && event.activity.kind === 'planning');
     assert(planActivities.some((event) => event.activity.state === 'error' && event.activity.detail?.includes('План обновлён')), 'invalid Plan status transition was not rejected as a tool error');
     const finalPlan = planActivities.filter((event) => event.activity.state === 'completed').at(-1)?.activity.plan;
-    assert(finalPlan?.steps.map((step) => `${step.id}:${step.status}`).join(',') === 'flow:completed,cancel:completed,verify:pending', 'Plan creation or status transitions lost their structured state');
+    assert(finalPlan?.steps.map((step) => `${step.id}:${step.status}`).join(',') === 'flow:completed,cancel:completed,verify:completed', 'Plan creation or status transitions lost their structured state');
     assert(planSnapshots[5].filter((message) => message.role === 'tool' && message.tool_name === 'task_plan').at(-1)?.content.includes('cancel'), 'Plan state was not available later in the same Agent run');
     let freshPlanCalls = 0;
     const freshPlanSnapshots: ToolMessage[][] = [];

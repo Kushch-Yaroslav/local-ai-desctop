@@ -195,19 +195,32 @@ export class Database {
     this.db.exec('BEGIN IMMEDIATE');
     try {
       this.db.prepare('UPDATE messages SET content=? WHERE id=?').run(text, messageId);
-      const downstream = this.db.prepare('SELECT id FROM messages WHERE conversation_id=? AND rowid>?').all(target.conversation_id, target.rowid) as Array<{ id: string }>;
-      const assistantIds = downstream.map((row) => row.id);
-      if (assistantIds.length) {
-        const placeholders = assistantIds.map(() => '?').join(',');
-        const runIds = this.db.prepare(`SELECT id FROM analysis_runs WHERE conversation_id=? AND assistant_message_id IN (${placeholders})`).all(target.conversation_id, ...assistantIds) as Array<{ id: string }>;
-        for (const run of runIds) this.db.prepare('DELETE FROM analysis_actions WHERE run_id=?').run(run.id);
-        if (runIds.length) this.db.prepare(`DELETE FROM analysis_runs WHERE id IN (${runIds.map(() => '?').join(',')})`).run(...runIds.map((run) => run.id));
-      }
-      this.db.prepare('DELETE FROM attachments WHERE message_id IN (SELECT id FROM messages WHERE conversation_id=? AND rowid>?)').run(target.conversation_id, target.rowid);
-      this.db.prepare('DELETE FROM messages WHERE conversation_id=? AND rowid>?').run(target.conversation_id, target.rowid);
-      this.db.prepare('UPDATE conversations SET updated_at=? WHERE id=?').run(new Date().toISOString(), target.conversation_id);
-      this.db.exec('COMMIT'); return this.listMessages(target.conversation_id);
+      return this.truncateAfterUserMessage(target, true);
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
+
+  regenerateUserMessageAndTruncate(messageId: string): ChatMessage[] {
+    const target = this.db.prepare("SELECT rowid, conversation_id, role FROM messages WHERE id=?").get(messageId) as { rowid: number; conversation_id: string; role: ChatMessage['role'] } | undefined;
+    if (!target || target.role !== 'user') throw new Error('Можно перегенерировать ответ только для существующего сообщения пользователя');
+    this.db.exec('BEGIN IMMEDIATE');
+    try { return this.truncateAfterUserMessage(target, true); }
+    catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
+
+  private truncateAfterUserMessage(target: { rowid: number; conversation_id: string }, commit: boolean): ChatMessage[] {
+    const downstream = this.db.prepare('SELECT id FROM messages WHERE conversation_id=? AND rowid>?').all(target.conversation_id, target.rowid) as Array<{ id: string }>;
+    const assistantIds = downstream.map((row) => row.id);
+    if (assistantIds.length) {
+      const placeholders = assistantIds.map(() => '?').join(',');
+      const runIds = this.db.prepare(`SELECT id FROM analysis_runs WHERE conversation_id=? AND assistant_message_id IN (${placeholders})`).all(target.conversation_id, ...assistantIds) as Array<{ id: string }>;
+      for (const run of runIds) this.db.prepare('DELETE FROM analysis_actions WHERE run_id=?').run(run.id);
+      if (runIds.length) this.db.prepare(`DELETE FROM analysis_runs WHERE id IN (${runIds.map(() => '?').join(',')})`).run(...runIds.map((run) => run.id));
+    }
+    this.db.prepare('DELETE FROM attachments WHERE message_id IN (SELECT id FROM messages WHERE conversation_id=? AND rowid>?)').run(target.conversation_id, target.rowid);
+    this.db.prepare('DELETE FROM messages WHERE conversation_id=? AND rowid>?').run(target.conversation_id, target.rowid);
+    this.db.prepare('UPDATE conversations SET updated_at=? WHERE id=?').run(new Date().toISOString(), target.conversation_id);
+    if (commit) this.db.exec('COMMIT');
+    return this.listMessages(target.conversation_id);
   }
 
   setContextUsage(conversationId: string, modelId: string | null, tokens: number | null): Conversation | null {

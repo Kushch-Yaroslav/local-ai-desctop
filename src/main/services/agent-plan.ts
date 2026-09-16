@@ -66,7 +66,7 @@ export class AgentPlanState {
     if (!step) return JSON.stringify({ error: `Шаг плана ${id} не найден`, plan: this.plan });
     const status = rawStatus as AgentPlanStepStatus;
     if (step.status === status) return JSON.stringify({ updated: false, plan: this.plan });
-    const allowed = step.status === 'pending' ? status === 'in_progress' : step.status === 'in_progress' ? status === 'completed' : false;
+    const allowed = step.status === 'pending' ? status === 'in_progress' || status === 'completed' : step.status === 'in_progress' ? status === 'completed' : false;
     if (!allowed) return JSON.stringify({ error: `Недопустимый переход ${step.status} → ${status}`, plan: this.plan });
     if (status === 'in_progress' && this.plan.steps.some((candidate) => candidate.status === 'in_progress')) return JSON.stringify({ error: 'Сначала заверши текущий шаг in_progress', plan: this.plan });
     step.status = status;

@@ -45,6 +45,9 @@ export async function runAttachmentPipelineRegression(): Promise<void> {
     await nativePipeline.preprocessCurrent([nativeImage.id], new AbortController().signal, () => undefined, true);
     const nativeStored = database.getAttachment(nativeImage.id)!;
     assert(nativeStored.status === 'ready' && !nativeStored.visionAnalysis, 'native vision did not preserve the original image');
+    const repeatedNativeActivities: string[] = [];
+    await nativePipeline.preprocessCurrent([nativeImage.id], new AbortController().signal, (event) => { if (event.type === 'attachment') repeatedNativeActivities.push(event.activity.detail ?? ''); }, true);
+    assert(repeatedNativeActivities.length === 0, 'a ready native image was shown as passed to the model again on a later turn');
     const nativeOnlyHistory = await nativePipeline.prepareNativeImages(nativePipeline.buildContext([nativeTurn], false), new AbortController().signal);
     assert(nativeOnlyHistory.length === 1 && nativeOnlyHistory[0].images?.length === 1, 'native image was not attached to its user turn');
     assert(!nativeOnlyHistory.some((entry) => entry.role === 'system' && entry.content.includes('Image 1')), 'native image was duplicated into attachment text context');
@@ -64,6 +67,28 @@ export async function runAttachmentPipelineRegression(): Promise<void> {
     const mixedDocumentBlock = mixedNative.find((entry) => entry.id === `attachments-${turn.id}`);
     assert(mixedDocumentBlock?.content.includes('Attachment: 0.txt'), 'documents were lost when native vision is active');
     assert(!mixedDocumentBlock?.content.includes('Image 1'), 'image descriptions leaked into native mixed attachment context');
+
+    const nativeAssistant = database.addMessage(chat.id, 'assistant', 'Image described.');
+    const unrelatedFollowUp = database.addMessage(chat.id, 'user', 'Спасибо, теперь объясни следующий шаг.');
+    const unrelatedHistory = await nativePipeline.prepareNativeImages(nativePipeline.buildContext([nativeTurn, nativeAssistant, unrelatedFollowUp], false), new AbortController().signal);
+    assert(!unrelatedHistory.some((entry) => entry.id === nativeTurn.id && entry.images?.length), 'an old image was re-encoded for an unrelated later turn');
+    const visualFollowUp = database.addMessage(chat.id, 'user', 'А что находится справа на той картинке?');
+    const visualHistory = await nativePipeline.prepareNativeImages(nativePipeline.buildContext([nativeTurn, nativeAssistant, unrelatedFollowUp, visualFollowUp], false), new AbortController().signal);
+    assert(visualHistory.some((entry) => entry.id === nativeTurn.id && entry.images?.length === 1), 'an explicit follow-up about an old image lost its native visual context');
+
+    const regenerateUser = database.addMessage(chat.id, 'user', 'Regenerate this image answer');
+    const regenerateImage = await service.import({ messageId: regenerateUser.id, index: 0, filename: 'regenerate.png', mimeType: 'image/png', data: png });
+    const originalTimestamp = regenerateUser.createdAt;
+    const oldAssistant = database.addMessage(chat.id, 'assistant', 'Old answer');
+    const downstreamUser = database.addMessage(chat.id, 'user', 'Discard this branch');
+    const downstreamAttachment = await service.import({ messageId: downstreamUser.id, index: 0, filename: 'downstream.txt', mimeType: 'text/plain', data: new Uint8Array(Buffer.from('discard')) });
+    const retained = database.regenerateUserMessageAndTruncate(regenerateUser.id);
+    assert(retained.filter((item) => item.id === regenerateUser.id).length === 1, 'regeneration duplicated the existing user message');
+    const preservedUser = retained.find((item) => item.id === regenerateUser.id);
+    assert(preservedUser?.content === 'Regenerate this image answer' && preservedUser.createdAt === originalTimestamp && preservedUser.attachments?.[0]?.id === regenerateImage.id, 'regeneration did not preserve the source user message and attachment');
+    assert(!retained.some((item) => item.id === oldAssistant.id || item.id === downstreamUser.id) && database.getAttachment(downstreamAttachment.id) === null, 'regeneration did not prune the downstream branch');
+    const afterInterruptedResponse = database.regenerateUserMessageAndTruncate(regenerateUser.id);
+    assert(afterInterruptedResponse.filter((item) => item.id === regenerateUser.id).length === 1, 'regeneration after an interrupted response changed the preserved user turn');
 
     // A text-only model is a controlled unsupported state; there is no hidden
     // second model or unload/reload routing any more.

@@ -8,7 +8,7 @@ const api: LocalAiApi = {
     update: (id, patch) => ipcRenderer.invoke('conversations:update', id, patch),
     delete: (id) => ipcRenderer.invoke('conversations:delete', id),
   },
-  messages: { list: (conversationId) => ipcRenderer.invoke('messages:list', conversationId), edit: (id, content, fallback) => ipcRenderer.invoke('messages:edit', id, content, fallback) },
+  messages: { list: (conversationId) => ipcRenderer.invoke('messages:list', conversationId), edit: (id, content, fallback) => ipcRenderer.invoke('messages:edit', id, content, fallback), regenerate: (id) => ipcRenderer.invoke('messages:regenerate', id) },
   attachments: {
     import: (input) => ipcRenderer.invoke('attachments:import', input),
     list: (messageId) => ipcRenderer.invoke('attachments:list', messageId),

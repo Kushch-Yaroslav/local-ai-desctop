@@ -33,6 +33,7 @@ export class AttachmentPipeline {
     if (useNativeVision) {
       for (const initial of images) {
         if (signal.aborted) { this.markCancelled(images); return; }
+        if (initial.status === 'ready' && initial.metadata?.nativeVision === true) continue;
         const processing = this.database.updateAttachment(initial.id, { status: 'processing', error: undefined })!;
         emit({ type: 'attachment', activity: activity(processing, 'Анализ…') });
         // The original binary is intentionally kept for the selected model. Do not
@@ -56,12 +57,17 @@ export class AttachmentPipeline {
     return contextualized;
   }
 
-  /** Rehydrates image binaries only for a single request; SQLite stores references, never base64 payloads. */
+  /** Whether this request needs a native image: its own images or an explicit follow-up about the latest prior image turn. */
+  hasNativeImagesForRequest(history: ChatMessage[]): boolean { return this.nativeImageMessageIds(history).size > 0; }
+
+  /** Rehydrates only request-relevant binaries; SQLite stores references, never base64 payloads. */
   async prepareNativeImages(history: ChatMessage[], signal: AbortSignal): Promise<ChatMessage[]> {
+    const nativeImageMessageIds = this.nativeImageMessageIds(history);
     const prepared: ChatMessage[] = [];
     for (const message of history) {
       if (signal.aborted) throw new DOMException('Attachment preparation cancelled', 'AbortError');
       if (message.role !== 'user') { prepared.push(message); continue; }
+      if (!nativeImageMessageIds.has(message.id)) { prepared.push(message); continue; }
       const images = this.database.listAttachments(message.id).filter((attachment) => attachment.kind === 'image');
       if (!images.length) { prepared.push(message); continue; }
       const encoded: string[] = [];
@@ -75,7 +81,23 @@ export class AttachmentPipeline {
     return prepared;
   }
 
+  private nativeImageMessageIds(history: ChatMessage[]): Set<string> {
+    const userMessages = history.filter((message) => message.role === 'user');
+    const current = userMessages.at(-1);
+    if (!current) return new Set();
+    const selected = new Set<string>();
+    if (this.database.listAttachments(current.id).some((attachment) => attachment.kind === 'image')) selected.add(current.id);
+    if (!refersToPriorImage(current.content)) return selected;
+    const prior = userMessages.slice(0, -1).reverse().find((message) => this.database.listAttachments(message.id).some((attachment) => attachment.kind === 'image'));
+    if (prior) selected.add(prior.id);
+    return selected;
+  }
+
   private markCancelled(attachments: Attachment[]): void { for (const attachment of attachments) if (attachment.status === 'pending' || attachment.status === 'processing') this.database.updateAttachment(attachment.id, { status: 'cancelled', error: 'Обработка отменена' }); }
+}
+
+function refersToPriorImage(content: string): boolean {
+  return /(?:изображ|картин|фото|скрин|рисунк|image|picture|photo|screenshot|слева|справа|на\s+(?:ней|нём|картинке|фото))/i.test(content);
 }
 
 function attachmentStatusDetail(attachment: Attachment): string {

@@ -107,6 +107,15 @@ export function registerIpc(): void {
     await attachments.removeManagedFiles(before.filter((attachment) => !kept.has(attachment.id)));
     return edited;
   });
+  ipcMain.handle('messages:regenerate', async (_event, messageId: string) => {
+    const message = database.getMessage(messageId); if (!message) throw new Error('Сообщение не найдено');
+    const before = database.listAttachmentsForConversation(message.conversationId);
+    await cancelGeneration(message.conversationId);
+    const retained = database.regenerateUserMessageAndTruncate(message.id);
+    const kept = new Set(database.listAttachmentsForConversation(message.conversationId).map((attachment) => attachment.id));
+    await attachments.removeManagedFiles(before.filter((attachment) => !kept.has(attachment.id)));
+    return retained;
+  });
   ipcMain.handle('attachments:import', (_event, input) => attachments.import(input));
   ipcMain.handle('attachments:list', (_event, messageId: string) => database.listAttachments(messageId));
   ipcMain.handle('attachments:dataUrl', async (_event, id: string) => {
@@ -166,9 +175,12 @@ export function registerIpc(): void {
     // Ollama advertises capabilities with the installed tag. This governs routing
     // for every image turn in the active history, rather than guessing from names.
     const hasImages = database.listAttachmentsForConversation(request.conversationId).some((attachment) => attachment.kind === 'image');
-    const nativeVision = hasImages && await backend.supportsVision(request.model, abort.signal);
-    const preprocessIds = hasImages ? [...new Set([...attachmentIds, ...database.listAttachmentsForConversation(request.conversationId).filter((attachment) => attachment.kind === 'image' && !attachment.visionAnalysis).map((attachment) => attachment.id)])] : attachmentIds;
-    log('attachment.vision-routing', { generationId: generation.id, modelId: request.model, hasImages, route: nativeVision ? 'native' : hasImages ? 'unsupported' : 'none' });
+    const requestUser = user ?? [...request.messages].reverse().find((message) => message.role === 'user');
+    const retryAttachmentIds = requestUser ? database.listAttachments(requestUser.id).filter((attachment) => attachment.status === 'pending' || attachment.status === 'cancelled').map((attachment) => attachment.id) : [];
+    const nativeImagesRequested = attachmentPipeline.hasNativeImagesForRequest(request.messages);
+    const nativeVision = nativeImagesRequested && await backend.supportsVision(request.model, abort.signal);
+    const preprocessIds = [...new Set([...attachmentIds, ...retryAttachmentIds])];
+    log('attachment.vision-routing', { generationId: generation.id, modelId: request.model, hasImages, nativeImagesRequested, route: nativeVision ? 'native' : nativeImagesRequested ? 'unsupported' : hasImages ? 'deferred' : 'none' });
     if (preprocessIds.length) await attachmentPipeline.preprocessCurrent(preprocessIds, abort.signal, emitAttachment, nativeVision);
     if (!current()) return;
     await backend.ensureModelAvailable(request.model);
@@ -184,7 +196,7 @@ export function registerIpc(): void {
       event.sender.send('chat:stream', { type: 'context', conversationId: request.conversationId, generationId: generation.id, ...context });
       // Image descriptions are excluded for native-vision requests: the original
       // image payload is attached only to its owning user turn below.
-      let history = attachmentPipeline.buildContext(request.messages, !nativeVision);
+      let history = attachmentPipeline.buildContext(request.messages, !hasImages);
       if (nativeVision) history = await attachmentPipeline.prepareNativeImages(history, abort.signal);
       const stream = agentRoot
         ? projectChat.stream(request.model, history, agentRoot, abort.signal, context.active, conversation.analysisDepth, conversation.webMode, inlineConfirmation(event, request.conversationId, generation, agentRoot), { generationId: generation.id, conversationId: request.conversationId })

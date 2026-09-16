@@ -199,7 +199,7 @@ export interface LocalAiApi {
     update(id: string, patch: Partial<Pick<Conversation, 'title' | 'modelId' | 'mode' | 'workingDirectory' | 'contextWindow' | 'analysisDepth' | 'webMode'>>): Promise<Conversation>;
     delete(id: string): Promise<void>;
   };
-  messages: { list(conversationId: string): Promise<ChatMessage[]>; edit(id: string, content: string, fallback?: Pick<ChatMessage, 'conversationId' | 'content'>): Promise<ChatMessage[]> };
+  messages: { list(conversationId: string): Promise<ChatMessage[]>; edit(id: string, content: string, fallback?: Pick<ChatMessage, 'conversationId' | 'content'>): Promise<ChatMessage[]>; regenerate(id: string): Promise<ChatMessage[]> };
   attachments: {
     import(input: AttachmentInput): Promise<Attachment>;
     list(messageId: string): Promise<Attachment[]>;
