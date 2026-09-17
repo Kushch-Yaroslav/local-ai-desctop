@@ -25,7 +25,8 @@ function readFrom(tool: string, raw: string, step: number): Read | undefined {
   const rangeValue: Range = typeof value.start_line === 'number'
     ? { kind: 'lines', start: value.start_line, end: typeof value.end_line === 'number' ? value.end_line : value.start_line, fullFile: value.start_line === 1 && value.has_more === false }
     : { kind: 'bytes', start: typeof value.byte_start === 'number' ? value.byte_start : 0, end: typeof value.byte_end === 'number' ? value.byte_end : 0, fullFile: value.byte_start === 0 && typeof value.size_bytes === 'number' && value.byte_end === value.size_bytes };
-  const path = normalizedPath(sourcePath); const range = `${rangeValue.kind}:${rangeValue.start}-${rangeValue.end}`;
+  const projectId = typeof value.project_id === 'string' ? value.project_id : 'project-1';
+  const path = `${projectId}:${normalizedPath(sourcePath)}`; const range = `${rangeValue.kind}:${rangeValue.start}-${rangeValue.end}`;
   return { key: `${path}\u0000${range}\u0000${fingerprint}`, path, range, rangeValue, fingerprint, readCount: 1, firstReadStep: step, lastReadStep: step, pinUntil: 0, loopSuspected: false };
 }
 function reference(entry: Entry, reason: string): string {

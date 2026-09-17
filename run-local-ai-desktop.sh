@@ -6,6 +6,9 @@ LOG_DIR="$APP_DIR/runtime/logs"
 LOG_FILE="$LOG_DIR/launcher.log"
 ELECTRON_BIN="$APP_DIR/node_modules/electron/dist/electron"
 SANDBOX_HELPER="/opt/google/chrome/chrome-sandbox"
+OLLAMA_URL="http://127.0.0.1:11434"
+ELECTRON_PID=""
+CLEANUP_REASON="normal exit"
 
 mkdir -p "$LOG_DIR"
 
@@ -49,8 +52,41 @@ export CHROME_DEVEL_SANDBOX="$SANDBOX_HELPER"
 
 export ELECTRON_ENABLE_LOGGING=1
 
+log() { printf '%s %s\n' "$(date --iso-8601=seconds)" "$*" >> "$LOG_FILE"; }
+release_ollama_models() {
+  # The UI only exposes these local models. This wrapper remains alive while
+  # Electron runs, so it also releases them if Electron terminates abnormally.
+  local running
+  running="$(curl --silent --show-error --max-time 4 "$OLLAMA_URL/api/ps" 2>/dev/null)" || { log "ollama.models.inspect.failed reason=$CLEANUP_REASON"; return; }
+  for model in "qwen3.8:27b-q4_K_M" "gpt-oss:20b"; do
+    grep -Eq "\"(name|model)\"[[:space:]]*:[[:space:]]*\"$model\"" <<< "$running" || continue
+    if curl --silent --show-error --max-time 4 --request POST "$OLLAMA_URL/api/generate" --header 'content-type: application/json' --data "{\"model\":\"$model\",\"keep_alive\":0}" >/dev/null 2>&1; then
+      log "ollama.model.unload model=$model reason=$CLEANUP_REASON"
+    else
+      log "ollama.model.unload.failed model=$model reason=$CLEANUP_REASON"
+    fi
+  done
+}
+cleanup() {
+  local status=$?
+  log "launcher.cleanup reason=$CLEANUP_REASON status=$status electron_pid=${ELECTRON_PID:-none}"
+  release_ollama_models
+  log "launcher.exit status=$status"
+}
+trap cleanup EXIT
+trap 'CLEANUP_REASON="SIGINT"; exit 130' INT
+trap 'CLEANUP_REASON="SIGTERM"; exit 143' TERM
+
 # The bundled helper is kept as chrome-sandbox.disabled because DATA is nosuid.
 # This root-owned system helper preserves Chromium's SUID sandbox.
 echo "launcher.sandbox_helper: $SANDBOX_HELPER" >> "$LOG_FILE"
 echo "launcher.electron: $ELECTRON_BIN" >> "$LOG_FILE"
-exec "$ELECTRON_BIN" "$APP_DIR" >> "$LOG_FILE" 2>&1
+"$ELECTRON_BIN" "$APP_DIR" >> "$LOG_FILE" 2>&1 &
+ELECTRON_PID=$!
+log "electron.started pid=$ELECTRON_PID"
+set +e
+wait "$ELECTRON_PID"
+electron_status=$?
+set -e
+CLEANUP_REASON="electron exited status=$electron_status"
+exit "$electron_status"

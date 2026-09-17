@@ -12,14 +12,15 @@ const maxPageSize = 250;
 const defaultChunkBytes = 64_000;
 const maxChunkBytes = 128_000;
 
-export type ProjectToolCall = { name: string; arguments: Record<string, unknown> };
+/** Kept outside tool schemas; it is protocol metadata, not a tool argument. */
+export type ProjectToolCall = { name: string; arguments: Record<string, unknown>; toolCallId?: string };
 export type ProjectToolDefinition = { type: 'function'; function: { name: string; description: string; parameters: Record<string, unknown> } };
-export type ConfirmationRequest = { title: string; detail: string; category: RiskCategory; actionId: string };
+export type ConfirmationRequest = { title: string; detail: string; category: RiskCategory; actionId: string; root?: string };
 export type ApprovalResult = { approved: boolean; reason: 'user_rejected' | 'cancelled' | 'once' | 'session' };
 export type ConfirmAction = (request: ConfirmationRequest, signal: AbortSignal) => Promise<ApprovalResult>;
 export type TerminalPolicy = { kind: 'allow' | 'confirm' | 'block'; category?: RiskCategory };
 
-export const projectToolDefinitions: ProjectToolDefinition[] = [
+const baseProjectToolDefinitions: ProjectToolDefinition[] = [
   { type: 'function', function: { name: 'report_progress', description: 'Сообщает пользователю короткий статус текущего этапа работы. Используй редко: только при смене значимого этапа (изучение, реализация, проверка). Одно короткое предложение. Не раскрывай скрытые рассуждения, пошаговую логику, внутренние инструкции и не повторяй каждый вызов инструмента.', parameters: { type: 'object', properties: { message: { type: 'string', minLength: 3, maxLength: 240, description: 'Короткое безопасное сообщение о текущем этапе.' } }, required: ['message'] } } },
   { type: 'function', function: { name: 'list_directory', description: 'Показывает дерево файлов выбранного проекта. Начни с корня; при has_more=true запроси следующую страницу с next_offset.', parameters: { type: 'object', properties: { path: { type: 'string', description: 'Относительный путь внутри проекта, по умолчанию корень.' }, depth: { type: 'integer', minimum: 1, maximum: 4 }, offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 250 } } } } },
   { type: 'function', function: { name: 'find_files', description: 'Ищет имена файлов и папок внутри выбранного проекта. Результат постраничный.', parameters: { type: 'object', properties: { query: { type: 'string' }, offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 250 } }, required: ['query'] } } },
@@ -29,12 +30,21 @@ export const projectToolDefinitions: ProjectToolDefinition[] = [
   { type: 'function', function: { name: 'inspect_package_json', description: 'Читает package.json в корне выбранного проекта, если он есть.', parameters: { type: 'object', properties: {} } } },
   { type: 'function', function: { name: 'git_status', description: 'Показывает read-only статус Git выбранного проекта.', parameters: { type: 'object', properties: {} } } },
   { type: 'function', function: { name: 'git_diff', description: 'Показывает read-only git diff выбранного проекта.', parameters: { type: 'object', properties: {} } } },
-  { type: 'function', function: { name: 'apply_patch', description: 'Основной инструмент точечного редактирования. Принимает patch в формате *** Begin Patch / *** Update File / *** Add File / *** Delete File. Все пути относительны корню проекта.', parameters: { type: 'object', properties: { patch: { type: 'string' } }, required: ['patch'] } } },
-  { type: 'function', function: { name: 'write_file', description: 'Создаёт новый текстовый файл внутри проекта. Не перезаписывает существующие файлы; для изменений используй apply_patch.', parameters: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'] } } },
-  { type: 'function', function: { name: 'create_file', description: 'Создаёт новый текстовый файл внутри проекта. Псевдоним write_file.', parameters: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'] } } },
+  { type: 'function', function: { name: 'apply_patch', description: 'Основной инструмент точечного редактирования. Принимает patch в формате *** Begin Patch / *** Update File / *** Add File / *** Delete File. Все пути относительны корню проекта. Для большого нового файла сначала создай короткий рабочий каркас, затем расширяй его несколькими небольшими точечными patch и после этого прочитай/проверь результат.', parameters: { type: 'object', properties: { patch: { type: 'string' } }, required: ['patch'] } } },
+  { type: 'function', function: { name: 'write_file', description: 'Создаёт новый текстовый файл внутри проекта. Не перезаписывает существующие файлы; для изменений используй apply_patch. Для существенного исходного файла сначала создай минимальный каркас, затем добавляй части небольшими apply_patch и прочитай/проверь файл. Не помещай длинный документ в один хрупкий JSON-аргумент без необходимости.', parameters: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'] } } },
+  { type: 'function', function: { name: 'create_file', description: 'Создаёт новый текстовый файл внутри проекта. Псевдоним write_file. Для существенного исходного файла сначала создай минимальный каркас, затем добавляй части небольшими apply_patch и прочитай/проверь файл.', parameters: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'] } } },
   { type: 'function', function: { name: 'delete_file', description: 'Удаляет один файл внутри проекта только после подтверждения пользователя.', parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } } },
   { type: 'function', function: { name: 'run_terminal', description: 'Запускает команду только в working folder. Без подтверждения разрешены диагностические команды; рискованные команды запросят подтверждение пользователя.', parameters: { type: 'object', properties: { command: { type: 'string' }, timeout_ms: { type: 'integer', minimum: 1000, maximum: 120000 } }, required: ['command'] } } },
 ];
+
+const projectScopeProperties = {
+  project_slot: { type: 'integer', enum: [1, 2], description: 'Слот проекта. По умолчанию Project 1.' },
+  project_id: { type: 'string', description: 'Явный идентификатор проекта из runtime context; используй для ссылок из прошлых сообщений.' },
+};
+export const projectToolDefinitions: ProjectToolDefinition[] = baseProjectToolDefinitions.map((definition) => ({
+  ...definition,
+  function: { ...definition.function, parameters: { ...definition.function.parameters, properties: { ...(definition.function.parameters.properties as Record<string, unknown>), ...projectScopeProperties } } },
+}));
 
 function requestedRange(argumentsObject: Record<string, unknown>): string | undefined {
   const start = typeof argumentsObject.start_line === 'number' ? argumentsObject.start_line : undefined;
@@ -72,20 +82,40 @@ export class ReadonlyProjectTools {
     return new ReadonlyProjectTools(resolved, confirm);
   }
 
+  /** Compact composer search. It exposes only paths below an already-authorized root. */
+  static async findResources(root: string, query: string, limit = 40): Promise<Array<{ relativePath: string; kind: 'file' | 'folder' }>> {
+    const resolved = await realpath(root); const details = await stat(resolved);
+    if (!details.isDirectory()) throw new Error('Рабочая папка не является каталогом');
+    const needle = query.toLowerCase(); const results: Array<{ relativePath: string; kind: 'file' | 'folder' }> = [];
+    const walk = async (directory: string, level: number): Promise<void> => {
+      if (results.length >= limit || level > 8) return;
+      const entries = await readdir(directory, { withFileTypes: true }); entries.sort((a, b) => a.name.localeCompare(b.name));
+      for (const entry of entries) {
+        if (results.length >= limit || entry.isSymbolicLink()) continue;
+        const full = resolve(directory, entry.name); const kind = entry.isDirectory() ? 'folder' as const : 'file' as const;
+        const relativePath = relative(resolved, full).replaceAll(sep, '/');
+        if (!needle || entry.name.toLowerCase().includes(needle) || relativePath.toLowerCase().includes(needle)) results.push({ relativePath, kind });
+        if (entry.isDirectory() && !ignoredDirectories.has(entry.name)) await walk(full, level + 1);
+      }
+    };
+    await walk(resolved, 1);
+    return results;
+  }
+
   async execute(call: ProjectToolCall, signal: AbortSignal, actionId: string): Promise<string> {
     try {
       if (signal.aborted) return JSON.stringify({ error: 'Generation cancelled' });
       if (call.name === 'list_directory') return await this.listDirectory(this.text(call.arguments.path), this.number(call.arguments.depth, 2, 1, 4), this.number(call.arguments.offset, 0, 0, 100_000), this.pageSize(call.arguments));
-      if (call.name === 'find_files' || call.name === 'search_files') return await this.findFiles(this.requiredText(call.arguments.query), this.number(call.arguments.offset, 0, 0, 100_000), this.pageSize(call.arguments));
-      if (call.name === 'search_text') return await this.searchText(this.requiredText(call.arguments.query), this.text(call.arguments.path), this.number(call.arguments.offset, 0, 0, 100_000), this.pageSize(call.arguments));
+      if (call.name === 'find_files' || call.name === 'search_files') return await this.findFiles(this.requiredText(call.arguments.query, 'query'), this.number(call.arguments.offset, 0, 0, 100_000), this.pageSize(call.arguments));
+      if (call.name === 'search_text') return await this.searchText(this.requiredText(call.arguments.query, 'query'), this.text(call.arguments.path), this.number(call.arguments.offset, 0, 0, 100_000), this.pageSize(call.arguments));
       if (call.name === 'read_file') return await this.readTextFile(call);
       if (call.name === 'inspect_package_json') return await this.readTextFile({ name: 'read_file', arguments: { path: 'package.json', max_bytes: maxChunkBytes } });
       if (call.name === 'git_status') return await this.gitStatus();
       if (call.name === 'git_diff') return await this.gitDiff();
-      if (call.name === 'apply_patch') return await this.applyPatch(this.requiredText(call.arguments.patch), signal, actionId);
-      if (call.name === 'write_file' || call.name === 'create_file') return await this.createFile(this.requiredText(call.arguments.path), this.text(call.arguments.content), signal);
-      if (call.name === 'delete_file') return await this.deleteFile(this.requiredText(call.arguments.path), signal, actionId);
-      if (call.name === 'run_terminal') return await this.runTerminal(this.requiredText(call.arguments.command), this.number(call.arguments.timeout_ms, 60_000, 1_000, 120_000), signal, actionId);
+      if (call.name === 'apply_patch') return await this.applyPatch(this.requiredText(call.arguments.patch, 'patch'), signal, actionId);
+      if (call.name === 'write_file' || call.name === 'create_file') return await this.createFile(this.requiredText(call.arguments.path, 'path'), this.requiredContent(call.arguments.content), signal);
+      if (call.name === 'delete_file') return await this.deleteFile(this.requiredText(call.arguments.path, 'path'), signal, actionId);
+      if (call.name === 'run_terminal') return await this.runTerminal(this.requiredText(call.arguments.command, 'command'), this.number(call.arguments.timeout_ms, 60_000, 1_000, 120_000), signal, actionId);
       return JSON.stringify({ error: `Неизвестный инструмент проекта: ${call.name}` });
     } catch (error) { return JSON.stringify({ error: error instanceof Error ? error.message : 'Ошибка чтения проекта' }); }
   }
@@ -149,7 +179,7 @@ export class ReadonlyProjectTools {
   }
 
   private async readTextFile(call: ProjectToolCall): Promise<string> {
-    const path = this.requiredText(call.arguments.path); const file = await this.resolveExisting(path); const info = await stat(file);
+    const path = this.requiredText(call.arguments.path, 'path'); const file = await this.resolveExisting(path); const info = await stat(file);
     if (!info.isFile()) throw new Error('Указанный путь не является файлом');
     const startLine = typeof call.arguments.start_line === 'number' ? this.number(call.arguments.start_line, 1, 1, 10_000_000) : null;
     if (startLine !== null && info.size <= maxLineReadBytes) {
@@ -189,7 +219,7 @@ export class ReadonlyProjectTools {
   private async deleteFile(path: string, signal: AbortSignal, actionId: string): Promise<string> {
     const file = await this.resolveExisting(path); const info = await stat(file);
     if (!info.isFile()) return JSON.stringify({ error: 'Можно удалить только один файл, не каталог.' });
-    const approval = await this.confirm({ title: 'Удалить файл?', detail: path, category: 'file_delete', actionId }, signal);
+    const approval = await this.confirm({ title: 'Удалить файл?', detail: path, category: 'file_delete', actionId, root: this.root }, signal);
     if (!approval.approved) return JSON.stringify({ approved: false, reason: approval.reason });
     if (signal.aborted) return JSON.stringify({ error: 'Generation cancelled' });
     await unlink(file); return JSON.stringify({ path, deleted: true });
@@ -211,7 +241,7 @@ export class ReadonlyProjectTools {
       }
       if (remove) {
         const file = await this.resolveExisting(remove[1]); const info = await stat(file); if (!info.isFile()) return JSON.stringify({ error: `Можно удалить только файл: ${remove[1]}` });
-        const approval = await this.confirm({ title: 'Удалить файл?', detail: remove[1], category: 'file_delete', actionId }, signal);
+        const approval = await this.confirm({ title: 'Удалить файл?', detail: remove[1], category: 'file_delete', actionId, root: this.root }, signal);
         if (!approval.approved) return JSON.stringify({ approved: false, reason: approval.reason });
         await unlink(file); changed.push(remove[1]); continue;
       }
@@ -245,7 +275,7 @@ export class ReadonlyProjectTools {
     if (/(^|[^<])>{1,2}/.test(lower)) return { kind: 'confirm', category: 'shell_redirection' };
     if (/[;|&]/.test(lower)) return { kind: 'confirm', category: 'shell_chaining' };
     if (/(^|\s)rm(\s|$)|curl\b.*\||wget\b.*\.(sh|run|bin|appimage)\b/.test(lower)) return { kind: 'confirm', category: 'system_command' };
-    if (/^(git\s+(status|diff)(\s|$)|npm\s+run\s+(lint|typecheck|test|build)(\s|$)|pnpm\s+(lint|typecheck|test|build)(\s|$)|yarn\s+(lint|typecheck|test|build)(\s|$)|nvidia-smi(\s|$)|(ls|find|rg|grep|cat|head|tail)(\s|$))/.test(lower)) return { kind: 'allow' };
+    if (/^(git\s+(status|diff)(\s|$)|npm\s+run\s+(lint|typecheck|test|build)(\s|$)|pnpm\s+(lint|typecheck|test|build)(\s|$)|yarn\s+(lint|typecheck|test|build)(\s|$)|nvidia-smi(\s|$)|(pwd|ls|find|rg|grep|cat|head|tail)(\s|$))/.test(lower)) return { kind: 'allow' };
     return { kind: 'confirm', category: 'system_command' };
   }
 
@@ -253,7 +283,7 @@ export class ReadonlyProjectTools {
     const policy = this.terminalPolicy(command);
     if (policy.kind === 'block') return JSON.stringify({ error: 'Команда заблокирована terminal policy: она может выйти за project scope или изменить систему.' });
     if (policy.kind === 'confirm') {
-      const approval = await this.confirm({ title: 'Разрешить terminal command?', detail: command, category: policy.category!, actionId }, signal);
+      const approval = await this.confirm({ title: 'Разрешить terminal command?', detail: command, category: policy.category!, actionId, root: this.root }, signal);
       if (!approval.approved) return JSON.stringify({ approved: false, reason: approval.reason });
     }
     if (signal.aborted) return JSON.stringify({ error: 'Generation cancelled' });
@@ -287,7 +317,8 @@ export class ReadonlyProjectTools {
     return actual;
   }
   private text(value: unknown): string { return typeof value === 'string' ? value : ''; }
-  private requiredText(value: unknown): string { const text = this.text(value).trim(); if (!text) throw new Error('Не указан поисковый запрос или путь'); return text; }
+  private requiredText(value: unknown, field: string): string { const text = this.text(value).trim(); if (!text) throw new Error(`Не указан обязательный параметр "${field}"`); return text; }
+  private requiredContent(value: unknown): string { if (typeof value !== 'string') throw new Error('Не указан обязательный параметр "content"'); return value; }
   private number(value: unknown, fallback: number, min: number, max: number): number { const number = typeof value === 'number' ? Math.floor(value) : fallback; return Math.max(min, Math.min(max, number)); }
   private pageSize(argumentsObject: Record<string, unknown>): number { return this.number(argumentsObject.limit ?? argumentsObject.max_results, defaultPageSize, 1, maxPageSize); }
 }

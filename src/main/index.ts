@@ -5,6 +5,7 @@ import { ensureAppDirectories, paths } from './services/paths';
 import { log } from './services/logger';
 
 let mainWindow: BrowserWindow | null = null;
+let shutdownStarted = false;
 
 ensureAppDirectories();
 app.setPath('userData', paths.userData);
@@ -54,4 +55,17 @@ app.whenReady().then(async () => {
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 });
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
-app.on('before-quit', () => log('application.stopped'));
+app.on('before-quit', (event) => {
+  // Electron exits synchronously by default. Keep the process alive just long
+  // enough to abort requests and release models loaded through this app.
+  event.preventDefault();
+  if (shutdownStarted) return;
+  shutdownStarted = true;
+  void import('./ipc/register-ipc')
+    .then(({ shutdownRuntime }) => shutdownRuntime())
+    .catch((error: unknown) => log('runtime.shutdown.failed', error instanceof Error ? { message: error.message } : { error: String(error) }))
+    .finally(() => {
+      log('application.stopped');
+      app.exit(0);
+    });
+});

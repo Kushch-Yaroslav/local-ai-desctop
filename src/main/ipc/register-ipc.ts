@@ -1,11 +1,11 @@
 import { BrowserWindow, dialog, ipcMain } from 'electron';
 import { randomUUID } from 'node:crypto';
-import type { AnalysisRun, ApprovalDecision, ApprovalStatus, ChatRequest, Conversation, RiskCategory } from '../../shared/types';
+import type { AnalysisRun, ApprovalDecision, ApprovalStatus, ChatRequest, Conversation, ProjectReference, ProjectSuggestion, RiskCategory } from '../../shared/types';
 import { Database } from '../services/database';
 import { getHardwareStats } from '../services/hardware';
 import { OllamaBackend } from '../backends/ollama-backend';
 import { LlamaCppBackend } from '../backends/llama-cpp-backend';
-import { ProjectChatService } from '../services/project-chat';
+import { ProjectChatService, type AgentProject } from '../services/project-chat';
 import { paths } from '../services/paths';
 import { log } from '../services/logger';
 import { contextPresetsFor, getModelProfile, modelRegistry } from '../models/model-registry';
@@ -13,7 +13,7 @@ import { WebBrowserService } from '../web/web-tools';
 import { webToolDefinitions } from '../web/web-tools';
 import { WebChatService } from '../services/web-chat';
 import { capabilitySystemContext } from '../services/capabilities';
-import { projectToolDefinitions, type ApprovalResult, type ConfirmAction } from '../tools/project-tools';
+import { projectToolDefinitions, ReadonlyProjectTools, type ApprovalResult, type ConfirmAction } from '../tools/project-tools';
 import { AttachmentService } from '../services/attachment-service';
 import { AttachmentPipeline } from '../services/attachment-pipeline';
 import { readFile } from 'node:fs/promises';
@@ -21,6 +21,9 @@ import { ollamaErrorDiagnostics } from '../backends/ollama-errors';
 import { saveGenerationDiagnosticsBestEffort } from '../services/generation-diagnostics';
 import { taskNotesToolDefinition } from '../services/task-notes';
 import { agentPlanToolDefinition } from '../services/agent-plan';
+import { projectDirectoryName } from '../../shared/project-references';
+import { executionMode } from '../../shared/generation-mode';
+import { existingProjectDirectory } from '../services/project-picker';
 
 const database = new Database();
 const selectedBackend = process.env.LOCAL_AI_BACKEND === 'llama-cpp' ? 'llama-cpp' : 'ollama';
@@ -38,6 +41,25 @@ type PendingApproval = { approvalId: string; conversationId: string; generation:
 const pendingApprovals = new Map<string, PendingApproval>();
 const sessionApprovals = new Map<string, { root: string; categories: Set<RiskCategory> }>();
 
+const waitFor = (promise: Promise<void>, timeoutMs: number): Promise<void> => new Promise((resolve) => {
+  const timeout = setTimeout(resolve, timeoutMs);
+  timeout.unref();
+  void promise.then(() => { clearTimeout(timeout); resolve(); }, () => { clearTimeout(timeout); resolve(); });
+});
+
+/** Called by Electron's main lifecycle before process exit, never by a renderer. */
+export async function shutdownRuntime(): Promise<void> {
+  const active = [...activeGenerations.values()];
+  log('runtime.shutdown.started', { backend: selectedBackend, activeGenerations: active.length });
+  for (const generation of active) generation.abort.abort();
+  await Promise.allSettled(active.map((generation) => waitFor(generation.settled, 4_000)));
+  if (selectedBackend === 'ollama') {
+    try { await ollama.unloadTrackedModels(); }
+    catch (error) { log('runtime.shutdown.ollama-unload.failed', ollamaErrorDiagnostics(error)); }
+  }
+  log('runtime.shutdown.finished', { backend: selectedBackend });
+}
+
 function settleApproval(pending: PendingApproval, result: ApprovalResult, status: Exclude<ApprovalStatus, 'pending'>): void {
   if (pending.settled) return;
   pending.settled = true;
@@ -49,9 +71,10 @@ function settleApproval(pending: PendingApproval, result: ApprovalResult, status
   }
 }
 
-async function cancelGeneration(conversationId: string, generationId?: string): Promise<void> {
+async function cancelGeneration(conversationId: string, generationId?: string, reason: 'user_stop' | 'superseded' = 'superseded'): Promise<void> {
   const active = activeGenerations.get(conversationId);
   if (!active || (generationId && active.id !== generationId)) return;
+  log('generation.cancelled', { conversationId, generationId: active.id, reason });
   active.abort.abort(); await active.settled;
 }
 
@@ -59,15 +82,16 @@ function inlineConfirmation(event: Electron.IpcMainInvokeEvent, conversationId: 
   const emit = (payload: Record<string, unknown>) => event.sender.send('chat:stream', payload);
   return async (request, signal) => {
     if (signal.aborted || activeGenerations.get(conversationId) !== generation) return { approved: false, reason: 'cancelled' };
+    const requestRoot = request.root ?? root;
     const session = sessionApprovals.get(conversationId);
-    if (session?.root === root && session.categories.has(request.category)) {
+    if (session?.root === requestRoot && session.categories.has(request.category)) {
       emit({ type: 'approval-resolved', conversationId, generationId: generation.id, actionId: request.actionId, approvalId: `session-${randomUUID()}`, status: 'session-approved' });
       return { approved: true, reason: 'session' };
     }
     const approvalId = randomUUID();
     return new Promise<ApprovalResult>((resolve) => {
       const abort = () => settleApproval(pending, { approved: false, reason: 'cancelled' }, 'rejected');
-      const pending: PendingApproval = { approvalId, conversationId, generation, actionId: request.actionId, category: request.category, root, resolve, settled: false, abort, emit };
+      const pending: PendingApproval = { approvalId, conversationId, generation, actionId: request.actionId, category: request.category, root: requestRoot, resolve, settled: false, abort, emit };
       pendingApprovals.set(approvalId, pending);
       signal.addEventListener('abort', abort, { once: true });
       emit({ type: 'approval-request', conversationId, generationId: generation.id, actionId: request.actionId, approval: { approvalId, category: request.category, status: 'pending' } });
@@ -82,7 +106,7 @@ export function registerIpc(): void {
     if (!getModelProfile(modelId)) throw new Error('Выбранная модель отсутствует в реестре приложения');
     return database.createConversation(modelId);
   });
-  ipcMain.handle('conversations:update', async (_event, id: string, patch: Partial<Pick<Conversation, 'title' | 'modelId' | 'mode' | 'workingDirectory' | 'contextWindow' | 'analysisDepth' | 'webMode'>>) => {
+  ipcMain.handle('conversations:update', async (_event, id: string, patch: Partial<Pick<Conversation, 'title' | 'modelId' | 'mode' | 'workingDirectory' | 'secondaryWorkingDirectory' | 'contextWindow' | 'analysisDepth' | 'webMode'>>) => {
     const current = database.getConversation(id);
     if (!current) throw new Error('Чат не найден');
     const nextModelId = patch.modelId ?? current.modelId;
@@ -92,7 +116,7 @@ export function registerIpc(): void {
     const requestedContext = patch.contextWindow ?? current.contextWindow;
     const contextWindow = allowed.length && !allowed.includes(requestedContext) ? allowed.at(-1)! : requestedContext;
     const updated = database.updateConversation(id, { ...patch, contextWindow });
-    if (patch.workingDirectory !== undefined && patch.workingDirectory !== current.workingDirectory) sessionApprovals.delete(id);
+    if ((patch.workingDirectory !== undefined && patch.workingDirectory !== current.workingDirectory) || (patch.secondaryWorkingDirectory !== undefined && patch.secondaryWorkingDirectory !== current.secondaryWorkingDirectory)) sessionApprovals.delete(id);
     if (patch.modelId !== undefined && patch.modelId !== current.modelId) database.setContextUsage(id, null, null);
     if (selectedBackend === 'ollama' && patch.modelId !== undefined && patch.modelId !== current.modelId && current.modelId) void ollama.unloadModel(current.modelId);
     return database.getConversation(id) ?? updated;
@@ -116,6 +140,16 @@ export function registerIpc(): void {
     await attachments.removeManagedFiles(before.filter((attachment) => !kept.has(attachment.id)));
     return retained;
   });
+  ipcMain.handle('projects:search', async (_event, conversationId: string, query: string): Promise<ProjectSuggestion[]> => {
+    const conversation = database.getConversation(conversationId);
+    if (!conversation?.workingDirectory || typeof query !== 'string') return [];
+    const projects = [
+      { id: conversation.primaryProjectId, slot: 1 as const, root: conversation.workingDirectory, label: `Project 1 (${projectDirectoryName(conversation.workingDirectory)})` },
+      ...(conversation.secondaryWorkingDirectory && conversation.secondaryProjectId ? [{ id: conversation.secondaryProjectId, slot: 2 as const, root: conversation.secondaryWorkingDirectory, label: `Project 2 (${projectDirectoryName(conversation.secondaryWorkingDirectory)})` }] : []),
+    ].filter((project): project is { id: string; slot: 1 | 2; root: string; label: string } => Boolean(project.id));
+    const groups = await Promise.all(projects.map(async (project) => (await ReadonlyProjectTools.findResources(project.root, query.trim(), 30)).map((resource): ProjectSuggestion => ({ id: randomUUID(), projectId: project.id, projectSlot: project.slot, projectPath: project.root, projectLabel: project.label, relativePath: resource.relativePath, kind: resource.kind }))));
+    return groups.flat();
+  });
   ipcMain.handle('attachments:import', (_event, input) => attachments.import(input));
   ipcMain.handle('attachments:list', (_event, messageId: string) => database.listAttachments(messageId));
   ipcMain.handle('attachments:dataUrl', async (_event, id: string) => {
@@ -129,12 +163,13 @@ export function registerIpc(): void {
   });
   ipcMain.handle('settings:get', () => ({ selectedBackend, ollamaUrl: 'http://127.0.0.1:11434', llamaServerPath: selectedBackend === 'llama-cpp' ? process.env.LOCAL_AI_LLAMA_SERVER_PATH ?? null : null, modelsPath: paths.models }));
   ipcMain.handle('hardware:get', getHardwareStats);
-  ipcMain.handle('dialog:chooseDirectory', async () => {
+  ipcMain.handle('dialog:chooseDirectory', async (_event, initialDirectory?: string | null) => {
     const window = BrowserWindow.getFocusedWindow();
-    const result = await dialog.showOpenDialog(window!, { properties: ['openDirectory'] });
+    const defaultPath = await existingProjectDirectory(initialDirectory);
+    const result = await dialog.showOpenDialog(window!, { properties: ['openDirectory'], ...(defaultPath ? { defaultPath } : {}) });
     return result.canceled ? null : result.filePaths[0] ?? null;
   });
-  ipcMain.handle('chat:stop', async (_event, conversationId: string, generationId?: string) => { await cancelGeneration(conversationId, generationId); });
+  ipcMain.handle('chat:stop', async (_event, conversationId: string, generationId?: string) => { await cancelGeneration(conversationId, generationId, 'user_stop'); });
   ipcMain.handle('chat:approve', (_event, request: { conversationId: string; generationId: string; approvalId: string; decision: ApprovalDecision }) => {
     const pending = pendingApprovals.get(request.approvalId);
     if (!['reject', 'once', 'session'].includes(request.decision) || !pending || pending.conversationId !== request.conversationId || pending.generation.id !== request.generationId || activeGenerations.get(request.conversationId) !== pending.generation || pending.generation.abort.signal.aborted) return false;
@@ -149,7 +184,7 @@ export function registerIpc(): void {
     return true;
   });
   ipcMain.handle('chat:send', async (event, request: ChatRequest) => {
-    await cancelGeneration(request.conversationId);
+    await cancelGeneration(request.conversationId, undefined, 'superseded');
     const abort = new AbortController(); let finish!: () => void;
     const generation: ActiveGeneration = { id: request.generationId, abort, settled: new Promise<void>((resolve) => { finish = resolve; }), finish };
     activeGenerations.set(request.conversationId, generation);
@@ -160,8 +195,12 @@ export function registerIpc(): void {
     if (request.persistUserMessage && (!user || user.role !== 'user')) throw new Error('Неверное сообщение');
     const conversation = database.getConversation(request.conversationId);
     if (!conversation) throw new Error('Чат не найден');
+    const mode = executionMode(conversation.mode, request.mode);
     if (conversation.modelId && conversation.modelId !== request.model) throw new Error('Выбранная модель была изменена. Повторите отправку сообщения.');
-    if (user) database.addMessage(request.conversationId, 'user', user.content, user.id);
+    const primaryProject = conversation.workingDirectory && conversation.primaryProjectId ? { id: conversation.primaryProjectId, slot: 1 as const, root: conversation.workingDirectory, label: `Project 1 — ${projectDirectoryName(conversation.workingDirectory)}` } : null;
+    const selectedProjects: AgentProject[] = primaryProject ? [primaryProject, ...(conversation.secondaryWorkingDirectory && conversation.secondaryProjectId ? [{ id: conversation.secondaryProjectId, slot: 2 as const, root: conversation.secondaryWorkingDirectory, label: `Project 2 — ${projectDirectoryName(conversation.secondaryWorkingDirectory)}` }] : [])] : [];
+    const validReferences = (references: ProjectReference[] | undefined): ProjectReference[] => (references ?? []).filter((reference) => selectedProjects.some((project) => project.id === reference.projectId && project.slot === reference.projectSlot && project.root === reference.projectPath) && (reference.kind === 'file' || reference.kind === 'folder') && Boolean(reference.relativePath));
+    if (user) { user.projectReferences = validReferences(user.projectReferences); database.addMessage(request.conversationId, 'user', user.content, user.id, user.projectReferences); }
     const emitAttachment = (chunk: import('../../shared/types').StreamEvent) => event.sender.send('chat:stream', { ...chunk, conversationId: request.conversationId, generationId: generation.id });
     const attachmentIds = [...(request.attachmentIds ?? [])];
     if (user) {
@@ -186,9 +225,12 @@ export function registerIpc(): void {
     await backend.ensureModelAvailable(request.model);
     if (!current()) return;
     let output = ''; let completed = false; let failed = false; let finishReason: 'stop' | 'length' = 'stop';
-    const agentRoot = conversation.mode === 'agent' ? conversation.workingDirectory ?? paths.root : null;
+    const agentProjects: AgentProject[] = mode === 'agent' ? (selectedProjects.length ? selectedProjects : [{ id: 'application-default', slot: 1, root: paths.root, label: `Project 1 — ${projectDirectoryName(paths.root)}` }]) : [];
+    // Stored references retain their root and identity even if the user later replaces Project 2.
+    for (const reference of database.listMessages(request.conversationId).flatMap((message) => message.projectReferences ?? [])) if (!agentProjects.some((project) => project.id === reference.projectId)) agentProjects.push({ id: reference.projectId, slot: reference.projectSlot, root: reference.projectPath, label: `Project ${reference.projectSlot} — ${projectDirectoryName(reference.projectPath)} (referenced)` });
+    const agentRoot = agentProjects[0]?.root ?? null;
     const enabledTools = agentRoot ? [taskNotesToolDefinition.function.name, agentPlanToolDefinition.function.name, ...projectToolDefinitions.map((tool) => tool.function.name), ...(conversation.webMode === 'auto' ? webToolDefinitions.map((tool) => tool.function.name) : [])] : conversation.webMode === 'auto' ? webToolDefinitions.map((tool) => tool.function.name) : [];
-    log('generation.snapshot', { generationId: generation.id, chatId: request.conversationId, mode: conversation.mode, workingDirectory: conversation.workingDirectory, resolvedWorkingDirectory: agentRoot, webMode: conversation.webMode, modelId: request.model, contextSize: conversation.contextWindow, reasoningPreset: conversation.analysisDepth, enabledTools });
+    log('generation.snapshot', { generationId: generation.id, chatId: request.conversationId, mode, storedMode: conversation.mode, requestedMode: request.mode, workingDirectory: conversation.workingDirectory, resolvedWorkingDirectory: agentRoot, projects: agentProjects.map((project) => ({ id: project.id, slot: project.slot })), webMode: conversation.webMode, modelId: request.model, contextSize: conversation.contextWindow, reasoningPreset: conversation.analysisDepth, enabledTools });
     run = agentRoot ? database.createAnalysisRun(request.conversationId, conversation.analysisDepth) : null;
     if (run && current()) event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run });
       const context = await backend.resolveContextWindow(request.model, conversation.contextWindow, abort.signal);
@@ -199,7 +241,7 @@ export function registerIpc(): void {
       let history = attachmentPipeline.buildContext(request.messages, !hasImages);
       if (nativeVision) history = await attachmentPipeline.prepareNativeImages(history, abort.signal);
       const stream = agentRoot
-        ? projectChat.stream(request.model, history, agentRoot, abort.signal, context.active, conversation.analysisDepth, conversation.webMode, inlineConfirmation(event, request.conversationId, generation, agentRoot), { generationId: generation.id, conversationId: request.conversationId })
+        ? projectChat.stream(request.model, history, agentProjects, abort.signal, context.active, conversation.analysisDepth, conversation.webMode, inlineConfirmation(event, request.conversationId, generation, agentRoot), { generationId: generation.id, conversationId: request.conversationId })
         : conversation.webMode === 'auto'
           ? webChat.stream(request.model, history, abort.signal, context.active, conversation.analysisDepth)
           : backend.streamChat(request.model, [{ id: `capability-${request.conversationId}`, conversationId: request.conversationId, role: 'system', content: capabilitySystemContext({ webAvailable: false }), createdAt: new Date().toISOString() }, ...history], abort.signal, context.active, conversation.analysisDepth);

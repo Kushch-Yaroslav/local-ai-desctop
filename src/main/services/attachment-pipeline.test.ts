@@ -4,12 +4,22 @@ import { AttachmentPipeline, MAX_ATTACHMENT_CONTEXT_CHARACTERS } from './attachm
 import { ProjectChatService } from './project-chat';
 import { WebBrowserService } from '../web/web-tools';
 import type { ToolMessage } from '../backends/types';
+import type { ProjectReference } from '../../shared/types';
+import { projectDirectoryName, removeProjectReferenceQuery } from '../../shared/project-references';
+import { existingProjectDirectory } from './project-picker';
 
 const png = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
 function assert(value: unknown, message: string): asserts value { if (!value) throw new Error(message); }
 
 /** Focused persistence/pipeline regression coverage; run with `npm run test:attachments`. */
 export async function runAttachmentPipelineRegression(): Promise<void> {
+  assert(projectDirectoryName('/media/yaroslav/DATA/Projects/local-ai-desktop/') === 'local-ai-desktop', 'project selector basename did not trim a POSIX root');
+  assert(projectDirectoryName('C:\\Projects\\platform_collectnpay') === 'platform_collectnpay', 'project selector basename did not support a Windows root');
+  assert(await existingProjectDirectory('/tmp') === '/tmp' && await existingProjectDirectory('/this/project/does/not/exist') === undefined, 'folder picker default directory did not preserve valid selections or fall back for stale roots');
+  const firstSelection = removeProjectReferenceQuery('Please inspect @git after this', 15, 19);
+  assert(firstSelection.value === 'Please inspect  after this' && firstSelection.cursor === 15, 'reference selection did not remove only its autocomplete query');
+  const secondSelection = removeProjectReferenceQuery(`${firstSelection.value} and @Input`, 31, 37);
+  assert(secondSelection.value.includes('Please inspect  after this') && !secondSelection.value.includes('@Input'), 'sequential reference selection did not preserve surrounding text');
   const database = new Database(); const chat = database.createConversation('qwen3.8:27b-q4_K_M'); const message = database.addMessage(chat.id, 'user', 'Inspect attachments'); const service = new AttachmentService(database);
   try {
     const images = [];
@@ -89,6 +99,23 @@ export async function runAttachmentPipelineRegression(): Promise<void> {
     assert(!retained.some((item) => item.id === oldAssistant.id || item.id === downstreamUser.id) && database.getAttachment(downstreamAttachment.id) === null, 'regeneration did not prune the downstream branch');
     const afterInterruptedResponse = database.regenerateUserMessageAndTruncate(regenerateUser.id);
     assert(afterInterruptedResponse.filter((item) => item.id === regenerateUser.id).length === 1, 'regeneration after an interrupted response changed the preserved user turn');
+
+    const oneProject = database.updateConversation(chat.id, { workingDirectory: '/project-one' });
+    assert(oneProject.primaryProjectId && !oneProject.secondaryWorkingDirectory, 'single-project conversation compatibility was not preserved');
+    const twoProjects = database.updateConversation(chat.id, { secondaryWorkingDirectory: '/project-two' });
+    assert(twoProjects.primaryProjectId && twoProjects.secondaryProjectId, 'optional Project 2 was not persisted');
+    const references: ProjectReference[] = [
+      { id: 'project-two-file', projectId: twoProjects.secondaryProjectId!, projectSlot: 2, projectPath: '/project-two', projectLabel: 'Project 2', relativePath: 'src/components/Input.tsx', kind: 'file' },
+      { id: 'project-one-folder', projectId: twoProjects.primaryProjectId!, projectSlot: 1, projectPath: '/project-one', projectLabel: 'Project 1', relativePath: 'src/components', kind: 'folder' },
+    ];
+    const referencedTurn = database.addMessage(chat.id, 'user', 'Use these resources.', undefined, references);
+    const changedSecondProject = database.updateConversation(chat.id, { secondaryWorkingDirectory: '/project-three' });
+    const storedReferences = database.getMessage(referencedTurn.id)?.projectReferences;
+    assert(storedReferences?.[0]?.projectId === twoProjects.secondaryProjectId && storedReferences[0].projectPath === '/project-two' && changedSecondProject.secondaryProjectId !== twoProjects.secondaryProjectId, 'changing Project 2 reinterpreted a persisted reference');
+    const editedReferences = database.editUserMessageAndTruncate(referencedTurn.id, 'Use these resources after editing.').find((message) => message.id === referencedTurn.id)?.projectReferences;
+    assert(editedReferences?.length === 2 && editedReferences[1].kind === 'folder', 'editing a message discarded its structured references');
+    const regeneratedReferences = database.regenerateUserMessageAndTruncate(referencedTurn.id).find((message) => message.id === referencedTurn.id)?.projectReferences;
+    assert(regeneratedReferences?.[0]?.projectId === twoProjects.secondaryProjectId, 'regeneration changed a stored reference identity');
 
     // A text-only model is a controlled unsupported state; there is no hidden
     // second model or unload/reload routing any more.

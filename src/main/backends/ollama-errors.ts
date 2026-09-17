@@ -9,6 +9,7 @@ export type OllamaFailureKind =
   | 'malformed_response'
   | 'empty_response'
   | 'output_limit'
+  | 'malformed_tool_arguments'
   | 'http_error'
   | 'internal';
 
@@ -47,14 +48,38 @@ function details(error: unknown): string {
   return values.filter(Boolean).join(' <- ') || String(error);
 }
 
-/** Preserve the transport cause so Agent retries can distinguish it from a model answer. */
+/**
+ * Both local runtimes can reject a model-generated tool argument before they
+ * return an assistant message. These are deliberately narrow server-parser
+ * signatures, not broad status-code handling.
+ */
+function malformedToolArguments(status: number | undefined, detail: string): OllamaRequestError | undefined {
+  if (status === 500 && /failed to parse tool call arguments as json/i.test(detail)) {
+    return new OllamaRequestError('malformed_tool_arguments', 'Локальный inference runtime отклонил некорректные JSON-аргументы вызова инструмента', { status, causeDetail: detail.slice(0, 500) });
+  }
+  if (status === 400 && /value looks like object, but can(?:no|'t|not) find closing ['"]?\}/i.test(detail)) {
+    return new OllamaRequestError('malformed_tool_arguments', 'Локальный inference runtime отклонил некорректные JSON-аргументы вызова инструмента', { status, causeDetail: detail.slice(0, 500) });
+  }
+  return undefined;
+}
+
+/** Preserve the transport cause so callers can distinguish runtime transport from a model answer. */
 export function classifyOllamaError(error: unknown, signal?: AbortSignal): OllamaRequestError {
-  if (error instanceof OllamaRequestError) return error;
+  if (error instanceof OllamaRequestError) {
+    return malformedToolArguments(error.status, error.causeDetail ?? error.message) ?? error;
+  }
   const detail = details(error);
   const lower = detail.toLowerCase();
   if (signal?.aborted || error instanceof DOMException && error.name === 'AbortError' || lower.includes('aborterror')) {
     return new OllamaRequestError('cancelled', 'Запрос к Ollama отменён', { causeDetail: detail });
   }
+  // A backend can reject generated tool-call JSON before it returns a
+  // ChatCompletion. Only explicit parser rejections are safe to hand back to
+  // the model for a corrected decision; unrelated 4xx/5xx responses are not.
+  const request = error && typeof error === 'object' ? (error as { request?: { status?: unknown; serverError?: unknown } }).request : undefined;
+  const serverError = typeof request?.serverError === 'string' ? request.serverError : '';
+  const malformed = malformedToolArguments(typeof request?.status === 'number' ? request.status : undefined, serverError);
+  if (malformed) return malformed;
   if (lower.includes('контекстное окно заполнено') || lower.includes('context window') || lower.includes('num_ctx')) {
     return new OllamaRequestError('context_exhausted', 'Контекстное окно заполнено. Уменьшите историю или выберите больший контекст, затем продолжите ответ.', { causeDetail: detail });
   }
@@ -68,7 +93,7 @@ export function classifyOllamaError(error: unknown, signal?: AbortSignal): Ollam
     return new OllamaRequestError('stream_interrupted', 'Поток ответа Ollama был прерван', { retryable: true, causeDetail: detail });
   }
   if (lower.includes('econnrefused') || lower.includes('enotfound') || lower.includes('ehostunreach') || lower.includes('fetch failed') || lower.includes('network')) {
-    return new OllamaRequestError('connection_failure', 'Не удалось подключиться к Ollama', { retryable: true, causeDetail: detail });
+    return new OllamaRequestError('connection_failure', 'Не удалось подключиться к локальному inference runtime.', { retryable: true, causeDetail: detail });
   }
   return new OllamaRequestError('internal', detail, { causeDetail: detail });
 }

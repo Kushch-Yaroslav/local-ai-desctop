@@ -1,10 +1,11 @@
 import type { AnalysisDepth, ChatMessage, FinishReason, ModelInfo, StreamEvent } from '../../shared/types';
-import { wholeNanoseconds, type InferenceDiagnostics, type LlmBackend, type ToolCallingBackend, type ToolMessage } from './types';
+import { createHash } from 'node:crypto';
+import { wholeNanoseconds, type InferenceDiagnostics, type LlmBackend, type ToolCallingBackend, type ToolInferenceRequestContext, type ToolMessage } from './types';
 import { contextPresetsFor, getModelProfile, modelInfo, requestedMaxOutputTokens } from '../models/model-registry';
 import type { ContextWindow } from './ollama-backend';
 import { log } from '../services/logger';
 
-type Choice = { finish_reason?: string | null; message?: { content?: string | null; reasoning_content?: string | null; tool_calls?: Array<{ function?: { name?: string; arguments?: string } }> }; delta?: { content?: string | null } };
+type Choice = { finish_reason?: string | null; message?: { content?: string | null; reasoning_content?: string | null; tool_calls?: Array<{ id?: string; type?: string; function?: { name?: string; arguments?: string } }> }; delta?: { content?: string | null } };
 type ChatResponse = { choices?: Choice[]; usage?: { prompt_tokens?: number; completion_tokens?: number }; timings?: { prompt_ms?: number; predicted_ms?: number; prompt_per_second?: number; predicted_per_second?: number } };
 type ModelsResponse = { data?: Array<{ meta?: { n_ctx?: number; size?: number } }> };
 type InputTokenResponse = { input_tokens?: unknown };
@@ -19,6 +20,36 @@ type ContextAccounting = {
   messageOverheadTokens: number; fixedOverheadTokens: number; toolSchemaCharsExcluded: number; estimatedPromptTokens: number; exactPromptTokens?: number;
 };
 type Budget = { inputTokens: number; maxTokens: number; requestedMaxTokens: number; source: 'exact' | 'estimate'; outputClamped: boolean; remainingContext?: number; accounting: ContextAccounting };
+
+function errorSummary(error: unknown): { error: string; errorCode?: string } {
+  const messages: string[] = []; let code: string | undefined; let current: unknown = error;
+  for (let depth = 0; depth < 4 && current; depth += 1) {
+    if (current instanceof Error) { messages.push(current.message); current = (current as Error & { cause?: unknown }).cause; continue; }
+    if (typeof current === 'object') {
+      const value = current as { message?: unknown; code?: unknown; cause?: unknown };
+      if (typeof value.message === 'string') messages.push(value.message);
+      if (typeof value.code === 'string') code ??= value.code;
+      current = value.cause; continue;
+    }
+    messages.push(String(current)); break;
+  }
+  return { error: messages.filter(Boolean).join(' <- ') || String(error), ...(code ? { errorCode: code } : {}) };
+}
+function responseTextShape(value: unknown): Record<string, unknown> {
+  if (typeof value !== 'string') return { present: value !== undefined && value !== null, type: typeof value };
+  const tags = value.match(/<\/?(?:tool_call|function|parameter|[a-z][\w-]*)(?:=[^>]+)?>/gi)?.slice(0, 12) ?? [];
+  return {
+    present: true,
+    length: value.length,
+    sha256: createHash('sha256').update(value).digest('hex'),
+    leadingWhitespaceLength: value.length - value.trimStart().length,
+    trailingWhitespaceLength: value.length - value.trimEnd().length,
+    hasToolCallTag: /<tool_call>/i.test(value),
+    hasCreateFileFunctionTag: /<function=create_file>/i.test(value),
+    hasPathParameterTag: /<parameter=path>/i.test(value),
+    tagSequence: tags,
+  };
+}
 
 export class LlamaCppRequestError extends Error {
   constructor(readonly request: RequestDiagnostics) { super(`llama.cpp отклонил запрос (HTTP ${request.status})${request.userMessage ? `: ${request.userMessage}` : ''}`); this.name = 'LlamaCppRequestError'; }
@@ -35,17 +66,27 @@ export class LlamaCppContextExhaustedError extends Error {
 
 /** Validates chronological OpenAI tool history without reordering it for a chat template. */
 export function validateLlamaMessageSequence(messages: ToolMessage[]): string | undefined {
-  let seenNonSystem = false; const pendingTools: string[] = [];
+  let seenNonSystem = false; const pendingTools: Array<{ id: string; name: string }> = [];
   for (const [index, message] of messages.entries()) {
     if (message.role === 'system') { if (seenNonSystem) return `system message at index ${index} follows conversation history`; continue; }
     seenNonSystem = true;
     if (message.role === 'tool') {
-      const toolIndex = pendingTools.indexOf(message.tool_name ?? '');
-      if (toolIndex < 0) return `tool result at index ${index} has no preceding matching tool call`;
+      const toolIndex = message.tool_call_id
+        ? pendingTools.findIndex((call) => call.id === message.tool_call_id)
+        : pendingTools.findIndex((call) => call.name === message.tool_name);
+      if (toolIndex < 0) return `tool result at index ${index} has no preceding matching tool call${message.tool_call_id ? ` (${message.tool_call_id})` : ''}`;
       pendingTools.splice(toolIndex, 1); continue;
     }
     if (pendingTools.length) return `message at index ${index} appears before ${pendingTools.length} tool result(s)`;
-    if (message.role === 'assistant' && message.tool_calls?.length) pendingTools.push(...message.tool_calls.map((call) => call.function.name));
+    if (message.role === 'assistant' && message.tool_calls?.length) {
+      for (const [callIndex, call] of message.tool_calls.entries()) {
+        const id = call.id ?? `legacy:${call.function.name}:${callIndex}`;
+        if (pendingTools.some((pending) => pending.id === id)) return `assistant tool call at index ${index} has duplicate id ${id}`;
+        // Older llama.cpp responses can omit IDs. Give these legacy calls a
+        // local unique key; name-based result matching remains only a fallback.
+        pendingTools.push({ id, name: call.function.name });
+      }
+    }
   }
   return pendingTools.length ? `${pendingTools.length} tool call(s) lack a result` : undefined;
 }
@@ -95,7 +136,7 @@ export class LlamaCppBackend implements LlmBackend, ToolCallingBackend {
     return messages.map((message) => {
       const tool = message as ToolMessage;
       if (tool.images?.length) return { role: message.role, content: [{ type: 'text', text: message.content }, ...tool.images.map((image) => ({ type: 'image_url', image_url: { url: image.startsWith('data:') ? image : `data:image/png;base64,${image}` } }))] };
-      return { role: message.role, content: message.content, ...(tool.tool_calls ? { tool_calls: tool.tool_calls.map((call) => ({ type: 'function', ...call })) } : {}), ...(tool.tool_name ? { name: tool.tool_name } : {}) };
+      return { role: message.role, content: message.content, ...(tool.tool_calls ? { tool_calls: tool.tool_calls.map((call) => ({ type: 'function', ...call, function: { ...call.function, arguments: typeof call.function.arguments === 'string' ? call.function.arguments : JSON.stringify(call.function.arguments) } })) } : {}), ...(tool.tool_name ? { name: tool.tool_name } : {}), ...(tool.tool_call_id ? { tool_call_id: tool.tool_call_id } : {}) };
     });
   }
   private payload(model: string, messages: Array<ChatMessage | ToolMessage>, tools: unknown[] | undefined, depth: AnalysisDepth, maxTokens?: number, stream?: boolean): Record<string, unknown> {
@@ -116,8 +157,8 @@ export class LlamaCppBackend implements LlmBackend, ToolCallingBackend {
       return undefined;
     }
   }
-  private async budget(model: string, messages: Array<ChatMessage | ToolMessage>, contextWindow: number, depth: AnalysisDepth, tools: unknown[] | undefined, signal: AbortSignal): Promise<Budget> {
-    const accounting = this.estimate(messages, tools); const requestedMaxTokens = requestedMaxOutputTokens(depth);
+  private async budget(model: string, messages: Array<ChatMessage | ToolMessage>, contextWindow: number, depth: AnalysisDepth, tools: unknown[] | undefined, signal: AbortSignal, requestedMaxTokens = requestedMaxOutputTokens(depth)): Promise<Budget> {
+    const accounting = this.estimate(messages, tools);
     const exactPromptTokens = await this.exactInputTokens(model, messages, tools, depth, signal);
     if (exactPromptTokens !== undefined) {
       accounting.exactPromptTokens = exactPromptTokens;
@@ -137,7 +178,7 @@ export class LlamaCppBackend implements LlmBackend, ToolCallingBackend {
   private requestDiagnostics(model: string, messages: Array<ChatMessage | ToolMessage>, tools: unknown[] | undefined, contextWindow: number, depth: AnalysisDepth, budget: Budget, status: number, endpoint: string, serverError?: string): RequestDiagnostics {
     const userMessage = serverError?.match(/Error:\s*(?:Jinja Exception:\s*)?([^\n]+)/)?.[1]?.slice(0, 240) || serverError?.slice(0, 240);
     const contextClassification = /context|n_ctx|prompt.*token|slot.*full|exceed/i.test(serverError ?? '') ? 'backend_context_rejected' : 'http_error';
-    return { endpoint, status, ...(serverError ? { serverError } : {}), ...(userMessage ? { userMessage } : {}), backend: 'llama-cpp', model, contextSize: contextWindow, requestedMaxOutput: requestedMaxOutputTokens(depth), effectiveMaxOutput: budget.maxTokens, messageCount: messages.length, toolCount: tools?.length ?? 0, hasImages: messages.some((message) => Boolean(message.images?.length)), estimatedPromptTokens: budget.accounting.estimatedPromptTokens, ...(budget.accounting.exactPromptTokens === undefined ? {} : { exactPromptTokens: budget.accounting.exactPromptTokens }), contextClassification };
+    return { endpoint, status, ...(serverError ? { serverError } : {}), ...(userMessage ? { userMessage } : {}), backend: 'llama-cpp', model, contextSize: contextWindow, requestedMaxOutput: budget.requestedMaxTokens, effectiveMaxOutput: budget.maxTokens, messageCount: messages.length, toolCount: tools?.length ?? 0, hasImages: messages.some((message) => Boolean(message.images?.length)), estimatedPromptTokens: budget.accounting.estimatedPromptTokens, ...(budget.accounting.exactPromptTokens === undefined ? {} : { exactPromptTokens: budget.accounting.exactPromptTokens }), contextClassification };
   }
   private async failedRequest(model: string, messages: Array<ChatMessage | ToolMessage>, tools: unknown[] | undefined, contextWindow: number, depth: AnalysisDepth, budget: Budget, response: Response, endpoint: string): Promise<never> {
     const body = await response.text().catch(() => ''); let serverError = '';
@@ -158,20 +199,61 @@ export class LlamaCppBackend implements LlmBackend, ToolCallingBackend {
     this.lastActualPromptTokens = actualPromptEvalCount;
     log('llama-cpp.context.calibration', { backend: 'llama-cpp', estimatedPromptTokens: budget.accounting.estimatedPromptTokens, ...(budget.accounting.exactPromptTokens === undefined ? {} : { exactPromptTokens: budget.accounting.exactPromptTokens }), actualPromptEvalCount, estimationErrorRatio: actualPromptEvalCount > 0 ? budget.accounting.estimatedPromptTokens / actualPromptEvalCount : undefined, contextLimit, remainingContext: contextLimit - actualPromptEvalCount, requestedOutput: budget.requestedMaxTokens, effectiveOutput: budget.maxTokens, outputClamped: budget.outputClamped, tokenCountSource: budget.source });
   }
-  async chatWithTools(model: string, messages: ToolMessage[], tools: unknown[] | undefined, signal: AbortSignal, contextWindow: number, depth: AnalysisDepth): Promise<ToolMessage> {
-    await this.ensureModelAvailable(model);
-    const sequenceError = validateLlamaMessageSequence(messages);
-    if (sequenceError) { log('llama-cpp.request.invalid', { backend: 'llama-cpp', model, endpoint: '/v1/chat/completions', sequenceError, messages: messages.map((message, index) => ({ index, role: message.role, toolName: message.tool_name, toolCallCount: message.tool_calls?.length ?? 0 })) }); throw new Error(`Некорректная последовательность Agent сообщений: ${sequenceError}`); }
-    const budget = await this.budget(model, messages, contextWindow, depth, tools, signal);
-    let response: Response; const endpoint = '/v1/chat/completions';
-    try { response = await fetch(this.url(endpoint), { method: 'POST', signal, headers: { 'content-type': 'application/json' }, body: JSON.stringify(this.payload(model, messages, tools, depth, budget.maxTokens, false)) }); }
-    catch (error) { throw new Error(`llama.cpp inference connection failed: ${error instanceof Error ? error.message : String(error)}`); }
-    if (!response.ok) return this.failedRequest(model, messages, tools, contextWindow, depth, budget, response, endpoint);
-    const data = await response.json().catch(() => null) as ChatResponse | null;
-    if (!data) throw new Error('llama.cpp вернул некорректный JSON-ответ');
-    const choice = data.choices?.[0]; if (!choice?.message) throw new Error('llama.cpp вернул ответ без assistant message');
-    this.recordCalibration(budget, contextWindow, data);
-    return { role: 'assistant', content: choice.message.content ?? '', thinking: choice.message.reasoning_content ?? undefined, tool_calls: (choice.message.tool_calls ?? []).flatMap((call) => call.function?.name ? [{ function: { name: call.function.name, arguments: call.function.arguments ?? '{}' } }] : []), finish_reason: finishReason(choice.finish_reason), prompt_eval_count: data.usage?.prompt_tokens, inference: this.diagnostics(depth, contextWindow, budget, data) };
+  async chatWithTools(model: string, messages: ToolMessage[], tools: unknown[] | undefined, signal: AbortSignal, contextWindow: number, depth: AnalysisDepth, requestContext?: ToolInferenceRequestContext): Promise<ToolMessage> {
+    const startedAt = Date.now(); const endpoint = '/v1/chat/completions';
+    let connectionError: unknown;
+    const agentDiagnostics = requestContext ? { generationId: requestContext.generationId, conversationId: requestContext.conversationId, agentStep: requestContext.agentStep, phase: requestContext.phase, messageCount: messages.length, toolResultCount: messages.filter((message) => message.role === 'tool').length, assistantToolCallCount: messages.reduce((count, message) => count + (message.tool_calls?.length ?? 0), 0), contextWindow, signalAborted: signal.aborted } : undefined;
+    if (agentDiagnostics) log('llama-cpp.agent.inference.started', { ...agentDiagnostics, startedAt: new Date(startedAt).toISOString() });
+    try {
+      await this.ensureModelAvailable(model);
+      const sequenceError = validateLlamaMessageSequence(messages);
+      if (sequenceError) { log('llama-cpp.request.invalid', { backend: 'llama-cpp', model, endpoint, sequenceError, messages: messages.map((message, index) => ({ index, role: message.role, toolName: message.tool_name, toolCallId: message.tool_call_id, toolCallCount: message.tool_calls?.length ?? 0, toolCallIds: message.tool_calls?.map((call) => call.id) })) }); throw new Error(`Некорректная последовательность Agent сообщений: ${sequenceError}`); }
+      const budget = await this.budget(model, messages, contextWindow, depth, tools, signal, requestContext?.maxOutputTokens);
+      const dispatchedAt = Date.now();
+      if (agentDiagnostics) log('llama-cpp.agent.inference.dispatched', { ...agentDiagnostics, dispatchedAt: new Date(dispatchedAt).toISOString(), preparationElapsedMs: dispatchedAt - startedAt, requestedMaxTokens: budget.requestedMaxTokens, maxTokens: budget.maxTokens, estimatedPromptTokens: budget.accounting.estimatedPromptTokens, exactPromptTokens: budget.accounting.exactPromptTokens });
+      let response: Response;
+      try { response = await fetch(this.url(endpoint), { method: 'POST', signal, headers: { 'content-type': 'application/json' }, body: JSON.stringify(this.payload(model, messages, tools, depth, budget.maxTokens, false)) }); }
+      catch (error) { connectionError = error; throw error; }
+      const completedAt = Date.now();
+      if (agentDiagnostics) log('llama-cpp.agent.inference.response', { ...agentDiagnostics, completedAt: new Date(completedAt).toISOString(), elapsedMs: completedAt - startedAt, fetchElapsedMs: completedAt - dispatchedAt, status: response.status, signalAborted: signal.aborted });
+      if (!response.ok) return this.failedRequest(model, messages, tools, contextWindow, depth, budget, response, endpoint);
+      const data = await response.json().catch(() => null) as ChatResponse | null;
+      if (!data) throw new Error('llama.cpp вернул некорректный JSON-ответ');
+      const choice = data.choices?.[0]; if (!choice?.message) throw new Error('llama.cpp вернул ответ без assistant message');
+      if (agentDiagnostics) {
+        const rawMessage = choice.message as Record<string, unknown>;
+        const rawToolCalls = rawMessage.tool_calls;
+        log('llama-cpp.agent.inference.raw-response', {
+          ...agentDiagnostics,
+          responseMessageKeys: Object.keys(rawMessage),
+          nativeToolCallsPresent: Array.isArray(rawToolCalls),
+          nativeToolCallCount: Array.isArray(rawToolCalls) ? rawToolCalls.length : 0,
+          nativeToolNames: Array.isArray(rawToolCalls) ? rawToolCalls.flatMap((call) => call && typeof call === 'object' && typeof (call as { function?: { name?: unknown } }).function?.name === 'string' ? [(call as { function: { name: string } }).function.name] : []) : [],
+          nativeToolCalls: Array.isArray(rawToolCalls) ? rawToolCalls.map((call) => {
+            const functionCall = call && typeof call === 'object' ? (call as { function?: Record<string, unknown> }).function : undefined;
+            return { keys: call && typeof call === 'object' ? Object.keys(call as Record<string, unknown>) : [], id: call && typeof call === 'object' && typeof (call as { id?: unknown }).id === 'string' ? (call as { id: string }).id : undefined, functionKeys: functionCall ? Object.keys(functionCall) : [], name: functionCall?.name, arguments: responseTextShape(functionCall?.arguments) };
+          }) : [],
+          content: responseTextShape(rawMessage.content),
+          reasoning: responseTextShape(rawMessage.reasoning_content),
+        });
+      }
+      this.recordCalibration(budget, contextWindow, data);
+      return { role: 'assistant', content: choice.message.content ?? '', thinking: choice.message.reasoning_content ?? undefined, tool_calls: (choice.message.tool_calls ?? []).flatMap((call) => call.function?.name ? [{ ...(call.id ? { id: call.id } : {}), ...(call.type === 'function' ? { type: 'function' as const } : {}), function: { name: call.function.name, arguments: call.function.arguments ?? '{}' } }] : []), finish_reason: finishReason(choice.finish_reason), prompt_eval_count: data.usage?.prompt_tokens, inference: this.diagnostics(depth, contextWindow, budget, data) };
+    } catch (error) {
+      const failedAt = Date.now(); const summary = errorSummary(error);
+      if (agentDiagnostics) {
+        const health = connectionError ? await this.probeHealth() : undefined;
+        log('llama-cpp.agent.inference.failed', { ...agentDiagnostics, failedAt: new Date(failedAt).toISOString(), elapsedMs: failedAt - startedAt, signalAborted: signal.aborted, ...summary, health });
+      }
+      if (connectionError && !signal.aborted) throw new Error(`llama.cpp inference connection failed: ${summary.error}`, { cause: error });
+      throw error;
+    }
+  }
+  private async probeHealth(): Promise<{ available: boolean; elapsedMs: number; status?: number; error?: string }> {
+    const startedAt = Date.now(); const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), 2_000);
+    try { const response = await fetch(this.url('/health'), { signal: controller.signal }); return { available: response.ok, elapsedMs: Date.now() - startedAt, status: response.status }; }
+    catch (error) { return { available: false, elapsedMs: Date.now() - startedAt, error: error instanceof Error ? error.message : String(error) }; }
+    finally { clearTimeout(timer); }
   }
   async *streamChat(model: string, messages: ChatMessage[], signal: AbortSignal, contextWindow = 32_768, depth: AnalysisDepth = 'normal'): AsyncIterable<StreamEvent> {
     try {

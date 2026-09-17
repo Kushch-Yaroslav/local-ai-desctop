@@ -17,6 +17,8 @@
     "test:diagnostics": "npm run build && node dist/main/services/generation-diagnostics.test.js",
     "test:regeneration": "npm run build && node dist/shared/generation-guard.test.js",
     "test:llama-cpp-backend": "npm run build && node dist/main/backends/llama-cpp-backend.test.js",
+    "test:ollama-errors": "npm run build && node dist/main/backends/ollama-errors.test.js",
+    "test:ollama-backend": "npm run build && node dist/main/backends/ollama-backend.test.js",
     "start": "electron ."
   },
   "dependencies": {

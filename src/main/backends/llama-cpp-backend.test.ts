@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import { createServer, type Server } from 'node:http';
 import { once } from 'node:events';
-import { LlamaCppBackend, LlamaCppContextExhaustedError, LlamaCppRequestError } from './llama-cpp-backend';
+import { LlamaCppBackend, LlamaCppContextExhaustedError, LlamaCppRequestError, validateLlamaMessageSequence } from './llama-cpp-backend';
 import type { ToolMessage } from './types';
 
 const model = 'qwen3.8:27b-q4_K_M';
-type Scenario = { tokenCounts?: number[]; lastTokenCount?: number; tokenCountStatus?: number; chatStatus?: number; timings?: { prompt_ms?: number; predicted_ms?: number }; requestBodies: Array<Record<string, unknown>>; countBodies: Array<Record<string, unknown>> };
+type Scenario = { tokenCounts?: number[]; lastTokenCount?: number; tokenCountStatus?: number; chatStatus?: number; chatError?: string; timings?: { prompt_ms?: number; predicted_ms?: number }; requestBodies: Array<Record<string, unknown>>; countBodies: Array<Record<string, unknown>> };
 
 async function readBody(request: AsyncIterable<Uint8Array>): Promise<Record<string, unknown>> {
   const chunks: Uint8Array[] = [];
@@ -28,7 +28,7 @@ async function startServer(scenario: Scenario): Promise<{ server: Server; url: s
     }
     if (path === '/v1/chat/completions') {
       scenario.requestBodies.push(body);
-      if (scenario.chatStatus) { reply(response, scenario.chatStatus, { error: { message: 'context length exceeded by server' } }); return; }
+      if (scenario.chatStatus) { reply(response, scenario.chatStatus, { error: { message: scenario.chatError ?? 'context length exceeded by server' } }); return; }
       reply(response, 200, { choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }], usage: { prompt_tokens: scenario.lastTokenCount ?? 1_000, completion_tokens: 1 }, ...(scenario.timings ? { timings: scenario.timings } : {}) }); return;
     }
     reply(response, 404, { error: { message: 'not found' } });
@@ -44,6 +44,20 @@ const toolSchema = [{ type: 'function', function: { name: 'read_file', descripti
 const call = (backend: LlamaCppBackend, messages: ToolMessage[], tools: unknown[] | undefined = toolSchema) => backend.chatWithTools(model, messages, tools, new AbortController().signal, 65_536, 'enhanced');
 
 export async function runLlamaCppBackendRegression(): Promise<void> {
+  {
+    const complete: ToolMessage[] = [
+      ...baseMessages(),
+      { role: 'assistant', content: '', tool_calls: [
+        { id: 'call-a', type: 'function', function: { name: 'read_file', arguments: { path: 'a.ts' } } },
+        { id: 'call-b', type: 'function', function: { name: 'read_file', arguments: { path: 'b.ts' } } },
+      ] },
+      { role: 'tool', tool_name: 'read_file', tool_call_id: 'call-b', content: '{}' },
+      { role: 'tool', tool_name: 'read_file', tool_call_id: 'call-a', content: '{}' },
+      { role: 'user', content: '<runtime_context kind="tool_call_failed">continue</runtime_context>' },
+    ];
+    assert.equal(validateLlamaMessageSequence(complete), undefined, 'matching tool_call_id results were rejected');
+    assert.match(validateLlamaMessageSequence(complete.slice(0, 4).concat(complete[5]!)) ?? '', /before 1 tool result/, 'a recovery context was accepted before a sibling tool result');
+  }
   {
     const scenario: Scenario = { tokenCounts: [1_000], timings: { prompt_ms: 12.3456789, predicted_ms: 0.0012345 }, requestBodies: [], countBodies: [] }; const { server, url } = await startServer(scenario);
     try {
@@ -85,14 +99,26 @@ export async function runLlamaCppBackendRegression(): Promise<void> {
     } finally { await stop(server); }
   }
   {
+    const scenario: Scenario = { tokenCounts: [2_000], chatStatus: 500, chatError: 'Failed to parse tool call arguments as JSON: [json.exception.parse_error.101] invalid string: missing closing quote', requestBodies: [], countBodies: [] }; const { server, url } = await startServer(scenario);
+    try {
+      await assert.rejects(call(new LlamaCppBackend(url), baseMessages()), (error: unknown) => error instanceof LlamaCppRequestError && error.request.status === 500 && /Failed to parse tool call arguments as JSON/.test(error.request.serverError ?? ''));
+    } finally { await stop(server); }
+  }
+  {
     const scenario: Scenario = { tokenCounts: [33_000, 34_000], requestBodies: [], countBodies: [] }; const { server, url } = await startServer(scenario);
     try {
       const backend = new LlamaCppBackend(url);
       await call(backend, baseMessages('first Agent request'));
-      const next: ToolMessage[] = [...baseMessages('first Agent request'), { role: 'assistant', content: '', tool_calls: [{ function: { name: 'read_file', arguments: { path: 'src/A.ts' } } }] }, { role: 'tool', tool_name: 'read_file', content: JSON.stringify({ path: 'src/A.ts', content: 'small result' }) }];
-      const response = await call(backend, next);
+      const next: ToolMessage[] = [...baseMessages('first Agent request'), { role: 'assistant', content: '', tool_calls: [{ id: 'call-read-a', type: 'function', function: { name: 'read_file', arguments: { path: 'src/A.ts' } } }] }, { role: 'tool', tool_name: 'read_file', tool_call_id: 'call-read-a', content: JSON.stringify({ path: 'src/A.ts', content: 'small result' }) }];
+      const response = await backend.chatWithTools(model, next, toolSchema, new AbortController().signal, 65_536, 'enhanced', { generationId: 'generation', conversationId: 'conversation', agentStep: 2, phase: 'post_tool', maxOutputTokens: 4_096 });
       assert.equal(response.inference?.inputTokens, 34_000, 'second request did not retain backend-authoritative token count');
       assert.equal(scenario.requestBodies.length, 2, 'appended Agent history was not sent');
+      assert.equal(scenario.requestBodies[0].max_tokens, 16_384, 'ordinary tool-call requests changed their output limit');
+      assert.equal(scenario.requestBodies[1].max_tokens, 4_096, 'post-tool Agent request did not use the bounded output limit');
+      const serializedMessages = scenario.requestBodies[1].messages as Array<Record<string, unknown>>;
+      assert.equal((serializedMessages[2].tool_calls as Array<Record<string, unknown>>)[0].id, 'call-read-a', 'assistant tool-call ID was dropped while serializing llama.cpp history');
+      assert.equal(((serializedMessages[2].tool_calls as Array<{ function: { arguments: unknown } }>)[0]).function.arguments, '{"path":"src/A.ts"}', 'llama.cpp did not serialize canonical tool arguments as OpenAI JSON text');
+      assert.equal(serializedMessages[3].tool_call_id, 'call-read-a', 'tool result did not retain its matching tool-call ID');
     } finally { await stop(server); }
   }
   {

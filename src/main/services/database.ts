@@ -1,10 +1,11 @@
 import { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
-import type { AnalysisDepth, AnalysisRun, Attachment, AttachmentKind, AttachmentStatus, ChatMessage, ChatMode, Conversation, GenerationDiagnostics, ToolActivity, WebMode } from '../../shared/types';
+import type { AnalysisDepth, AnalysisRun, Attachment, AttachmentKind, AttachmentStatus, ChatMessage, ChatMode, Conversation, GenerationDiagnostics, ProjectReference, ProjectReferenceKind, ToolActivity, WebMode } from '../../shared/types';
 import { paths } from './paths';
 
 type ConversationRow = {
   id: string; title: string; model_id: string | null; mode: ChatMode; working_directory: string | null;
+  primary_project_id: string | null; secondary_working_directory: string | null; secondary_project_id: string | null;
   context_window: number;
   analysis_depth: AnalysisDepth;
   context_tokens: number | null; context_model_id: string | null;
@@ -12,13 +13,14 @@ type ConversationRow = {
   created_at: string; updated_at: string;
 };
 type MessageRow = { id: string; conversation_id: string; role: ChatMessage['role']; content: string; created_at: string };
+type ProjectReferenceRow = { id: string; message_id: string; position: number; project_id: string; project_slot: 1 | 2; project_path: string; project_label: string; relative_path: string; kind: ProjectReferenceKind };
 type AttachmentRow = { id: string; message_id: string; position: number; kind: AttachmentKind; mime_type: string; filename: string; size: number; storage_ref: string; status: AttachmentStatus; extracted_text: string | null; structured_data: string | null; vision_analysis: string | null; error: string | null; metadata: string | null; created_at: string; updated_at: string };
 type AnalysisRunRow = { id: string; conversation_id: string; assistant_message_id: string | null; depth: AnalysisDepth; status: AnalysisRun['status']; action_count: number; created_at: string; completed_at: string | null };
 type AnalysisActionRow = { id: string; run_id: string; label: string; detail: string | null; data: string | null; position: number };
 
 const mapConversation = (row: ConversationRow): Conversation => ({
   id: row.id, title: row.title, modelId: row.model_id, mode: row.mode,
-  workingDirectory: row.working_directory, contextWindow: row.context_window ?? 32_768, analysisDepth: row.analysis_depth ?? 'normal', contextTokens: row.context_tokens ?? null, contextModelId: row.context_model_id ?? null, webMode: row.web_mode ?? 'auto', createdAt: row.created_at, updatedAt: row.updated_at,
+  workingDirectory: row.working_directory, primaryProjectId: row.primary_project_id ?? null, secondaryWorkingDirectory: row.secondary_working_directory ?? null, secondaryProjectId: row.secondary_project_id ?? null, contextWindow: row.context_window ?? 32_768, analysisDepth: row.analysis_depth ?? 'normal', contextTokens: row.context_tokens ?? null, contextModelId: row.context_model_id ?? null, webMode: row.web_mode ?? 'auto', createdAt: row.created_at, updatedAt: row.updated_at,
 });
 const mapAttachment = (row: AttachmentRow): Attachment => ({
   id: row.id, messageId: row.message_id, index: row.position, kind: row.kind, mimeType: row.mime_type, filename: row.filename, size: row.size, storageRef: row.storage_ref, status: row.status,
@@ -29,9 +31,11 @@ function parseAttachmentMetadata(value: string | null): Record<string, unknown> 
   if (!value) return undefined;
   try { const parsed = JSON.parse(value); return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : undefined; } catch { return undefined; }
 }
-const mapMessage = (row: MessageRow, attachments?: Attachment[]): ChatMessage => ({
+const mapReference = (row: ProjectReferenceRow): ProjectReference => ({ id: row.id, projectId: row.project_id, projectSlot: row.project_slot, projectPath: row.project_path, projectLabel: row.project_label, relativePath: row.relative_path, kind: row.kind });
+const mapMessage = (row: MessageRow, attachments?: Attachment[], projectReferences?: ProjectReference[]): ChatMessage => ({
   id: row.id, conversationId: row.conversation_id, role: row.role, content: row.content, createdAt: row.created_at,
   attachments,
+  projectReferences,
 });
 const mapRun = (row: AnalysisRunRow, actions: AnalysisActionRow[]): AnalysisRun => ({ id: row.id, conversationId: row.conversation_id, assistantMessageId: row.assistant_message_id, depth: row.depth, status: row.status, actionCount: row.action_count, actions: actions.map((action) => {
   let stored: Partial<ToolActivity> = {};
@@ -54,6 +58,12 @@ export class Database {
         role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL
       ) STRICT;
       CREATE INDEX IF NOT EXISTS messages_conversation_idx ON messages(conversation_id, created_at);
+      CREATE TABLE IF NOT EXISTS project_references (
+        id TEXT PRIMARY KEY, message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+        position INTEGER NOT NULL, project_id TEXT NOT NULL, project_slot INTEGER NOT NULL,
+        project_path TEXT NOT NULL, project_label TEXT NOT NULL, relative_path TEXT NOT NULL, kind TEXT NOT NULL
+      ) STRICT;
+      CREATE INDEX IF NOT EXISTS project_references_message_idx ON project_references(message_id, position);
       CREATE TABLE IF NOT EXISTS attachments (
         id TEXT PRIMARY KEY, message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
         position INTEGER NOT NULL, kind TEXT NOT NULL, mime_type TEXT NOT NULL, filename TEXT NOT NULL,
@@ -81,6 +91,10 @@ export class Database {
     try { this.db.exec('ALTER TABLE conversations ADD COLUMN context_tokens INTEGER'); } catch { /* Existing databases already have this column. */ }
     try { this.db.exec('ALTER TABLE conversations ADD COLUMN context_model_id TEXT'); } catch { /* Existing databases already have this column. */ }
     try { this.db.exec("ALTER TABLE conversations ADD COLUMN web_mode TEXT NOT NULL DEFAULT 'auto'"); } catch { /* Existing databases already have this column. */ }
+    try { this.db.exec('ALTER TABLE conversations ADD COLUMN primary_project_id TEXT'); } catch { /* Existing databases already have this column. */ }
+    try { this.db.exec('ALTER TABLE conversations ADD COLUMN secondary_working_directory TEXT'); } catch { /* Existing databases already have this column. */ }
+    try { this.db.exec('ALTER TABLE conversations ADD COLUMN secondary_project_id TEXT'); } catch { /* Existing databases already have this column. */ }
+    this.db.exec("UPDATE conversations SET primary_project_id=lower(hex(randomblob(16))) WHERE working_directory IS NOT NULL AND primary_project_id IS NULL");
     try { this.db.exec('ALTER TABLE generation_diagnostics ADD COLUMN prompt_eval_count INTEGER'); } catch { /* Existing databases already have this column. */ }
     try { this.db.exec('ALTER TABLE generation_diagnostics ADD COLUMN prompt_eval_duration INTEGER'); } catch { /* Existing databases already have this column. */ }
     try { this.db.exec('ALTER TABLE generation_diagnostics ADD COLUMN eval_count INTEGER'); } catch { /* Existing databases already have this column. */ }
@@ -100,20 +114,22 @@ export class Database {
   createConversation(modelId: string | null = null): Conversation {
     const id = randomUUID(); const now = new Date().toISOString();
     const title = 'Новый чат';
-    this.db.prepare("INSERT INTO conversations (id, title, model_id, mode, working_directory, context_window, analysis_depth, context_tokens, context_model_id, web_mode, created_at, updated_at) VALUES (?, ?, ?, ?, NULL, ?, ?, NULL, NULL, 'auto', ?, ?)").run(id, title, modelId, 'chat', 32_768, 'normal', now, now);
-    return { id, title, modelId, mode: 'chat', workingDirectory: null, contextWindow: 32_768, analysisDepth: 'normal', contextTokens: null, contextModelId: null, webMode: 'auto', createdAt: now, updatedAt: now };
+    this.db.prepare("INSERT INTO conversations (id, title, model_id, mode, working_directory, primary_project_id, secondary_working_directory, secondary_project_id, context_window, analysis_depth, context_tokens, context_model_id, web_mode, created_at, updated_at) VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, NULL, NULL, 'auto', ?, ?)").run(id, title, modelId, 'chat', 32_768, 'normal', now, now);
+    return { id, title, modelId, mode: 'chat', workingDirectory: null, primaryProjectId: null, secondaryWorkingDirectory: null, secondaryProjectId: null, contextWindow: 32_768, analysisDepth: 'normal', contextTokens: null, contextModelId: null, webMode: 'auto', createdAt: now, updatedAt: now };
   }
 
-  updateConversation(id: string, patch: Partial<Pick<Conversation, 'title' | 'modelId' | 'mode' | 'workingDirectory' | 'contextWindow' | 'analysisDepth' | 'webMode'>>): Conversation {
+  updateConversation(id: string, patch: Partial<Pick<Conversation, 'title' | 'modelId' | 'mode' | 'workingDirectory' | 'secondaryWorkingDirectory' | 'contextWindow' | 'analysisDepth' | 'webMode'>>): Conversation {
     const current = this.getConversation(id);
     if (!current) throw new Error('Чат не найден');
     const next = { ...current, ...patch, updatedAt: new Date().toISOString() };
+    if (patch.workingDirectory !== undefined && patch.workingDirectory !== current.workingDirectory) next.primaryProjectId = patch.workingDirectory ? randomUUID() : null;
+    if (patch.secondaryWorkingDirectory !== undefined && patch.secondaryWorkingDirectory !== current.secondaryWorkingDirectory) next.secondaryProjectId = patch.secondaryWorkingDirectory ? randomUUID() : null;
     const contextWindow = [16_384, 32_768, 65_536, 131_072, 262_144].includes(next.contextWindow) ? next.contextWindow : 32_768;
     // Existing fast/normal/deep values remain valid; enhanced is additive and needs no data rewrite.
     const analysisDepth: AnalysisDepth = ['fast', 'normal', 'enhanced', 'deep'].includes(next.analysisDepth) ? next.analysisDepth : 'normal';
     const webMode: WebMode = next.webMode === 'off' ? 'off' : 'auto';
-    this.db.prepare('UPDATE conversations SET title=?, model_id=?, mode=?, working_directory=?, context_window=?, analysis_depth=?, web_mode=?, updated_at=? WHERE id=?')
-      .run(next.title, next.modelId, next.mode, next.workingDirectory, contextWindow, analysisDepth, webMode, next.updatedAt, id);
+    this.db.prepare('UPDATE conversations SET title=?, model_id=?, mode=?, working_directory=?, primary_project_id=?, secondary_working_directory=?, secondary_project_id=?, context_window=?, analysis_depth=?, web_mode=?, updated_at=? WHERE id=?')
+      .run(next.title, next.modelId, next.mode, next.workingDirectory, next.primaryProjectId, next.secondaryWorkingDirectory, next.secondaryProjectId, contextWindow, analysisDepth, webMode, next.updatedAt, id);
     next.contextWindow = contextWindow;
     next.analysisDepth = analysisDepth;
     next.webMode = webMode;
@@ -127,6 +143,7 @@ export class Database {
     this.db.prepare('DELETE FROM analysis_runs WHERE conversation_id=?').run(id);
     this.db.prepare('DELETE FROM generation_diagnostics WHERE conversation_id=?').run(id);
     this.db.prepare('DELETE FROM attachments WHERE message_id IN (SELECT id FROM messages WHERE conversation_id=?)').run(id);
+    this.db.prepare('DELETE FROM project_references WHERE message_id IN (SELECT id FROM messages WHERE conversation_id=?)').run(id);
     this.db.prepare('DELETE FROM messages WHERE conversation_id=?').run(id);
     this.db.prepare('DELETE FROM conversations WHERE id=?').run(id);
     return attachments;
@@ -138,24 +155,29 @@ export class Database {
   }
 
   listMessages(conversationId: string): ChatMessage[] {
-    return (this.db.prepare('SELECT * FROM messages WHERE conversation_id=? ORDER BY created_at ASC').all(conversationId) as unknown as MessageRow[]).map((row) => mapMessage(row, this.listAttachments(row.id)));
+    return (this.db.prepare('SELECT * FROM messages WHERE conversation_id=? ORDER BY created_at ASC').all(conversationId) as unknown as MessageRow[]).map((row) => mapMessage(row, this.listAttachments(row.id), this.listProjectReferences(row.id)));
   }
 
   getMessage(id: string): ChatMessage | null {
     const row = this.db.prepare('SELECT * FROM messages WHERE id=?').get(id) as unknown as MessageRow | undefined;
-    return row ? mapMessage(row, this.listAttachments(row.id)) : null;
+    return row ? mapMessage(row, this.listAttachments(row.id), this.listProjectReferences(row.id)) : null;
   }
 
   findUserMessage(conversationId: string, content: string): ChatMessage | null {
     const row = this.db.prepare("SELECT * FROM messages WHERE conversation_id=? AND role='user' AND content=? ORDER BY rowid DESC LIMIT 1").get(conversationId, content) as unknown as MessageRow | undefined;
-    return row ? mapMessage(row, this.listAttachments(row.id)) : null;
+    return row ? mapMessage(row, this.listAttachments(row.id), this.listProjectReferences(row.id)) : null;
   }
 
-  addMessage(conversationId: string, role: ChatMessage['role'], content: string, id: string = randomUUID()): ChatMessage {
+  addMessage(conversationId: string, role: ChatMessage['role'], content: string, id: string = randomUUID(), projectReferences: ProjectReference[] = []): ChatMessage {
     const message = { id, conversationId, role, content, createdAt: new Date().toISOString() };
     this.db.prepare('INSERT INTO messages VALUES (?, ?, ?, ?, ?)').run(message.id, message.conversationId, message.role, message.content, message.createdAt);
+    for (const [position, reference] of projectReferences.entries()) this.db.prepare('INSERT INTO project_references (id, message_id, position, project_id, project_slot, project_path, project_label, relative_path, kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run(reference.id, message.id, position, reference.projectId, reference.projectSlot, reference.projectPath, reference.projectLabel, reference.relativePath, reference.kind);
     this.db.prepare('UPDATE conversations SET updated_at=? WHERE id=?').run(message.createdAt, conversationId);
-    return message;
+    return { ...message, projectReferences };
+  }
+
+  listProjectReferences(messageId: string): ProjectReference[] {
+    return (this.db.prepare('SELECT * FROM project_references WHERE message_id=? ORDER BY position ASC').all(messageId) as unknown as ProjectReferenceRow[]).map(mapReference);
   }
 
   createAttachment(input: Omit<Attachment, 'createdAt' | 'updatedAt' | 'status'> & { status?: AttachmentStatus }): Attachment {
@@ -217,6 +239,7 @@ export class Database {
       if (runIds.length) this.db.prepare(`DELETE FROM analysis_runs WHERE id IN (${runIds.map(() => '?').join(',')})`).run(...runIds.map((run) => run.id));
     }
     this.db.prepare('DELETE FROM attachments WHERE message_id IN (SELECT id FROM messages WHERE conversation_id=? AND rowid>?)').run(target.conversation_id, target.rowid);
+    this.db.prepare('DELETE FROM project_references WHERE message_id IN (SELECT id FROM messages WHERE conversation_id=? AND rowid>?)').run(target.conversation_id, target.rowid);
     this.db.prepare('DELETE FROM messages WHERE conversation_id=? AND rowid>?').run(target.conversation_id, target.rowid);
     this.db.prepare('UPDATE conversations SET updated_at=? WHERE id=?').run(new Date().toISOString(), target.conversation_id);
     if (commit) this.db.exec('COMMIT');

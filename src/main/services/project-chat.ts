@@ -1,44 +1,140 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { AgentPlan, AnalysisDepth, ChatMessage, FinishReason, StreamEvent, ToolActivity, WebMode } from '../../shared/types';
 import type { InferenceDiagnostics, ToolCall, ToolCallingBackend, ToolMessage } from '../backends/types';
+import { validateLlamaMessageSequence } from '../backends/llama-cpp-backend';
 import { AnalysisEngine } from './analysis-engine';
 import { log } from './logger';
 import { ReadonlyProjectTools, activityForTool, projectToolDefinitions, type ConfirmAction, type ProjectToolCall } from '../tools/project-tools';
 import { capabilitySystemContext } from './capabilities';
 import { WebBrowserService, type WebBrowserSession, activityForWebTool, webToolDefinitions } from '../web/web-tools';
 import { AgentToolContext, type ReadDiagnostic, type ToolContextStats } from './agent-tool-context';
-import { OllamaRequestError, ollamaErrorDiagnostics } from '../backends/ollama-errors';
+import { OllamaRequestError, classifyOllamaError, ollamaErrorDiagnostics } from '../backends/ollama-errors';
 import { isTaskNotesCall, TaskNotes, taskNotesToolDefinition } from './task-notes';
 import { agentPlanToolDefinition, AgentPlanState, isAgentPlanCall } from './agent-plan';
+import { projectDirectoryName } from '../../shared/project-references';
 
 const finalizationThreshold = 5;
 const finalSynthesisTimeoutMs = 120_000;
-const maxInferenceAttempts = 3;
-const retryDelayMs = (attempt: number): number => 150 * 2 ** (attempt - 1);
+const initialInferenceRetryDelayMs = 150;
+// Tool-decision turns are non-streaming. Keep them well below Node's five-minute response-header timeout.
+const agentToolTurnMaxOutputTokens = 4_096;
+const maxMalformedToolArgumentRecoveries = 2;
+const maxToolFailureRecoveries = 3;
 type AgentRuntimeContext = { generationId: string; conversationId: string };
+export type AgentProject = { id: string; slot: 1 | 2; root: string; label: string };
 
 function parseCall(call: ToolCall): ProjectToolCall {
   const raw = call.function.arguments; let argumentsObject: Record<string, unknown> = {};
   if (typeof raw === 'string') { try { argumentsObject = JSON.parse(raw) as Record<string, unknown>; } catch { argumentsObject = {}; } } else if (raw && typeof raw === 'object') argumentsObject = raw;
-  return { name: call.function.name, arguments: argumentsObject };
+  return { name: call.function.name, arguments: argumentsObject, ...(call.id ? { toolCallId: call.id } : {}) };
 }
-function parseInlineToolCalls(content: string): ProjectToolCall[] {
+type TextualToolCallParse = { calls: ProjectToolCall[]; malformed: boolean; reason?: string };
+function safeTextShape(value: string): Record<string, unknown> {
+  return {
+    length: value.length,
+    sha256: createHash('sha256').update(value).digest('hex'),
+    hasToolCallTag: /<tool_call>/i.test(value),
+    hasCreateFileFunctionTag: /<function=create_file>/i.test(value),
+    hasPathParameterTag: /<parameter=path>/i.test(value),
+    leadingWhitespaceLength: value.length - value.trimStart().length,
+    trailingWhitespaceLength: value.length - value.trimEnd().length,
+  };
+}
+function safeArgumentsShape(argumentsObject: Record<string, unknown>): Record<string, unknown> {
+  return {
+    keys: Object.keys(argumentsObject).sort(),
+    content: typeof argumentsObject.content === 'string' ? { length: argumentsObject.content.length, sha256: createHash('sha256').update(argumentsObject.content).digest('hex') } : undefined,
+  };
+}
+
+/**
+ * Qwen chat templates can emit this exact protocol through llama.cpp instead of
+ * OpenAI's `tool_calls`. Accept only complete wrappers and complete parameter
+ * pairs so ordinary prose cannot become a project operation.
+ */
+function parseTextualToolCalls(content: string): TextualToolCallParse {
   const calls: ProjectToolCall[] = [];
-  for (const match of content.matchAll(/<function=([a-z_]+)>([\s\S]*?)<\/function>/g)) {
+  const callPattern = /<tool_call>\s*<function=([a-z_]+)>([\s\S]*?)<\/function>\s*<\/tool_call>/g;
+  for (const call of content.matchAll(callPattern)) {
     const argumentsObject: Record<string, unknown> = {};
-    for (const parameter of match[2].matchAll(/<parameter=([a-z_]+)>\s*([\s\S]*?)\s*<\/parameter>/g)) argumentsObject[parameter[1]] = /^\d+$/.test(parameter[2].trim()) ? Number(parameter[2].trim()) : parameter[2].trim();
-    calls.push({ name: match[1], arguments: argumentsObject });
+    const parameterPattern = /<parameter=([a-z_]+)>([\s\S]*?)<\/parameter>/g;
+    let parameterCursor = 0;
+    for (const parameter of call[2].matchAll(parameterPattern)) {
+      if (call[2].slice(parameterCursor, parameter.index).trim()) return { calls: [], malformed: true, reason: 'unexpected_function_content' };
+      const name = parameter[1];
+      // File content is opaque: do not trim or otherwise modify multiline HTML,
+      // scripts, styles, or template literals. Scalar parameters are normalized.
+      const raw = parameter[2]; const normalized = name === 'content' ? raw : raw.trim();
+      argumentsObject[name] = /^\d+$/.test(normalized) ? Number(normalized) : normalized;
+      parameterCursor = (parameter.index ?? 0) + parameter[0].length;
+    }
+    if (!Object.keys(argumentsObject).length || call[2].slice(parameterCursor).trim()) return { calls: [], malformed: true, reason: 'missing_or_invalid_parameters' };
+    // Qwen's textual template uses file_path, while the registered project tools
+    // use path. Keep this narrowly scoped to the two file-content tools.
+    if ((call[1] === 'create_file' || call[1] === 'write_file') && argumentsObject.path === undefined && argumentsObject.file_path !== undefined) {
+      argumentsObject.path = argumentsObject.file_path;
+      delete argumentsObject.file_path;
+    }
+    calls.push({ name: call[1], arguments: argumentsObject });
   }
-  return calls;
+  const resemblesProtocol = /<tool_call>\s*<function=[a-z_]+>/s.test(content);
+  return calls.length ? { calls, malformed: false } : resemblesProtocol ? { calls: [], malformed: true, reason: 'incomplete_wrapper' } : { calls: [], malformed: false };
 }
-/** Removes inline tool-call markup so it never leaks into the assistant message text. */
-function stripInlineToolCalls(content: string): string {
-  return content.replace(/<function=[a-z_]+>[\s\S]*?<\/function>/g, '').replace(/\s{2,}/g, ' ').trim();
+
+/** Removes only complete internal protocol wrappers, never ordinary prose. */
+function stripTextualToolCalls(content: string): string {
+  return content
+    .replace(/<tool_call>\s*<function=[a-z_]+>[\s\S]*?<\/function>\s*<\/tool_call>/g, '')
+    // A native structured call still wins, but a malformed duplicate protocol
+    // fragment must not become visible assistant prose.
+    .replace(/<tool_call>\s*<function=[a-z_]+>[\s\S]*?(?:<\/tool_call>|$)/g, '')
+    .replace(/\n{3,}/g, '\n\n').trim();
+}
+/**
+ * Keep the Agent's replayable history as structured arguments. Ollama feeds
+ * historical assistant calls back through its Qwen tool parser and rejects a
+ * JSON string there, while llama.cpp's OpenAI wire adapter serializes this
+ * canonical object at its own boundary.
+ */
+function normalizedToolCalls(calls: ProjectToolCall[]): ToolCall[] {
+  return calls.map((call) => ({ id: call.toolCallId ?? randomUUID(), type: 'function', function: { name: call.name, arguments: call.arguments } }));
+}
+function toolResult(call: ProjectToolCall, content: string): ToolMessage {
+  return { role: 'tool', tool_name: call.name, ...(call.toolCallId ? { tool_call_id: call.toolCallId } : {}), content };
+}
+function skippedToolResult(call: ProjectToolCall, failedCall: ProjectToolCall): ToolMessage {
+  return toolResult(call, JSON.stringify({ error: `Вызов пропущен после ошибки ${failedCall.name}; исправь предыдущий вызов и затем повтори нужные действия.`, code: 'tool_call_skipped', tool: call.name }));
 }
 const chunkText = (content: string): string[] => content.match(/[\s\S]{1,96}/g) ?? [];
 const signature = (call: ProjectToolCall): string => `${call.name}:${JSON.stringify(Object.entries(call.arguments).sort(([a], [b]) => a.localeCompare(b)))}`;
 function lowInformation(raw: string): boolean { try { const value = JSON.parse(raw) as Record<string, unknown>; return typeof value.error === 'string' || (Array.isArray(value.entries) && value.entries.length === 0) || (Array.isArray(value.matches) && value.matches.length === 0); } catch { return false; } }
 function resultObject(raw: string): Record<string, unknown> { try { const value = JSON.parse(raw); return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}; } catch { return {}; } }
+function compactFailureReason(value: unknown): string {
+  return typeof value === 'string' && value.trim() ? value.replace(/\s+/g, ' ').trim().slice(0, 240) : 'Инструмент не смог выполнить запрос.';
+}
+function compactToolFailure(call: ProjectToolCall, raw: string): string {
+  const result = resultObject(raw);
+  return JSON.stringify({
+    error: compactFailureReason(result.error),
+    code: 'tool_call_failed',
+    tool: call.name,
+    instruction: 'Исправь аргументы или выбери другой допустимый инструмент. Не повторяй действие, отклонённое пользователем.',
+  });
+}
+function toolRecoveryNotice(call: ProjectToolCall, attempt: number, reason: string): ToolMessage {
+  return runtimeNotice('tool_call_failed', `Вызов инструмента не выполнен. tool=${call.name}; reason=${reason}; recovery_attempt=${attempt}. Исправь аргументы или выбери другой допустимый инструмент и продолжи. Не повторяй действие, отклонённое пользователем.`);
+}
+function malformedToolArgumentsNotice(attempt: number): ToolMessage {
+  return runtimeNotice('malformed_tool_arguments', `Локальный inference runtime отклонил сгенерированные JSON-аргументы вызова инструмента до выполнения. recovery_attempt=${attempt}. Повтори решение с одним корректным вызовом инструмента и валидным JSON. Для большого содержимого сначала создай короткий каркас, затем вноси небольшие patch; не отправляй длинный документ одним аргументом.`);
+}
+function recoveryActivity(label: string, attempt: number, failure: string): ToolActivity {
+  return { id: randomUUID(), label, kind: 'other', state: 'error', metadata: { recovery_attempt: attempt, failure } };
+}
+function scopedProjectResult(raw: string, project: AgentProject | undefined): string {
+  if (!project) return raw;
+  const value = resultObject(raw);
+  return Object.keys(value).length ? JSON.stringify({ ...value, project_id: project.id, project_slot: project.slot, project_label: project.label }) : raw;
+}
 function planSnapshot(value: Record<string, unknown>): AgentPlan | undefined {
   const plan = value.plan;
   return plan && typeof plan === 'object' && !Array.isArray(plan) && Array.isArray((plan as { steps?: unknown }).steps) ? plan as AgentPlan : undefined;
@@ -188,19 +284,31 @@ function completedActivity(activity: ToolActivity, call: ProjectToolCall, raw: s
   return { ...activity, detail, state: error || (call.name === 'run_terminal' && value.exit_code !== 0) ? 'error' : 'completed', metadata, output };
 }
 const runtimeNotice = (kind: string, content: string): ToolMessage => ({ role: 'user', content: `<runtime_context kind="${kind}">${content}</runtime_context>` });
-const agentHistory = (history: ChatMessage[]): ToolMessage[] => history.map(({ role, content, images }) => role === 'system' ? runtimeNotice('history', content) : ({ role, content, ...(images?.length ? { images } : {}) }));
+const referenceContext = (message: ChatMessage): string => {
+  const references = message.projectReferences ?? [];
+  if (!references.length) return message.content;
+  const items = references.map((reference) => `- ${reference.kind === 'file' ? 'Explicit file (read this directly before broad exploration when relevant)' : 'Explicit folder scope (use list/search/read inside it; do not recursively load it)'}: ${reference.relativePath} | Project ${reference.projectSlot} (${projectDirectoryName(reference.projectPath)}) | project_id=${reference.projectId} | created_slot=Project ${reference.projectSlot}`).join('\n');
+  return `<project_references>\n${items}\n</project_references>\n\n${message.content}`;
+};
+const agentHistory = (history: ChatMessage[]): ToolMessage[] => {
+  const representedReferences = new Set(history.filter((message) => message.role === 'system' && message.id.startsWith('project-references-')).map((message) => message.id.slice('project-references-'.length)));
+  return history.map(({ id, role, content, images, projectReferences, ...message }) => role === 'system' ? runtimeNotice('history', content) : ({ role, content: role === 'user' && !representedReferences.has(id) ? referenceContext({ id, ...message, role, content, images, projectReferences }) : content, ...(images?.length ? { images } : {}) }));
+};
 const messageMetadata = (messages: ToolMessage[]): Array<Record<string, unknown>> => messages.map((message, index) => {
   let contentKind: string | undefined;
   try { const value = JSON.parse(message.content) as { context_compacted?: boolean; cached_read?: boolean; status?: unknown }; if (value.context_compacted) contentKind = 'compacted_tool_result'; else if (value.cached_read || value.status === 'unchanged') contentKind = 'cached_read'; } catch { /* Do not log content. */ }
   if (message.content.startsWith('<runtime_context')) contentKind = 'runtime_context';
-  return { index, role: message.role, toolName: message.tool_name, toolCallCount: message.tool_calls?.length ?? 0, contentKind };
+  return { index, role: message.role, toolName: message.tool_name, toolCallId: message.tool_call_id, toolCallCount: message.tool_calls?.length ?? 0, toolCallIds: message.tool_calls?.map((call) => call.id), contentKind };
 });
 
 export class ProjectChatService {
   constructor(private readonly backend: ToolCallingBackend, private readonly web: WebBrowserService) {}
 
-  async *stream(model: string, history: ChatMessage[], root: string, signal: AbortSignal, contextWindow: number, depth: AnalysisDepth, webMode: WebMode, confirm: ConfirmAction, runtime?: AgentRuntimeContext): AsyncIterable<StreamEvent> {
-    const engine = new AnalysisEngine(depth); const tools = await ReadonlyProjectTools.open(root, confirm);
+  async *stream(model: string, history: ChatMessage[], root: string | AgentProject[], signal: AbortSignal, contextWindow: number, depth: AnalysisDepth, webMode: WebMode, confirm: ConfirmAction, runtime?: AgentRuntimeContext): AsyncIterable<StreamEvent> {
+    const projects: AgentProject[] = typeof root === 'string' ? [{ id: 'project-1', slot: 1, root, label: 'Project 1' }] : root;
+    const primary = projects.find((project) => project.slot === 1) ?? projects[0];
+    if (!primary) throw new Error('Primary project is unavailable');
+    const engine = new AnalysisEngine(depth); const tools = new Map(await Promise.all(projects.map(async (project) => [project.id, await ReadonlyProjectTools.open(project.root, confirm)] as const)));
     let webSession: WebBrowserSession | null = null;
     if (webMode === 'auto') {
       try { webSession = await this.web.openSession(); }
@@ -209,11 +317,14 @@ export class ProjectChatService {
     const closeWebOnAbort = () => { void webSession?.close(); };
     signal.addEventListener('abort', closeWebOnAbort, { once: true });
     const toolDefinitions = [taskNotesToolDefinition, agentPlanToolDefinition, ...projectToolDefinitions, ...(webSession ? webToolDefinitions : [])];
-    const messages: ToolMessage[] = [{ role: 'system', content: `${capabilitySystemContext({ webAvailable: Boolean(webSession), projectRoot: root, projectWriteAvailable: true, terminalAvailable: true })} Не предполагай тип, технологию или предметную область проекта. ${engine.strategy()} Рабочий цикл для задач изменения кода: Explore → Implement → Verify → Finalize. Сначала найди только нужные места и зависимости; когда поведение и точки изменения понятны, переходи к минимальной реализации, а не продолжай широкое исследование ради дополнительной уверенности. Перед повторным чтением неизменённого файла назови конкретный неразрешённый вопрос и предпочти узкий диапазон. В сложных или длинных задачах используй Task Notes: фиксируй существенные находки и перед повторным чтением уже исследованных файлов сначала сверяйся с notes. Planning через task_plan доступен для задач с несколькими этапами, исследованием нескольких частей проекта или существенной проверкой; простые задачи не требуют плана. Plan хранит этапы, а Task Notes — факты и решения. После исследования обновляй статусы Plan и переходи к реализации, не продолжай бесконечное чтение. Не обновляй notes или Plan после каждого вызова инструмента. После изменения выполни сфокусированную проверку и заверши ответ. Для явно исследовательской задачи изменение файла не требуется. Используй report_progress редко и только при переходе между изучением, реализацией и проверкой; это короткий пользовательский статус, не рассуждение. Результаты инструментов могут быть детерминированно сокращены ради контекстного бюджета; для полного содержания файла снова вызови read_file с конкретным диапазоном.` }, ...agentHistory(history)];
+    const availableToolNames = new Set(toolDefinitions.map((definition) => definition.function.name));
+    const projectContext = projects.map((project) => `- Project ${project.slot}: Name: ${projectDirectoryName(project.root)}; Role: ${project.slot === 1 ? 'primary' : 'secondary'}; project_id=${project.id}${project.slot === 1 ? '; default for every tool call without a project scope.' : ''}`).join('\n');
+    const messages: ToolMessage[] = [{ role: 'system', content: `${capabilitySystemContext({ webAvailable: Boolean(webSession), projectRoot: primary.root, projectWriteAvailable: true, terminalAvailable: true })}\nAvailable projects (paths are scoped by the tool runtime):\n${projectContext}\nEvery project tool accepts optional project_id or project_slot. Use project_id for an explicit reference, and never infer project identity from a relative path. ${engine.strategy()} Рабочий цикл для задач изменения кода: Explore → Implement → Verify → Finalize. Сначала найди только нужные места и зависимости; когда поведение и точки изменения понятны, переходи к минимальной реализации, а не продолжай широкое исследование ради дополнительной уверенности. Перед повторным чтением неизменённого файла назови конкретный неразрешённый вопрос и предпочти узкий диапазон. В сложных или длинных задачах используй Task Notes: фиксируй существенные находки и перед повторным чтением уже исследованных файлов сначала сверяйся с notes. Planning через task_plan доступен для задач с несколькими этапами, исследованием нескольких частей проекта или существенной проверкой; простые задачи не требуют плана. Plan хранит этапы, а Task Notes — факты и решения. После исследования обновляй статусы Plan и переходи к реализации, не продолжай бесконечное чтение. Не обновляй notes или Plan после каждого вызова инструмента. После изменения выполни сфокусированную проверку и заверши ответ. Для явно исследовательской задачи изменение файла не требуется. Используй report_progress редко и только при переходе между изучением, реализацией и проверкой; это короткий пользовательский статус, не рассуждение. Результаты инструментов могут быть детерминированно сокращены ради контекстного бюджета; для полного содержания файла снова вызови read_file с конкретным диапазоном.` }, ...agentHistory(history)];
     const toolContext = new AgentToolContext(contextWindow);
     const taskNotes = new TaskNotes();
     const plan = new AgentPlanState();
-    let actions = 0; let progressReports = 0; let repeats = 0; let lowInfo = 0; let warningSent = false; let researchFinished = false;
+    let actions = 0; let progressReports = 0; let repeats = 0; let lowInfo = 0; let warningSent = false; let researchFinished = false; let initialInferencePending = true; let truncatedToolDecisions = 0; let malformedToolArgumentRecoveries = 0; let protocolFailureRecoveries = 0; let recoveryPending = false;
+    const toolFailureAttempts = new Map<string, number>();
     const progressMessages = new Set<string>();
     const completed = new Set<string>();
     const stagnation = new AgentStagnation(history);
@@ -222,22 +333,109 @@ export class ProjectChatService {
       const remaining = engine.budget - actions;
       if (remaining <= 0) { yield* this.synthesize(model, messages, engine, signal, contextWindow, '', actions, toolContext.stats(), runtime); return; }
       if (remaining <= finalizationThreshold && !warningSent) { messages.push(runtimeNotice('action_budget', 'Осталось мало вызовов. Закрой только наиболее важные пробелы и заверши исследование.')); warningSent = true; }
-      const response = await this.inference(model, messages, toolDefinitions, signal, contextWindow, depth, actions, toolContext.stats(), runtime);
+      let response: ToolMessage;
+      try {
+        response = await this.inference(model, messages, toolDefinitions, signal, contextWindow, depth, actions, toolContext.stats(), runtime, initialInferencePending, recoveryPending);
+        initialInferencePending = false;
+        recoveryPending = false;
+        // A response reached the normal Agent protocol, so a later malformed
+        // server-side call is a new recovery episode.
+        malformedToolArgumentRecoveries = 0;
+      } catch (error) {
+        initialInferencePending = false;
+        const classified = classifyOllamaError(error, signal);
+        if (signal.aborted || classified.kind === 'cancelled') throw classified;
+        if (classified.kind !== 'malformed_tool_arguments') throw classified;
+        malformedToolArgumentRecoveries += 1;
+        log('agent.malformed-tool-arguments', { ...runtime, agentStep: actions, phase: 'tool_decision', recoveryAttempt: malformedToolArgumentRecoveries, recoveryLimit: maxMalformedToolArgumentRecoveries, tool: undefined, argumentLength: undefined, ...ollamaErrorDiagnostics(classified) });
+        if (malformedToolArgumentRecoveries > maxMalformedToolArgumentRecoveries) {
+          log('agent.malformed-tool-arguments.exhausted', { ...runtime, agentStep: actions, recoveryAttempts: malformedToolArgumentRecoveries - 1, recoveryLimit: maxMalformedToolArgumentRecoveries });
+          yield { type: 'error', message: 'Агент не смог сформировать корректный вызов инструмента', details: 'Модель дважды получила запрос исправить JSON-аргументы инструмента.' };
+          return;
+        }
+        yield { type: 'tool', activity: recoveryActivity('Некорректные аргументы инструмента — запрошено исправление', malformedToolArgumentRecoveries, 'malformed_tool_arguments') };
+        messages.push(malformedToolArgumentsNotice(malformedToolArgumentRecoveries));
+        recoveryPending = true;
+        continue;
+      }
       const rawContent = response.content ?? '';
-      const calls = response.tool_calls?.length ? response.tool_calls.map(parseCall) : parseInlineToolCalls(rawContent);
-      const assistantContent = calls.length ? stripInlineToolCalls(rawContent) : rawContent;
-      messages.push({ role: 'assistant', content: assistantContent, tool_calls: response.tool_calls });
+      const textual = response.tool_calls?.length ? undefined : parseTextualToolCalls(rawContent);
+      if (textual && /<tool_call>/i.test(rawContent)) log('agent.tool-call.textual.fallback', { ...runtime, agentStep: actions, raw: safeTextShape(rawContent), malformed: textual.malformed, reason: textual.reason, calls: textual.calls.map((call) => ({ name: call.name, arguments: safeArgumentsShape(call.arguments), registered: availableToolNames.has(call.name) })) });
+      if (textual?.malformed) {
+        protocolFailureRecoveries += 1;
+        log('agent.tool-call.textual.invalid', { ...runtime, agentStep: actions, reason: textual.reason, recoveryAttempt: protocolFailureRecoveries, recoveryLimit: maxToolFailureRecoveries });
+        if (protocolFailureRecoveries > maxToolFailureRecoveries) {
+          yield { type: 'error', message: 'Агент не смог исправить вызов инструмента', details: 'Модель несколько раз вернула некорректный формат вызова инструмента.' };
+          return;
+        }
+        yield { type: 'tool', activity: recoveryActivity('Некорректный вызов инструмента — запрошено исправление', protocolFailureRecoveries, 'malformed_textual_protocol') };
+        messages.push({ role: 'assistant', content: stripTextualToolCalls(rawContent) });
+        messages.push(runtimeNotice('malformed_tool_protocol', `Вызов инструмента не выполнен: некорректный формат (${textual.reason ?? 'unknown'}). recovery_attempt=${protocolFailureRecoveries}. Сформируй один корректный вызов доступного инструмента или короткий итог без инструмента.`));
+        recoveryPending = true;
+        continue;
+      }
+      const calls = response.tool_calls?.length ? response.tool_calls.map(parseCall) : textual?.calls ?? [];
+      // llama.cpp sometimes omits call IDs. Generate one before history is
+      // constructed so sibling calls with the same name remain distinguishable.
+      for (const call of calls) call.toolCallId ??= randomUUID();
+      const assistantContent = calls.length ? stripTextualToolCalls(rawContent) : rawContent;
+      // Calls are retained in canonical structured form. Each backend adapts
+      // this representation at its own protocol boundary.
+      messages.push({ role: 'assistant', content: assistantContent, tool_calls: calls.length ? normalizedToolCalls(calls) : undefined });
       if (calls.length === 0) {
+        // A reasoning model can exhaust a tool-decision turn before it emits the
+        // call. That is not a final answer: keep tools enabled for two bounded
+        // continuation instead of sending it to tool-less final synthesis.
+        if (response.finish_reason === 'length') {
+          truncatedToolDecisions += 1;
+          log('agent.tool-decision.truncated', { ...runtime, agentStep: actions, continuation: truncatedToolDecisions, content: safeTextShape(rawContent), reasoning: safeTextShape(response.thinking ?? '') });
+          if (truncatedToolDecisions <= 2) {
+            messages.push(runtimeNotice('tool_decision_truncated', 'Предыдущий выбор действия остановился по лимиту вывода до завершения. Не формируй итоговый ответ и не раскрывай рассуждения: сейчас вызови один нужный доступный инструмент либо дай короткий итог без инструмента.'));
+            continue;
+          }
+          yield { type: 'error', message: 'Агент не завершил выбор действия', details: 'Модель дважды достигла лимита вывода до вызова инструмента.' };
+          return;
+        }
         researchFinished = true;
         if (engine.isDeep) log('deep.lifecycle', { phase: 'research.finished', actions });
         yield* this.synthesize(model, messages, engine, signal, contextWindow, assistantContent, actions, toolContext.stats(), runtime);
         return;
       }
+      truncatedToolDecisions = 0;
+      protocolFailureRecoveries = 0;
       let lowInformationNotice = false;
       let stagnationIntervention: StagnationIntervention | undefined;
       let latestStagnationStats: StagnationStats | undefined;
-      for (const call of calls) {
-        if (signal.aborted || actions >= engine.budget) break;
+      let batchRecovery: { call: ProjectToolCall; attempt: number; reason: string; failure: string } | undefined;
+      let batchRecoveryExhausted = false;
+      let actionBudgetReached = false;
+      for (const [callIndex, call] of calls.entries()) {
+        if (signal.aborted) {
+          // A stopped run will not request another inference, but retaining a
+          // complete local history prevents an invalid partial batch being
+          // persisted or accidentally reused by future orchestration.
+          for (const skipped of calls.slice(callIndex)) messages.push(toolResult(skipped, JSON.stringify({ error: 'Generation cancelled', code: 'tool_call_cancelled', tool: skipped.name })));
+          break;
+        }
+        if (batchRecovery || actionBudgetReached) {
+          messages.push(skippedToolResult(call, batchRecovery?.call ?? call));
+          continue;
+        }
+        if (actions >= engine.budget) {
+          actionBudgetReached = true;
+          messages.push(toolResult(call, JSON.stringify({ error: 'Лимит действий агента исчерпан; вызов не выполнен.', code: 'action_budget_exhausted', tool: call.name })));
+          continue;
+        }
+        if (!availableToolNames.has(call.name)) {
+          protocolFailureRecoveries += 1;
+          const reason = `Недоступный инструмент "${call.name}"`;
+          const result = compactToolFailure(call, JSON.stringify({ error: reason }));
+          messages.push(toolResult(call, result));
+          log('agent.tool-call.unknown', { ...runtime, agentStep: actions, tool: call.name, toolCallId: call.toolCallId, argumentKeys: Object.keys(call.arguments), recoveryAttempt: protocolFailureRecoveries, recoveryLimit: maxToolFailureRecoveries });
+          batchRecovery = { call, attempt: protocolFailureRecoveries, reason, failure: 'unknown_tool' };
+          batchRecoveryExhausted = protocolFailureRecoveries > maxToolFailureRecoveries;
+          continue;
+        }
         if (call.name === 'report_progress') {
           const message = typeof call.arguments.message === 'string' ? call.arguments.message.replace(/\s+/g, ' ').trim().slice(0, 240) : '';
           const accepted = message.length >= 3 && progressReports < 12 && !progressMessages.has(message);
@@ -246,15 +444,25 @@ export class ProjectChatService {
             progressReports += 1; progressMessages.add(message);
             yield { type: 'tool', activity: { id: actionId, ...activityForTool({ ...call, arguments: { message } }), metadata: { progress_index: progressReports } } };
           }
-          messages.push({ role: 'tool', tool_name: call.name, content: JSON.stringify(accepted ? { reported: true } : { reported: false, reason: 'Progress updates are limited; continue with the task.' }) });
+          messages.push(toolResult(call, JSON.stringify(accepted ? { reported: true } : { reported: false, reason: 'Progress updates are limited; continue with the task.' })));
           continue;
         }
         const key = signature(call);
         // Re-reading is valid after mutations, for another range, and for verification.
         // The context manager deduplicates unchanged same-range reads without hiding content.
+        if (completed.has(key) && toolFailureAttempts.has(key)) {
+          const failedAttempt = toolFailureAttempts.get(key);
+          const recoveryAttempt = (failedAttempt ?? 0) + 1;
+          toolFailureAttempts.set(key, recoveryAttempt);
+          log('agent.tool-call.recovery.repeated-failure', { ...runtime, agentStep: actions, tool: call.name, recoveryAttempt, recoveryLimit: maxToolFailureRecoveries });
+          messages.push(toolResult(call, compactToolFailure(call, JSON.stringify({ error: 'Идентичный вызов уже завершился ошибкой.' }))));
+          batchRecovery = { call, attempt: recoveryAttempt, reason: 'Идентичный вызов уже завершился ошибкой. Измени аргументы или выбери другой инструмент.', failure: 'repeated_tool_failure' };
+          batchRecoveryExhausted = recoveryAttempt > maxToolFailureRecoveries;
+          continue;
+        }
         if (completed.has(key) && call.name !== 'read_file' && !isTaskNotesCall(call) && !isAgentPlanCall(call)) {
-          repeats += 1; messages.push({ role: 'tool', tool_name: call.name, content: JSON.stringify({ warning: 'Идентичный вызов уже выполнен. Смени стратегию или заверши исследование.' }) });
-          if (repeats >= 3) { researchFinished = true; yield* this.synthesize(model, messages, engine, signal, contextWindow, '', actions, toolContext.stats(), runtime); return; }
+          repeats += 1; messages.push(toolResult(call, JSON.stringify({ warning: 'Идентичный вызов уже выполнен. Смени стратегию или заверши исследование.' })));
+          if (repeats >= 3) researchFinished = true;
           continue;
         }
         completed.add(key); actions += 1;
@@ -263,8 +471,26 @@ export class ProjectChatService {
         const activity: ToolActivity = { id: actionId, ...(isWebTool ? { ...activityForWebTool(call), kind: 'web' as const, state: 'running' as const } : activityForTool(call)) };
         yield { type: 'tool', activity };
         const startedAt = Date.now();
-        const result = isTaskNotesCall(call) ? taskNotes.execute(call) : isAgentPlanCall(call) ? plan.execute(call) : isWebTool && webSession ? await webSession.execute(call) : await tools.execute(call, signal, actionId); engine.record(call.name, result);
-        const toolMessage: ToolMessage = { role: 'tool', tool_name: call.name, content: result };
+        const explicitProjectId = typeof call.arguments.project_id === 'string' ? call.arguments.project_id : undefined;
+        const requestedSlot = call.arguments.project_slot === 2 ? 2 : 1;
+        const targetProject = explicitProjectId ? projects.find((project) => project.id === explicitProjectId) : projects.find((project) => project.slot === requestedSlot) ?? primary;
+        log('agent.tool.execute.started', { ...runtime, agentStep: actions, actionId, tool: call.name, arguments: safeArgumentsShape(call.arguments), targetProject: targetProject ? { id: targetProject.id, slot: targetProject.slot } : null, registered: availableToolNames.has(call.name), route: isTaskNotesCall(call) ? 'task_notes' : isAgentPlanCall(call) ? 'task_plan' : isWebTool ? 'web' : targetProject ? 'project' : 'missing_project' });
+        let unscopedResult: string;
+        try {
+          unscopedResult = isTaskNotesCall(call) ? taskNotes.execute(call) : isAgentPlanCall(call) ? plan.execute(call) : isWebTool && webSession ? await webSession.execute(call) : targetProject ? await tools.get(targetProject.id)!.execute(call, signal, actionId) : JSON.stringify({ error: `Unknown or unavailable project_id: ${explicitProjectId}` });
+        } catch (error) {
+          // A Stop can race a running executor. Its call was already emitted by
+          // the assistant, so record a cancellation result before terminating
+          // the run rather than leaving an invalid partial tool batch.
+          unscopedResult = JSON.stringify({ error: signal.aborted ? 'Generation cancelled' : compactFailureReason(error instanceof Error ? error.message : String(error)) });
+        }
+        const scopedResult = !isTaskNotesCall(call) && !isAgentPlanCall(call) && !isWebTool ? scopedProjectResult(unscopedResult, targetProject) : unscopedResult;
+        const rawExecutionResult = resultObject(scopedResult);
+        const failed = typeof rawExecutionResult.error === 'string';
+        const result = failed ? compactToolFailure(call, scopedResult) : scopedResult;
+        log('agent.tool.execute.finished', { ...runtime, agentStep: actions, actionId, tool: call.name, resultLength: result.length, resultSha256: createHash('sha256').update(result).digest('hex'), succeeded: !failed, error: failed ? compactFailureReason(rawExecutionResult.error) : undefined });
+        engine.record(call.name, result);
+        const toolMessage = toolResult(call, result);
         messages.push(toolMessage);
         if (lowInformation(result)) { lowInfo += 1; if (lowInfo === 3) lowInformationNotice = true; } else lowInfo = 0;
         const contextUpdate = toolContext.add(call.name, call.arguments, toolMessage, actions);
@@ -281,6 +507,7 @@ export class ProjectChatService {
         }
         if (stats.compacted) log('agent.context.compacted', { ...runtime, agentStep: actions, tool: call.name, toolResultContextSize: stats.size, toolResultContextBudget: stats.budget, compactedResults: stats.compacted });
         const finishedActivity = completedActivity(activity, call, result, Date.now() - startedAt, contextUpdate);
+        if (targetProject && !isTaskNotesCall(call) && !isAgentPlanCall(call) && !isWebTool) finishedActivity.metadata = { ...finishedActivity.metadata, project: targetProject.label, project_slot: targetProject.slot };
         const contextResult = resultObject(toolMessage.content);
         if (isAgentPlanCall(call)) {
           const snapshot = planSnapshot(contextResult);
@@ -288,7 +515,34 @@ export class ProjectChatService {
         }
         if (typeof contextResult.status === 'string') finishedActivity.metadata = { ...finishedActivity.metadata, status: contextResult.status };
         yield { type: 'tool', activity: finishedActivity };
+        if (failed) {
+          const reason = compactFailureReason(rawExecutionResult.error);
+          const failureKey = signature(call);
+          const recoveryAttempt = (toolFailureAttempts.get(failureKey) ?? 0) + 1;
+          toolFailureAttempts.set(failureKey, recoveryAttempt);
+          log('agent.tool-call.recovery', { ...runtime, agentStep: actions, tool: call.name, argumentLength: typeof call.arguments.content === 'string' ? call.arguments.content.length : undefined, recoveryAttempt, recoveryLimit: maxToolFailureRecoveries, reason });
+          batchRecovery = { call, attempt: recoveryAttempt, reason, failure: 'tool_call_failed' };
+          batchRecoveryExhausted = recoveryAttempt > maxToolFailureRecoveries;
+          if (batchRecoveryExhausted) log('agent.tool-call.recovery.exhausted', { ...runtime, agentStep: actions, tool: call.name, recoveryAttempts: recoveryAttempt - 1, recoveryLimit: maxToolFailureRecoveries });
+        }
       }
+      const sequenceError = validateLlamaMessageSequence(messages);
+      if (sequenceError) {
+        log('agent.message-sequence.invalid', { ...runtime, agentStep: actions, sequenceError, messages: messageMetadata(messages) });
+        throw new Error(`Некорректная последовательность Agent сообщений: ${sequenceError}`);
+      }
+      if (signal.aborted) return;
+      if (batchRecovery) {
+        if (batchRecoveryExhausted) {
+          yield { type: 'error', message: 'Агент не смог исправить вызов инструмента', details: 'Несколько вызовов инструмента завершились ошибкой. Проверьте задачу или сформулируйте следующий шаг точнее.' };
+          return;
+        }
+        yield { type: 'tool', activity: recoveryActivity(batchRecovery.failure === 'unknown_tool' ? 'Недоступный инструмент — запрошено исправление' : 'Неуспешный вызов инструмента — запрошено исправление', batchRecovery.attempt, batchRecovery.failure) };
+        messages.push(toolRecoveryNotice(batchRecovery.call, batchRecovery.attempt, batchRecovery.reason));
+        recoveryPending = true;
+        continue;
+      }
+      if (researchFinished) { yield* this.synthesize(model, messages, engine, signal, contextWindow, '', actions, toolContext.stats(), runtime); return; }
       if (stagnationIntervention === 'stalled') {
         log('agent.stalled.exploration', { ...runtime, actions, ...latestStagnationStats });
         yield { type: 'error', message: 'Агент остановился: исследование не продвигается', details: 'agent_stalled_exploration: после двух подсказок не появились реализация или новая существенная информация.' };
@@ -299,9 +553,12 @@ export class ProjectChatService {
       if (lowInformationNotice) messages.push(runtimeNotice('low_information', 'Последние действия дали мало новой информации. Сузь исследование или заверши ответ.'));
     } } catch (error) {
       if (signal.aborted) return;
+      const classified = classifyOllamaError(error, signal);
       const details = error instanceof Error ? error.message : String(error);
-      log('agent.inference.failed', { ...runtime, phase: researchFinished ? 'final-synthesis.error' : 'research.error', actions, model, contextWindow, toolResultContext: toolContext.stats(), ...ollamaErrorDiagnostics(error) });
-      yield { type: 'error', message: 'Анализ не завершился', details };
+      log('agent.inference.failed', { ...runtime, phase: researchFinished ? 'final-synthesis.error' : 'research.error', actions, model, contextWindow, toolResultContext: toolContext.stats(), ...ollamaErrorDiagnostics(classified) });
+      if (classified.kind === 'connection_failure' || classified.kind === 'connection_reset') {
+        yield { type: 'error', message: classified.message };
+      } else yield { type: 'error', message: 'Анализ не завершился', details };
     } finally { signal.removeEventListener('abort', closeWebOnAbort); await webSession?.close(); if (engine.isDeep) log('deep.lifecycle', { phase: 'request.finalized', actions, aborted: signal.aborted }); }
   }
 
@@ -313,6 +570,7 @@ export class ProjectChatService {
       const response = await this.finalRequest(model, messages, signal, contextWindow, engine.depth, actions, toolContext, runtime);
       if (response.finish_reason === 'length') throw new OllamaRequestError('output_limit', 'Итоговый ответ Ollama был остановлен по лимиту длины', { causeDetail: 'done_reason=length' });
       if (response.tool_calls?.length) throw new OllamaRequestError('malformed_response', 'Ollama вернул tool call вместо итогового ответа', { causeDetail: 'final request did not allow tools' });
+      if (/<tool_call>\s*<function=[a-z_]+>/i.test(response.content ?? '')) throw new OllamaRequestError('malformed_response', 'Ollama вернул текстовый tool call вместо итогового ответа', { causeDetail: 'final request did not allow tools' });
       const content = response.content?.trim() || fallback;
       if (!content) {
         const reason = response.thinking?.trim() ? 'Ollama вернул reasoning без итогового текста' : 'Ollama вернул корректный ответ без итогового текста';
@@ -323,11 +581,21 @@ export class ProjectChatService {
       yield* this.emit(content, engine, signal, response.inference ? { ...response.inference, toolResultContextSize: toolContext.size, toolResultContextBudget: toolContext.budget, toolResultCompacted: toolContext.compacted } : undefined, actions, response.finish_reason);
     } catch (error) {
       if (signal.aborted) return;
+      const classified = classifyOllamaError(error, signal);
       const details = error instanceof Error ? error.message : String(error);
       const timedOut = details.includes('timed out');
       log('agent.final.failed', { ...runtime, phase: timedOut ? 'final-synthesis.timeout' : 'final-synthesis.error', model, actions, contextWindow, fallback: Boolean(fallback), ...ollamaErrorDiagnostics(error) });
+      // A tool protocol in final synthesis is neither an answer nor a safe
+      // fallback condition. Tools are unavailable in this phase, so reporting
+      // completion here would turn an invalid model action into false success.
+      if (classified.kind === 'malformed_response') {
+        yield { type: 'error', message: 'Не удалось сформировать итоговый ответ' };
+        return;
+      }
       if (fallback.trim()) { yield* this.emit(fallback, engine, signal, undefined, actions, 'stop'); return; }
-      yield { type: 'error', message: 'Не удалось сформировать итоговый ответ', details };
+      yield classified.kind === 'connection_failure' || classified.kind === 'connection_reset'
+        ? { type: 'error', message: classified.message }
+        : { type: 'error', message: 'Не удалось сформировать итоговый ответ', details };
     }
   }
 
@@ -344,29 +612,39 @@ export class ProjectChatService {
     } finally { clearTimeout(timer); if (rejectTimeout) clearTimeout(rejectTimeout); }
   }
 
-  /** Retries only an inference boundary. Tool execution occurs after this returns. */
-  private async inference(model: string, messages: ToolMessage[], tools: unknown[] | undefined, signal: AbortSignal, contextWindow: number, depth: AnalysisDepth, agentStep: number, toolContext: ToolContextStats | undefined, runtime?: AgentRuntimeContext): Promise<ToolMessage> {
-    let lastError: unknown;
-    for (let attempt = 1; attempt <= maxInferenceAttempts; attempt += 1) {
-      if (signal.aborted) throw new OllamaRequestError('cancelled', 'Запрос к Ollama отменён');
+  /** The first model request has no tool side effects, so one transient connection retry is safe. */
+  private async inference(model: string, messages: ToolMessage[], tools: unknown[] | undefined, signal: AbortSignal, contextWindow: number, depth: AnalysisDepth, agentStep: number, toolContext: ToolContextStats | undefined, runtime?: AgentRuntimeContext, initialInference = false, recoveryPending = false): Promise<ToolMessage> {
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      if (signal.aborted) {
+        if (initialInference) log('agent.initial-inference.cancelled', { ...runtime, model, agentStep, attempt, reason: 'cancelled_or_superseded' });
+        throw new OllamaRequestError('cancelled', 'Запрос к локальному inference runtime отменён');
+      }
       try {
         log('agent.message.sequence', { ...runtime, agentStep, messages: messageMetadata(messages) });
         log('agent.inference.attempt', { ...runtime, model, agentStep, attempt, retryCount: attempt - 1, contextLimit: contextWindow, toolResultContextSize: toolContext?.size, toolResultContextBudget: toolContext?.budget, toolResultCompacted: toolContext?.compacted });
-        const response = await this.backend.chatWithTools(model, messages, tools, signal, contextWindow, depth);
+        if (initialInference && attempt === 1) log('agent.initial-inference.started', { ...runtime, model, agentStep, contextLimit: contextWindow });
+        const phase = recoveryPending ? 'recovery' : initialInference ? 'initial' : tools ? 'post_tool' : 'final';
+        const response = await this.backend.chatWithTools(model, messages, tools, signal, contextWindow, depth, { ...runtime, agentStep, phase, ...(tools ? { maxOutputTokens: agentToolTurnMaxOutputTokens } : {}) });
         log('agent.inference.success', { ...runtime, model, agentStep, attempt, retryCount: attempt - 1, promptEvalCount: response.prompt_eval_count, finishReason: response.finish_reason });
+        if (initialInference && attempt === 2) log('agent.initial-inference.retry.succeeded', { ...runtime, model, agentStep, retryCount: 1 });
         if (response.inference) {
           response.inference = { ...response.inference, ollamaRequestAttempt: attempt, ollamaRetryCount: attempt - 1, toolResultContextSize: toolContext?.size, toolResultContextBudget: toolContext?.budget, toolResultCompacted: toolContext?.compacted };
         }
         return response;
       } catch (error) {
-        lastError = error;
-        const retryable = error instanceof OllamaRequestError && error.retryable;
-        log('agent.inference.failure', { ...runtime, model, agentStep, attempt, retryCount: attempt - 1, contextLimit: contextWindow, willRetry: retryable && attempt < maxInferenceAttempts && !signal.aborted, ...ollamaErrorDiagnostics(error) });
-        if (!retryable || attempt === maxInferenceAttempts || signal.aborted) throw error;
-        await this.waitForRetry(retryDelayMs(attempt), signal);
+        const classified = classifyOllamaError(error, signal);
+        const connectionFailure = classified.kind === 'connection_failure' || classified.kind === 'connection_reset';
+        const willRetry = initialInference && agentStep === 0 && connectionFailure && attempt === 1 && !signal.aborted;
+        log('agent.inference.failure', { ...runtime, model, agentStep, attempt, retryCount: attempt - 1, contextLimit: contextWindow, initialInference, willRetry, ...ollamaErrorDiagnostics(classified) });
+        if (initialInference && connectionFailure) {
+          log(attempt === 1 ? 'agent.initial-inference.connection-failed' : 'agent.initial-inference.retry.failed', { ...runtime, model, agentStep, retryCount: attempt - 1, ...ollamaErrorDiagnostics(classified) });
+        }
+        if (!willRetry) throw classified;
+        log('agent.initial-inference.retry.started', { ...runtime, model, agentStep, retryCount: 1, delayMs: initialInferenceRetryDelayMs });
+        await this.waitForRetry(initialInferenceRetryDelayMs, signal);
       }
     }
-    throw lastError;
+    throw new OllamaRequestError('internal', 'Initial inference retry exited unexpectedly');
   }
 
   private async waitForRetry(delay: number, signal: AbortSignal): Promise<void> {

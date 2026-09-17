@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { ActionApproval, AnalysisProgress, AnalysisRun, AppSettings, Attachment, AttachmentStatus, ApprovalDecision, ApprovalStatus, ChatMessage, Conversation, FinishReason, GenerationDiagnostics, HardwareStats, ModelInfo, ToolActivity } from '../../shared/types';
+import type { ActionApproval, AnalysisProgress, AnalysisRun, AppSettings, Attachment, AttachmentStatus, ApprovalDecision, ApprovalStatus, ChatMessage, Conversation, FinishReason, GenerationDiagnostics, HardwareStats, ModelInfo, ProjectReference, ToolActivity } from '../../shared/types';
 import { isCurrentGenerationEvent } from '../../shared/generation-guard';
 
 type State = {
@@ -28,7 +28,7 @@ type State = {
   updateConversation: (id: string, patch: Partial<Conversation>) => Promise<void>;
   deleteConversation: (id: string) => Promise<void>;
   refreshHardware: () => Promise<void>;
-  sendMessage: (content: string, files?: File[]) => Promise<void>;
+  sendMessage: (content: string, files?: File[], projectReferences?: ProjectReference[]) => Promise<void>;
   continueGeneration: () => Promise<void>;
   approveAction: (decision: ApprovalDecision) => Promise<void>;
   editMessage: (message: ChatMessage, content: string) => Promise<boolean>;
@@ -59,7 +59,7 @@ export const useAppStore = create<State>((set, get) => {
     if (!activeId || !chat || !model) return false;
     const generationId = crypto.randomUUID(); const streaming: ChatMessage = { id: assistantId(generationId), conversationId: activeId, role: 'assistant', content: '', createdAt: now() };
     set({ messages: [...saved, streaming], isGenerating: true, generationId, generationState: 'thinking', error: null, toolActivities: [], toolActivityCount: 0, analysisProgress: [], lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false });
-    try { await window.localAi.chat.send({ conversationId: activeId, model, messages: saved, generationId, persistUserMessage: false }); }
+    try { await window.localAi.chat.send({ conversationId: activeId, model, mode: chat.mode, messages: saved, generationId, persistUserMessage: false }); }
     catch (error) { set((state) => state.generationId === generationId ? { isGenerating: false, generationId: null, generationState: 'error', error: error instanceof Error ? error.message : errorMessage, messages: state.messages.filter((message) => message.id !== assistantId(generationId)) } : {}); }
     return true;
   };
@@ -79,8 +79,15 @@ export const useAppStore = create<State>((set, get) => {
     set((state) => ({ conversations: [conversation, ...state.conversations] })); await get().selectConversation(conversation.id);
   },
   updateConversation: async (id, patch) => {
-    const updated = await window.localAi.conversations.update(id, patch);
-    set((state) => ({ conversations: state.conversations.map((chat) => chat.id === id ? updated : chat), activeContextWindow: state.activeId === id ? updated.contextWindow : state.activeContextWindow, performance: state.activeId === id && patch.modelId !== undefined ? null : state.performance }));
+    const before = get().conversations.find((chat) => chat.id === id);
+    if (before) set((state) => ({ conversations: state.conversations.map((chat) => chat.id === id ? { ...chat, ...patch } : chat), activeContextWindow: state.activeId === id && patch.contextWindow !== undefined ? patch.contextWindow : state.activeContextWindow, performance: state.activeId === id && patch.modelId !== undefined ? null : state.performance }));
+    try {
+      const updated = await window.localAi.conversations.update(id, patch);
+      set((state) => ({ conversations: state.conversations.map((chat) => chat.id === id ? updated : chat), activeContextWindow: state.activeId === id ? updated.contextWindow : state.activeContextWindow, performance: state.activeId === id && patch.modelId !== undefined ? null : state.performance }));
+    } catch (error) {
+      if (before) set((state) => ({ conversations: state.conversations.map((chat) => chat.id === id && Object.entries(patch).every(([key, value]) => chat[key as keyof Conversation] === value) ? before : chat) }));
+      throw error;
+    }
   },
   deleteConversation: async (id) => {
     await window.localAi.conversations.delete(id);
@@ -89,7 +96,7 @@ export const useAppStore = create<State>((set, get) => {
     if (remaining[0]) await get().selectConversation(remaining[0].id); else await get().createConversation();
   },
   refreshHardware: async () => set({ hardware: await window.localAi.hardware.get() }),
-  sendMessage: async (content, files = []) => {
+  sendMessage: async (content, files = [], projectReferences = []) => {
     if (get().generationId) await get().stop();
     const { activeId, conversations, messages, models } = get();
     if (!activeId || (!content.trim() && files.length === 0)) return;
@@ -98,14 +105,14 @@ export const useAppStore = create<State>((set, get) => {
     const userId = crypto.randomUUID();
     let imageIndex = 0;
     const attached: Attachment[] = files.map((file, index) => { const isImage = isImageFile(file); return { id: crypto.randomUUID(), messageId: userId, index, kind: isImage ? 'image' : file.name.endsWith('.pdf') ? 'pdf' : /\.(xlsx|xls)$/i.test(file.name) ? 'spreadsheet' : file.name.endsWith('.docx') ? 'document' : 'text', mimeType: file.type || 'application/octet-stream', filename: file.name, size: file.size, storageRef: '', status: 'pending', metadata: isImage ? { imageNumber: ++imageIndex } : undefined, createdAt: now(), updatedAt: now() }; });
-    const user: ChatMessage = { id: userId, conversationId: activeId, role: 'user', content: content.trim() || 'Вложения', createdAt: now(), attachments: attached };
+    const user: ChatMessage = { id: userId, conversationId: activeId, role: 'user', content: content.trim() || 'Вложения', createdAt: now(), attachments: attached, projectReferences };
     const generationId = crypto.randomUUID(); const streaming: ChatMessage = { id: assistantId(generationId), conversationId: activeId, role: 'assistant', content: '', createdAt: now() };
     set({ messages: [...messages, user, streaming], isGenerating: true, generationId, generationState: 'thinking', error: null, toolActivities: [], toolActivityCount: 0, analysisProgress: [], lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false });
     if (!chat?.modelId) await get().updateConversation(activeId, { modelId: model });
     if (chat?.title === 'Новый чат') await get().updateConversation(activeId, { title: content.trim().slice(0, 56) });
     try {
       const attachmentInputs = await Promise.all(files.map(async (file, index) => ({ id: attached[index].id, messageId: user.id, index: attached[index].index, filename: file.name, mimeType: file.type, data: new Uint8Array(await file.arrayBuffer()) })));
-      await window.localAi.chat.send({ conversationId: activeId, model, messages: [...messages, user], generationId, persistUserMessage: true, attachments: attachmentInputs });
+      await window.localAi.chat.send({ conversationId: activeId, model, mode: chat?.mode, messages: [...messages, user], generationId, persistUserMessage: true, attachments: attachmentInputs });
     }
     catch (error) { set((state) => state.generationId === generationId ? { isGenerating: false, generationId: null, generationState: 'error', error: error instanceof Error ? error.message : 'Не удалось отправить сообщение', messages: state.messages.filter((message) => message.id !== assistantId(generationId)) } : {}); }
   },
@@ -117,7 +124,7 @@ export const useAppStore = create<State>((set, get) => {
     const generationId = crypto.randomUUID(); const streaming: ChatMessage = { id: assistantId(generationId), conversationId: activeId, role: 'assistant', content: '', createdAt: now() };
     const continuation: ChatMessage = { id: `continue-${generationId}`, conversationId: activeId, role: 'system', content: 'Продолжи предыдущий ответ с места остановки. Не повторяй уже сказанное; начни с следующей незавершённой мысли.', createdAt: now() };
     set({ messages: [...messages, streaming], isGenerating: true, generationId, generationState: 'thinking', error: null, toolActivities: [], toolActivityCount: 0, analysisProgress: [], lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false });
-    try { await window.localAi.chat.send({ conversationId: activeId, model, messages: [...messages, continuation], generationId, persistUserMessage: false }); }
+    try { await window.localAi.chat.send({ conversationId: activeId, model, mode: chat?.mode, messages: [...messages, continuation], generationId, persistUserMessage: false }); }
     catch (error) { set((state) => state.generationId === generationId ? { isGenerating: false, generationId: null, generationState: 'error', error: error instanceof Error ? error.message : 'Не удалось продолжить ответ', messages: state.messages.filter((message) => message.id !== assistantId(generationId)) } : {}); }
   },
   editMessage: async (message, content) => {

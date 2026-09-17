@@ -91,6 +91,11 @@ export interface Conversation {
   modelId: string | null;
   mode: ChatMode;
   workingDirectory: string | null;
+  /** Stable identity for the primary project. workingDirectory remains for old chats. */
+  primaryProjectId: string | null;
+  /** Optional second project. Its identity is independent of its slot. */
+  secondaryWorkingDirectory: string | null;
+  secondaryProjectId: string | null;
   contextWindow: number;
   analysisDepth: AnalysisDepth;
   contextTokens: number | null;
@@ -100,6 +105,21 @@ export interface Conversation {
   updatedAt: string;
 }
 
+export type ProjectReferenceKind = 'file' | 'folder';
+
+/** A message-owned resource locator. projectPath is retained so changing a slot never retargets history. */
+export interface ProjectReference {
+  id: string;
+  projectId: string;
+  projectSlot: 1 | 2;
+  projectPath: string;
+  projectLabel: string;
+  relativePath: string;
+  kind: ProjectReferenceKind;
+}
+
+export type ProjectSuggestion = ProjectReference;
+
 export interface ChatMessage {
   id: string;
   conversationId: string;
@@ -107,6 +127,7 @@ export interface ChatMessage {
   content: string;
   createdAt: string;
   attachments?: Attachment[];
+  projectReferences?: ProjectReference[];
   /** Ephemeral base64 image inputs for Ollama. These are rebuilt from managed attachment storage and are never persisted in SQLite. */
   images?: string[];
 }
@@ -130,6 +151,8 @@ export interface AppSettings {
 export interface ChatRequest {
   conversationId: string;
   model: string;
+  /** Renderer mode snapshot for this logical generation, including Regenerate. */
+  mode?: ChatMode;
   messages: ChatMessage[];
   generationId: string;
   persistUserMessage: boolean;
@@ -196,10 +219,11 @@ export interface LocalAiApi {
   conversations: {
     list(): Promise<Conversation[]>;
     create(modelId?: string): Promise<Conversation>;
-    update(id: string, patch: Partial<Pick<Conversation, 'title' | 'modelId' | 'mode' | 'workingDirectory' | 'contextWindow' | 'analysisDepth' | 'webMode'>>): Promise<Conversation>;
+    update(id: string, patch: Partial<Pick<Conversation, 'title' | 'modelId' | 'mode' | 'workingDirectory' | 'secondaryWorkingDirectory' | 'contextWindow' | 'analysisDepth' | 'webMode'>>): Promise<Conversation>;
     delete(id: string): Promise<void>;
   };
   messages: { list(conversationId: string): Promise<ChatMessage[]>; edit(id: string, content: string, fallback?: Pick<ChatMessage, 'conversationId' | 'content'>): Promise<ChatMessage[]>; regenerate(id: string): Promise<ChatMessage[]> };
+  projects: { search(conversationId: string, query: string): Promise<ProjectSuggestion[]> };
   attachments: {
     import(input: AttachmentInput): Promise<Attachment>;
     list(messageId: string): Promise<Attachment[]>;
@@ -209,7 +233,7 @@ export interface LocalAiApi {
   models: { list(): Promise<ModelInfo[]> };
   settings: { get(): Promise<AppSettings> };
   hardware: { get(): Promise<HardwareStats> };
-  dialog: { chooseDirectory(): Promise<string | null> };
+  dialog: { chooseDirectory(initialDirectory?: string | null): Promise<string | null> };
   chat: {
     send(request: ChatRequest): Promise<void>;
     stop(conversationId: string, generationId?: string): Promise<void>;

@@ -9,6 +9,7 @@ const api: LocalAiApi = {
     delete: (id) => ipcRenderer.invoke('conversations:delete', id),
   },
   messages: { list: (conversationId) => ipcRenderer.invoke('messages:list', conversationId), edit: (id, content, fallback) => ipcRenderer.invoke('messages:edit', id, content, fallback), regenerate: (id) => ipcRenderer.invoke('messages:regenerate', id) },
+  projects: { search: (conversationId, query) => ipcRenderer.invoke('projects:search', conversationId, query) },
   attachments: {
     import: (input) => ipcRenderer.invoke('attachments:import', input),
     list: (messageId) => ipcRenderer.invoke('attachments:list', messageId),
@@ -18,7 +19,7 @@ const api: LocalAiApi = {
   models: { list: () => ipcRenderer.invoke('models:list') },
   settings: { get: () => ipcRenderer.invoke('settings:get') },
   hardware: { get: () => ipcRenderer.invoke('hardware:get') },
-  dialog: { chooseDirectory: () => ipcRenderer.invoke('dialog:chooseDirectory') },
+  dialog: { chooseDirectory: (initialDirectory) => ipcRenderer.invoke('dialog:chooseDirectory', initialDirectory) },
   chat: {
     send: (request) => ipcRenderer.invoke('chat:send', request),
     stop: (conversationId, generationId) => ipcRenderer.invoke('chat:stop', conversationId, generationId),

@@ -1,7 +1,8 @@
 import { readFile } from 'node:fs/promises';
-import type { Attachment, ChatMessage, StreamEvent, ToolActivity } from '../../shared/types';
+import type { Attachment, ChatMessage, ProjectReference, StreamEvent, ToolActivity } from '../../shared/types';
 import { AttachmentService, attachmentDisplayName } from './attachment-service';
 import { Database } from './database';
+import { projectDirectoryName } from '../../shared/project-references';
 
 type Emit = (event: StreamEvent) => void;
 /** This is per user turn, after document/vision results have been normalized. */
@@ -52,6 +53,7 @@ export class AttachmentPipeline {
     for (const message of history) {
       const attachments = this.database.listAttachments(message.id).filter((attachment) => includeImageDescriptions || attachment.kind !== 'image');
       if (attachments.length) contextualized.push({ id: `attachments-${message.id}`, conversationId: message.conversationId, role: 'system', createdAt: message.createdAt, content: attachmentTurnContext(attachments) });
+      if (message.projectReferences?.length) contextualized.push({ id: `project-references-${message.id}`, conversationId: message.conversationId, role: 'system', createdAt: message.createdAt, content: projectReferenceTurnContext(message.projectReferences) });
       contextualized.push(message);
     }
     return contextualized;
@@ -94,6 +96,12 @@ export class AttachmentPipeline {
   }
 
   private markCancelled(attachments: Attachment[]): void { for (const attachment of attachments) if (attachment.status === 'pending' || attachment.status === 'processing') this.database.updateAttachment(attachment.id, { status: 'cancelled', error: 'Обработка отменена' }); }
+}
+
+/** Structured project references are a scoped hint, never a recursive attachment. */
+export function projectReferenceTurnContext(references: ProjectReference[]): string {
+  const items = references.map((reference) => `- ${reference.kind === 'file' ? 'Explicit file: read this directly before broad exploration when relevant.' : 'Explicit folder scope: use list/search/read inside it; do not recursively load it.'} Project: Project ${reference.projectSlot} (${projectDirectoryName(reference.projectPath)}); Path: ${reference.relativePath}; project_id=${reference.projectId}; created_slot=Project ${reference.projectSlot}`).join('\n');
+  return `## Project references\nThese resources were explicitly selected with the following user message. Project identity is explicit; never infer it from the relative path alone.\n${items}`;
 }
 
 function refersToPriorImage(content: string): boolean {

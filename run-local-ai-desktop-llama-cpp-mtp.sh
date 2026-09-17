@@ -31,12 +31,25 @@ show_failure() {
 }
 fail() { local message="$1"; CLEANUP_REASON="startup failure: $message"; log "launcher.error=$message"; show_failure "$message"; exit 1; }
 same_llama_process() { [[ -n "$1" && -r "/proc/$1/exe" && "$(readlink -f "/proc/$1/exe")" == "$LLAMA_BIN" ]]; }
+stop_llama_server() {
+  local pid="$1"
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null || return 0
+  log "llama-server.stop pid=$pid signal=TERM"
+  kill -TERM "$pid" 2>/dev/null || true
+  for _ in $(seq 1 20); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.25
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    log "llama-server.stop pid=$pid signal=KILL"
+    kill -KILL "$pid" 2>/dev/null || true
+  fi
+  wait "$pid" 2>/dev/null || true
+}
 cleanup() {
   local status=$?
   log "launcher.cleanup reason=$CLEANUP_REASON status=$status launcher_pid=$$ electron_pid=${ELECTRON_PID:-none} server_pid=${SERVER_PID:-none}"
-  if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
-    log "llama-server.stop pid=$SERVER_PID"; kill "$SERVER_PID" 2>/dev/null || true; wait "$SERVER_PID" 2>/dev/null || true
-  fi
+  stop_llama_server "$SERVER_PID"
   rm -f "$SERVER_PID_FILE" "$LAUNCHER_PID_FILE"
   log "launcher.exit status=$status"
 }
@@ -58,7 +71,7 @@ if curl --silent --fail "$URL/health" >/dev/null 2>&1; then
   existing_server_pid="$(cat "$SERVER_PID_FILE" 2>/dev/null || true)"; existing_launcher_pid="$(cat "$LAUNCHER_PID_FILE" 2>/dev/null || true)"
   log "port.occupied port=$PORT server_pid=${existing_server_pid:-unknown} launcher_pid=${existing_launcher_pid:-unknown}"
   if same_llama_process "$existing_server_pid" && ! kill -0 "$existing_launcher_pid" 2>/dev/null; then
-    log "port.stale_owned_server pid=$existing_server_pid"; kill "$existing_server_pid" 2>/dev/null || true; wait "$existing_server_pid" 2>/dev/null || true; rm -f "$SERVER_PID_FILE" "$LAUNCHER_PID_FILE"
+    log "port.stale_owned_server pid=$existing_server_pid"; stop_llama_server "$existing_server_pid"; rm -f "$SERVER_PID_FILE" "$LAUNCHER_PID_FILE"
   else
     fail "Порт $PORT уже занят. Existing llama.cpp instance не будет завершён автоматически."
   fi
