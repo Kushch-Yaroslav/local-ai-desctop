@@ -18,6 +18,7 @@ export const modelRegistry: readonly ModelProfile[] = [
   { id: 'qwen3.8:27b-q4_K_M', displayName: 'Qwen3.8-27B', shortName: 'Qwen3.8', quantization: 'Q4_K_M', maxContext: 262_144, supportsTools: true, supportsThinking: true },
   // The official gpt-oss build keeps its native MXFP4 MoE weights and BF16 tensors; it is not a re-quantized Q4 build.
   { id: 'gpt-oss:20b', displayName: 'gpt-oss-20b', shortName: 'GPT-OSS', quantization: 'MXFP4 / BF16', maxContext: 131_072, supportsTools: true, supportsThinking: true },
+  { id: 'glm-4.7-flash:q4_k', displayName: 'GLM-4.7-Flash', shortName: 'GLM-4.7-Flash', quantization: 'Q4_K', maxContext: 65_536, supportsTools: true, supportsThinking: true },
 ];
 
 export function getModelProfile(id: string): ModelProfile | undefined {

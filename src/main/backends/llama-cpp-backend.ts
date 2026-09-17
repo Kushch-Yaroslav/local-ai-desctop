@@ -10,6 +10,7 @@ type ChatResponse = { choices?: Choice[]; usage?: { prompt_tokens?: number; comp
 type ModelsResponse = { data?: Array<{ meta?: { n_ctx?: number; size?: number } }> };
 type InputTokenResponse = { input_tokens?: unknown };
 const qwenModel = 'qwen3.8:27b-q4_K_M';
+const glmFlashModel = 'glm-4.7-flash:q4_k';
 const contextSafetyMarginTokens = 512;
 // Qwen3.8's bundled llama.cpp chat template accepts low, medium and xhigh.
 const reasoningEffort: Record<AnalysisDepth, string> = { fast: 'low', normal: 'medium', enhanced: 'xhigh', deep: 'xhigh' };
@@ -94,7 +95,7 @@ export function validateLlamaMessageSequence(messages: ToolMessage[]): string | 
 /** Adapter for the launcher-managed, OpenAI-compatible llama-server. */
 export class LlamaCppBackend implements LlmBackend, ToolCallingBackend {
   private lastActualPromptTokens: number | undefined;
-  constructor(private readonly baseUrl = 'http://127.0.0.1:8081', private readonly contextLimit = 65_536, private readonly visionEnabled = true) {}
+  constructor(private readonly baseUrl = 'http://127.0.0.1:8081', private readonly contextLimit = 65_536, private readonly visionEnabled = true, private readonly runtimeModelId = qwenModel) {}
   private url(path: string): string { return `${this.baseUrl.replace(/\/$/, '')}${path}`; }
 
   async getModels(): Promise<ModelInfo[]> {
@@ -102,7 +103,8 @@ export class LlamaCppBackend implements LlmBackend, ToolCallingBackend {
     if (!response.ok) throw new Error(`llama.cpp вернул HTTP ${response.status}`);
     const data = await response.json() as ModelsResponse;
     const runtimeContext = Math.min(this.contextLimit, data.data?.[0]?.meta?.n_ctx ?? this.contextLimit);
-    const profile = getModelProfile(qwenModel)!;
+    const profile = getModelProfile(this.runtimeModelId);
+    if (!profile) throw new Error(`llama.cpp запущен с неизвестной моделью: ${this.runtimeModelId}`);
     const info = modelInfo(profile, (data.data ?? []).length > 0, data.data?.[0]?.meta?.size, runtimeContext);
     return [{ ...info, backend: 'llama-cpp', supportedContextPresets: contextPresetsFor(runtimeContext) }];
   }
@@ -111,13 +113,13 @@ export class LlamaCppBackend implements LlmBackend, ToolCallingBackend {
     try { const response = await fetch(this.url('/health')); return response.ok ? { available: true } : { available: false, message: `llama.cpp вернул HTTP ${response.status}` }; }
     catch (error) { return { available: false, message: error instanceof Error ? error.message : String(error) }; }
   }
-  async supportsVision(model: string): Promise<boolean> { return model === qwenModel && this.visionEnabled; }
+  async supportsVision(model: string): Promise<boolean> { return model === qwenModel && this.runtimeModelId === qwenModel && this.visionEnabled; }
   async resolveContextWindow(model: string, requested: number): Promise<ContextWindow> {
-    if (model !== qwenModel) throw new Error('llama.cpp MTP launcher поддерживает только Qwen3.8-27B');
+    if (model !== this.runtimeModelId) throw new Error(`llama.cpp launcher запущен с моделью ${this.runtimeModelId}`);
     return { requested, active: Math.min(requested, this.contextLimit), supported: this.contextLimit };
   }
   async ensureModelAvailable(model: string): Promise<void> {
-    if (model !== qwenModel) throw new Error('llama.cpp MTP launcher поддерживает только Qwen3.8-27B');
+    if (model !== this.runtimeModelId) throw new Error(`llama.cpp launcher запущен с моделью ${this.runtimeModelId}`);
     const status = await this.getStatus(); if (!status.available) throw new Error(`llama.cpp server недоступен: ${status.message ?? 'health check failed'}`);
   }
   private estimate(messages: Array<ChatMessage | ToolMessage>, tools?: unknown[]): ContextAccounting {
@@ -140,7 +142,7 @@ export class LlamaCppBackend implements LlmBackend, ToolCallingBackend {
     });
   }
   private payload(model: string, messages: Array<ChatMessage | ToolMessage>, tools: unknown[] | undefined, depth: AnalysisDepth, maxTokens?: number, stream?: boolean): Record<string, unknown> {
-    return { model, messages: this.messages(messages), ...(tools ? { tools, tool_choice: 'auto' } : {}), ...(maxTokens === undefined ? {} : { max_tokens: maxTokens }), reasoning_effort: reasoningEffort[depth], ...(stream === undefined ? {} : { stream }) };
+    return { model, messages: this.messages(messages), ...(tools ? { tools, tool_choice: 'auto' } : {}), ...(maxTokens === undefined ? {} : { max_tokens: maxTokens }), reasoning_effort: depth === 'fast' && model === glmFlashModel ? 'none' : reasoningEffort[depth], ...(model === glmFlashModel ? { chat_template_kwargs: { enable_thinking: depth !== 'fast' } } : {}), ...(stream === undefined ? {} : { stream }) };
   }
   /** Uses llama.cpp's own OpenAI parser, chat template and tokenizer. Older servers fall back without a local rejection. */
   private async exactInputTokens(model: string, messages: Array<ChatMessage | ToolMessage>, tools: unknown[] | undefined, depth: AnalysisDepth, signal: AbortSignal): Promise<number | undefined> {

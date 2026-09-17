@@ -122,6 +122,19 @@ export async function runLlamaCppBackendRegression(): Promise<void> {
     } finally { await stop(server); }
   }
   {
+    const scenario: Scenario = { tokenCounts: [1_000, 1_000], requestBodies: [], countBodies: [] }; const { server, url } = await startServer(scenario);
+    try {
+      const glm = 'glm-4.7-flash:q4_k';
+      const backend = new LlamaCppBackend(url, 65_536, false, glm);
+      await backend.chatWithTools(glm, baseMessages('GLM normal'), toolSchema, new AbortController().signal, 65_536, 'normal');
+      await backend.chatWithTools(glm, baseMessages('GLM fast'), toolSchema, new AbortController().signal, 65_536, 'fast');
+      assert.deepEqual(scenario.requestBodies[0].chat_template_kwargs, { enable_thinking: true }, 'GLM normal request did not enable its native thinking template mode');
+      assert.equal(scenario.requestBodies[0].reasoning_effort, 'medium');
+      assert.deepEqual(scenario.requestBodies[1].chat_template_kwargs, { enable_thinking: false }, 'GLM fast request did not disable native thinking');
+      assert.equal(scenario.requestBodies[1].reasoning_effort, 'none', 'GLM fast request did not use llama.cpp\'s native no-reasoning setting');
+    } finally { await stop(server); }
+  }
+  {
     const scenario: Scenario = { tokenCountStatus: 404, requestBodies: [], countBodies: [] }; const { server, url } = await startServer(scenario);
     try {
       const messages = [...baseMessages('x'.repeat(134_599)), { role: 'assistant' as const, content: '', tool_calls: [{ function: { name: 'report_progress', arguments: { message: 'Проверяю тесты' } } }] }, { role: 'tool' as const, tool_name: 'report_progress', content: JSON.stringify({ reported: true }) }];

@@ -1,0 +1,14 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Local AI Desktop — GLM-4.7-Flash
+Name[ru]=Local AI Desktop — GLM-4.7-Flash
+Comment=Локальный AI-клиент через llama.cpp и GLM-4.7-Flash
+Exec=/usr/bin/env LOCAL_AI_LLAMA_VARIANT=glm-4.7-flash /media/yaroslav/DATA/local-ai-desktop/run-local-ai-desktop-llama-cpp-mtp.sh
+Path=/media/yaroslav/DATA/local-ai-desktop
+TryExec=/media/yaroslav/DATA/local-ai-desktop/run-local-ai-desktop-llama-cpp-mtp.sh
+Icon=/media/yaroslav/DATA/local-ai-desktop/assets/fluent-bot-sparkle-cyan.png
+Terminal=false
+Categories=Development;
+Keywords=AI;LLM;GLM;local;
+StartupNotify=true

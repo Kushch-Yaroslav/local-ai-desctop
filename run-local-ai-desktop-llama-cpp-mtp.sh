@@ -3,8 +3,21 @@ set -euo pipefail
 
 APP_DIR="/media/yaroslav/DATA/local-ai-desktop"
 LLAMA_BIN="/media/yaroslav/DATA/llama.cpp/build-cuda/bin/llama-server"
-MODEL="/media/yaroslav/DATA/llama-models/qwen3.8-27b-q4_K_M.gguf"
-MMPROJ="/media/yaroslav/DATA/llama-models/qwen3.8-27b-mmproj.gguf"
+VARIANT="${LOCAL_AI_LLAMA_VARIANT:-qwen-mtp}"
+if [[ "$VARIANT" == "glm-4.7-flash" ]]; then
+  MODEL="/media/yaroslav/DATA/llama-models/GLM-4.7-Flash-Q4_K.gguf"
+  MMPROJ=""
+  RUNTIME_MODEL_ID="glm-4.7-flash:q4_k"
+  RUNTIME_LABEL="GLM-4.7-Flash"
+elif [[ "$VARIANT" == "qwen-mtp" ]]; then
+  MODEL="/media/yaroslav/DATA/llama-models/qwen3.8-27b-q4_K_M.gguf"
+  MMPROJ="/media/yaroslav/DATA/llama-models/qwen3.8-27b-mmproj.gguf"
+  RUNTIME_MODEL_ID="qwen3.8:27b-q4_K_M"
+  RUNTIME_LABEL="Qwen3.8 MTP"
+else
+  printf 'Unknown LOCAL_AI_LLAMA_VARIANT: %s\n' "$VARIANT" >&2
+  exit 2
+fi
 PORT="8081"
 URL="http://127.0.0.1:${PORT}"
 LOG_DIR="$APP_DIR/runtime/logs"
@@ -26,8 +39,8 @@ timestamp() { date --iso-8601=seconds; }
 log() { printf '%s %s\n' "$(timestamp)" "$*" >> "$LOG_FILE"; }
 show_failure() {
   local message="$1"
-  if command -v zenity >/dev/null 2>&1 && [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then zenity --error --title="Local AI Desktop — llama.cpp MTP" --text="$message\n\nЛог: $LOG_FILE" --no-wrap >/dev/null 2>&1 &
-  elif command -v notify-send >/dev/null 2>&1; then notify-send "Local AI Desktop — llama.cpp MTP" "$message\nЛог: $LOG_FILE" || true; fi
+  if command -v zenity >/dev/null 2>&1 && [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then zenity --error --title="Local AI Desktop — llama.cpp $RUNTIME_LABEL" --text="$message\n\nЛог: $LOG_FILE" --no-wrap >/dev/null 2>&1 &
+  elif command -v notify-send >/dev/null 2>&1; then notify-send "Local AI Desktop — llama.cpp $RUNTIME_LABEL" "$message\nЛог: $LOG_FILE" || true; fi
 }
 fail() { local message="$1"; CLEANUP_REASON="startup failure: $message"; log "launcher.error=$message"; show_failure "$message"; exit 1; }
 same_llama_process() { [[ -n "$1" && -r "/proc/$1/exe" && "$(readlink -f "/proc/$1/exe")" == "$LLAMA_BIN" ]]; }
@@ -59,11 +72,11 @@ trap 'CLEANUP_REASON="SIGTERM"; exit 143' TERM
 
 log "===== launcher.started pid=$$ ====="
 log "cwd=$(pwd) project_root=$APP_DIR initial_path=$INITIAL_PATH effective_path=$PATH display=${DISPLAY:-} wayland_display=${WAYLAND_DISPLAY:-} xdg_runtime_dir=${XDG_RUNTIME_DIR:-}"
-log "electron=$ELECTRON_BIN llama_server=$LLAMA_BIN model=$MODEL mmproj=$MMPROJ port=$PORT"
+log "electron=$ELECTRON_BIN llama_server=$LLAMA_BIN variant=$VARIANT runtime_model_id=$RUNTIME_MODEL_ID model=$MODEL mmproj=${MMPROJ:-none} port=$PORT"
 
 [[ -x "$LLAMA_BIN" ]] || fail "Не найден исполняемый llama-server: $LLAMA_BIN"
-[[ -f "$MODEL" ]] || fail "Не найден Qwen GGUF: $MODEL"
-[[ -f "$MMPROJ" ]] || fail "Не найден Qwen vision projector: $MMPROJ"
+[[ -f "$MODEL" ]] || fail "Не найден GGUF выбранной модели: $MODEL"
+[[ -z "$MMPROJ" || -f "$MMPROJ" ]] || fail "Не найден Qwen vision projector: $MMPROJ"
 [[ -x "$ELECTRON_BIN" && -f "$APP_DIR/dist/main/index.js" && -f "$APP_DIR/dist/preload/index.js" && -f "$APP_DIR/dist/renderer/index.html" ]] || fail "Не найден production build или Electron: $ELECTRON_BIN"
 [[ -u "$SANDBOX_HELPER" && -x "$SANDBOX_HELPER" ]] || fail "Не найден system Chrome sandbox helper: $SANDBOX_HELPER"
 
@@ -85,14 +98,19 @@ export ELECTRON_ENABLE_LOGGING=1
 export LOCAL_AI_BACKEND="llama-cpp"
 export LOCAL_AI_LLAMA_CPP_URL="$URL"
 export LOCAL_AI_LLAMA_SERVER_PATH="$LLAMA_BIN"
-export LOCAL_AI_LLAMA_CPP_VISION=1
+export LOCAL_AI_LLAMA_MODEL_ID="$RUNTIME_MODEL_ID"
+export LOCAL_AI_LLAMA_CPP_VISION=$([[ "$VARIANT" == "qwen-mtp" ]] && echo 1 || echo 0)
 unset LOCAL_AI_DEV_SERVER_URL VITE_DEV_SERVER_URL
 cd "$APP_DIR"
 printf '%s\n' "$$" > "$LAUNCHER_PID_FILE"
 
 : > "$SERVER_LOG"
-log "llama-server.start health_wait_started=true"
-"$LLAMA_BIN" -m "$MODEL" --mmproj "$MMPROJ" --no-mmproj-offload --host 127.0.0.1 --port "$PORT" --ctx-size 65536 --gpu-layers 999 --flash-attn on --spec-type draft-mtp >> "$SERVER_LOG" 2>&1 &
+log "llama-server.start health_wait_started=true variant=$VARIANT"
+if [[ "$VARIANT" == "glm-4.7-flash" ]]; then
+  "$LLAMA_BIN" -m "$MODEL" --alias "$RUNTIME_MODEL_ID" --host 127.0.0.1 --port "$PORT" --ctx-size 65536 --gpu-layers 999 --flash-attn auto --cache-type-k q8_0 --cache-type-v q8_0 --batch-size 512 --ubatch-size 512 --parallel 1 --jinja --reasoning on --no-warmup >> "$SERVER_LOG" 2>&1 &
+else
+  "$LLAMA_BIN" -m "$MODEL" --alias "$RUNTIME_MODEL_ID" --mmproj "$MMPROJ" --no-mmproj-offload --host 127.0.0.1 --port "$PORT" --ctx-size 65536 --gpu-layers 999 --flash-attn on --spec-type draft-mtp >> "$SERVER_LOG" 2>&1 &
+fi
 SERVER_PID=$!
 printf '%s\n' "$SERVER_PID" > "$SERVER_PID_FILE"
 log "llama-server.pid=$SERVER_PID"
@@ -103,8 +121,7 @@ for _ in $(seq 1 45); do
   sleep 2
 done
 curl --silent --fail "$URL/health" >/dev/null 2>&1 || fail "llama-server не стал готов за 90 секунд. См. $SERVER_LOG"
-grep -q 'creating MTP draft context' "$SERVER_LOG" || fail "MTP draft context не подтверждён. См. $SERVER_LOG"
-log "mtp.confirmed=true"
+if [[ "$VARIANT" == "qwen-mtp" ]]; then grep -q 'creating MTP draft context' "$SERVER_LOG" || fail "MTP draft context не подтверждён. См. $SERVER_LOG"; log "mtp.confirmed=true"; fi
 
 log "electron.start command=$ELECTRON_BIN cwd=$(pwd) backend=$LOCAL_AI_BACKEND"
 "$ELECTRON_BIN" "$APP_DIR" >> "$LOG_FILE" 2>&1 &

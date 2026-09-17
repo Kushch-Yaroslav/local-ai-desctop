@@ -145,6 +145,7 @@ export interface AppSettings {
   selectedBackend: BackendId;
   ollamaUrl: string;
   llamaServerPath: string | null;
+  llamaRuntimeModelId?: string;
   modelsPath: string;
 }
 

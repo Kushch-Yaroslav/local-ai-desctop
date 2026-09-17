@@ -27,8 +27,9 @@ import { existingProjectDirectory } from '../services/project-picker';
 
 const database = new Database();
 const selectedBackend = process.env.LOCAL_AI_BACKEND === 'llama-cpp' ? 'llama-cpp' : 'ollama';
+const llamaRuntimeModelId = process.env.LOCAL_AI_LLAMA_MODEL_ID ?? 'qwen3.8:27b-q4_K_M';
 const ollama = new OllamaBackend();
-const llamaCpp = new LlamaCppBackend(process.env.LOCAL_AI_LLAMA_CPP_URL ?? 'http://127.0.0.1:8081', 65_536, process.env.LOCAL_AI_LLAMA_CPP_VISION === '1');
+const llamaCpp = new LlamaCppBackend(process.env.LOCAL_AI_LLAMA_CPP_URL ?? 'http://127.0.0.1:8081', 65_536, process.env.LOCAL_AI_LLAMA_CPP_VISION === '1', llamaRuntimeModelId);
 const backend = selectedBackend === 'llama-cpp' ? llamaCpp : ollama;
 const web = new WebBrowserService();
 const projectChat = new ProjectChatService(backend, web);
@@ -102,7 +103,7 @@ function inlineConfirmation(event: Electron.IpcMainInvokeEvent, conversationId: 
 export function registerIpc(): void {
   ipcMain.handle('conversations:list', () => database.listConversations());
   ipcMain.handle('conversations:create', (_event, requestedModelId?: string) => {
-    const modelId = requestedModelId ?? modelRegistry[0].id;
+    const modelId = requestedModelId ?? (selectedBackend === 'llama-cpp' ? llamaRuntimeModelId : modelRegistry[0].id);
     if (!getModelProfile(modelId)) throw new Error('Выбранная модель отсутствует в реестре приложения');
     return database.createConversation(modelId);
   });
@@ -161,7 +162,7 @@ export function registerIpc(): void {
     try { return await backend.getModels(); }
     catch (error) { log('backend.models.failed', { backend: selectedBackend, message: error instanceof Error ? error.message : String(error) }); return []; }
   });
-  ipcMain.handle('settings:get', () => ({ selectedBackend, ollamaUrl: 'http://127.0.0.1:11434', llamaServerPath: selectedBackend === 'llama-cpp' ? process.env.LOCAL_AI_LLAMA_SERVER_PATH ?? null : null, modelsPath: paths.models }));
+  ipcMain.handle('settings:get', () => ({ selectedBackend, ollamaUrl: 'http://127.0.0.1:11434', llamaServerPath: selectedBackend === 'llama-cpp' ? process.env.LOCAL_AI_LLAMA_SERVER_PATH ?? null : null, ...(selectedBackend === 'llama-cpp' ? { llamaRuntimeModelId } : {}), modelsPath: paths.models }));
   ipcMain.handle('hardware:get', getHardwareStats);
   ipcMain.handle('dialog:chooseDirectory', async (_event, initialDirectory?: string | null) => {
     const window = BrowserWindow.getFocusedWindow();

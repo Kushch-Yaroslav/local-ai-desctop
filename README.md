@@ -72,6 +72,8 @@ Web работает через `playwright-core` и установленный 
 
 Интерфейс `LlmBackend` поддерживает Ollama и launcher-managed `llama-server`. Ярлык **Local AI Desktop — llama.cpp MTP** запускает собственный Qwen server с `draft-mtp`, ждёт его health check и завершает только PID, который создал сам. Он использует символические имена на существующие Ollama GGUF blobs, не создавая вторую копию модели.
 
+Ярлык **Local AI Desktop — GLM-4.7-Flash** запускает официальный `ggml-org/GLM-4.7-Flash-GGUF` в квантизации `Q4_K` (18,244,193,920 байт) на `llama.cpp` с контекстом 65,536 токенов. Для GLM включаются его нативный Jinja chat template, reasoning и OpenAI-compatible native tool calling; Qwen MTP и Ollama-модели используют прежние параметры.
+
 SQLite хранит полную историю, а не KV-кэш модели. Поэтому сессии не создают отдельных постоянных контекстов в VRAM: при переключении чата для запроса передаётся сохранённая история активного чата. Это позволяет в дальнейшем держать загруженным только один inference context/model одновременно.
 
 ## Следующие этапы
