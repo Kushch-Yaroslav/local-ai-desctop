@@ -24,6 +24,9 @@ export function isTaskNotesCall(call: ProjectToolCall): boolean { return call.na
 export class TaskNotes {
   private notes = '';
 
+  /** The context manager reuses the Agent's own notes as durable working memory. */
+  snapshot(): string { return this.notes; }
+
   execute(call: ProjectToolCall): string {
     const action = call.arguments.action;
     if (action === 'read') return JSON.stringify({ notes: this.notes, empty: !this.notes });

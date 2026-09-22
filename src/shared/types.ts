@@ -1,7 +1,8 @@
 export type ChatMode = 'chat' | 'agent';
 export type WebMode = 'off' | 'auto';
 export type BackendId = 'ollama' | 'llama-cpp';
-export type AnalysisDepth = 'fast' | 'normal' | 'enhanced' | 'deep';
+/** A backend-native reasoning control. It never changes the output token budget. */
+export type ReasoningMode = 'auto' | 'fast' | 'deep';
 export type FinishReason = 'stop' | 'length' | 'cancelled' | 'error';
 export type RiskCategory = 'git_commit' | 'git_push' | 'destructive_git' | 'package_install' | 'package_remove' | 'file_delete' | 'chmod_chown' | 'shell_redirection' | 'shell_chaining' | 'system_command';
 export type ApprovalDecision = 'reject' | 'once' | 'session';
@@ -47,7 +48,7 @@ export interface ActionApproval {
 export interface GenerationDiagnostics {
   generationId: string;
   conversationId: string;
-  reasoningPreset: AnalysisDepth;
+  reasoningMode: ReasoningMode;
   requestedMaxOutputTokens: number;
   effectiveMaxOutputTokens: number;
   contextLimit: number;
@@ -81,7 +82,7 @@ export interface ModelInfo {
   maxContext: number;
   supportedContextPresets: number[];
   supportsTools: boolean;
-  supportsThinking: boolean;
+  supportsReasoning: boolean;
   shortName: string;
 }
 
@@ -97,7 +98,7 @@ export interface Conversation {
   secondaryWorkingDirectory: string | null;
   secondaryProjectId: string | null;
   contextWindow: number;
-  analysisDepth: AnalysisDepth;
+  reasoningMode: ReasoningMode;
   contextTokens: number | null;
   contextModelId: string | null;
   webMode: WebMode;
@@ -166,13 +167,15 @@ export interface ToolActivity {
   label: string;
   detail?: string;
   /** User-visible execution category. Missing means a record saved by an older app version. */
-  kind?: 'progress' | 'planning' | 'file_read' | 'search' | 'directory' | 'terminal' | 'mutation' | 'git' | 'web' | 'other';
+  kind?: 'progress' | 'planning' | 'notes' | 'context' | 'file_read' | 'search' | 'directory' | 'terminal' | 'mutation' | 'git' | 'web' | 'other';
   /** Lifecycle of an action. Progress events are informational and never consume the Agent action budget. */
   state?: 'running' | 'completed' | 'error';
   /** Compact, user-facing fields shown only when this activity is expanded. */
   metadata?: Record<string, string | number | boolean | null>;
   /** Bounded command output or error text, rendered lazily when details are expanded. */
   output?: string;
+  /** Full raw tool result for SQLite run history. It is stripped before IPC/UI rendering. */
+  rawOutput?: string;
   approval?: ActionApproval;
   status?: AttachmentStatus;
   attachment?: Attachment;
@@ -188,7 +191,7 @@ export interface AnalysisRun {
   id: string;
   conversationId: string;
   assistantMessageId: string | null;
-  depth: AnalysisDepth;
+  reasoningMode: ReasoningMode;
   status: 'running' | 'completed' | 'error' | 'cancelled';
   actionCount: number;
   actions: ToolActivity[];
@@ -220,7 +223,7 @@ export interface LocalAiApi {
   conversations: {
     list(): Promise<Conversation[]>;
     create(modelId?: string): Promise<Conversation>;
-    update(id: string, patch: Partial<Pick<Conversation, 'title' | 'modelId' | 'mode' | 'workingDirectory' | 'secondaryWorkingDirectory' | 'contextWindow' | 'analysisDepth' | 'webMode'>>): Promise<Conversation>;
+    update(id: string, patch: Partial<Pick<Conversation, 'title' | 'modelId' | 'mode' | 'workingDirectory' | 'secondaryWorkingDirectory' | 'contextWindow' | 'reasoningMode' | 'webMode'>>): Promise<Conversation>;
     delete(id: string): Promise<void>;
   };
   messages: { list(conversationId: string): Promise<ChatMessage[]>; edit(id: string, content: string, fallback?: Pick<ChatMessage, 'conversationId' | 'content'>): Promise<ChatMessage[]>; regenerate(id: string): Promise<ChatMessage[]> };

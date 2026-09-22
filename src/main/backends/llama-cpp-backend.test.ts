@@ -41,7 +41,7 @@ async function stop(server: Server): Promise<void> { server.close(); await once(
 
 const baseMessages = (content = 'hello'): ToolMessage[] => [{ role: 'system', content: 'system instructions' }, { role: 'user', content }];
 const toolSchema = [{ type: 'function', function: { name: 'read_file', description: 'read a project file', parameters: { type: 'object', properties: { path: { type: 'string' } } } } }];
-const call = (backend: LlamaCppBackend, messages: ToolMessage[], tools: unknown[] | undefined = toolSchema) => backend.chatWithTools(model, messages, tools, new AbortController().signal, 65_536, 'enhanced');
+const call = (backend: LlamaCppBackend, messages: ToolMessage[], tools: unknown[] | undefined = toolSchema) => backend.chatWithTools(model, messages, tools, new AbortController().signal, 65_536, 'deep');
 
 export async function runLlamaCppBackendRegression(): Promise<void> {
   {
@@ -71,9 +71,9 @@ export async function runLlamaCppBackendRegression(): Promise<void> {
     try {
       const response = await call(new LlamaCppBackend(url), baseMessages('x'.repeat(134_599)));
       assert.equal(response.inference?.inputTokens, 33_458, 'exact llama.cpp count was not used');
-      assert.equal(response.inference?.effectiveMaxOutputTokens, 16_384, 'false-positive estimate reduced enhanced output');
+      assert.equal(response.inference?.effectiveMaxOutputTokens, 31_566, 'shared output budget was not clamped to exact remaining context');
       assert.equal(scenario.requestBodies.length, 1, 'exact ~33K request was rejected before inference');
-      assert.equal(scenario.requestBodies[0].max_tokens, 16_384);
+      assert.equal(scenario.requestBodies[0].max_tokens, 31_566);
       assert.equal((scenario.countBodies[0].tools as unknown[])?.length, 1, 'token count request omitted tool schema');
     } finally { await stop(server); }
   }
@@ -110,11 +110,11 @@ export async function runLlamaCppBackendRegression(): Promise<void> {
       const backend = new LlamaCppBackend(url);
       await call(backend, baseMessages('first Agent request'));
       const next: ToolMessage[] = [...baseMessages('first Agent request'), { role: 'assistant', content: '', tool_calls: [{ id: 'call-read-a', type: 'function', function: { name: 'read_file', arguments: { path: 'src/A.ts' } } }] }, { role: 'tool', tool_name: 'read_file', tool_call_id: 'call-read-a', content: JSON.stringify({ path: 'src/A.ts', content: 'small result' }) }];
-      const response = await backend.chatWithTools(model, next, toolSchema, new AbortController().signal, 65_536, 'enhanced', { generationId: 'generation', conversationId: 'conversation', agentStep: 2, phase: 'post_tool', maxOutputTokens: 4_096 });
+      const response = await backend.chatWithTools(model, next, toolSchema, new AbortController().signal, 65_536, 'deep', { generationId: 'generation', conversationId: 'conversation', agentStep: 2, phase: 'post_tool' });
       assert.equal(response.inference?.inputTokens, 34_000, 'second request did not retain backend-authoritative token count');
       assert.equal(scenario.requestBodies.length, 2, 'appended Agent history was not sent');
-      assert.equal(scenario.requestBodies[0].max_tokens, 16_384, 'ordinary tool-call requests changed their output limit');
-      assert.equal(scenario.requestBodies[1].max_tokens, 4_096, 'post-tool Agent request did not use the bounded output limit');
+      assert.equal(scenario.requestBodies[0].max_tokens, 32_024, 'ordinary tool-call requests did not use the shared output limit');
+      assert.equal(scenario.requestBodies[1].max_tokens, 31_024, 'post-tool Agent request did not use the same shared output limit');
       const serializedMessages = scenario.requestBodies[1].messages as Array<Record<string, unknown>>;
       assert.equal((serializedMessages[2].tool_calls as Array<Record<string, unknown>>)[0].id, 'call-read-a', 'assistant tool-call ID was dropped while serializing llama.cpp history');
       assert.equal(((serializedMessages[2].tool_calls as Array<{ function: { arguments: unknown } }>)[0]).function.arguments, '{"path":"src/A.ts"}', 'llama.cpp did not serialize canonical tool arguments as OpenAI JSON text');
@@ -126,12 +126,15 @@ export async function runLlamaCppBackendRegression(): Promise<void> {
     try {
       const glm = 'glm-4.7-flash:q4_k';
       const backend = new LlamaCppBackend(url, 65_536, false, glm);
-      await backend.chatWithTools(glm, baseMessages('GLM normal'), toolSchema, new AbortController().signal, 65_536, 'normal');
+      await backend.chatWithTools(glm, baseMessages('GLM auto'), toolSchema, new AbortController().signal, 65_536, 'auto');
       await backend.chatWithTools(glm, baseMessages('GLM fast'), toolSchema, new AbortController().signal, 65_536, 'fast');
-      assert.deepEqual(scenario.requestBodies[0].chat_template_kwargs, { enable_thinking: true }, 'GLM normal request did not enable its native thinking template mode');
-      assert.equal(scenario.requestBodies[0].reasoning_effort, 'medium');
+      await backend.chatWithTools(glm, baseMessages('GLM deep'), toolSchema, new AbortController().signal, 65_536, 'deep');
+      assert.equal(scenario.requestBodies[0].reasoning_effort, undefined, 'GLM Auto should leave native reasoning at the model default');
+      assert.equal(scenario.requestBodies[0].chat_template_kwargs, undefined, 'GLM Auto should not override template thinking');
       assert.deepEqual(scenario.requestBodies[1].chat_template_kwargs, { enable_thinking: false }, 'GLM fast request did not disable native thinking');
       assert.equal(scenario.requestBodies[1].reasoning_effort, 'none', 'GLM fast request did not use llama.cpp\'s native no-reasoning setting');
+      assert.deepEqual(scenario.requestBodies[2].chat_template_kwargs, { enable_thinking: true }, 'GLM deep request did not enable native thinking');
+      assert.equal(scenario.requestBodies[2].reasoning_effort, 'xhigh', 'GLM deep request did not use llama.cpp\'s native high-reasoning setting');
     } finally { await stop(server); }
   }
   {

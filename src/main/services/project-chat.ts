@@ -1,27 +1,40 @@
 import { createHash, randomUUID } from 'node:crypto';
-import type { AgentPlan, AnalysisDepth, ChatMessage, FinishReason, StreamEvent, ToolActivity, WebMode } from '../../shared/types';
+import { homedir } from 'node:os';
+import type { AgentPlan, ChatMessage, FinishReason, ReasoningMode, StreamEvent, ToolActivity, WebMode } from '../../shared/types';
 import type { InferenceDiagnostics, ToolCall, ToolCallingBackend, ToolMessage } from '../backends/types';
 import { validateLlamaMessageSequence } from '../backends/llama-cpp-backend';
-import { AnalysisEngine } from './analysis-engine';
+import { AgentActionBudget, AnalysisEngine } from './analysis-engine';
 import { log } from './logger';
-import { ReadonlyProjectTools, activityForTool, projectToolDefinitions, type ConfirmAction, type ProjectToolCall } from '../tools/project-tools';
+import { ReadonlyProjectTools, TerminalTools, activityForTool, projectToolDefinitions, reportProgressToolDefinition, terminalToolDefinition, type ConfirmAction, type ProjectToolCall, type ProjectToolDefinition } from '../tools/project-tools';
 import { capabilitySystemContext } from './capabilities';
 import { WebBrowserService, type WebBrowserSession, activityForWebTool, webToolDefinitions } from '../web/web-tools';
 import { AgentToolContext, type ReadDiagnostic, type ToolContextStats } from './agent-tool-context';
+import { AgentContextManager, type ContextCompactionStats } from './agent-context-manager';
 import { OllamaRequestError, classifyOllamaError, ollamaErrorDiagnostics } from '../backends/ollama-errors';
 import { isTaskNotesCall, TaskNotes, taskNotesToolDefinition } from './task-notes';
 import { agentPlanToolDefinition, AgentPlanState, isAgentPlanCall } from './agent-plan';
 import { projectDirectoryName } from '../../shared/project-references';
 
 const finalizationThreshold = 5;
-const finalSynthesisTimeoutMs = 120_000;
+// A near-full 32K prompt can spend more than two minutes on prompt evaluation
+// alone. This is a bounded final-answer reserve, independent of tool turns.
+const finalSynthesisTimeoutMs = 240_000;
 const initialInferenceRetryDelayMs = 150;
-// Tool-decision turns are non-streaming. Keep them well below Node's five-minute response-header timeout.
-const agentToolTurnMaxOutputTokens = 4_096;
 const maxMalformedToolArgumentRecoveries = 2;
 const maxToolFailureRecoveries = 3;
 type AgentRuntimeContext = { generationId: string; conversationId: string };
 export type AgentProject = { id: string; slot: 1 | 2; root: string; label: string };
+
+const agentActionExecutionPolicy = `
+AGENT ACTION EXECUTION POLICY:
+In Agent mode, when the user asks you to make, configure, install, modify, inspect, fix, create, delete, run, or otherwise perform an action on their local computer, prefer using available tools to perform the task.
+Do not replace an executable action with a tutorial or a list of commands when the required tools are available. First inspect the current environment when necessary, then execute the task.
+For system configuration, begin with safe diagnostics of the current environment before choosing an implementation. If elevated privileges are needed, complete every safe non-privileged step first, then request confirmation only for the specific privileged command.
+If a task can be completed or materially progressed with a tool, do not finish the Agent turn with zero tool calls unless there is a concrete reason.
+This rule applies to action-oriented requests, not ordinary informational questions. It is correct to answer without tools when the user asks only for an explanation or explicitly says not to perform anything.
+Only fall back to instructions when the required capability is unavailable, a required permission or confirmation cannot be obtained automatically, the action is blocked by policy, or the user explicitly asks only for instructions.`;
+const recallPreviousToolResultDefinition: ProjectToolDefinition = { type: 'function', function: { name: 'recall_previous_tool_result', description: 'Точечно возвращает raw evidence из более раннего tool result текущего Agent run после context compaction. Используй, когда Working Memory указывает на нужную точную старую деталь; не заменяй этим широкое повторное исследование.', parameters: { type: 'object', properties: { query: { type: 'string', maxLength: 240 }, tool_call_id: { type: 'string', maxLength: 100 } }, required: ['query'] } } };
+const isHistoryRecallCall = (call: ProjectToolCall): boolean => call.name === 'recall_previous_tool_result';
 
 function parseCall(call: ToolCall): ProjectToolCall {
   const raw = call.function.arguments; let argumentsObject: Record<string, unknown> = {};
@@ -147,7 +160,7 @@ function lineRange(value: Record<string, unknown>): string | undefined {
 type StagnationStats = {
   explorationActions: number; broadExplorationActions: number; targetedExplorationActions: number; repeatedExplorationActions: number; mutationActions: number; verificationActions: number;
   exactDuplicateReads: number; coveredReads: number; overlappingReads: number; newInformationReads: number; meaningfulSourceDiscoveries: number; stepsSinceLastNewInformation: number; stepsSinceLastMeaningfulSourceInformation: number; stepsSinceLastMutation: number;
-  codingChangeTask: boolean; interventionLevel: number; stagnationSuspected: boolean;
+  codingChangeTask: boolean; analysisTask: boolean; progressEvents: number; planProgressEvents: number; taskNoteUpdates: number; stepsSinceLastProgress: number; inspectionActionsSinceCheckpoint: number; overlappingInspections: number; repeatedSearches: number; interventionLevel: number; stagnationSuspected: boolean;
 };
 type StagnationIntervention = 'first' | 'second' | 'stalled';
 type StagnationUpdate = { stats: StagnationStats; intervention?: StagnationIntervention };
@@ -156,6 +169,7 @@ const mutationTools = new Set(['apply_patch', 'write_file', 'create_file', 'dele
 const verificationTools = new Set(['git_status', 'git_diff', 'run_terminal']);
 const explorationTools = new Set(['read_file', 'inspect_package_json', 'search_text', 'find_files', 'search_files', 'list_directory', 'web_search', 'web_open']);
 const codingChangeLanguage = /(?:\b(?:add|change|create|edit|feature|fix|implement|improve|refactor|remove|update|bug)\b|исправ|реализ|добав|измен|редакт|созда|удал|улучш|рефактор|фич)/i;
+const analysisOnlyLanguage = /(?:\b(?:analysis(?:[ -]only)?|research(?:[ -]only)?|review(?:[ -]only)?|read[ -]only|do not modify(?: any)? files?|without (?:making )?changes?|no file changes?)\b|только анализ|без изменений|не изменяй(?:те)? файлы|не менять файлы|исследовательск(?:ая|ий)|ревью)/i;
 const sourcePath = (call: ProjectToolCall, read?: ReadDiagnostic): string => read?.path ?? (typeof call.arguments.path === 'string' ? call.arguments.path.replace(/\\/g, '/').replace(/^\.\//, '') : '');
 const lowValuePathSegment = new Set(['.git', '.next', '.cache', '.venv', '__pycache__', 'build', 'coverage', 'dist', 'generated', 'node_modules', 'out', 'target', 'vendor', 'venv']);
 const meaningfulExtension = /\.(?:[cm]?[jt]sx?|py|rs|go|java|kt|kts|swift|rb|php|cs|c(?:pp|xx)?|h(?:pp)?|css|s[ac]ss|less|html?|vue|svelte|json|ya?ml|toml|ini|cfg)$/i;
@@ -173,19 +187,56 @@ const resultPaths = (raw: string): string[] => {
 const firstStagnationGuidance = 'Релевантные области проекта уже изучены, а последние действия повторяют известный контекст. Перед новым исследованием назови один конкретный неразрешённый вопрос и используй только узкий поиск или диапазон чтения для него. Если такого вопроса нет, перейди к запрошенному изменению, затем выполни сфокусированную проверку. Не перечитывай неизменённые доступные диапазоны только ради уверенности.';
 const secondStagnationGuidance = 'Исследование всё ещё не продвигается после предыдущей подсказки, а реализации нет. Не выполняй широкий обзор проекта и не перечитывай целиком неизменённые файлы. Изучай только узкую конкретную зависимость; иначе внеси запрошенное изменение, проверь его и заверши работу.';
 const plannedStagnationGuidance = 'У тебя уже есть Plan. Сначала сверяйся с task_plan и Task Notes: отметь завершённое исследование, зафиксируй существенные факты в notes и определи один минимально необходимый следующий шаг. Если исследование закрыто, переведи следующий шаг плана в in_progress и переходи к реализации или проверке, а не продолжай широкий поиск.';
+const analysisStagnationGuidance = 'Ты долго исследуешь проект. Зафиксируй новые выводы в Task Notes. Закрой текущий Plan step или объясни, какой конкретный неизвестный факт ещё нужен. Если данных уже достаточно — переходи к следующим пунктам Plan или final synthesis. Не перечитывай уже изученные области без конкретной причины.';
+const analysisStagnationGuard = 'Исследование всё ещё не даёт новых подтверждённых фактов. Не повторяй уже изученные файлы или одинаковые поиски. Зафиксируй оставшиеся evidence в Task Notes и Plan; если этого достаточно для исходного вопроса, подготовь итоговый synthesis.';
+const analysisCheckpointActions = 10;
+type Inspection = { path: string; start?: number; end?: number };
+const terminalInspection = (call: ProjectToolCall): Inspection | undefined => {
+  if (call.name !== 'run_terminal' || typeof call.arguments.command !== 'string') return undefined;
+  const command = call.arguments.command;
+  if (!/\b(?:sed|awk|grep|rg|cat|head|tail)\b/.test(command)) return undefined;
+  // Keep the path itself in capture group 1. The previous non-capturing
+  // expression always produced undefined here, so sed/awk/grep inspections
+  // escaped the overlap detector merely by using a different tool.
+  const path = command.match(/([\w./-]+\.(?:py|[cm]?[jt]sx?|go|rs|java|kt|json|ya?ml))(?:\s|$)/)?.[1];
+  if (!path) return undefined;
+  const range = command.match(/(\d+)\s*[,\-:]\s*(\d+)/);
+  return { path: path.replace(/^\.\//, ''), ...(range ? { start: Number(range[1]), end: Number(range[2]) } : {}) };
+};
+const overlappingInspection = (one: Inspection, two: Inspection): boolean => one.path === two.path && (one.start === undefined || two.start === undefined || (one.start <= (two.end ?? two.start) && two.start <= (one.end ?? one.start)));
+const searchKey = (call: ProjectToolCall): string | undefined => (call.name === 'search_text' || call.name === 'find_files' || call.name === 'search_files') && typeof call.arguments.query === 'string' ? `${call.name}:${String(call.arguments.path ?? '')}:${call.arguments.query.trim().toLowerCase()}` : undefined;
 
 class AgentStagnation {
   private readonly codingChangeTask: boolean;
+  private readonly analysisTask: boolean;
   private readonly stats: StagnationStats;
   private interventionLevel = 0;
   private interventionStep = 0;
   private interventionRepeatedReads = 0;
   private interventionMeaningfulDiscoveries = 0;
   private readonly meaningfulResources = new Set<string>();
+  private lastNotes = '';
+  private lastPlan = '';
+  private readonly inspections: Inspection[] = [];
+  private readonly searches = new Set<string>();
 
   constructor(history: ChatMessage[]) {
-    this.codingChangeTask = history.some((message) => message.role === 'user' && codingChangeLanguage.test(message.content));
-    this.stats = { explorationActions: 0, broadExplorationActions: 0, targetedExplorationActions: 0, repeatedExplorationActions: 0, mutationActions: 0, verificationActions: 0, exactDuplicateReads: 0, coveredReads: 0, overlappingReads: 0, newInformationReads: 0, meaningfulSourceDiscoveries: 0, stepsSinceLastNewInformation: 0, stepsSinceLastMeaningfulSourceInformation: 0, stepsSinceLastMutation: 0, codingChangeTask: this.codingChangeTask, interventionLevel: 0, stagnationSuspected: false };
+    const userText = history.filter((message) => message.role === 'user').map((message) => message.content).join('\n');
+    this.analysisTask = analysisOnlyLanguage.test(userText);
+    this.codingChangeTask = !this.analysisTask && codingChangeLanguage.test(userText);
+    this.stats = { explorationActions: 0, broadExplorationActions: 0, targetedExplorationActions: 0, repeatedExplorationActions: 0, mutationActions: 0, verificationActions: 0, exactDuplicateReads: 0, coveredReads: 0, overlappingReads: 0, newInformationReads: 0, meaningfulSourceDiscoveries: 0, stepsSinceLastNewInformation: 0, stepsSinceLastMeaningfulSourceInformation: 0, stepsSinceLastMutation: 0, codingChangeTask: this.codingChangeTask, analysisTask: this.analysisTask, progressEvents: 0, planProgressEvents: 0, taskNoteUpdates: 0, stepsSinceLastProgress: 0, inspectionActionsSinceCheckpoint: 0, overlappingInspections: 0, repeatedSearches: 0, interventionLevel: 0, stagnationSuspected: false };
+  }
+
+  isAnalysisTask(): boolean { return this.analysisTask; }
+  hasSufficientAnalysisEvidence(): boolean {
+    // Evidence has to be materialized, but a good long analysis should not
+    // lose its final answer merely because reads themselves are no longer
+    // treated as progress. Two Notes/Plan checkpoints plus several distinct
+    // sources are enough for a bounded best-effort synthesis.
+    return this.analysisTask
+      && this.stats.meaningfulSourceDiscoveries >= 5
+      && this.stats.taskNoteUpdates >= 2
+      && this.stats.planProgressEvents >= 2;
   }
 
   record(call: ProjectToolCall, read: ReadDiagnostic | undefined, raw: string, action: number): StagnationUpdate {
@@ -213,11 +264,39 @@ class AgentStagnation {
     }
     if (!read || read.relationship !== 'new') this.stats.stepsSinceLastNewInformation += 1;
     if (meaningfulDiscovery) { this.stats.meaningfulSourceDiscoveries += 1; this.stats.stepsSinceLastMeaningfulSourceInformation = 0; } else this.stats.stepsSinceLastMeaningfulSourceInformation += 1;
+    const value = resultObject(raw);
+    const readInspection = read ? { path: sourcePath(call, read), ...(typeof value.start_line === 'number' ? { start: value.start_line, end: typeof value.end_line === 'number' ? value.end_line : value.start_line } : {}) } : undefined;
+    const inspected = readInspection ?? terminalInspection(call);
+    const overlapping = Boolean(inspected && this.inspections.some((previous) => overlappingInspection(previous, inspected)));
+    if (inspected) { this.inspections.push(inspected); if (overlapping) this.stats.overlappingInspections += 1; }
+    if (this.analysisTask && call.name === 'run_terminal' && inspected) { this.stats.explorationActions += 1; this.stats.targetedExplorationActions += 1; }
+    const query = searchKey(call); const repeatedSearch = Boolean(query && this.searches.has(query));
+    if (query) { this.searches.add(query); if (repeatedSearch) this.stats.repeatedSearches += 1; }
+    const notes = typeof value.notes === 'string' ? value.notes.trim() : '';
+    const notesProgress = isTaskNotesCall(call) && call.arguments.action === 'update' && notes.length > 0 && notes !== this.lastNotes;
+    if (notesProgress) { this.lastNotes = notes; this.stats.taskNoteUpdates += 1; }
+    const plan = isAgentPlanCall(call) ? planSnapshot(value) : undefined;
+    const planState = plan ? plan.steps.map((step) => `${step.id}:${step.status}`).join('|') : '';
+    const planProgress = Boolean(planState && planState !== this.lastPlan);
+    if (planProgress) { this.lastPlan = planState; this.stats.planProgressEvents += 1; }
+    // Inspection is evidence only once it is materialized as a finding, Notes
+    // delta or Plan transition. A new tool or slightly shifted range alone is
+    // not meaningful analysis progress.
+    const nonInspectionVerification = verification && !inspected && !lowInformation(raw);
+    const progress = (!this.analysisTask && meaningfulDiscovery) || notesProgress || planProgress || nonInspectionVerification || (call.name === 'web_search' || call.name === 'web_open') && !lowInformation(raw) || Boolean(query && !repeatedSearch && !lowInformation(raw));
+    const inspectionAction = Boolean(inspected || query);
+    if (progress) { this.stats.progressEvents += 1; this.stats.stepsSinceLastProgress = 0; this.stats.inspectionActionsSinceCheckpoint = 0; this.stats.overlappingInspections = 0; this.stats.repeatedSearches = 0; } else {
+      this.stats.stepsSinceLastProgress += 1;
+      if (inspectionAction) this.stats.inspectionActionsSinceCheckpoint += 1;
+    }
     if (mutation) this.resetEpisode();
     const repeatedSignal = this.stats.repeatedExplorationActions >= 3;
     const broadLowYieldSignal = this.stats.broadExplorationActions >= 4 && this.stats.stepsSinceLastMeaningfulSourceInformation >= 6;
     const staleMeaningfulSourceSignal = this.stats.stepsSinceLastMeaningfulSourceInformation >= 8;
-    this.stats.stagnationSuspected = this.codingChangeTask && this.stats.mutationActions === 0 && this.stats.explorationActions >= 18 && this.stats.meaningfulSourceDiscoveries >= 5 && (repeatedSignal || broadLowYieldSignal || staleMeaningfulSourceSignal);
+    const analysisLoopSignal = (repeatedSignal && this.stats.stepsSinceLastProgress >= 3) || (this.stats.broadExplorationActions >= 4 && this.stats.stepsSinceLastProgress >= 6) || this.stats.stepsSinceLastProgress >= 8 || (this.stats.inspectionActionsSinceCheckpoint >= analysisCheckpointActions && (this.stats.overlappingInspections >= 3 || this.stats.repeatedSearches >= 2));
+    this.stats.stagnationSuspected = this.analysisTask
+      ? this.stats.explorationActions >= 18 && analysisLoopSignal
+      : this.codingChangeTask && this.stats.mutationActions === 0 && this.stats.explorationActions >= 18 && this.stats.meaningfulSourceDiscoveries >= 5 && (repeatedSignal || broadLowYieldSignal || staleMeaningfulSourceSignal);
     const intervention = this.nextIntervention(action);
     this.stats.interventionLevel = this.interventionLevel;
     return { stats: { ...this.stats, stepsSinceLastMutation: this.stats.mutationActions ? this.stats.stepsSinceLastMutation : action }, ...(intervention ? { intervention } : {}) };
@@ -277,13 +356,26 @@ function completedActivity(activity: ToolActivity, call: ProjectToolCall, raw: s
       metadata.completed_steps = plan.steps.filter((step) => step.status === 'completed').length;
     }
   }
-  const output = call.name === 'run_terminal' ? [typeof value.stdout === 'string' ? value.stdout : '', typeof value.stderr === 'string' ? value.stderr : ''].filter(Boolean).join('\n').slice(0, 12_000)
+  const output = call.name === 'task_notes' ? (typeof value.notes === 'string' ? value.notes : undefined)
+    : call.name === 'run_terminal' ? [typeof value.stdout === 'string' ? value.stdout : '', typeof value.stderr === 'string' ? value.stderr : ''].filter(Boolean).join('\n').slice(0, 12_000)
     : call.name === 'search_text' || call.name === 'find_files' || call.name === 'search_files' || call.name === 'list_directory' ? JSON.stringify(value.matches ?? value.entries ?? [], null, 2).slice(0, 12_000)
       : call.name === 'git_status' || call.name === 'git_diff' ? String(value.status ?? value.diff ?? '').slice(0, 12_000)
         : error ? String(value.error).slice(0, 2_000) : undefined;
   return { ...activity, detail, state: error || (call.name === 'run_terminal' && value.exit_code !== 0) ? 'error' : 'completed', metadata, output };
 }
 const runtimeNotice = (kind: string, content: string): ToolMessage => ({ role: 'user', content: `<runtime_context kind="${kind}">${content}</runtime_context>` });
+function contextCompactionActivity(stats: ContextCompactionStats): ToolActivity {
+  const effective = stats.meaningfulSavings;
+  return {
+    id: randomUUID(), label: effective ? 'Контекст оптимизирован' : 'Контекст не сокращён', detail: effective ? `${stats.inputTokensBefore.toLocaleString('ru-RU')} → ${stats.inputTokensAfter.toLocaleString('ru-RU')} токенов` : 'Недостаточно места для полезного сокращения', kind: 'context', state: 'completed',
+    metadata: { context_window: stats.contextWindow, input_tokens_before: stats.inputTokensBefore, input_tokens_after: stats.inputTokensAfter, saved_tokens: stats.savedTokens, meaningful_savings: effective, compacted_messages: stats.compactedMessages, compacted_tool_results: stats.compactedToolResults, compaction_count: stats.compactionCount, ineffective_compaction_count: stats.ineffectiveCompactionCount, working_memory_tokens: stats.workingMemoryTokens, facts_added: stats.factsAdded, facts_updated: stats.factsUpdated, facts_deduplicated: stats.factsDeduplicated, stale_facts_removed: stats.staleFactsRemoved, history_retrieval_count: stats.historyRetrievalCount, post_compaction_reread_count: stats.postCompactionRereadCount, checkpoint_reason: stats.checkpointReason ?? 'refresh', level: stats.level ?? 'normal' },
+  };
+}
+const planIsComplete = (value: AgentPlan | null): boolean => Boolean(value?.steps.length && value.steps.every((step) => step.status === 'completed'));
+const recentAgentProgress = (stats: StagnationStats | undefined): boolean => Boolean(stats && !stats.stagnationSuspected && (stats.stepsSinceLastMeaningfulSourceInformation <= 12 || stats.stepsSinceLastMutation <= 12 || stats.verificationActions > 0));
+function actionBudgetActivity(previous: number, next: number): ToolActivity {
+  return { id: randomUUID(), label: 'Бюджет действий расширен', detail: `${previous} → ${next}`, kind: 'progress', state: 'completed', metadata: { previous_budget: previous, action_budget: next } };
+}
 const referenceContext = (message: ChatMessage): string => {
   const references = message.projectReferences ?? [];
   if (!references.length) return message.content;
@@ -304,11 +396,11 @@ const messageMetadata = (messages: ToolMessage[]): Array<Record<string, unknown>
 export class ProjectChatService {
   constructor(private readonly backend: ToolCallingBackend, private readonly web: WebBrowserService) {}
 
-  async *stream(model: string, history: ChatMessage[], root: string | AgentProject[], signal: AbortSignal, contextWindow: number, depth: AnalysisDepth, webMode: WebMode, confirm: ConfirmAction, runtime?: AgentRuntimeContext): AsyncIterable<StreamEvent> {
+  async *stream(model: string, history: ChatMessage[], root: string | AgentProject[], signal: AbortSignal, contextWindow: number, reasoningMode: ReasoningMode, webMode: WebMode, confirm: ConfirmAction, runtime?: AgentRuntimeContext): AsyncIterable<StreamEvent> {
     const projects: AgentProject[] = typeof root === 'string' ? [{ id: 'project-1', slot: 1, root, label: 'Project 1' }] : root;
     const primary = projects.find((project) => project.slot === 1) ?? projects[0];
-    if (!primary) throw new Error('Primary project is unavailable');
-    const engine = new AnalysisEngine(depth); const tools = new Map(await Promise.all(projects.map(async (project) => [project.id, await ReadonlyProjectTools.open(project.root, confirm)] as const)));
+    const engine = new AnalysisEngine(); const tools = new Map(await Promise.all(projects.map(async (project) => [project.id, await ReadonlyProjectTools.open(project.root, confirm)] as const)));
+    const terminal = await TerminalTools.open(primary?.root ?? homedir(), confirm);
     let webSession: WebBrowserSession | null = null;
     if (webMode === 'auto') {
       try { webSession = await this.web.openSession(); }
@@ -316,26 +408,44 @@ export class ProjectChatService {
     }
     const closeWebOnAbort = () => { void webSession?.close(); };
     signal.addEventListener('abort', closeWebOnAbort, { once: true });
-    const toolDefinitions = [taskNotesToolDefinition, agentPlanToolDefinition, ...projectToolDefinitions, ...(webSession ? webToolDefinitions : [])];
+    const toolDefinitions = [taskNotesToolDefinition, agentPlanToolDefinition, reportProgressToolDefinition, recallPreviousToolResultDefinition, terminalToolDefinition, ...(projects.length ? projectToolDefinitions : []), ...(webSession ? webToolDefinitions : [])];
     const availableToolNames = new Set(toolDefinitions.map((definition) => definition.function.name));
     const projectContext = projects.map((project) => `- Project ${project.slot}: Name: ${projectDirectoryName(project.root)}; Role: ${project.slot === 1 ? 'primary' : 'secondary'}; project_id=${project.id}${project.slot === 1 ? '; default for every tool call without a project scope.' : ''}`).join('\n');
-    const messages: ToolMessage[] = [{ role: 'system', content: `${capabilitySystemContext({ webAvailable: Boolean(webSession), projectRoot: primary.root, projectWriteAvailable: true, terminalAvailable: true })}\nAvailable projects (paths are scoped by the tool runtime):\n${projectContext}\nEvery project tool accepts optional project_id or project_slot. Use project_id for an explicit reference, and never infer project identity from a relative path. ${engine.strategy()} Рабочий цикл для задач изменения кода: Explore → Implement → Verify → Finalize. Сначала найди только нужные места и зависимости; когда поведение и точки изменения понятны, переходи к минимальной реализации, а не продолжай широкое исследование ради дополнительной уверенности. Перед повторным чтением неизменённого файла назови конкретный неразрешённый вопрос и предпочти узкий диапазон. В сложных или длинных задачах используй Task Notes: фиксируй существенные находки и перед повторным чтением уже исследованных файлов сначала сверяйся с notes. Planning через task_plan доступен для задач с несколькими этапами, исследованием нескольких частей проекта или существенной проверкой; простые задачи не требуют плана. Plan хранит этапы, а Task Notes — факты и решения. После исследования обновляй статусы Plan и переходи к реализации, не продолжай бесконечное чтение. Не обновляй notes или Plan после каждого вызова инструмента. После изменения выполни сфокусированную проверку и заверши ответ. Для явно исследовательской задачи изменение файла не требуется. Используй report_progress редко и только при переходе между изучением, реализацией и проверкой; это короткий пользовательский статус, не рассуждение. Результаты инструментов могут быть детерминированно сокращены ради контекстного бюджета; для полного содержания файла снова вызови read_file с конкретным диапазоном.` }, ...agentHistory(history)];
+    const projectInstructions = projects.length
+      ? `Available projects (paths are scoped by the tool runtime):\n${projectContext}\nEvery project tool accepts optional project_id or project_slot. Use project_id for an explicit reference, and never infer project identity from a relative path.`
+      : 'Проект не выбран: project filesystem tools недоступны. Для пользовательских и системных задач используй run_terminal.';
+    const messages: ToolMessage[] = [{ role: 'system', content: `${capabilitySystemContext({ webAvailable: Boolean(webSession), projectRoot: primary?.root, projectWriteAvailable: Boolean(primary), terminalAvailable: true, terminalInitialCwd: terminal.cwd })}\n${projectInstructions}\n${agentActionExecutionPolicy}\n${engine.strategy()} Рабочий цикл для задач изменения кода: Explore → Implement → Verify → Finalize. Сначала найди только нужные места и зависимости; когда поведение и точки изменения понятны, переходи к минимальной реализации, а не продолжай широкое исследование ради дополнительной уверенности. Перед повторным чтением неизменённого файла назови конкретный неразрешённый вопрос и предпочти узкий диапазон. В сложных или длинных задачах используй Task Notes: фиксируй существенные находки и перед повторным чтением уже исследованных файлов сначала сверяйся с notes. Planning через task_plan доступен для задач с несколькими этапами, исследованием нескольких частей проекта или существенной проверкой; простые задачи не требуют плана. Plan хранит этапы, а Task Notes — факты и решения. После исследования обновляй статусы Plan и переходи к реализации, не продолжай бесконечное чтение. Не обновляй notes или Plan после каждого вызова инструмента. После изменения выполни сфокусированную проверку и заверши ответ. Для явно исследовательской задачи изменение файла не требуется. Используй report_progress редко и только при переходе между изучением, реализацией и проверкой; это короткий пользовательский статус, не рассуждение. Результаты инструментов могут быть детерминированно сокращены ради контекстного бюджета; для полного содержания файла снова вызови read_file с конкретным диапазоном.` }, ...agentHistory(history)];
     const toolContext = new AgentToolContext(contextWindow);
     const taskNotes = new TaskNotes();
     const plan = new AgentPlanState();
-    let actions = 0; let progressReports = 0; let repeats = 0; let lowInfo = 0; let warningSent = false; let researchFinished = false; let initialInferencePending = true; let truncatedToolDecisions = 0; let malformedToolArgumentRecoveries = 0; let protocolFailureRecoveries = 0; let recoveryPending = false;
+    const contextManager = new AgentContextManager(contextWindow);
+    const actionBudget = new AgentActionBudget();
+    const workingMemory = () => ({ plan: plan.snapshot(), taskNotes: taskNotes.snapshot() });
+    const runtimeActivities: ToolActivity[] = [];
+    const onContextCompaction = (stats: ContextCompactionStats) => runtimeActivities.push(contextCompactionActivity(stats));
+    let actions = 0; let progressReports = 0; let repeats = 0; let lowInfo = 0; let warningSent = false; let researchFinished = false; let initialInferencePending = true; let malformedToolArgumentRecoveries = 0; let protocolFailureRecoveries = 0; let recoveryPending = false; let latestStagnationStats: StagnationStats | undefined;
     const toolFailureAttempts = new Map<string, number>();
     const progressMessages = new Set<string>();
     const completed = new Set<string>();
     const stagnation = new AgentStagnation(history);
-    if (engine.isDeep) { log('deep.lifecycle', { phase: 'research.started', model, contextWindow }); yield { type: 'analysis', progress: { stage: 'reconnaissance', status: 'active' } }; }
     try { while (!signal.aborted) {
-      const remaining = engine.budget - actions;
-      if (remaining <= 0) { yield* this.synthesize(model, messages, engine, signal, contextWindow, '', actions, toolContext.stats(), runtime); return; }
+      const previousBudget = actionBudget.snapshot();
+      const budget = actionBudget.assess({ actions, planComplete: planIsComplete(plan.snapshot()), stalled: Boolean(latestStagnationStats?.stagnationSuspected), recentProgress: recentAgentProgress(latestStagnationStats) });
+      if (budget.extended) {
+        log('agent.action-budget.extended', { ...runtime, actions, previousBudget, actionBudget: budget.limit, compactionCount: contextManager.stats().compactionCount, recentProgress: recentAgentProgress(latestStagnationStats) });
+        yield { type: 'tool', activity: actionBudgetActivity(previousBudget, budget.limit) };
+        messages.push(runtimeNotice('action_budget_extended', `Задача продолжает продвигаться, поэтому бюджет действий расширен с ${previousBudget} до ${budget.limit}. Продолжай только необходимые шаги и заверши работу после проверки.`));
+      }
+      if (budget.shouldFinalize) {
+        log('agent.action-budget.finalize', { ...runtime, actions, actionBudget: budget.limit, planComplete: planIsComplete(plan.snapshot()), stalled: Boolean(latestStagnationStats?.stagnationSuspected), atAbsoluteCap: budget.atAbsoluteCap });
+        yield* this.synthesize(model, messages, engine, signal, contextWindow, reasoningMode, '', actions, toolContext.stats(), runtime, contextManager, workingMemory, runtimeActivities, onContextCompaction); return;
+      }
+      const remaining = budget.limit - actions;
       if (remaining <= finalizationThreshold && !warningSent) { messages.push(runtimeNotice('action_budget', 'Осталось мало вызовов. Закрой только наиболее важные пробелы и заверши исследование.')); warningSent = true; }
       let response: ToolMessage;
       try {
-        response = await this.inference(model, messages, toolDefinitions, signal, contextWindow, depth, actions, toolContext.stats(), runtime, initialInferencePending, recoveryPending);
+        response = await this.inference(model, messages, toolDefinitions, signal, contextWindow, reasoningMode, actions, toolContext.stats(), runtime, initialInferencePending, recoveryPending, contextManager, workingMemory, onContextCompaction);
+        while (runtimeActivities.length) yield { type: 'tool', activity: runtimeActivities.shift()! };
         initialInferencePending = false;
         recoveryPending = false;
         // A response reached the normal Agent protocol, so a later malformed
@@ -383,29 +493,19 @@ export class ProjectChatService {
       // this representation at its own protocol boundary.
       messages.push({ role: 'assistant', content: assistantContent, tool_calls: calls.length ? normalizedToolCalls(calls) : undefined });
       if (calls.length === 0) {
-        // A reasoning model can exhaust a tool-decision turn before it emits the
-        // call. That is not a final answer: keep tools enabled for two bounded
-        // continuation instead of sending it to tool-less final synthesis.
         if (response.finish_reason === 'length') {
-          truncatedToolDecisions += 1;
-          log('agent.tool-decision.truncated', { ...runtime, agentStep: actions, continuation: truncatedToolDecisions, content: safeTextShape(rawContent), reasoning: safeTextShape(response.thinking ?? '') });
-          if (truncatedToolDecisions <= 2) {
-            messages.push(runtimeNotice('tool_decision_truncated', 'Предыдущий выбор действия остановился по лимиту вывода до завершения. Не формируй итоговый ответ и не раскрывай рассуждения: сейчас вызови один нужный доступный инструмент либо дай короткий итог без инструмента.'));
-            continue;
-          }
-          yield { type: 'error', message: 'Агент не завершил выбор действия', details: 'Модель дважды достигла лимита вывода до вызова инструмента.' };
+          log('agent.tool-decision.truncated', { ...runtime, agentStep: actions, content: safeTextShape(rawContent), reasoning: safeTextShape(response.thinking ?? '') });
+          yield { type: 'error', message: 'Агент не завершил выбор действия', details: 'Модель достигла доступного лимита вывода до вызова инструмента. Увеличьте Context Window или сократите историю.' };
           return;
         }
         researchFinished = true;
-        if (engine.isDeep) log('deep.lifecycle', { phase: 'research.finished', actions });
-        yield* this.synthesize(model, messages, engine, signal, contextWindow, assistantContent, actions, toolContext.stats(), runtime);
+        yield* this.synthesize(model, messages, engine, signal, contextWindow, reasoningMode, assistantContent, actions, toolContext.stats(), runtime, contextManager, workingMemory, runtimeActivities, onContextCompaction);
         return;
       }
-      truncatedToolDecisions = 0;
       protocolFailureRecoveries = 0;
       let lowInformationNotice = false;
       let stagnationIntervention: StagnationIntervention | undefined;
-      let latestStagnationStats: StagnationStats | undefined;
+      let pendingWorkingMemoryReminder: ReturnType<AgentContextManager['observe']>;
       let batchRecovery: { call: ProjectToolCall; attempt: number; reason: string; failure: string } | undefined;
       let batchRecoveryExhausted = false;
       let actionBudgetReached = false;
@@ -421,9 +521,9 @@ export class ProjectChatService {
           messages.push(skippedToolResult(call, batchRecovery?.call ?? call));
           continue;
         }
-        if (actions >= engine.budget) {
+        if (actions >= actionBudget.snapshot()) {
           actionBudgetReached = true;
-          messages.push(toolResult(call, JSON.stringify({ error: 'Лимит действий агента исчерпан; вызов не выполнен.', code: 'action_budget_exhausted', tool: call.name })));
+          messages.push(toolResult(call, JSON.stringify({ error: 'Текущий бюджет действий исчерпан; вызов не выполнен.', code: 'action_budget_exhausted', tool: call.name })));
           continue;
         }
         if (!availableToolNames.has(call.name)) {
@@ -467,6 +567,7 @@ export class ProjectChatService {
         }
         completed.add(key); actions += 1;
         const isWebTool = webToolDefinitions.some((definition) => definition.function.name === call.name);
+        const isTerminalTool = call.name === terminalToolDefinition.function.name;
         const actionId = randomUUID();
         const activity: ToolActivity = { id: actionId, ...(isWebTool ? { ...activityForWebTool(call), kind: 'web' as const, state: 'running' as const } : activityForTool(call)) };
         yield { type: 'tool', activity };
@@ -474,17 +575,17 @@ export class ProjectChatService {
         const explicitProjectId = typeof call.arguments.project_id === 'string' ? call.arguments.project_id : undefined;
         const requestedSlot = call.arguments.project_slot === 2 ? 2 : 1;
         const targetProject = explicitProjectId ? projects.find((project) => project.id === explicitProjectId) : projects.find((project) => project.slot === requestedSlot) ?? primary;
-        log('agent.tool.execute.started', { ...runtime, agentStep: actions, actionId, tool: call.name, arguments: safeArgumentsShape(call.arguments), targetProject: targetProject ? { id: targetProject.id, slot: targetProject.slot } : null, registered: availableToolNames.has(call.name), route: isTaskNotesCall(call) ? 'task_notes' : isAgentPlanCall(call) ? 'task_plan' : isWebTool ? 'web' : targetProject ? 'project' : 'missing_project' });
+        log('agent.tool.execute.started', { ...runtime, agentStep: actions, actionId, tool: call.name, arguments: safeArgumentsShape(call.arguments), targetProject: targetProject ? { id: targetProject.id, slot: targetProject.slot } : null, registered: availableToolNames.has(call.name), route: isTaskNotesCall(call) ? 'task_notes' : isAgentPlanCall(call) ? 'task_plan' : isWebTool ? 'web' : isTerminalTool ? 'terminal' : targetProject ? 'project' : 'missing_project' });
         let unscopedResult: string;
         try {
-          unscopedResult = isTaskNotesCall(call) ? taskNotes.execute(call) : isAgentPlanCall(call) ? plan.execute(call) : isWebTool && webSession ? await webSession.execute(call) : targetProject ? await tools.get(targetProject.id)!.execute(call, signal, actionId) : JSON.stringify({ error: `Unknown or unavailable project_id: ${explicitProjectId}` });
+          unscopedResult = isTaskNotesCall(call) ? taskNotes.execute(call) : isAgentPlanCall(call) ? plan.execute(call) : isHistoryRecallCall(call) ? contextManager.retrieve(typeof call.arguments.query === 'string' ? call.arguments.query : '', typeof call.arguments.tool_call_id === 'string' ? call.arguments.tool_call_id : undefined) : isWebTool && webSession ? await webSession.execute(call) : isTerminalTool ? await terminal.execute(call, signal, actionId) : targetProject ? await tools.get(targetProject.id)!.execute(call, signal, actionId) : JSON.stringify({ error: `Unknown or unavailable project_id: ${explicitProjectId}` });
         } catch (error) {
           // A Stop can race a running executor. Its call was already emitted by
           // the assistant, so record a cancellation result before terminating
           // the run rather than leaving an invalid partial tool batch.
           unscopedResult = JSON.stringify({ error: signal.aborted ? 'Generation cancelled' : compactFailureReason(error instanceof Error ? error.message : String(error)) });
         }
-        const scopedResult = !isTaskNotesCall(call) && !isAgentPlanCall(call) && !isWebTool ? scopedProjectResult(unscopedResult, targetProject) : unscopedResult;
+        const scopedResult = !isTaskNotesCall(call) && !isAgentPlanCall(call) && !isHistoryRecallCall(call) && !isWebTool && !isTerminalTool ? scopedProjectResult(unscopedResult, targetProject) : unscopedResult;
         const rawExecutionResult = resultObject(scopedResult);
         const failed = typeof rawExecutionResult.error === 'string';
         const result = failed ? compactToolFailure(call, scopedResult) : scopedResult;
@@ -494,6 +595,10 @@ export class ProjectChatService {
         messages.push(toolMessage);
         if (lowInformation(result)) { lowInfo += 1; if (lowInfo === 3) lowInformationNotice = true; } else lowInfo = 0;
         const contextUpdate = toolContext.add(call.name, call.arguments, toolMessage, actions);
+        const workingMemoryReminder = contextManager.observe(toolMessage, messages, workingMemory(), scopedResult);
+        // A model may emit sibling calls in one assistant message. A user
+        // runtime notice is valid only after every sibling has its tool result.
+        if (workingMemoryReminder) pendingWorkingMemoryReminder = workingMemoryReminder;
         const stats = contextUpdate.stats;
         if (contextUpdate.read) log('agent.read.diagnostics', { ...runtime, agentStep: actions, normalizedPath: contextUpdate.read.path, requestedRange: contextUpdate.read.range, fileFingerprint: contextUpdate.read.fingerprint, readCount: contextUpdate.read.readCount, sameContentAlreadyRead: contextUpdate.read.sameContentAlreadyRead, relationship: contextUpdate.read.relationship, coveredByRange: contextUpdate.read.coveredByRange, previousResultActive: contextUpdate.read.previousResultActive, previousResultCompacted: contextUpdate.read.previousResultCompacted, previousCompactionReason: contextUpdate.read.previousCompactionReason, previousResultInvalidated: contextUpdate.read.previousResultInvalidated, previousInvalidationReason: contextUpdate.read.previousInvalidationReason, repeatedReadLoopSuspected: contextUpdate.read.repeatedReadLoopSuspected, pinned: contextUpdate.read.pinned, activeToolResultContextSize: stats.size, contextBudget: stats.budget, peakActiveToolResultContextSize: stats.peakSize });
         if (contextUpdate.invalidation) log('agent.read.cache.invalidated', { ...runtime, agentStep: actions, tool: call.name, ...contextUpdate.invalidation, totalInvalidatedReads: stats.invalidatedReads });
@@ -506,8 +611,8 @@ export class ProjectChatService {
           log('agent.stagnation.intervention', { ...runtime, agentStep: actions, level: stagnationUpdate.intervention, ...stagnationUpdate.stats });
         }
         if (stats.compacted) log('agent.context.compacted', { ...runtime, agentStep: actions, tool: call.name, toolResultContextSize: stats.size, toolResultContextBudget: stats.budget, compactedResults: stats.compacted });
-        const finishedActivity = completedActivity(activity, call, result, Date.now() - startedAt, contextUpdate);
-        if (targetProject && !isTaskNotesCall(call) && !isAgentPlanCall(call) && !isWebTool) finishedActivity.metadata = { ...finishedActivity.metadata, project: targetProject.label, project_slot: targetProject.slot };
+        const finishedActivity = { ...completedActivity(activity, call, result, Date.now() - startedAt, contextUpdate), rawOutput: scopedResult };
+        if (targetProject && !isTaskNotesCall(call) && !isAgentPlanCall(call) && !isWebTool && !isTerminalTool) finishedActivity.metadata = { ...finishedActivity.metadata, project: targetProject.label, project_slot: targetProject.slot };
         const contextResult = resultObject(toolMessage.content);
         if (isAgentPlanCall(call)) {
           const snapshot = planSnapshot(contextResult);
@@ -526,6 +631,7 @@ export class ProjectChatService {
           if (batchRecoveryExhausted) log('agent.tool-call.recovery.exhausted', { ...runtime, agentStep: actions, tool: call.name, recoveryAttempts: recoveryAttempt - 1, recoveryLimit: maxToolFailureRecoveries });
         }
       }
+      if (pendingWorkingMemoryReminder) messages.push(runtimeNotice(`working_memory_${pendingWorkingMemoryReminder.reason}`, pendingWorkingMemoryReminder.message));
       const sequenceError = validateLlamaMessageSequence(messages);
       if (sequenceError) {
         log('agent.message-sequence.invalid', { ...runtime, agentStep: actions, sequenceError, messages: messageMetadata(messages) });
@@ -542,14 +648,19 @@ export class ProjectChatService {
         recoveryPending = true;
         continue;
       }
-      if (researchFinished) { yield* this.synthesize(model, messages, engine, signal, contextWindow, '', actions, toolContext.stats(), runtime); return; }
+      if (researchFinished) { yield* this.synthesize(model, messages, engine, signal, contextWindow, reasoningMode, '', actions, toolContext.stats(), runtime, contextManager, workingMemory, runtimeActivities, onContextCompaction); return; }
       if (stagnationIntervention === 'stalled') {
         log('agent.stalled.exploration', { ...runtime, actions, ...latestStagnationStats });
-        yield { type: 'error', message: 'Агент остановился: исследование не продвигается', details: 'agent_stalled_exploration: после двух подсказок не появились реализация или новая существенная информация.' };
+        if (stagnation.isAnalysisTask() && stagnation.hasSufficientAnalysisEvidence()) {
+          messages.push(runtimeNotice('stagnation_synthesis', 'Повторное исследование больше не добавляет новых фактов. Сформируй лучший итог по уже собранным evidence, Plan и Task Notes. Не вызывай инструменты.'));
+          yield* this.synthesize(model, messages, engine, signal, contextWindow, reasoningMode, '', actions, toolContext.stats(), runtime, contextManager, workingMemory, runtimeActivities, onContextCompaction);
+          return;
+        }
+        yield { type: 'error', message: 'Агент остановился: исследование не продвигается', details: stagnation.isAnalysisTask() ? 'agent_stalled_exploration: после двух подсказок не появились новые подтверждённые факты, Plan progress или Task Notes evidence.' : 'agent_stalled_exploration: после двух подсказок не появились реализация или новая существенная информация.' };
         return;
       }
-      if (stagnationIntervention === 'first') messages.push(runtimeNotice(plan.hasPlan ? 'stagnation_plan_guidance' : 'stagnation_guidance', plan.hasPlan ? plannedStagnationGuidance : firstStagnationGuidance));
-      if (stagnationIntervention === 'second') messages.push(runtimeNotice('stagnation_guard', secondStagnationGuidance));
+      if (stagnationIntervention === 'first') messages.push(runtimeNotice(plan.hasPlan ? 'stagnation_plan_guidance' : 'stagnation_guidance', stagnation.isAnalysisTask() ? analysisStagnationGuidance : plan.hasPlan ? plannedStagnationGuidance : firstStagnationGuidance));
+      if (stagnationIntervention === 'second') messages.push(runtimeNotice('stagnation_guard', stagnation.isAnalysisTask() ? analysisStagnationGuard : secondStagnationGuidance));
       if (lowInformationNotice) messages.push(runtimeNotice('low_information', 'Последние действия дали мало новой информации. Сузь исследование или заверши ответ.'));
     } } catch (error) {
       if (signal.aborted) return;
@@ -559,15 +670,15 @@ export class ProjectChatService {
       if (classified.kind === 'connection_failure' || classified.kind === 'connection_reset') {
         yield { type: 'error', message: classified.message };
       } else yield { type: 'error', message: 'Анализ не завершился', details };
-    } finally { signal.removeEventListener('abort', closeWebOnAbort); await webSession?.close(); if (engine.isDeep) log('deep.lifecycle', { phase: 'request.finalized', actions, aborted: signal.aborted }); }
+    } finally { signal.removeEventListener('abort', closeWebOnAbort); await webSession?.close(); }
   }
 
-  private async *synthesize(model: string, messages: ToolMessage[], engine: AnalysisEngine, signal: AbortSignal, contextWindow: number, fallback: string, actions: number, toolContext: ToolContextStats, runtime?: AgentRuntimeContext): AsyncIterable<StreamEvent> {
+  private async *synthesize(model: string, messages: ToolMessage[], engine: AnalysisEngine, signal: AbortSignal, contextWindow: number, reasoningMode: ReasoningMode, fallback: string, actions: number, toolContext: ToolContextStats, runtime?: AgentRuntimeContext, contextManager?: AgentContextManager, workingMemory?: () => { plan: ReturnType<AgentPlanState['snapshot']>; taskNotes: string }, runtimeActivities: ToolActivity[] = [], onContextCompaction?: (stats: ContextCompactionStats) => void): AsyncIterable<StreamEvent> {
     const evidence = engine.prompt();
-    if (engine.isDeep) { log('deep.lifecycle', { phase: 'evidence-map.created', actions }); log('deep.lifecycle', { phase: 'final-synthesis.started', actions }); yield { type: 'analysis', progress: { stage: 'synthesis', status: 'active' } }; }
     messages.push(runtimeNotice('evidence_map', evidence), runtimeNotice('finalization', 'Исследование завершено. Сформируй один итоговый ответ на исходный вопрос пользователя, опираясь на evidence map и релевантные доступные результаты инструментов. Не вызывай инструменты.'));
     try {
-      const response = await this.finalRequest(model, messages, signal, contextWindow, engine.depth, actions, toolContext, runtime);
+      const response = await this.finalRequest(model, messages, signal, contextWindow, reasoningMode, actions, toolContext, runtime, contextManager, workingMemory, onContextCompaction);
+      while (runtimeActivities.length) yield { type: 'tool', activity: runtimeActivities.shift()! };
       if (response.finish_reason === 'length') throw new OllamaRequestError('output_limit', 'Итоговый ответ Ollama был остановлен по лимиту длины', { causeDetail: 'done_reason=length' });
       if (response.tool_calls?.length) throw new OllamaRequestError('malformed_response', 'Ollama вернул tool call вместо итогового ответа', { causeDetail: 'final request did not allow tools' });
       if (/<tool_call>\s*<function=[a-z_]+>/i.test(response.content ?? '')) throw new OllamaRequestError('malformed_response', 'Ollama вернул текстовый tool call вместо итогового ответа', { causeDetail: 'final request did not allow tools' });
@@ -576,7 +687,6 @@ export class ProjectChatService {
         const reason = response.thinking?.trim() ? 'Ollama вернул reasoning без итогового текста' : 'Ollama вернул корректный ответ без итогового текста';
         throw new OllamaRequestError('empty_response', reason, { causeDetail: JSON.stringify({ finish_reason: response.finish_reason, has_thinking: Boolean(response.thinking?.trim()) }) });
       }
-      if (engine.isDeep) log('deep.lifecycle', { phase: 'final-synthesis.finished', responseChars: content.length });
       if (typeof response.prompt_eval_count === 'number') yield { type: 'context-usage', used: response.prompt_eval_count, maximum: contextWindow };
       yield* this.emit(content, engine, signal, response.inference ? { ...response.inference, toolResultContextSize: toolContext.size, toolResultContextBudget: toolContext.budget, toolResultCompacted: toolContext.compacted } : undefined, actions, response.finish_reason);
     } catch (error) {
@@ -599,32 +709,42 @@ export class ProjectChatService {
     }
   }
 
-  private async finalRequest(model: string, messages: ToolMessage[], signal: AbortSignal, contextWindow: number, depth: AnalysisDepth, actions: number, toolContext: ToolContextStats, runtime?: AgentRuntimeContext): Promise<ToolMessage> {
+  private async finalRequest(model: string, messages: ToolMessage[], signal: AbortSignal, contextWindow: number, reasoningMode: ReasoningMode, actions: number, toolContext: ToolContextStats, runtime?: AgentRuntimeContext, contextManager?: AgentContextManager, workingMemory?: () => { plan: ReturnType<AgentPlanState['snapshot']>; taskNotes: string }, onContextCompaction?: (stats: ContextCompactionStats) => void): Promise<ToolMessage> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), finalSynthesisTimeoutMs);
     let rejectTimeout: ReturnType<typeof setTimeout> | null = null;
     const combined = AbortSignal.any([signal, controller.signal]);
     try {
       return await Promise.race([
-        this.inference(model, messages, undefined, combined, contextWindow, depth, actions, toolContext, runtime),
+        // Finalization does not need another tool-planning reasoning trace.
+        // Keeping it in auto mode leaves the available output budget for the
+        // user-facing answer instead of exhausting it before any text appears.
+        this.inference(model, messages, undefined, combined, contextWindow, 'auto', actions, toolContext, runtime, false, false, contextManager, workingMemory, onContextCompaction),
         new Promise<never>((_resolve, reject) => { rejectTimeout = setTimeout(() => reject(new Error('final synthesis timed out')), finalSynthesisTimeoutMs); }),
       ]);
     } finally { clearTimeout(timer); if (rejectTimeout) clearTimeout(rejectTimeout); }
   }
 
   /** The first model request has no tool side effects, so one transient connection retry is safe. */
-  private async inference(model: string, messages: ToolMessage[], tools: unknown[] | undefined, signal: AbortSignal, contextWindow: number, depth: AnalysisDepth, agentStep: number, toolContext: ToolContextStats | undefined, runtime?: AgentRuntimeContext, initialInference = false, recoveryPending = false): Promise<ToolMessage> {
+  private async inference(model: string, messages: ToolMessage[], tools: unknown[] | undefined, signal: AbortSignal, contextWindow: number, reasoningMode: ReasoningMode, agentStep: number, toolContext: ToolContextStats | undefined, runtime?: AgentRuntimeContext, initialInference = false, recoveryPending = false, contextManager?: AgentContextManager, workingMemory?: () => { plan: ReturnType<AgentPlanState['snapshot']>; taskNotes: string }, onContextCompaction?: (stats: ContextCompactionStats) => void): Promise<ToolMessage> {
     for (let attempt = 1; attempt <= 2; attempt += 1) {
       if (signal.aborted) {
         if (initialInference) log('agent.initial-inference.cancelled', { ...runtime, model, agentStep, attempt, reason: 'cancelled_or_superseded' });
         throw new OllamaRequestError('cancelled', 'Запрос к локальному inference runtime отменён');
       }
       try {
+        if (contextManager && workingMemory) {
+          const context = await contextManager.prepare(messages, tools, async () => this.backend.countInputTokens
+            ? this.backend.countInputTokens(model, messages, tools, contextWindow, reasoningMode, signal)
+            : contextManager.estimate(messages, tools), workingMemory());
+          log('agent.context.manager', { ...runtime, agentStep, ...context });
+          if (context.compactionAttempted) onContextCompaction?.(context);
+        }
         log('agent.message.sequence', { ...runtime, agentStep, messages: messageMetadata(messages) });
         log('agent.inference.attempt', { ...runtime, model, agentStep, attempt, retryCount: attempt - 1, contextLimit: contextWindow, toolResultContextSize: toolContext?.size, toolResultContextBudget: toolContext?.budget, toolResultCompacted: toolContext?.compacted });
         if (initialInference && attempt === 1) log('agent.initial-inference.started', { ...runtime, model, agentStep, contextLimit: contextWindow });
         const phase = recoveryPending ? 'recovery' : initialInference ? 'initial' : tools ? 'post_tool' : 'final';
-        const response = await this.backend.chatWithTools(model, messages, tools, signal, contextWindow, depth, { ...runtime, agentStep, phase, ...(tools ? { maxOutputTokens: agentToolTurnMaxOutputTokens } : {}) });
+        const response = await this.backend.chatWithTools(model, messages, tools, signal, contextWindow, reasoningMode, { ...runtime, agentStep, phase });
         log('agent.inference.success', { ...runtime, model, agentStep, attempt, retryCount: attempt - 1, promptEvalCount: response.prompt_eval_count, finishReason: response.finish_reason });
         if (initialInference && attempt === 2) log('agent.initial-inference.retry.succeeded', { ...runtime, model, agentStep, retryCount: 1 });
         if (response.inference) {
@@ -659,7 +779,6 @@ export class ProjectChatService {
   }
 
   private async *emit(content: string, engine: AnalysisEngine, signal: AbortSignal, inference: InferenceDiagnostics | undefined, actions: number, finishReason: FinishReason | undefined): AsyncIterable<StreamEvent> {
-    if (engine.isDeep) log('deep.lifecycle', { phase: 'response.emitted', responseChars: content.length });
     for (const token of chunkText(content)) { if (signal.aborted) return; yield { type: 'token', content: token }; }
     if (inference) yield { type: 'diagnostics', diagnostics: { ...inference, agentStepCount: actions, finishReason: finishReason ?? 'stop' } };
     yield { type: 'done', finishReason: finishReason ?? 'stop' };

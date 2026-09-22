@@ -6,6 +6,7 @@ import { Composer } from './components/Composer';
 import { Markdown } from './components/Markdown';
 import { useAppStore } from './store/app-store';
 import type { AgentPlan, AnalysisRun, ApprovalDecision, Attachment, ProjectReference, ToolActivity } from '../shared/types';
+import { parseTaskNotes } from '../shared/task-notes-format';
 
 function GenerationIndicator({ state }: { state: string }) {
   const label = state === 'waiting-for-approval' ? 'Ожидает подтверждения' : state === 'using-tool' ? 'Использую инструмент' : state === 'running-terminal' ? 'Запускаю terminal' : state === 'stopping' ? 'Останавливаю' : state === 'generating' ? 'Пишу ответ' : 'Думаю';
@@ -37,14 +38,25 @@ function MessageAttachment({ attachment }: { attachment: Attachment }) {
   return <div className={`message-attachment ${attachment.kind === 'image' ? 'image' : ''}`}>{url ? <img src={url} alt={name} /> : attachment.kind === 'image' ? <span className="attachment-image-placeholder">{imageNumber}</span> : <span className="attachment-file-icon">{attachment.filename.split('.').at(-1)?.toUpperCase() ?? 'FILE'}</span>}<span><strong>{name}</strong><small>{detail}</small></span></div>;
 }
 
+const noteInline = (text: string) => text.split(/((?:[\w.-]+\/)+[\w./-]+|\b(?:npm|pnpm|yarn|git)\s+[\w./:@=-]+)/g).map((part, index) => /^(?:[\w.-]+\/)+[\w./-]+$|^(?:npm|pnpm|yarn|git)\s+/.test(part) ? <code key={index}>{part}</code> : part);
+function TaskNotesContent({ notes }: { notes: string }) {
+  const [expanded, setExpanded] = useState(false); const long = notes.length > 1_200;
+  const visible = long && !expanded ? notes.slice(0, 1_200).replace(/\s+\S*$/, '').trimEnd() : notes;
+  return <div className="task-notes-content">{parseTaskNotes(visible).map((block, index) => block.kind === 'paragraph' ? <p key={index}>{block.lines.map((line, lineIndex) => <span key={lineIndex}>{noteInline(line)}{lineIndex < block.lines.length - 1 && <br />}</span>)}</p> : block.kind === 'unordered' ? <ul key={index}>{block.lines.map((line, lineIndex) => <li key={lineIndex}>{noteInline(line)}</li>)}</ul> : <ol key={index}>{block.lines.map((line, lineIndex) => <li key={lineIndex}>{noteInline(line)}</li>)}</ol>)}{long && <button type="button" className="task-notes-toggle" onClick={() => setExpanded((value) => !value)}>{expanded ? 'Свернуть' : 'Показать полностью'}</button>}</div>;
+}
+
 function ToolActivityItem({ activity, onApproval, approvalSubmitting = false }: { activity: ToolActivity; onApproval?: (decision: ApprovalDecision) => void; approvalSubmitting?: boolean }) {
   const [detailsOpen, setDetailsOpen] = useState(false);
   const approval = activity.approval;
   const approvalStatus = approval?.status === 'approved' ? '✓ Разрешено' : approval?.status === 'session-approved' ? '✓ Разрешено правилом сессии' : approval?.status === 'rejected' ? '✕ Отклонено пользователем' : null;
-  const icon = activity.kind === 'progress' ? <CircleDot size={13} /> : activity.kind === 'planning' ? <ListTodo size={13} /> : activity.kind === 'file_read' || activity.kind === 'directory' ? '↳' : activity.kind === 'search' ? '⌕' : activity.kind === 'terminal' ? '$' : activity.kind === 'mutation' ? '✎' : activity.kind === 'git' ? '⌁' : '•';
-  const hasDetails = Boolean((activity.metadata && Object.keys(activity.metadata).length) || activity.output);
-  return <div className={`tool-action ${activity.kind === 'progress' ? 'progress' : ''} ${activity.state ?? ''}`}>
-    <p className="tool-action-row"><i>{icon}</i><span className="tool-action-label">{activity.label}</span>{activity.detail && <small className="tool-action-detail">{activity.detail}</small>}{activity.state === 'error' && <small className="tool-action-error">Ошибка</small>}</p>
+  const icon = activity.kind === 'progress' ? <CircleDot size={13} /> : activity.kind === 'planning' ? <ListTodo size={13} /> : activity.kind === 'notes' ? '▤' : activity.kind === 'context' ? '◌' : activity.kind === 'file_read' || activity.kind === 'directory' ? '↳' : activity.kind === 'search' ? '⌕' : activity.kind === 'terminal' ? '$' : activity.kind === 'mutation' ? '✎' : activity.kind === 'git' ? '⌁' : '•';
+  const isPlan = activity.kind === 'planning' && Boolean(activity.plan);
+  const isNotes = activity.kind === 'notes' && Boolean(activity.output);
+  const hasDetails = !isPlan && !isNotes && Boolean((activity.metadata && Object.keys(activity.metadata).length) || activity.output);
+  return <div className={`tool-action ${activity.kind === 'progress' ? 'progress' : ''} ${activity.kind ?? 'other'} ${activity.state ?? ''}`}>
+    <p className="tool-action-row"><i>{icon}</i><span className="tool-action-copy"><span className="tool-action-label">{activity.label}</span>{activity.detail && <small className="tool-action-detail">{activity.detail}</small>}</span>{activity.state === 'completed' && <small className="tool-action-complete">Завершено</small>}{activity.state === 'error' && <small className="tool-action-error">Ошибка</small>}</p>
+    {isPlan && <PlanCard plan={activity.plan!} title={activity.detail ?? 'Планирование'} compact />}
+    {isNotes && <TaskNotesContent notes={activity.output!} />}
     {hasDetails && <details className="tool-action-details" open={detailsOpen} onToggle={(event) => { event.stopPropagation(); setDetailsOpen((event.currentTarget as HTMLDetailsElement).open); }}><summary>Детали</summary>{detailsOpen && <div>{activity.metadata && Object.entries(activity.metadata).map(([key, value]) => <p key={key}><span>{key}</span>{String(value)}</p>)}{activity.output && <pre>{activity.output}</pre>}</div>}</details>}
     {approval?.status === 'pending' && onApproval && <div className="tool-approval"><strong>Требуется подтверждение</strong><div><button disabled={approvalSubmitting} onClick={() => onApproval('reject')}>Отклонить</button><button disabled={approvalSubmitting} onClick={() => onApproval('once')}>Разрешить</button><button disabled={approvalSubmitting} onClick={() => onApproval('session')}>Всегда разрешать в этой сессии</button></div></div>}
     {approvalStatus && <small className={`tool-approval-status ${approval?.status}`}>{approvalStatus}</small>}
@@ -56,9 +68,9 @@ function durationLabel(start: string, end: string | null): string | null {
   const seconds = Math.max(0, Math.round((new Date(end).getTime() - new Date(start).getTime()) / 1000));
   return seconds >= 60 ? `${Math.floor(seconds / 60)}м ${seconds % 60}с` : `${seconds}с`;
 }
-function PlanCard({ plan }: { plan: AgentPlan }) {
+function PlanCard({ plan, title = 'Последняя версия плана', compact = false }: { plan: AgentPlan; title?: string; compact?: boolean }) {
   const marker = (status: AgentPlan['steps'][number]['status']) => status === 'completed' ? '✓' : status === 'in_progress' ? '●' : '○';
-  return <section className="agent-plan" aria-label="План работы"><p><ListTodo size={14} /><strong>Планирование</strong></p><ol>{plan.steps.map((step) => <li className={step.status} key={step.id}><i>{marker(step.status)}</i><span>{step.label}</span></li>)}</ol></section>;
+  return <section className={`agent-plan ${compact ? 'compact' : ''}`} aria-label="План работы"><p><ListTodo size={14} /><strong>{title}</strong></p><ol>{plan.steps.map((step) => <li className={step.status} key={step.id}><i>{marker(step.status)}</i><span>{step.label}</span></li>)}</ol></section>;
 }
 function ActivityTrace({ activities, actionCount, status, createdAt, completedAt, active, onApproval, approvalSubmitting }: { activities: ToolActivity[]; actionCount: number; status: 'running' | 'completed' | 'error' | 'cancelled'; createdAt?: string; completedAt?: string | null; active: boolean; onApproval?: (decision: ApprovalDecision) => void; approvalSubmitting?: boolean }) {
   const [expanded, setExpanded] = useState(active); const wasActive = useRef(active);
@@ -66,9 +78,9 @@ function ActivityTrace({ activities, actionCount, status, createdAt, completedAt
   const latestProgress = [...activities].reverse().find((activity) => activity.kind === 'progress')?.label;
   const stateLabel = status === 'completed' ? 'завершено' : status === 'cancelled' ? 'остановлено' : status === 'error' ? 'ошибка' : latestProgress ? `${latestProgress}…` : 'Работа агента';
   const duration = createdAt ? durationLabel(createdAt, completedAt ?? null) : null;
-  const plan = [...activities].reverse().find((activity) => activity.kind === 'planning' && activity.plan)?.plan;
-  const visibleActivities = activities.filter((activity) => activity.kind !== 'planning' || !activity.plan);
-  return <details className="tool-activity activity-trace" open={expanded} onToggle={(event) => { if (event.currentTarget !== event.target) return; setExpanded((event.currentTarget as HTMLDetailsElement).open); }}><summary><ChevronRight size={15} /><strong>{active && latestProgress ? latestProgress : 'Работа агента'}</strong><span>· {actionCount} действий{duration ? ` · ${duration}` : ''}{!active ? ` · ${stateLabel}` : ''}</span></summary><div>{plan && <PlanCard plan={plan} />}{visibleActivities.map((activity) => <ToolActivityItem key={activity.id} activity={activity} onApproval={onApproval} approvalSubmitting={approvalSubmitting} />)}</div></details>;
+  const latestPlanActivity = [...activities].reverse().find((activity) => activity.kind === 'planning' && activity.plan);
+  const visibleActivities = activities.filter((activity) => !(activity.kind === 'planning' && activity.plan));
+  return <details className="tool-activity activity-trace" open={expanded} onToggle={(event) => { if (event.currentTarget !== event.target) return; setExpanded((event.currentTarget as HTMLDetailsElement).open); }}><summary><ChevronRight size={15} /><strong>{active && latestProgress ? latestProgress : 'Работа агента'}</strong><span>· {actionCount} действий{duration ? ` · ${duration}` : ''}{!active ? ` · ${stateLabel}` : ''}</span></summary><div>{latestPlanActivity?.plan && <PlanCard plan={latestPlanActivity.plan} title={latestPlanActivity.detail ?? 'Последняя версия плана'} />}{visibleActivities.map((activity) => <ToolActivityItem key={activity.id} activity={activity} onApproval={onApproval} approvalSubmitting={approvalSubmitting} />)}</div></details>;
 }
 
 export function App() {
@@ -82,7 +94,7 @@ export function App() {
   const updateFollowState = () => { const element = conversationRef.current; if (element) followStream.current = element.scrollHeight - element.scrollTop - element.clientHeight < 96; };
   const runFor = (run: AnalysisRun) => <ActivityTrace key={run.id} activities={run.actions} actionCount={run.actionCount} status={run.status} createdAt={run.createdAt} completedAt={run.completedAt} active={false} />;
   return <div className="app-shell"><Sidebar /><main className="main"><Toolbar /><section ref={conversationRef} onScroll={updateFollowState} className="conversation">
-    {active?.mode === 'agent' && <div className="agent-notice"><Bot size={17} /> Агент использует {active.workingDirectory ? 'выбранную рабочую папку' : 'папку приложения по умолчанию'} и может запускать контролируемые terminal-команды{active.webMode === 'auto' ? ', а также использовать изолированный web.' : '.'}</div>}
+    {active?.mode === 'agent' && <div className="agent-notice"><Bot size={17} /> {active.workingDirectory ? 'Файловые инструменты ограничены выбранным проектом; terminal стартует в его корне и может работать с пользовательскими путями.' : 'Файловые инструменты проекта отключены; terminal стартует в домашней папке и может выполнять контролируемые системные задачи.'}{active.webMode === 'auto' ? ' Также доступен изолированный web.' : ''}</div>}
     {messages.length === 0 && <div className="welcome"><Bot size={34} /><h1>Чем могу помочь?</h1><p>Выберите одну из локальных моделей и начните разговор.</p></div>}
     {messages.map((message) => <article className={`message ${message.role} ${editingId === message.id ? 'is-editing' : ''} ${message.id.startsWith('stream-') && isGenerating ? 'is-generating' : ''}`} key={message.id}><div className="message-content">{editingId === message.id ? <MessageEditor text={editingText} onChange={setEditingText} onSave={() => { void (async () => { if (await editMessage(message, editingText)) setEditingId(null); })(); }} onCancel={() => setEditingId(null)} /> : <>{message.projectReferences?.length ? <MessageProjectReferences references={message.projectReferences} /> : null}{message.attachments?.length ? <MessageAttachments attachments={message.attachments} /> : null}{message.content ? <Markdown>{message.content}</Markdown> : message.role === 'assistant' && isGenerating ? <GenerationIndicator state={generationState} /> : null}{message.role === 'user' && <span className="message-actions"><button className="message-edit" title="Редактировать" aria-label="Редактировать сообщение" onClick={() => { setEditingId(message.id); setEditingText(message.content); }}><Pencil size={14} /></button><button className="message-regenerate" title="Сгенерировать ответ заново" aria-label="Сгенерировать ответ заново" disabled={isGenerating} onClick={() => { void regenerateMessage(message); }}><RotateCcw size={14} /></button></span>}</>}{message.role === 'assistant' && analysisRuns.filter((run) => run.assistantMessageId === message.id).map(runFor)}</div></article>)}
     {lastFinishReason === 'length' && !isGenerating && <button className="continue-button" onClick={() => void continueGeneration()}>Продолжить ответ</button>}

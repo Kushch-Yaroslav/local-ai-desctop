@@ -3,7 +3,7 @@ import type { GenerationDiagnostics } from '../../shared/types';
 import { saveGenerationDiagnosticsBestEffort } from './generation-diagnostics';
 
 const diagnostics: GenerationDiagnostics = {
-  generationId: 'generation', conversationId: 'conversation', reasoningPreset: 'normal', requestedMaxOutputTokens: 1, effectiveMaxOutputTokens: 1,
+  generationId: 'generation', conversationId: 'conversation', reasoningMode: 'auto', requestedMaxOutputTokens: 1, effectiveMaxOutputTokens: 1,
   contextLimit: 1, inputTokens: 1, agentStepCount: 0, finishReason: 'stop', createdAt: new Date().toISOString(),
 };
 

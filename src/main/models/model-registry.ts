@@ -1,4 +1,4 @@
-import type { AnalysisDepth, ModelInfo } from '../../shared/types';
+import type { ModelInfo, ReasoningMode } from '../../shared/types';
 
 export const contextPresets = [16_384, 32_768, 65_536, 131_072, 262_144] as const;
 export const ollamaModelsPath = '/media/yaroslav/DATA/ollama';
@@ -9,16 +9,16 @@ export type ModelProfile = {
   quantization: string;
   maxContext: number;
   supportsTools: boolean;
-  supportsThinking: boolean;
+  supportsReasoning: boolean;
   shortName: string;
 };
 
 /** The only local models exposed by the desktop client. Tags are pinned to the requested precisions. */
 export const modelRegistry: readonly ModelProfile[] = [
-  { id: 'qwen3.8:27b-q4_K_M', displayName: 'Qwen3.8-27B', shortName: 'Qwen3.8', quantization: 'Q4_K_M', maxContext: 262_144, supportsTools: true, supportsThinking: true },
+  { id: 'qwen3.8:27b-q4_K_M', displayName: 'Qwen3.8-27B', shortName: 'Qwen3.8', quantization: 'Q4_K_M', maxContext: 262_144, supportsTools: true, supportsReasoning: true },
   // The official gpt-oss build keeps its native MXFP4 MoE weights and BF16 tensors; it is not a re-quantized Q4 build.
-  { id: 'gpt-oss:20b', displayName: 'gpt-oss-20b', shortName: 'GPT-OSS', quantization: 'MXFP4 / BF16', maxContext: 131_072, supportsTools: true, supportsThinking: true },
-  { id: 'glm-4.7-flash:q4_k', displayName: 'GLM-4.7-Flash', shortName: 'GLM-4.7-Flash', quantization: 'Q4_K', maxContext: 65_536, supportsTools: true, supportsThinking: true },
+  { id: 'gpt-oss:20b', displayName: 'gpt-oss-20b', shortName: 'GPT-OSS', quantization: 'MXFP4 / BF16', maxContext: 131_072, supportsTools: true, supportsReasoning: true },
+  { id: 'glm-4.7-flash:q4_k', displayName: 'GLM-4.7-Flash', shortName: 'GLM-4.7-Flash', quantization: 'Q4_K', maxContext: 65_536, supportsTools: true, supportsReasoning: true },
 ];
 
 export function getModelProfile(id: string): ModelProfile | undefined {
@@ -29,7 +29,7 @@ export function contextPresetsFor(maxContext: number): number[] {
   return contextPresets.filter((preset) => preset <= maxContext);
 }
 
-export function modelInfo(profile: ModelProfile, installed: boolean, size?: number, maxContext = profile.maxContext): ModelInfo {
+export function modelInfo(profile: ModelProfile, installed: boolean, size?: number, maxContext = profile.maxContext, supportsReasoning = profile.supportsReasoning): ModelInfo {
   const supportedMaxContext = Math.min(profile.maxContext, maxContext);
   return {
     id: profile.id,
@@ -41,41 +41,26 @@ export function modelInfo(profile: ModelProfile, installed: boolean, size?: numb
     maxContext: supportedMaxContext,
     supportedContextPresets: contextPresetsFor(supportedMaxContext),
     supportsTools: profile.supportsTools,
-    supportsThinking: profile.supportsThinking,
+    supportsReasoning,
     shortName: profile.shortName,
   };
 }
 
-export type InferenceSettings = {
-  contextWindow: number;
-  depth: AnalysisDepth;
-};
+/** A single output ceiling for every model and reasoning mode. */
+export const maxOutputTokens = 32_768;
+export const outputSafetyReserveTokens = 512;
 
-export const outputBudgetByReasoningPreset: Record<AnalysisDepth, number> = {
-  fast: 4_096,
-  normal: 8_192,
-  enhanced: 16_384,
-  deep: 32_768,
-};
-
-export function requestedMaxOutputTokens(depth: AnalysisDepth): number {
-  return outputBudgetByReasoningPreset[depth];
+export function outputBudget(contextWindow: number, inputTokens: number): number {
+  return Math.min(maxOutputTokens, Math.max(0, contextWindow - inputTokens - outputSafetyReserveTokens));
 }
 
-/** Maps one UI depth control to the native thinking protocol. Output length is applied separately per request. */
-export function inferenceSettings(profile: ModelProfile, settings: InferenceSettings, effectiveMaxOutputTokens = requestedMaxOutputTokens(settings.depth)): { think: boolean | string; options: Record<string, number> } {
-  const base = { num_ctx: Math.min(settings.contextWindow, profile.maxContext), num_predict: effectiveMaxOutputTokens };
-  if (profile.id.startsWith('qwen3.8:')) {
-    if (settings.depth === 'fast') return { think: 'low', options: base };
-    if (settings.depth === 'normal') return { think: 'medium', options: base };
-    // Qwen exposes three native levels. Both higher UI levels use its high reasoning mode.
-    return { think: 'high', options: base };
-  }
-  if (profile.id.startsWith('gpt-oss:')) {
-    if (settings.depth === 'fast') return { think: 'low', options: base };
-    if (settings.depth === 'normal') return { think: 'medium', options: base };
-    // gpt-oss likewise has low/medium/high rather than four distinct native levels.
-    return { think: 'high', options: base };
-  }
-  return { think: false, options: base };
+/** Ollama's native `think` values exist only for these model families. */
+export function supportsOllamaReasoning(profile: ModelProfile): boolean {
+  return profile.id.startsWith('qwen3.8:') || profile.id.startsWith('gpt-oss:');
+}
+
+/** Maps the UI control to Ollama's documented native `think` parameter. */
+export function ollamaReasoning(mode: ReasoningMode, profile: ModelProfile): boolean | string | undefined {
+  if (!supportsOllamaReasoning(profile) || mode === 'auto') return undefined;
+  return mode === 'fast' ? 'low' : 'high';
 }

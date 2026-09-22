@@ -1,6 +1,6 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import type { StreamEvent } from '../../shared/types';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { ToolInferenceRequestContext, ToolMessage } from '../backends/types';
 import { OllamaRequestError } from '../backends/ollama-errors';
@@ -10,6 +10,7 @@ import { ProjectChatService } from './project-chat';
 import { WebBrowserService } from '../web/web-tools';
 import { validateLlamaMessageSequence } from '../backends/llama-cpp-backend';
 import { projectDirectoryName } from '../../shared/project-references';
+import { terminalPolicy } from '../tools/project-tools';
 
 function assert(value: unknown, message: string): asserts value { if (!value) throw new Error(message); }
 const confirm = async () => ({ approved: false as const, reason: 'cancelled' as const });
@@ -29,10 +30,82 @@ async function eventsFor(service: ProjectChatService, root: string, signal = new
   return events;
 }
 
+async function eventsWithoutProject(service: ProjectChatService, signal = new AbortController().signal, messages = history): Promise<StreamEvent[]> {
+  const events: StreamEvent[] = [];
+  for await (const event of service.stream('test-model', messages, [], signal, 16_384, 'fast', 'off', confirm)) events.push(event);
+  return events;
+}
+
 /** Focused Agent lifecycle regression coverage; run with `npm run test:agent-runtime`. */
 export async function runProjectChatRegression(): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), 'local-ai-agent-runtime-'));
   try {
+    // Terminal is an Agent capability, not a project filesystem capability.
+    // A project-less Agent starts in $HOME and retains no read/write project tools.
+    let noProjectCalls = 0;
+    const noProjectToolSets: string[][] = [];
+    const noProjectSnapshots: ToolMessage[][] = [];
+    const systemTaskHistory = [{ ...history[0], content: 'Настрой мне на Ubuntu переключение раскладки.' }];
+    const systemDiagnostics = [
+      'echo $XDG_SESSION_TYPE',
+      'gsettings get org.gnome.desktop.input-sources sources',
+      'gsettings get org.gnome.desktop.wm.keybindings switch-input-source',
+      'pwd',
+      'whoami',
+      'echo $HOME',
+    ];
+    const noProjectAgent = new ProjectChatService({ chatWithTools: async (_model, messages, tools) => {
+      noProjectCalls += 1; noProjectSnapshots.push(messages.map((message) => ({ ...message }))); noProjectToolSets.push((tools as Array<{ function: { name: string } }>).map((tool) => tool.function.name));
+      const command = systemDiagnostics[noProjectCalls - 1];
+      if (command) return { role: 'assistant' as const, content: '', tool_calls: [{ function: { name: 'run_terminal', arguments: { command } } }] };
+      return { role: 'assistant' as const, content: 'Terminal checks completed.', finish_reason: 'stop' as const };
+    } }, new WebBrowserService());
+    const noProjectEvents = await eventsWithoutProject(noProjectAgent, new AbortController().signal, systemTaskHistory);
+    const noProjectResults = noProjectSnapshots.flatMap((snapshot) => snapshot.filter((message) => message.role === 'tool' && message.tool_name === 'run_terminal'));
+    const seenTerminalCallIds = new Set<string>();
+    const diagnosticResults = noProjectResults.filter((message) => {
+      const id = message.tool_call_id ?? message.content;
+      if (seenTerminalCallIds.has(id)) return false;
+      seenTerminalCallIds.add(id);
+      return true;
+    });
+    const pwdResult = JSON.parse(noProjectResults.find((message) => JSON.parse(message.content).command === 'pwd')!.content) as { cwd: string; stdout: string };
+    const whoamiResult = JSON.parse(noProjectResults.find((message) => JSON.parse(message.content).command === 'whoami')!.content) as { stdout: string };
+    const homeResult = JSON.parse(noProjectResults.find((message) => JSON.parse(message.content).command === 'echo $HOME')!.content) as { stdout: string };
+    assert(noProjectToolSets[0].includes('run_terminal') && !noProjectToolSets[0].includes('read_file') && !noProjectToolSets[0].includes('write_file'), 'project-less Agent exposed project filesystem tools or omitted terminal');
+    assert(noProjectSnapshots[0][0].content.includes('AGENT ACTION EXECUTION POLICY') && noProjectSnapshots[0][0].content.includes('do not finish the Agent turn with zero tool calls'), 'Agent action-execution policy was not included in the initial system prompt');
+    assert(diagnosticResults.slice(0, 3).map((message) => JSON.parse(message.content).command).join('|') === systemDiagnostics.slice(0, 3).join('|'), 'system configuration did not begin with environment diagnostics');
+    assert(pwdResult.cwd === homedir() && pwdResult.stdout.trim() === homedir(), 'project-less terminal did not start in $HOME');
+    assert(Boolean(whoamiResult.stdout.trim()) && homeResult.stdout.trim() === process.env.HOME, 'project-less terminal could not run ordinary user commands');
+    assert(noProjectEvents.some((event) => event.type === 'tool' && event.activity.kind === 'terminal' && event.activity.state === 'completed'), 'project-less terminal activity was not completed');
+    assert(terminalPolicy('mkdir -p ~/.local/bin').kind === 'allow' && terminalPolicy('mkdir -p ~/.config/autostart').kind === 'allow' && terminalPolicy('gsettings get org.gnome.desktop.input-sources sources').kind === 'allow' && terminalPolicy('systemctl --user status example.service').kind === 'allow' && terminalPolicy('setxkbmap us').kind === 'allow' && terminalPolicy('nvidia-smi').kind === 'allow', 'safe user terminal operations require a project or confirmation');
+    assert(terminalPolicy('sudo apt install curl').kind === 'confirm' && terminalPolicy('systemctl restart ssh').kind === 'confirm' && terminalPolicy('rm -rf /tmp/example').kind === 'confirm', 'dangerous system commands are not protected by terminal confirmation');
+
+    const assertZeroToolAnswer = async (userContent: string, expected: string, description: string): Promise<void> => {
+      let turns = 0;
+      const agent = new ProjectChatService({ chatWithTools: async () => {
+        turns += 1;
+        return turns === 1 ? { role: 'assistant' as const, content: expected } : { role: 'assistant' as const, content: expected, finish_reason: 'stop' as const };
+      } }, new WebBrowserService());
+      const events = await eventsWithoutProject(agent, new AbortController().signal, [{ ...history[0], content: userContent }]);
+      assert(turns === 2 && !events.some((event) => event.type === 'tool') && events.some((event) => event.type === 'token' && event.content.includes(expected)), description);
+    };
+    await assertZeroToolAnswer('Как настроить переключение раскладки в Ubuntu?', 'Вот как это настроить вручную.', 'informational question was forced into a tool call');
+    await assertZeroToolAnswer('Только объясни, ничего не выполняй: как настроить раскладку?', 'Объясняю без изменений.', 'explicit instruction-only request was forced into a tool call');
+    await assertZeroToolAnswer('Переустанови ядро, но доступная policy блокирует эту операцию.', 'Операция требует недоступного подтверждения.', 'blocked action was presented as fictitious execution');
+
+    let projectTerminalCalls = 0;
+    const projectTerminalSnapshots: ToolMessage[][] = [];
+    const projectTerminalAgent = new ProjectChatService({ chatWithTools: async (_model, messages) => {
+      projectTerminalCalls += 1; projectTerminalSnapshots.push(messages.map((message) => ({ ...message })));
+      if (projectTerminalCalls === 1) return { role: 'assistant' as const, content: '', tool_calls: [{ function: { name: 'run_terminal', arguments: { command: 'cd "$HOME" && pwd' } } }] };
+      return { role: 'assistant' as const, content: 'Home directory is available from the project terminal.', finish_reason: 'stop' as const };
+    } }, new WebBrowserService());
+    const approvedTerminal = async () => ({ approved: true as const, reason: 'once' as const });
+    for await (const event of projectTerminalAgent.stream('test-model', history, root, new AbortController().signal, 16_384, 'fast', 'off', approvedTerminal)) { void event; }
+    const projectHomeResult = JSON.parse(projectTerminalSnapshots.flatMap((snapshot) => snapshot.filter((message) => message.role === 'tool' && message.tool_name === 'run_terminal'))[0].content) as { cwd: string; stdout: string };
+    assert(projectHomeResult.cwd === root && projectHomeResult.stdout.trim() === homedir(), 'terminal selected a project root but could not access $HOME');
+
     let calls = 0;
     const snapshots: ToolMessage[][] = [];
     const requestContexts: ToolInferenceRequestContext[] = [];
@@ -49,7 +122,7 @@ export async function runProjectChatRegression(): Promise<void> {
     assert(calls === 4, 'initial transient llama.cpp connection failure was not retried exactly once');
     assert(JSON.stringify(snapshots[0]) === JSON.stringify(snapshots[1]), 'initial retry changed the logical Agent request');
     assert(requestContexts.length === 4 && requestContexts[0].phase === 'initial' && requestContexts[1].phase === 'initial' && requestContexts[2].phase === 'post_tool' && requestContexts[3].phase === 'final', 'Agent inference phases were not preserved for runtime diagnostics');
-    assert(requestContexts.slice(0, 3).every((context) => context.maxOutputTokens === 4_096) && requestContexts[3].maxOutputTokens === undefined, 'non-streaming tool-decision turns were not bounded independently from final synthesis');
+    assert(requestContexts.every((context) => context.phase !== undefined), 'Agent inference contexts were not recorded after removing per-turn output limits');
     const writeEvents = events.filter((event): event is Extract<StreamEvent, { type: 'tool' }> => event.type === 'tool' && event.activity.kind === 'mutation');
     assert(writeEvents.length === 2 && writeEvents[0].activity.id === writeEvents[1].activity.id, 'initial retry duplicated Agent tool telemetry');
     assert(await readFile(join(root, 'once.txt'), 'utf8') === 'written once', 'initial retry duplicated a mutating tool');
@@ -68,19 +141,13 @@ export async function runProjectChatRegression(): Promise<void> {
     assert(!inlineTokens.includes('<tool_call>') && !inlineTokens.includes('<function=') && !inlineTokens.includes('<parameter='), 'raw inline tool-call markup leaked into the assistant message');
 
     let truncatedDecisionCalls = 0;
-    const truncatedDecisionSnapshots: ToolMessage[][] = [];
-    const truncatedDecisionAgent = new ProjectChatService({ chatWithTools: async (_model, messages) => {
-      truncatedDecisionCalls += 1; truncatedDecisionSnapshots.push(messages.map((message) => ({ ...message })));
-      if (truncatedDecisionCalls === 1) return { role: 'assistant' as const, content: '', thinking: 'tool decision was cut off before the call', finish_reason: 'length' as const };
-      if (truncatedDecisionCalls === 2) return { role: 'assistant' as const, content: '<tool_call>\n<function=run_terminal>\n<parameter=command>\npwd\n</parameter>\n</function>\n</tool_call>' };
-      if (truncatedDecisionCalls === 3) return { role: 'assistant' as const, content: 'The terminal command completed.' };
-      return { role: 'assistant' as const, content: 'Final terminal result.', finish_reason: 'stop' as const };
+    const truncatedDecisionAgent = new ProjectChatService({ chatWithTools: async () => {
+      truncatedDecisionCalls += 1;
+      return { role: 'assistant' as const, content: '', thinking: 'tool decision was cut off before the call', finish_reason: 'length' as const };
     } }, new WebBrowserService());
     const truncatedDecisionEvents = await eventsFor(truncatedDecisionAgent, root);
-    assert(truncatedDecisionCalls === 4, 'a truncated tool-decision response entered final synthesis instead of continuing with tools enabled');
-    assert(truncatedDecisionEvents.some((event) => event.type === 'tool' && event.activity.kind === 'terminal' && event.activity.state === 'completed'), 'textual run_terminal after a truncated tool decision was not executed');
-    assert(truncatedDecisionSnapshots[2].some((message) => message.role === 'tool' && message.tool_name === 'run_terminal'), 'terminal result after a truncated tool decision was not returned to Qwen');
-    assert(truncatedDecisionEvents.some((event) => event.type === 'token' && event.content.includes('Final terminal result.')), 'truncated tool-decision continuation did not reach a final response');
+    assert(truncatedDecisionCalls === 1, 'an output-limited tool decision retried the identical request');
+    assert(truncatedDecisionEvents.some((event) => event.type === 'error' && event.message === 'Агент не завершил выбор действия'), 'an output-limited tool decision was not reported clearly');
 
     const html = '<!doctype html>\n<html>\n<head><style>body { color: #123; }</style></head>\n<body><script>const title = `Local <tool_call> text`;</script><h1>Ready</h1></body>\n</html>\n';
     let textualCalls = 0;
@@ -567,6 +634,22 @@ export async function runProjectChatRegression(): Promise<void> {
     await eventsFor(freshPlanAgent, root);
     const freshPlanRead = freshPlanSnapshots[1].find((message) => message.role === 'tool' && message.tool_name === 'task_plan')?.content ?? '';
     assert(freshPlanRead.includes('"plan":null') && freshPlanRead.includes('"empty":true'), 'Plan leaked into a new independent Agent run');
+
+    const budgetPaths = Array.from({ length: 99 }, (_, index) => `budget-progress-${index + 1}.ts`);
+    await Promise.all(budgetPaths.map((path, index) => writeFile(join(root, path), `export const progress${index + 1} = true;\n`, 'utf8')));
+    let budgetCalls = 0;
+    const budgetAgent = new ProjectChatService({ chatWithTools: async (_model: string, _messages: ToolMessage[], tools?: unknown[]) => {
+      budgetCalls += 1;
+      if (!tools) return { role: 'assistant' as const, content: 'Final response after the completed Plan.', finish_reason: 'stop' as const };
+      if (budgetCalls === 1) return toolReply('task_plan', { action: 'create', steps: [{ id: 'long-work', label: 'Complete the long investigation', status: 'in_progress' }] });
+      if (budgetCalls <= 100) return toolReply('read_file', { path: budgetPaths[budgetCalls - 2] });
+      if (budgetCalls === 101) return toolReply('task_plan', { action: 'update', step_id: 'long-work', status: 'completed' });
+      throw new Error('runtime requested a tool decision after a completed Plan near the soft cap');
+    } }, new WebBrowserService());
+    const budgetEvents = await eventsFor(budgetAgent, root);
+    assert(budgetEvents.some((event) => event.type === 'tool' && event.activity.label === 'Бюджет действий расширен' && event.activity.detail === '100 → 150'), 'productive long run did not extend its runtime action budget');
+    assert(budgetEvents.some((event) => event.type === 'token' && event.content.includes('Final response after the completed Plan.')), 'completed Plan near the soft cap did not reach final synthesis');
+    assert(!budgetEvents.some((event) => event.type === 'error'), 'soft-budget finalization emitted an Agent error');
     const stagnationContexts = (snapshots: ToolMessage[][], kind: string): ToolMessage[] => [...new Map(snapshots.flat().filter((message) => message.role === 'user' && message.content.startsWith(`<runtime_context kind="${kind}"`)).map((message) => [message.content, message])).values()];
     const writeFixture = async (paths: string[], source: (path: string, index: number) => string): Promise<void> => {
       await Promise.all(paths.map(async (path, index) => {
@@ -665,6 +748,62 @@ export async function runProjectChatRegression(): Promise<void> {
     const researchEvents = await eventsFor(researchAgent, root, new AbortController().signal, researchHistory);
     assert(!researchEvents.some((event) => event.type === 'error'), 'read-only research task was treated as a failed coding task');
     assert(stagnationContexts(researchSnapshots, 'stagnation_guidance').length === 0, 'read-only research task was pushed toward a mutation');
+
+    const analysisHistory = [{ ...history[0], content: 'Analyze this project, trace the UI to logic flow, find real problems, and keep a Plan and Task Notes. Do not modify any files; this is an analysis-only review task.' }];
+    let analysisCalls = 0;
+    const analysisSnapshots: ToolMessage[][] = [];
+    const analysisAgent = new ProjectChatService({ chatWithTools: async (_model: string, messages: ToolMessage[]) => {
+      analysisCalls += 1; analysisSnapshots.push(messages.map((message) => ({ ...message })));
+      if (analysisCalls === 1) return toolReply('task_notes', { action: 'update', notes: 'Flow starts at the UI and continues through the orchestrator.' });
+      if (analysisCalls === 2) return toolReply('task_plan', { action: 'create', steps: [{ id: 'trace', label: 'Trace UI to service flow', status: 'in_progress' }, { id: 'review', label: 'Review findings', status: 'pending' }] });
+      if (analysisCalls <= 17) return toolReply('read_file', { path: reactPaths[analysisCalls - 3] });
+      if (analysisCalls === 18) return toolReply('task_notes', { action: 'update', notes: 'Confirmed UI → controller → service dependency; candidate issue is unvalidated configuration.' });
+      if (analysisCalls === 19) return toolReply('task_plan', { action: 'update', step_id: 'trace', status: 'completed' });
+      if (analysisCalls <= 28) return toolReply('read_file', { path: reactPaths[analysisCalls - 5] });
+      return { role: 'assistant' as const, content: 'Architecture review complete.', finish_reason: 'stop' as const };
+    } }, new WebBrowserService());
+    const analysisEvents = await eventsFor(analysisAgent, root, new AbortController().signal, analysisHistory);
+    assert(!analysisEvents.some((event) => event.type === 'error' && event.details?.includes('agent_stalled_exploration')), 'meaningful analysis-only tracing was treated as stalled');
+    assert(!analysisEvents.some((event) => event.type === 'tool' && event.activity.kind === 'mutation'), 'analysis-only progress required a file mutation');
+    assert(analysisEvents.some((event) => event.type === 'tool' && event.activity.kind === 'notes' && event.activity.state === 'completed'), 'analysis-only Task Notes were not retained as progress');
+
+    let analysisLoopCalls = 0;
+    const analysisLoopAgent = new ProjectChatService({ chatWithTools: async (_model: string, _messages: ToolMessage[]) => {
+      analysisLoopCalls += 1;
+      if (analysisLoopCalls === 1) return toolReply('task_notes', { action: 'update', notes: 'Initial architecture hypothesis.' });
+      if (analysisLoopCalls === 2) return toolReply('task_plan', { action: 'create', steps: [{ id: 'trace', label: 'Trace architecture', status: 'in_progress' }] });
+      if (analysisLoopCalls <= 17) return toolReply('read_file', { path: reactPaths[analysisLoopCalls - 3] });
+      return toolReply('read_file', { path: reactPaths[0] });
+    } }, new WebBrowserService());
+    const analysisLoopEvents = await eventsFor(analysisLoopAgent, root, new AbortController().signal, analysisHistory);
+    assert(analysisLoopEvents.some((event) => event.type === 'error' && event.details?.includes('agent_stalled_exploration')), 'analysis-only repeated reads without new findings bypassed the stalled guard');
+
+    let crossToolLoopCalls = 0;
+    const crossToolLoopAgent = new ProjectChatService({ chatWithTools: async (_model: string, _messages: ToolMessage[]) => {
+      crossToolLoopCalls += 1;
+      if (crossToolLoopCalls === 1) return toolReply('task_notes', { action: 'update', notes: 'Tracing the controller entry point.' });
+      if (crossToolLoopCalls === 2) return toolReply('task_plan', { action: 'create', steps: [{ id: 'trace', label: 'Trace UI flow', status: 'in_progress' }] });
+      if (crossToolLoopCalls === 3) return toolReply('read_file', { path: reactPaths[0], start_line: 1, end_line: 2 });
+      const command = crossToolLoopCalls % 3 === 0 ? `sed -n '1,2p' ${reactPaths[0]} # inspect-${crossToolLoopCalls}` : crossToolLoopCalls % 3 === 1 ? `awk 'NR>=1 && NR<=2' ${reactPaths[0]} # inspect-${crossToolLoopCalls}` : `grep implementation ${reactPaths[0]} # inspect-${crossToolLoopCalls}`;
+      return toolReply('run_terminal', { command });
+    } }, new WebBrowserService());
+    const crossToolLoopEvents = await eventsFor(crossToolLoopAgent, root, new AbortController().signal, analysisHistory);
+    assert(crossToolLoopEvents.some((event) => event.type === 'error' && event.details?.includes('agent_stalled_exploration')), 'overlapping terminal inspection did not join the same analysis stagnation cluster');
+
+    let synthesisCalls = 0;
+    const synthesisAgent = new ProjectChatService({ chatWithTools: async (_model: string, _messages: ToolMessage[], tools?: unknown[]) => {
+      synthesisCalls += 1;
+      if (!tools) return { role: 'assistant' as const, content: 'Best analysis from gathered evidence.', finish_reason: 'stop' as const };
+      if (synthesisCalls === 1) return toolReply('task_notes', { action: 'update', notes: 'Initial flow evidence.' });
+      if (synthesisCalls === 2) return toolReply('task_plan', { action: 'create', steps: [{ id: 'trace', label: 'Trace architecture', status: 'in_progress' }, { id: 'review', label: 'Review risks', status: 'pending' }] });
+      if (synthesisCalls <= 17) return toolReply('read_file', { path: reactPaths[synthesisCalls - 3] });
+      if (synthesisCalls === 18) return toolReply('task_notes', { action: 'update', notes: 'Confirmed UI → controller → service flow; candidate issue: configuration keys are silently ignored.' });
+      if (synthesisCalls === 19) return toolReply('task_plan', { action: 'update', step_id: 'trace', status: 'completed' });
+      return toolReply('read_file', { path: reactPaths[0] });
+    } }, new WebBrowserService());
+    const synthesisEvents = await eventsFor(synthesisAgent, root, new AbortController().signal, analysisHistory);
+    assert(synthesisEvents.some((event) => event.type === 'token' && event.content.includes('Best analysis from gathered evidence.')), 'near-stalled analysis with sufficient evidence did not enter final synthesis');
+    assert(!synthesisEvents.some((event) => event.type === 'error' && event.details?.includes('agent_stalled_exploration')), 'near-stalled analysis discarded gathered evidence');
 
     const nonJavaScriptPaths = Array.from({ length: 18 }, (_, index) => {
       const extension = ['py', 'go', 'rs'][index % 3];

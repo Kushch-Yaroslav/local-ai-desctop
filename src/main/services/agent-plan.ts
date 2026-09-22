@@ -31,6 +31,8 @@ export class AgentPlanState {
 
   get hasPlan(): boolean { return this.plan !== null; }
 
+  snapshot(): AgentPlan | null { return this.plan ? { steps: this.plan.steps.map((step) => ({ ...step })) } : null; }
+
   execute(call: ProjectToolCall): string {
     const action = call.arguments.action;
     if (action === 'read') return JSON.stringify({ plan: this.plan, empty: this.plan === null });

@@ -17,6 +17,27 @@ export type ReadDiagnostic = {
 export type ToolContextUpdate = { stats: ToolContextStats; read?: ReadDiagnostic; invalidation?: { reason: string; reads: number } };
 
 const json = (content: string): Record<string, unknown> | undefined => { try { const value = JSON.parse(content); return value && typeof value === 'object' ? value as Record<string, unknown> : undefined; } catch { return undefined; } };
+const largeResultLimit = (contextWindow: number): number => Math.max(8_000, Math.min(14_000, Math.floor(contextWindow * 0.38)));
+const shapedText = (text: string, limit: number): string => {
+  if (text.length <= limit) return text;
+  const lines = text.split('\n');
+  const critical = lines.filter((line) => /\b(?:error|exception|failed|failure|warning|assert|fatal)\b/i.test(line)).slice(0, 24);
+  const head = text.slice(0, Math.floor(limit * 0.45)); const tail = text.slice(-Math.floor(limit * 0.35));
+  return `${head}\n… [${text.length - head.length - tail.length} chars omitted; full raw result is preserved in run history] …\n${critical.length ? `Critical lines:\n${critical.join('\n')}\n` : ''}${tail}`;
+};
+function shapeLargeResult(raw: string, limit: number): string {
+  if (raw.length <= limit) return raw;
+  const value = json(raw);
+  if (!value) return JSON.stringify({ context_shaped: true, original_chars: raw.length, important_result: shapedText(raw, limit - 300), full_raw_result: 'preserved in Agent run history' });
+  const shaped: Record<string, unknown> = { ...value, context_shaped: true, original_chars: raw.length, full_raw_result: 'preserved in Agent run history' };
+  for (const key of ['stdout', 'stderr', 'content', 'diff', 'status'] as const) if (typeof shaped[key] === 'string') shaped[key] = shapedText(shaped[key] as string, Math.max(1_200, Math.floor(limit * (key === 'stderr' ? 0.5 : 0.7))));
+  let encoded = JSON.stringify(shaped);
+  if (encoded.length > limit) {
+    for (const key of ['matches', 'entries', 'files'] as const) if (Array.isArray(shaped[key]) && shaped[key].length > 40) shaped[key] = [...(shaped[key] as unknown[]).slice(0, 24), { omitted: (shaped[key] as unknown[]).length - 40 }, ...(shaped[key] as unknown[]).slice(-16)];
+    encoded = JSON.stringify(shaped);
+  }
+  return encoded.length <= limit * 1.3 ? encoded : JSON.stringify({ context_shaped: true, original_chars: raw.length, tool_result_metadata: Object.fromEntries(Object.entries(value).filter(([key, item]) => typeof item !== 'string' && !Array.isArray(item) || ['path', 'command', 'cwd', 'exit_code', 'error'].includes(key))), important_result: shapedText(raw, limit - 350), full_raw_result: 'preserved in Agent run history' });
+}
 const normalizedPath = (path: string): string => path.replace(/\\/g, '/').replace(/^\.\//, '');
 function readFrom(tool: string, raw: string, step: number): Read | undefined {
   if (tool !== 'read_file' && tool !== 'inspect_package_json') return undefined;
@@ -62,9 +83,22 @@ export class AgentToolContext {
   private peakSize = 0;
   private invalidatedReads = 0;
   readonly budget: number;
-  constructor(contextWindow: number) { this.budget = Math.max(12_000, Math.min(160_000, Math.floor(contextWindow * 2))); }
+  constructor(private readonly contextWindow: number) {
+    // Keep enough recent verbatim evidence for Context Manager to form a
+    // useful checkpoint. The previous 2× character cap stopped a 32K run at
+    // roughly 16K source tokens, so compaction (and therefore durable Working
+    // Memory) was rarely reachable in read-heavy analysis. `prepare()` still
+    // uses the backend tokenizer and compacts before every inference.
+    const recentWindowMultiplier = contextWindow >= 24_000 ? 3 : 2;
+    this.budget = Math.max(12_000, Math.min(160_000, Math.floor(contextWindow * recentWindowMultiplier)));
+  }
 
   add(tool: string, argumentsObject: Record<string, unknown>, message: ToolMessage, step = 0): ToolContextUpdate {
+    const sourceRaw = message.content;
+    // A single log/diff must not occupy the working context before Qwen can
+    // inspect the next tool result. The unmodified string is persisted by the
+    // analysis run; this is only the model-facing representation.
+    message.content = shapeLargeResult(sourceRaw, largeResultLimit(this.contextWindow));
     const raw = message.content; const value = json(raw);
     const entry: Entry = { tool, argumentsObject, message, raw, compacted: false, mutating: mutatingTools.has(tool) || tool === 'run_terminal' && terminalMayMutate(typeof argumentsObject.command === 'string' ? argumentsObject.command : ''), failed: typeof value?.error === 'string', step };
     const read = readFrom(tool, raw, step); let diagnostic: ReadDiagnostic | undefined;

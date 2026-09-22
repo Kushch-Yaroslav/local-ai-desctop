@@ -13,10 +13,11 @@ import { WebBrowserService } from '../web/web-tools';
 import { webToolDefinitions } from '../web/web-tools';
 import { WebChatService } from '../services/web-chat';
 import { capabilitySystemContext } from '../services/capabilities';
-import { projectToolDefinitions, ReadonlyProjectTools, type ApprovalResult, type ConfirmAction } from '../tools/project-tools';
+import { projectToolDefinitions, ReadonlyProjectTools, reportProgressToolDefinition, terminalToolDefinition, type ApprovalResult, type ConfirmAction } from '../tools/project-tools';
 import { AttachmentService } from '../services/attachment-service';
 import { AttachmentPipeline } from '../services/attachment-pipeline';
 import { readFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
 import { ollamaErrorDiagnostics } from '../backends/ollama-errors';
 import { saveGenerationDiagnosticsBestEffort } from '../services/generation-diagnostics';
 import { taskNotesToolDefinition } from '../services/task-notes';
@@ -107,7 +108,7 @@ export function registerIpc(): void {
     if (!getModelProfile(modelId)) throw new Error('Выбранная модель отсутствует в реестре приложения');
     return database.createConversation(modelId);
   });
-  ipcMain.handle('conversations:update', async (_event, id: string, patch: Partial<Pick<Conversation, 'title' | 'modelId' | 'mode' | 'workingDirectory' | 'secondaryWorkingDirectory' | 'contextWindow' | 'analysisDepth' | 'webMode'>>) => {
+  ipcMain.handle('conversations:update', async (_event, id: string, patch: Partial<Pick<Conversation, 'title' | 'modelId' | 'mode' | 'workingDirectory' | 'secondaryWorkingDirectory' | 'contextWindow' | 'reasoningMode' | 'webMode'>>) => {
     const current = database.getConversation(id);
     if (!current) throw new Error('Чат не найден');
     const nextModelId = patch.modelId ?? current.modelId;
@@ -226,13 +227,11 @@ export function registerIpc(): void {
     await backend.ensureModelAvailable(request.model);
     if (!current()) return;
     let output = ''; let completed = false; let failed = false; let finishReason: 'stop' | 'length' = 'stop';
-    const agentProjects: AgentProject[] = mode === 'agent' ? (selectedProjects.length ? selectedProjects : [{ id: 'application-default', slot: 1, root: paths.root, label: `Project 1 — ${projectDirectoryName(paths.root)}` }]) : [];
-    // Stored references retain their root and identity even if the user later replaces Project 2.
-    for (const reference of database.listMessages(request.conversationId).flatMap((message) => message.projectReferences ?? [])) if (!agentProjects.some((project) => project.id === reference.projectId)) agentProjects.push({ id: reference.projectId, slot: reference.projectSlot, root: reference.projectPath, label: `Project ${reference.projectSlot} — ${projectDirectoryName(reference.projectPath)} (referenced)` });
+    const agentProjects: AgentProject[] = mode === 'agent' ? [...selectedProjects] : [];
     const agentRoot = agentProjects[0]?.root ?? null;
-    const enabledTools = agentRoot ? [taskNotesToolDefinition.function.name, agentPlanToolDefinition.function.name, ...projectToolDefinitions.map((tool) => tool.function.name), ...(conversation.webMode === 'auto' ? webToolDefinitions.map((tool) => tool.function.name) : [])] : conversation.webMode === 'auto' ? webToolDefinitions.map((tool) => tool.function.name) : [];
-    log('generation.snapshot', { generationId: generation.id, chatId: request.conversationId, mode, storedMode: conversation.mode, requestedMode: request.mode, workingDirectory: conversation.workingDirectory, resolvedWorkingDirectory: agentRoot, projects: agentProjects.map((project) => ({ id: project.id, slot: project.slot })), webMode: conversation.webMode, modelId: request.model, contextSize: conversation.contextWindow, reasoningPreset: conversation.analysisDepth, enabledTools });
-    run = agentRoot ? database.createAnalysisRun(request.conversationId, conversation.analysisDepth) : null;
+    const enabledTools = mode === 'agent' ? [taskNotesToolDefinition.function.name, agentPlanToolDefinition.function.name, reportProgressToolDefinition.function.name, terminalToolDefinition.function.name, ...(agentProjects.length ? projectToolDefinitions.map((tool) => tool.function.name) : []), ...(conversation.webMode === 'auto' ? webToolDefinitions.map((tool) => tool.function.name) : [])] : conversation.webMode === 'auto' ? webToolDefinitions.map((tool) => tool.function.name) : [];
+    log('generation.snapshot', { generationId: generation.id, chatId: request.conversationId, mode, storedMode: conversation.mode, requestedMode: request.mode, workingDirectory: conversation.workingDirectory, resolvedWorkingDirectory: agentRoot, projects: agentProjects.map((project) => ({ id: project.id, slot: project.slot })), webMode: conversation.webMode, modelId: request.model, contextSize: conversation.contextWindow, reasoningMode: conversation.reasoningMode, enabledTools });
+    run = mode === 'agent' ? database.createAnalysisRun(request.conversationId, conversation.reasoningMode) : null;
     if (run && current()) event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run });
       const context = await backend.resolveContextWindow(request.model, conversation.contextWindow, abort.signal);
       if (!current()) return;
@@ -241,11 +240,11 @@ export function registerIpc(): void {
       // image payload is attached only to its owning user turn below.
       let history = attachmentPipeline.buildContext(request.messages, !hasImages);
       if (nativeVision) history = await attachmentPipeline.prepareNativeImages(history, abort.signal);
-      const stream = agentRoot
-        ? projectChat.stream(request.model, history, agentProjects, abort.signal, context.active, conversation.analysisDepth, conversation.webMode, inlineConfirmation(event, request.conversationId, generation, agentRoot), { generationId: generation.id, conversationId: request.conversationId })
+      const stream = mode === 'agent'
+        ? projectChat.stream(request.model, history, agentProjects, abort.signal, context.active, conversation.reasoningMode, conversation.webMode, inlineConfirmation(event, request.conversationId, generation, agentRoot ?? homedir()), { generationId: generation.id, conversationId: request.conversationId })
         : conversation.webMode === 'auto'
-          ? webChat.stream(request.model, history, abort.signal, context.active, conversation.analysisDepth)
-          : backend.streamChat(request.model, [{ id: `capability-${request.conversationId}`, conversationId: request.conversationId, role: 'system', content: capabilitySystemContext({ webAvailable: false }), createdAt: new Date().toISOString() }, ...history], abort.signal, context.active, conversation.analysisDepth);
+          ? webChat.stream(request.model, history, abort.signal, context.active, conversation.reasoningMode)
+          : backend.streamChat(request.model, [{ id: `capability-${request.conversationId}`, conversationId: request.conversationId, role: 'system', content: capabilitySystemContext({ webAvailable: false }), createdAt: new Date().toISOString() }, ...history], abort.signal, context.active, conversation.reasoningMode);
       for await (const chunk of stream) {
         if (!current()) break;
         if (chunk.type === 'token') output += chunk.content;
@@ -265,7 +264,9 @@ export function registerIpc(): void {
         if (chunk.type === 'error') failed = true;
         if (run && chunk.type === 'tool') {
           const updated = database.addAnalysisAction(run.id, chunk.activity);
-          event.sender.send('chat:stream', { ...chunk, runId: run.id, conversationId: request.conversationId, generationId: generation.id });
+          const visibleActivity = { ...chunk.activity };
+          delete visibleActivity.rawOutput;
+          event.sender.send('chat:stream', { ...chunk, activity: visibleActivity, runId: run.id, conversationId: request.conversationId, generationId: generation.id });
           event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run: updated });
         } else event.sender.send('chat:stream', { ...chunk, conversationId: request.conversationId, generationId: generation.id });
       }

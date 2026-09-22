@@ -1,5 +1,3 @@
-import type { AnalysisDepth } from '../../shared/types';
-
 export type ProjectMap = {
   discoveredAreas: string[];
   inspectedAreas: string[];
@@ -13,8 +11,45 @@ export type ProjectMap = {
 
 const emptyMap = (): ProjectMap => ({ discoveredAreas: [], inspectedAreas: [], importantResources: [], relationships: [], findings: [], unresolvedQuestions: [], evidence: [], coverage: 'не оценено' });
 
-/** A generation-scoped ceiling. A new AnalysisEngine is created for every generation. */
+/** A generation-scoped soft budget. A new AnalysisEngine is created for every generation. */
 export const MAX_AGENT_STEPS_PER_GENERATION = 100;
+export const AGENT_ACTION_BUDGET_EXTENSION = 50;
+export const ABSOLUTE_MAX_AGENT_STEPS_PER_GENERATION = 250;
+
+export type AgentActionBudgetInput = {
+  actions: number;
+  planComplete: boolean;
+  stalled: boolean;
+  recentProgress: boolean;
+};
+export type AgentActionBudgetDecision = {
+  limit: number;
+  extended: boolean;
+  shouldFinalize: boolean;
+  atAbsoluteCap: boolean;
+};
+
+/**
+ * Keeps 100 actions as the normal operating budget while allowing a bounded
+ * long task to continue only when it is still making progress. Plan completion
+ * always wins over another tool-decision turn near a budget boundary.
+ */
+export class AgentActionBudget {
+  private limit = MAX_AGENT_STEPS_PER_GENERATION;
+
+  snapshot(): number { return this.limit; }
+
+  assess(input: AgentActionBudgetInput): AgentActionBudgetDecision {
+    const atAbsoluteCap = input.actions >= ABSOLUTE_MAX_AGENT_STEPS_PER_GENERATION;
+    if (input.planComplete) return { limit: this.limit, extended: false, shouldFinalize: true, atAbsoluteCap };
+    if (input.actions < this.limit) return { limit: this.limit, extended: false, shouldFinalize: false, atAbsoluteCap };
+    if (!atAbsoluteCap && !input.stalled && input.recentProgress) {
+      this.limit = Math.min(ABSOLUTE_MAX_AGENT_STEPS_PER_GENERATION, this.limit + AGENT_ACTION_BUDGET_EXTENSION);
+      return { limit: this.limit, extended: true, shouldFinalize: false, atAbsoluteCap: false };
+    }
+    return { limit: this.limit, extended: false, shouldFinalize: true, atAbsoluteCap };
+  }
+}
 
 const addUnique = (target: string[], values: unknown, maximum: number): void => {
   if (!Array.isArray(values)) return;
@@ -28,19 +63,11 @@ const addUnique = (target: string[], values: unknown, maximum: number): void => 
 export class AnalysisEngine {
   readonly map = emptyMap();
 
-  constructor(readonly depth: AnalysisDepth) {}
-
   get budget(): number { return MAX_AGENT_STEPS_PER_GENERATION; }
-  get isDeep(): boolean { return this.depth === 'deep'; }
 
   strategy(): string {
-    if (this.depth === 'fast') return 'Быстро: выбери только наиболее информативные ресурсы для конкретного вопроса. Останавливайся, когда есть достаточно доказательств для полезного ответа; не составляй широкий обзор без необходимости.';
-    if (this.depth === 'normal') return 'Обычно: исследуй основные релевантные области, проследи важные связи и сверь выводы по нескольким источникам. Заверши, когда ответ хорошо подтверждён и основные пробелы закрыты.';
-    if (this.depth === 'enhanced') return 'Повышенно: последовательно исследуй релевантные области и связи, проверяй важные выводы несколькими источниками и устраняй существенные пробелы, но заверши работу, как только ответ достаточно доказан.';
-    return 'Глубоко: сначала широко сориентируйся, затем построй и уточняй карту проекта, исследуй важные связи и нераскрытые крупные области, проверяй слабые выводы и пробелы. Заверши только когда существенные для вопроса части имеют доказательства, а неопределённость низка или явно указана. Перед синтезом сверь каждый явно запрошенный пользователем аспект с собранными данными; дай конкретные выводы и связи, а не заменяй их общим перечислением технологий. Стадии — ориентир, а не фиксированная последовательность или квота вызовов.';
+    return 'Исследуй основные релевантные области, проследи важные связи и сверь выводы по нескольким источникам. Заверши, когда ответ хорошо подтверждён и основные пробелы закрыты.';
   }
-
-  shouldCompact(usedCalls: number, lastCompaction: number): boolean { return this.isDeep && usedCalls >= 12 && usedCalls - lastCompaction >= 12; }
 
   merge(raw: string): boolean {
     const data = this.parseMap(raw);

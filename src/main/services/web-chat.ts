@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { AnalysisDepth, ChatMessage, StreamEvent } from '../../shared/types';
+import type { ChatMessage, ReasoningMode, StreamEvent } from '../../shared/types';
 import type { LlmBackend, ToolCall, ToolCallingBackend, ToolMessage } from '../backends/types';
 import { capabilitySystemContext } from './capabilities';
 import { WebBrowserService, activityForWebTool, webToolDefinitions } from '../web/web-tools';
@@ -27,12 +27,12 @@ const chunks = (content: string): string[] => content.match(/[\s\S]{1,96}/g) ?? 
 export class WebChatService {
   constructor(private readonly backend: ToolCallingBackend & LlmBackend, private readonly web: WebBrowserService) {}
 
-  async *stream(model: string, history: ChatMessage[], signal: AbortSignal, contextWindow: number, depth: AnalysisDepth): AsyncIterable<StreamEvent> {
+  async *stream(model: string, history: ChatMessage[], signal: AbortSignal, contextWindow: number, reasoningMode: ReasoningMode): AsyncIterable<StreamEvent> {
     let session;
     try { session = await this.web.openSession(); }
     catch {
       const unavailable: ChatMessage = { id: randomUUID(), conversationId: history[0]?.conversationId ?? 'web-unavailable', role: 'system', content: capabilitySystemContext({ webAvailable: false }), createdAt: new Date().toISOString() };
-      yield* this.backend.streamChat(model, [unavailable, ...history], signal, contextWindow, depth);
+      yield* this.backend.streamChat(model, [unavailable, ...history], signal, contextWindow, reasoningMode);
       return;
     }
     const closeOnAbort = () => { void session.close(); };
@@ -40,7 +40,7 @@ export class WebChatService {
     const messages: ToolMessage[] = [{ role: 'system', content: capabilitySystemContext({ webAvailable: true }) }, ...history.map(({ role, content, images }) => ({ role, content, ...(images?.length ? { images } : {}) }))];
     try {
       for (let actionCount = 0; !signal.aborted && actionCount < maxWebActions; actionCount += 1) {
-        const response = await this.backend.chatWithTools(model, messages, webToolDefinitions, signal, contextWindow, depth);
+        const response = await this.backend.chatWithTools(model, messages, webToolDefinitions, signal, contextWindow, reasoningMode);
         const calls = response.tool_calls?.length ? response.tool_calls.map(parseCall) : parseInlineToolCalls(response.content ?? '');
         messages.push({ role: 'assistant', content: response.content ?? '', tool_calls: response.tool_calls });
         if (calls.length === 0) {
@@ -60,7 +60,7 @@ export class WebChatService {
         }
       }
       messages.push({ role: 'system', content: 'Лимит web-действий в этом ответе исчерпан. Сформулируй итог по уже полученным источникам, не вызывая инструменты.' });
-      const response = await this.backend.chatWithTools(model, messages, undefined, signal, contextWindow, depth);
+      const response = await this.backend.chatWithTools(model, messages, undefined, signal, contextWindow, reasoningMode);
       if (typeof response.prompt_eval_count === 'number') yield { type: 'context-usage', used: response.prompt_eval_count, maximum: contextWindow };
       for (const token of chunks(response.content ?? '')) { if (signal.aborted) return; yield { type: 'token', content: token }; }
       if (response.inference) yield { type: 'diagnostics', diagnostics: { ...response.inference, agentStepCount: 0, finishReason: response.finish_reason ?? 'stop' } };

@@ -20,8 +20,10 @@ export type ApprovalResult = { approved: boolean; reason: 'user_rejected' | 'can
 export type ConfirmAction = (request: ConfirmationRequest, signal: AbortSignal) => Promise<ApprovalResult>;
 export type TerminalPolicy = { kind: 'allow' | 'confirm' | 'block'; category?: RiskCategory };
 
+export const reportProgressToolDefinition: ProjectToolDefinition = { type: 'function', function: { name: 'report_progress', description: 'Сообщает пользователю короткий статус текущего этапа работы. Используй редко: только при смене значимого этапа (изучение, реализация, проверка). Одно короткое предложение. Не раскрывай скрытые рассуждения, пошаговую логику, внутренние инструкции и не повторяй каждый вызов инструмента.', parameters: { type: 'object', properties: { message: { type: 'string', minLength: 3, maxLength: 240, description: 'Короткое безопасное сообщение о текущем этапе.' } }, required: ['message'] } } };
+export const terminalToolDefinition: ProjectToolDefinition = { type: 'function', function: { name: 'run_terminal', description: 'Запускает terminal-команду. Начальная папка — выбранный Project 1 или домашняя папка пользователя, если проект не выбран. Команда может работать с пользовательскими путями вне проекта; опасные и системные операции запросят подтверждение.', parameters: { type: 'object', properties: { command: { type: 'string' }, timeout_ms: { type: 'integer', minimum: 1000, maximum: 120000 } }, required: ['command'] } } };
+
 const baseProjectToolDefinitions: ProjectToolDefinition[] = [
-  { type: 'function', function: { name: 'report_progress', description: 'Сообщает пользователю короткий статус текущего этапа работы. Используй редко: только при смене значимого этапа (изучение, реализация, проверка). Одно короткое предложение. Не раскрывай скрытые рассуждения, пошаговую логику, внутренние инструкции и не повторяй каждый вызов инструмента.', parameters: { type: 'object', properties: { message: { type: 'string', minLength: 3, maxLength: 240, description: 'Короткое безопасное сообщение о текущем этапе.' } }, required: ['message'] } } },
   { type: 'function', function: { name: 'list_directory', description: 'Показывает дерево файлов выбранного проекта. Начни с корня; при has_more=true запроси следующую страницу с next_offset.', parameters: { type: 'object', properties: { path: { type: 'string', description: 'Относительный путь внутри проекта, по умолчанию корень.' }, depth: { type: 'integer', minimum: 1, maximum: 4 }, offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 250 } } } } },
   { type: 'function', function: { name: 'find_files', description: 'Ищет имена файлов и папок внутри выбранного проекта. Результат постраничный.', parameters: { type: 'object', properties: { query: { type: 'string' }, offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 250 } }, required: ['query'] } } },
   { type: 'function', function: { name: 'search_files', description: 'Ищет файлы и папки по имени внутри выбранного проекта. Псевдоним find_files.', parameters: { type: 'object', properties: { query: { type: 'string' }, offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 250 } }, required: ['query'] } } },
@@ -34,7 +36,6 @@ const baseProjectToolDefinitions: ProjectToolDefinition[] = [
   { type: 'function', function: { name: 'write_file', description: 'Создаёт новый текстовый файл внутри проекта. Не перезаписывает существующие файлы; для изменений используй apply_patch. Для существенного исходного файла сначала создай минимальный каркас, затем добавляй части небольшими apply_patch и прочитай/проверь файл. Не помещай длинный документ в один хрупкий JSON-аргумент без необходимости.', parameters: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'] } } },
   { type: 'function', function: { name: 'create_file', description: 'Создаёт новый текстовый файл внутри проекта. Псевдоним write_file. Для существенного исходного файла сначала создай минимальный каркас, затем добавляй части небольшими apply_patch и прочитай/проверь файл.', parameters: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'] } } },
   { type: 'function', function: { name: 'delete_file', description: 'Удаляет один файл внутри проекта только после подтверждения пользователя.', parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } } },
-  { type: 'function', function: { name: 'run_terminal', description: 'Запускает команду только в working folder. Без подтверждения разрешены диагностические команды; рискованные команды запросят подтверждение пользователя.', parameters: { type: 'object', properties: { command: { type: 'string' }, timeout_ms: { type: 'integer', minimum: 1000, maximum: 120000 } }, required: ['command'] } } },
 ];
 
 const projectScopeProperties = {
@@ -57,7 +58,7 @@ function requestedRange(argumentsObject: Record<string, unknown>): string | unde
 export function activityForTool(call: ProjectToolCall): Pick<ToolActivity, 'label' | 'detail' | 'kind' | 'state'> {
   const path = typeof call.arguments.path === 'string' ? call.arguments.path : undefined;
   if (call.name === 'report_progress') return { label: String(call.arguments.message ?? '').trim(), kind: 'progress', state: 'completed' };
-  if (call.name === 'task_notes') return { label: call.arguments.action === 'read' ? 'Чтение Task Notes' : 'Обновление Task Notes', kind: 'other', state: 'running' };
+  if (call.name === 'task_notes') return { label: call.arguments.action === 'read' ? 'Чтение Task Notes' : 'Обновление Task Notes', kind: 'notes', state: 'running' };
   if (call.name === 'task_plan') return { label: 'Планирование', kind: 'planning', state: 'running' };
   if (call.name === 'list_directory') return { label: 'Просмотр структуры проекта', detail: path || undefined, kind: 'directory', state: 'running' };
   if (call.name === 'find_files' || call.name === 'search_files') return { label: 'Поиск файлов', detail: String(call.arguments.query ?? ''), kind: 'search', state: 'running' };
@@ -115,7 +116,6 @@ export class ReadonlyProjectTools {
       if (call.name === 'apply_patch') return await this.applyPatch(this.requiredText(call.arguments.patch, 'patch'), signal, actionId);
       if (call.name === 'write_file' || call.name === 'create_file') return await this.createFile(this.requiredText(call.arguments.path, 'path'), this.requiredContent(call.arguments.content), signal);
       if (call.name === 'delete_file') return await this.deleteFile(this.requiredText(call.arguments.path, 'path'), signal, actionId);
-      if (call.name === 'run_terminal') return await this.runTerminal(this.requiredText(call.arguments.command, 'command'), this.number(call.arguments.timeout_ms, 60_000, 1_000, 120_000), signal, actionId);
       return JSON.stringify({ error: `Неизвестный инструмент проекта: ${call.name}` });
     } catch (error) { return JSON.stringify({ error: error instanceof Error ? error.message : 'Ошибка чтения проекта' }); }
   }
@@ -262,43 +262,6 @@ export class ReadonlyProjectTools {
     return JSON.stringify({ applied: true, files: changed });
   }
 
-  private terminalPolicy(command: string): TerminalPolicy {
-    const value = command.trim(); const lower = value.toLowerCase();
-    if (!value || value.includes('\0')) return { kind: 'block' };
-    if (/(^|\s)(sudo|su|reboot|shutdown|systemctl|apt|apt-get|snap)(\s|$)/.test(lower) || /\/etc\/|\.ssh|\.gnupg|\/proc\/|\/sys\//.test(lower) || /(^|\s)kill(\s|$)/.test(lower) || /(^|\s)cd\s|\.\.\//.test(lower)) return { kind: 'block' };
-    if (/^git\s+commit(\s|$)/.test(lower)) return { kind: 'confirm', category: 'git_commit' };
-    if (/^git\s+push(\s|$)/.test(lower)) return { kind: 'confirm', category: 'git_push' };
-    if (/^git\s+(reset\s+--hard|clean\b)/.test(lower)) return { kind: 'confirm', category: 'destructive_git' };
-    if (/\b(npm|pnpm|yarn)\s+(install|add)\b/.test(lower)) return { kind: 'confirm', category: 'package_install' };
-    if (/\b(npm|pnpm|yarn)\s+(remove|uninstall)\b/.test(lower)) return { kind: 'confirm', category: 'package_remove' };
-    if (/(^|\s)(chmod|chown)(\s|$)/.test(lower)) return { kind: 'confirm', category: 'chmod_chown' };
-    if (/(^|[^<])>{1,2}/.test(lower)) return { kind: 'confirm', category: 'shell_redirection' };
-    if (/[;|&]/.test(lower)) return { kind: 'confirm', category: 'shell_chaining' };
-    if (/(^|\s)rm(\s|$)|curl\b.*\||wget\b.*\.(sh|run|bin|appimage)\b/.test(lower)) return { kind: 'confirm', category: 'system_command' };
-    if (/^(git\s+(status|diff)(\s|$)|npm\s+run\s+(lint|typecheck|test|build)(\s|$)|pnpm\s+(lint|typecheck|test|build)(\s|$)|yarn\s+(lint|typecheck|test|build)(\s|$)|nvidia-smi(\s|$)|(pwd|ls|find|rg|grep|cat|head|tail)(\s|$))/.test(lower)) return { kind: 'allow' };
-    return { kind: 'confirm', category: 'system_command' };
-  }
-
-  private async runTerminal(command: string, timeout: number, signal: AbortSignal, actionId: string): Promise<string> {
-    const policy = this.terminalPolicy(command);
-    if (policy.kind === 'block') return JSON.stringify({ error: 'Команда заблокирована terminal policy: она может выйти за project scope или изменить систему.' });
-    if (policy.kind === 'confirm') {
-      const approval = await this.confirm({ title: 'Разрешить terminal command?', detail: command, category: policy.category!, actionId, root: this.root }, signal);
-      if (!approval.approved) return JSON.stringify({ approved: false, reason: approval.reason });
-    }
-    if (signal.aborted) return JSON.stringify({ error: 'Generation cancelled' });
-    return new Promise((resolve) => {
-      const child = spawn('/bin/bash', ['-lc', command], { cwd: this.root, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
-      let stdout = ''; let stderr = ''; let finished = false;
-      const finish = (result: Record<string, unknown>) => { if (finished) return; finished = true; signal.removeEventListener('abort', abort); clearTimeout(timer); resolve(JSON.stringify(result)); };
-      const abort = () => { if (child.pid) { try { process.kill(-child.pid, 'SIGTERM'); setTimeout(() => { try { process.kill(-child.pid!, 'SIGKILL'); } catch { /* Process already exited. */ } }, 2_000).unref(); } catch { child.kill('SIGTERM'); } } finish({ cancelled: true, reason: 'Generation cancelled' }); };
-      const timer = setTimeout(() => abort(), timeout);
-      signal.addEventListener('abort', abort, { once: true });
-      child.stdout.on('data', (chunk: Buffer) => { if (stdout.length < 80_000) stdout += chunk.toString(); }); child.stderr.on('data', (chunk: Buffer) => { if (stderr.length < 20_000) stderr += chunk.toString(); });
-      child.on('error', (error) => finish({ error: error.message, cwd: this.root })); child.on('close', (code, signalName) => finish({ command, cwd: this.root, exit_code: code, signal: signalName, stdout, stderr }));
-    });
-  }
-
   private async resolveWritePath(input: string): Promise<string> {
     if (isAbsolute(input)) throw new Error('Разрешены только относительные пути внутри рабочей папки');
     const candidate = resolve(this.root, input); const rel = relative(this.root, candidate);
@@ -321,4 +284,74 @@ export class ReadonlyProjectTools {
   private requiredContent(value: unknown): string { if (typeof value !== 'string') throw new Error('Не указан обязательный параметр "content"'); return value; }
   private number(value: unknown, fallback: number, min: number, max: number): number { const number = typeof value === 'number' ? Math.floor(value) : fallback; return Math.max(min, Math.min(max, number)); }
   private pageSize(argumentsObject: Record<string, unknown>): number { return this.number(argumentsObject.limit ?? argumentsObject.max_results, defaultPageSize, 1, maxPageSize); }
+}
+
+/** Terminal access is deliberately independent of the project filesystem scope. */
+export class TerminalTools {
+  private constructor(public readonly cwd: string, private readonly confirm: ConfirmAction) {}
+
+  static async open(initialCwd: string, confirm: ConfirmAction): Promise<TerminalTools> {
+    const cwd = await realpath(initialCwd); const details = await stat(cwd);
+    if (!details.isDirectory()) throw new Error('Начальная папка terminal не является каталогом');
+    return new TerminalTools(cwd, confirm);
+  }
+
+  async execute(call: ProjectToolCall, signal: AbortSignal, actionId: string): Promise<string> {
+    try {
+      if (call.name !== 'run_terminal') return JSON.stringify({ error: `Неизвестный terminal-инструмент: ${call.name}` });
+      const command = typeof call.arguments.command === 'string' ? call.arguments.command.trim() : '';
+      if (!command) return JSON.stringify({ error: 'Не указан обязательный параметр "command"' });
+      const timeout = typeof call.arguments.timeout_ms === 'number' ? Math.max(1_000, Math.min(120_000, Math.floor(call.arguments.timeout_ms))) : 60_000;
+      const policy = terminalPolicy(command);
+      if (policy.kind === 'block') return JSON.stringify({ error: 'Команда заблокирована terminal policy.' });
+      if (policy.kind === 'confirm') {
+        const approval = await this.confirm({ title: 'Разрешить terminal command?', detail: command, category: policy.category!, actionId, root: this.cwd }, signal);
+        if (!approval.approved) return JSON.stringify({ approved: false, reason: approval.reason });
+      }
+      if (signal.aborted) return JSON.stringify({ error: 'Generation cancelled' });
+      return await runTerminal(command, timeout, this.cwd, signal);
+    } catch (error) { return JSON.stringify({ error: error instanceof Error ? error.message : 'Ошибка terminal' }); }
+  }
+}
+
+/**
+ * Safety policy is intentionally separate from project path validation. The
+ * terminal may work in a user's home directory and elsewhere, while commands
+ * that can change the system still require explicit confirmation.
+ */
+export function terminalPolicy(command: string): TerminalPolicy {
+  const value = command.trim(); const lower = value.toLowerCase();
+  if (!value || value.includes('\0')) return { kind: 'block' };
+  if (/(^|\s)git\s+commit(\s|$)/.test(lower)) return { kind: 'confirm', category: 'git_commit' };
+  if (/(^|\s)git\s+push(\s|$)/.test(lower)) return { kind: 'confirm', category: 'git_push' };
+  if (/(^|\s)git\s+(reset\s+--hard|clean\b)/.test(lower)) return { kind: 'confirm', category: 'destructive_git' };
+  if (/\b(npm|pnpm|yarn)\s+(install|add)\b/.test(lower)) return { kind: 'confirm', category: 'package_install' };
+  if (/\b(npm|pnpm|yarn)\s+(remove|uninstall)\b/.test(lower)) return { kind: 'confirm', category: 'package_remove' };
+  if (/(^|\s)(apt|apt-get|dnf|pacman)\s+.*\b(install|remove|purge|upgrade|dist-upgrade)\b/.test(lower)) return { kind: 'confirm', category: /\b(remove|purge)\b/.test(lower) ? 'package_remove' : 'package_install' };
+  if (/(^|\s)(sudo|su|reboot|shutdown|poweroff|halt|kill)(\s|$)/.test(lower)) return { kind: 'confirm', category: 'system_command' };
+  if (/(^|\s)(dd|mkfs(?:\.[a-z0-9]+)?|fdisk|parted|wipefs|sfdisk|cfdisk)(\s|$)/.test(lower)) return { kind: 'confirm', category: 'system_command' };
+  if (/(^|\s)systemctl(\s|$)/.test(lower)) {
+    if (/^systemctl\s+--user\s+(status|is-active|is-enabled|show)(\s|$)/.test(lower)) return { kind: 'allow' };
+    return { kind: 'confirm', category: 'system_command' };
+  }
+  if (/(^|\s)(chmod|chown)(\s|$)/.test(lower)) return { kind: 'confirm', category: 'chmod_chown' };
+  if (/(^|\s)rm(\s|$)|curl\b.*\||wget\b.*\.(sh|run|bin|appimage)\b/.test(lower)) return { kind: 'confirm', category: 'system_command' };
+  if (/(?:^|\s)(?:\/etc\/|\/usr\/|\/boot\/|\.ssh(?:\/|\s|$)|\.gnupg(?:\/|\s|$)|\/proc\/|\/sys\/)/.test(lower)) return { kind: 'confirm', category: 'system_command' };
+  if (/(^|[^<])>{1,2}/.test(lower)) return { kind: 'confirm', category: 'shell_redirection' };
+  if (/[;|&]/.test(lower)) return { kind: 'confirm', category: 'shell_chaining' };
+  if (/^(git\s+(status|diff)(\s|$)|npm\s+run\s+(lint|typecheck|test|build)(\s|$)|pnpm\s+(lint|typecheck|test|build)(\s|$)|yarn\s+(lint|typecheck|test|build)(\s|$)|nvidia-smi(\s|$)|(pwd|whoami|uname|ls|find|rg|grep|cat|head|tail|echo)(\s|$)|gsettings\s+get(\s|$)|setxkbmap(\s|$)|mkdir\s+(?:-p\s+)?(?:~\/|\$home\/))/.test(lower)) return { kind: 'allow' };
+  return { kind: 'confirm', category: 'system_command' };
+}
+
+function runTerminal(command: string, timeout: number, cwd: string, signal: AbortSignal): Promise<string> {
+  return new Promise((resolve) => {
+    const child = spawn('/bin/bash', ['-lc', command], { cwd, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = ''; let stderr = ''; let finished = false;
+    const finish = (result: Record<string, unknown>) => { if (finished) return; finished = true; signal.removeEventListener('abort', abort); clearTimeout(timer); resolve(JSON.stringify(result)); };
+    const abort = () => { if (child.pid) { try { process.kill(-child.pid, 'SIGTERM'); setTimeout(() => { try { process.kill(-child.pid!, 'SIGKILL'); } catch { /* Process already exited. */ } }, 2_000).unref(); } catch { child.kill('SIGTERM'); } } finish({ cancelled: true, reason: 'Generation cancelled' }); };
+    const timer = setTimeout(() => abort(), timeout);
+    signal.addEventListener('abort', abort, { once: true });
+    child.stdout.on('data', (chunk: Buffer) => { if (stdout.length < 80_000) stdout += chunk.toString(); }); child.stderr.on('data', (chunk: Buffer) => { if (stderr.length < 20_000) stderr += chunk.toString(); });
+    child.on('error', (error) => finish({ error: error.message, cwd })); child.on('close', (code, signalName) => finish({ command, cwd, exit_code: code, signal: signalName, stdout, stderr }));
+  });
 }

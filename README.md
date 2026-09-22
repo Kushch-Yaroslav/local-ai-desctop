@@ -41,7 +41,7 @@ env NPM_CONFIG_CACHE="$PWD/local-cache/npm" npm start
 | Qwen3.8-27B | `qwen3.8:27b-q4_K_M` | Q4_K_M | 16K, 32K, 64K, 128K, 256K |
 | gpt-oss-20b | `gpt-oss:20b` | нативные MXFP4 MoE-веса и BF16-тензоры | 16K, 32K, 64K, 128K |
 
-Контекст передаётся Ollama на каждый запрос как `num_ctx`. Пресеты «Быстрый», «Обычный», «Повышенный» и «Глубокий» задают верхние границы `num_predict` в 4K, 8K, 16K и 32K соответственно; модель может закончить ответ раньше. Перед каждым inference приложение делает однотокенный preflight через Ollama и получает фактический `prompt_eval_count`, затем ограничивает output реально доступным остатком context window. Qwen и gpt-oss сопоставляют четыре UI-пресета с low/medium/high thinking. Для каждой генерации SQLite сохраняет применённый reasoning preset, запрошенный и effective output, context/input tokens, число agent steps и finish reason. При `length` интерфейс показывает «Продолжить ответ». Agent budget составляет 100 действий на один generationId.
+Контекст передаётся Ollama на каждый запрос как `num_ctx`. Output budget не зависит от Reasoning: для каждого запроса он составляет до 32K токенов и ограничивается фактически оставшимся местом context window с запасом 512 токенов. Перед каждым inference приложение делает однотокенный preflight через Ollama и получает фактический `prompt_eval_count`. Если backend поддерживает независимый reasoning control, UI показывает `Auto`, `Fast` и `Deep`: Qwen3.8 и gpt-oss используют Ollama `think`, GLM-4.7-Flash через llama.cpp — `reasoning_effort` и `enable_thinking`. Для каждой генерации SQLite сохраняет reasoning mode, запрошенный и effective output, context/input tokens, число agent steps и finish reason. Agent budget составляет 100 действий на один generationId.
 
 ## Web-доступ
 

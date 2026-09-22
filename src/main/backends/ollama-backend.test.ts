@@ -21,11 +21,12 @@ export async function runOllamaBackendRegression(): Promise<void> {
       { role: 'tool', tool_name: 'list_directory', tool_call_id: 'call-1', content: '{"entries":[]}' },
     ];
     const backend = new OllamaBackend('http://unit.test');
-    await backend.chatWithTools(model, messages, tools, new AbortController().signal, 65_536, 'normal', { phase: 'post_tool', maxOutputTokens: 4_096 });
+    await backend.chatWithTools(model, messages, tools, new AbortController().signal, 65_536, 'fast', { phase: 'post_tool' });
     assert.equal(requests.length, 2, 'Ollama Agent request did not run a preflight and a chat turn');
     assert.equal(requests[0].tools, undefined, 'one-token Ollama preflight still enabled tool parsing');
     assert.equal((requests[0].options as Record<string, unknown>).num_predict, 1, 'Ollama preflight output budget changed');
-    assert.equal((requests[1].options as Record<string, unknown>).num_predict, 4_096, 'Ollama ignored the bounded Agent tool-turn output limit');
+    assert.equal((requests[1].options as Record<string, unknown>).num_predict, 32_768, 'Ollama Agent request did not use the shared safe output budget');
+    assert.equal(requests[1].think, 'low', 'Ollama Fast reasoning did not use its native think control');
     assert.equal((requests[1].tools as unknown[])?.length, 1, 'actual Ollama Agent request lost its tool schema');
     const result = (requests[1].messages as Array<Record<string, unknown>>)[3];
     assert.equal(result.tool_name, 'list_directory', 'Ollama tool result lost its supported name field');
@@ -45,7 +46,7 @@ export async function runOllamaBackendRegression(): Promise<void> {
     }) as typeof fetch;
     try {
       const messages: ToolMessage[] = [{ role: 'system', content: 'system' }, { role: 'user', content: 'continue' }, { role: 'assistant', content: '', tool_calls: [{ id: 'call-plan', type: 'function', function: { name: 'list_directory', arguments: '{"path":"."}' } }] }, { role: 'tool', tool_name: 'list_directory', content: '{"entries":[]}' }];
-      await new OllamaBackend('http://unit.test').chatWithTools(model, messages, tools, new AbortController().signal, 65_536, 'normal');
+      await new OllamaBackend('http://unit.test').chatWithTools(model, messages, tools, new AbortController().signal, 65_536, 'auto');
       const historicalCall = ((requests[1].messages as Array<Record<string, unknown>>)[2].tool_calls as Array<{ function: { arguments: unknown } }>)[0];
       assert.deepEqual(historicalCall.function.arguments, { path: '.' }, 'stringified Agent history was forwarded to Ollama instead of canonical object arguments');
     } finally {
