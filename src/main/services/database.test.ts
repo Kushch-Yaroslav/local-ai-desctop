@@ -88,7 +88,12 @@ export async function runDatabaseMigrationRegression(): Promise<void> {
     const finalPlan = { steps: [{ id: 'inspect', label: 'Inspect Project 1', status: 'completed' as const }, { id: 'implement', label: 'Implement Project 2 change', status: 'in_progress' as const }] };
     fresh.addAnalysisAction(persistedRun.id, { id: 'plan-update', label: 'Планирование', kind: 'planning', state: 'completed', plan: finalPlan, metadata: { steps: 2, completed_steps: 1 } });
     fresh.addAnalysisAction(persistedRun.id, { id: 'notes-update', label: 'Обновление Task Notes', kind: 'notes', state: 'completed', output: 'Known finding; next step is implementation.' });
-    fresh.addAnalysisAction(persistedRun.id, { id: 'context-1', label: 'Контекст оптимизирован', detail: '26 151 → 18 028 токенов', kind: 'context', state: 'completed', metadata: { context_window: 32_768, input_tokens_before: 26_151, input_tokens_after: 18_028, compacted_messages: 13, compacted_tool_results: 6, compaction_count: 1 } });
+    const actionCountedRun = fresh.addAnalysisAction(persistedRun.id, { id: 'context-1', label: 'Контекст оптимизирован', detail: '26 151 → 18 028 токенов', kind: 'context', state: 'completed', metadata: { context_window: 32_768, input_tokens_before: 26_151, input_tokens_after: 18_028, compacted_messages: 13, compacted_tool_results: 6, compaction_count: 1 } });
+    const progressRun = fresh.addAnalysisAction(persistedRun.id, { id: 'progress-1', label: 'Проверка', kind: 'progress', state: 'completed' });
+    const deduplicatedRun = fresh.addAnalysisAction(persistedRun.id, { id: 'context-1', label: 'Контекст оптимизирован', kind: 'context', state: 'completed', metadata: { input_tokens_after: 18_028 } });
+    assert.equal(actionCountedRun.actionCount, 3, 'structured Plan, Notes, and context activities were not counted exactly once');
+    assert.equal(progressRun.actionCount, 3, 'reasoning/progress activity was counted as an Agent action');
+    assert.equal(deduplicatedRun.actionCount, 3, 'updating a persisted activity counted the same action twice');
     fresh.finishAnalysisRun(persistedRun.id, 'completed', null);
     fresh.close();
     const legacyMode = new DatabaseSync(freshPath);

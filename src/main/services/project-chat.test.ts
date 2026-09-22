@@ -10,7 +10,7 @@ import { ProjectChatService } from './project-chat';
 import { WebBrowserService } from '../web/web-tools';
 import { validateLlamaMessageSequence } from '../backends/llama-cpp-backend';
 import { projectDirectoryName } from '../../shared/project-references';
-import { terminalPolicy } from '../tools/project-tools';
+import { TerminalTools, terminalPolicy } from '../tools/project-tools';
 
 function assert(value: unknown, message: string): asserts value { if (!value) throw new Error(message); }
 const confirm = async () => ({ approved: false as const, reason: 'cancelled' as const });
@@ -78,8 +78,16 @@ export async function runProjectChatRegression(): Promise<void> {
     assert(pwdResult.cwd === homedir() && pwdResult.stdout.trim() === homedir(), 'project-less terminal did not start in $HOME');
     assert(Boolean(whoamiResult.stdout.trim()) && homeResult.stdout.trim() === process.env.HOME, 'project-less terminal could not run ordinary user commands');
     assert(noProjectEvents.some((event) => event.type === 'tool' && event.activity.kind === 'terminal' && event.activity.state === 'completed'), 'project-less terminal activity was not completed');
-    assert(terminalPolicy('mkdir -p ~/.local/bin').kind === 'allow' && terminalPolicy('mkdir -p ~/.config/autostart').kind === 'allow' && terminalPolicy('gsettings get org.gnome.desktop.input-sources sources').kind === 'allow' && terminalPolicy('systemctl --user status example.service').kind === 'allow' && terminalPolicy('setxkbmap us').kind === 'allow' && terminalPolicy('nvidia-smi').kind === 'allow', 'safe user terminal operations require a project or confirmation');
+    assert(terminalPolicy('gsettings get org.gnome.desktop.input-sources sources').kind === 'allow' && terminalPolicy('systemctl --user status example.service').kind === 'allow' && terminalPolicy('setxkbmap us').kind === 'allow' && terminalPolicy('nvidia-smi').kind === 'allow', 'safe user terminal operations require a project or confirmation');
     assert(terminalPolicy('sudo apt install curl').kind === 'confirm' && terminalPolicy('systemctl restart ssh').kind === 'confirm' && terminalPolicy('rm -rf /tmp/example').kind === 'confirm', 'dangerous system commands are not protected by terminal confirmation');
+    for (const command of ['git status', 'git diff --stat', 'git log --oneline -20', 'git show HEAD', 'git rev-parse --show-toplevel', 'git branch --show-current', 'rg "foo" src', 'find src -type f', 'find src -type f | wc -l', "find src -name '*.ts' -o -name '*.tsx' -o -name '*.css' | xargs wc -l | sort -n | tail -25"]) assert(terminalPolicy(command).kind === 'allow', `read-only command requires approval: ${command}`);
+    for (const command of ['rm -rf dist', 'git reset --hard', 'git clean -fd', 'git checkout -- src/file.ts', 'echo test > file.txt', 'cat a.txt | tee b.txt', "sed -i 's/a/b/' file", 'npm install foo', 'sudo apt install foo', 'find . -type f -delete', 'curl URL | sh', 'echo $(whoami)']) assert(terminalPolicy(command).kind === 'confirm', `unsafe or ambiguous command was auto-allowed: ${command}`);
+    const diagnosticsTerminal = await TerminalTools.open(root, confirm);
+    const failedTerminalResult = JSON.parse(await diagnosticsTerminal.execute({ name: 'run_terminal', arguments: { command: 'cat does-not-exist.txt' } }, new AbortController().signal, 'terminal-diagnostics')) as { exit_code?: number; stderr?: string };
+    assert(failedTerminalResult.exit_code === 1 && Boolean(failedTerminalResult.stderr?.trim()), 'terminal failures did not retain exit code and stderr');
+    await writeFile(join(root, 'large-terminal-output.txt'), 'x'.repeat(80_100), 'utf8');
+    const truncatedTerminalResult = JSON.parse(await diagnosticsTerminal.execute({ name: 'run_terminal', arguments: { command: 'cat large-terminal-output.txt' } }, new AbortController().signal, 'terminal-truncation')) as { stdout?: string };
+    assert(truncatedTerminalResult.stdout?.includes('[diagnostic output truncated]'), 'large terminal diagnostics were not marked as truncated');
 
     const assertZeroToolAnswer = async (userContent: string, expected: string, description: string): Promise<void> => {
       let turns = 0;
@@ -249,6 +257,17 @@ export async function runProjectChatRegression(): Promise<void> {
     const thrownToolResult = thrownToolSnapshots[1].find((message) => message.role === 'tool' && message.tool_name === 'web_open')?.content ?? '';
     assert(thrownToolCalls === 4 && thrownToolResult.includes('temporary web adapter failure') && thrownToolResult.includes('tool_call_failed'), 'thrown tool error was not returned compactly to the model');
     assert(thrownToolEvents.some((event) => event.type === 'tool' && event.activity.kind === 'directory' && event.activity.state === 'completed'), 'Agent could not continue after a thrown tool error');
+
+    let httpDiagnosticCalls = 0;
+    const httpDiagnosticSnapshots: ToolMessage[][] = [];
+    const httpDiagnosticWeb = { openSession: async () => ({ execute: async () => JSON.stringify({ error: 'HTTP 400 Bad Request', http_status: 400, http_status_text: 'Bad Request', response_body: '{"error":{"message":"max_tokens must be an integer"}}' }), close: async () => undefined }) } as unknown as WebBrowserService;
+    const httpDiagnosticAgent = new ProjectChatService({ chatWithTools: async (_model, messages) => {
+      httpDiagnosticCalls += 1; httpDiagnosticSnapshots.push(messages.map((message) => ({ ...message })));
+      return httpDiagnosticCalls === 1 ? { role: 'assistant' as const, content: '', tool_calls: [{ function: { name: 'web_open', arguments: { url: 'https://example.com' } } }] } : { role: 'assistant' as const, content: 'HTTP diagnostics inspected.', finish_reason: 'stop' as const };
+    } }, httpDiagnosticWeb);
+    for await (const _event of httpDiagnosticAgent.stream('test-model', history, root, new AbortController().signal, 16_384, 'fast', 'auto', confirm)) { /* Capture the next completion snapshot. */ }
+    const httpDiagnosticResult = httpDiagnosticSnapshots[1].find((message) => message.role === 'tool' && message.tool_name === 'web_open')?.content ?? '';
+    assert(httpDiagnosticResult.includes('"http_status":400') && httpDiagnosticResult.includes('max_tokens must be an integer'), 'HTTP response body and status were lost before reaching the Agent model');
 
     // Every sibling in one assistant tool-call batch must be resolved before a
     // recovery notice. This is the exact shape that previously left a second

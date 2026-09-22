@@ -54,7 +54,9 @@ function contentBlock(snapshot: PageSnapshot): PolicyBlock | null {
   return null;
 }
 
-function toolError(message: string, details?: string): string { return JSON.stringify({ error: message, ...(details ? { details } : {}) }); }
+const diagnosticOutputLimit = 20_000;
+function diagnosticOutput(value: string): string { return value.length <= diagnosticOutputLimit ? value : `${value.slice(0, diagnosticOutputLimit)}\n[diagnostic output truncated]`; }
+function toolError(message: string, details?: string | Record<string, unknown>): string { return JSON.stringify({ error: message, ...(details ? typeof details === 'string' ? { details: diagnosticOutput(details) } : details : {}) }); }
 function blocked(kind: PolicyBlock): string {
   if (kind === 'ru_domain') return JSON.stringify({ blocked_reason: 'ru_domain', message: 'Access to .ru domains is disabled by local web policy.' });
   return toolError(`Blocked by web policy: ${kind}`);
@@ -171,7 +173,14 @@ export class WebBrowserSession {
     const preflight = policyBlock(url); if (preflight) { log('web.blocked', { timestamp: new Date().toISOString(), tool: 'web_open', url, reason: preflight }); return blocked(preflight); }
     log('web.open.started', { timestamp: new Date().toISOString(), url });
     const page = await this.activePage(); const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: pageTimeoutMs });
-    if (response && !response.ok()) return toolError(`Страница вернула HTTP ${response.status()}`, response.statusText());
+    if (response && !response.ok()) {
+      const responseBody = await response.text().catch(() => '');
+      return toolError(`HTTP ${response.status()} ${response.statusText()}`, {
+        http_status: response.status(),
+        http_status_text: response.statusText(),
+        ...(responseBody ? { response_body: diagnosticOutput(responseBody) } : {}),
+      });
+    }
     const current = page.url(); const redirectedBlock = policyBlock(current); if (redirectedBlock) return blocked(redirectedBlock);
     this.lastSnapshot = await snapshot(page); const detected = contentBlock(this.lastSnapshot); if (detected) { log('web.blocked', { timestamp: new Date().toISOString(), tool: 'web_open', url: current, reason: detected }); return blocked(detected); }
     log('web.open.completed', { timestamp: new Date().toISOString(), url: current, status: 'ok', title: this.lastSnapshot.title, chars: this.lastSnapshot.content.length });

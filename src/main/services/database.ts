@@ -346,7 +346,7 @@ export class Database {
     if (existing) this.db.prepare('UPDATE analysis_actions SET label=?, detail=?, data=? WHERE id=? AND run_id=?').run(activity.label, activity.detail ?? null, data, activity.id, runId);
     else {
       this.db.prepare('INSERT INTO analysis_actions (id, run_id, label, detail, data, position) VALUES (?, ?, ?, ?, ?, ?)').run(activity.id, runId, activity.label, activity.detail ?? null, data, position);
-      if (activity.kind !== 'progress' && activity.kind !== 'context') this.db.prepare('UPDATE analysis_runs SET action_count=action_count+1 WHERE id=?').run(runId);
+      if (activity.kind !== 'progress') this.db.prepare('UPDATE analysis_runs SET action_count=action_count+1 WHERE id=?').run(runId);
     }
     return this.getAnalysisRun(runId)!;
   }

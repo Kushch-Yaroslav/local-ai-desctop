@@ -320,38 +320,61 @@ export class TerminalTools {
  * that can change the system still require explicit confirmation.
  */
 export function terminalPolicy(command: string): TerminalPolicy {
-  const value = command.trim(); const lower = value.toLowerCase();
+  const value = command.trim();
   if (!value || value.includes('\0')) return { kind: 'block' };
-  if (/(^|\s)git\s+commit(\s|$)/.test(lower)) return { kind: 'confirm', category: 'git_commit' };
-  if (/(^|\s)git\s+push(\s|$)/.test(lower)) return { kind: 'confirm', category: 'git_push' };
-  if (/(^|\s)git\s+(reset\s+--hard|clean\b)/.test(lower)) return { kind: 'confirm', category: 'destructive_git' };
-  if (/\b(npm|pnpm|yarn)\s+(install|add)\b/.test(lower)) return { kind: 'confirm', category: 'package_install' };
-  if (/\b(npm|pnpm|yarn)\s+(remove|uninstall)\b/.test(lower)) return { kind: 'confirm', category: 'package_remove' };
-  if (/(^|\s)(apt|apt-get|dnf|pacman)\s+.*\b(install|remove|purge|upgrade|dist-upgrade)\b/.test(lower)) return { kind: 'confirm', category: /\b(remove|purge)\b/.test(lower) ? 'package_remove' : 'package_install' };
-  if (/(^|\s)(sudo|su|reboot|shutdown|poweroff|halt|kill)(\s|$)/.test(lower)) return { kind: 'confirm', category: 'system_command' };
-  if (/(^|\s)(dd|mkfs(?:\.[a-z0-9]+)?|fdisk|parted|wipefs|sfdisk|cfdisk)(\s|$)/.test(lower)) return { kind: 'confirm', category: 'system_command' };
-  if (/(^|\s)systemctl(\s|$)/.test(lower)) {
-    if (/^systemctl\s+--user\s+(status|is-active|is-enabled|show)(\s|$)/.test(lower)) return { kind: 'allow' };
-    return { kind: 'confirm', category: 'system_command' };
+  if (/[`$][(]|`|\n|;|&&|\|\||[<>]/.test(value)) return { kind: 'confirm', category: /[<>]/.test(value) ? 'shell_redirection' : 'shell_chaining' };
+  const stages = splitPipeline(value);
+  if (!stages) return { kind: 'confirm', category: 'shell_chaining' };
+  if (!stages.length || stages.some((stage) => !stage || !readOnlyStage(stage))) return { kind: 'confirm', category: 'system_command' };
+  return { kind: 'allow' };
+}
+
+/** Split only unquoted pipe stages. Anything shell-like we cannot classify is rejected. */
+function splitPipeline(command: string): string[] | null {
+  const stages: string[] = []; let value = ''; let quote = '';
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index];
+    if (quote) { value += char; if (char === quote) quote = ''; continue; }
+    if (char === "'" || char === '"') { quote = char; value += char; continue; }
+    if (char === '\\') { const next = command[++index]; if (next === undefined) return null; value += `\\${next}`; continue; }
+    if (char === '|') { stages.push(value.trim()); value = ''; continue; }
+    value += char;
   }
-  if (/(^|\s)(chmod|chown)(\s|$)/.test(lower)) return { kind: 'confirm', category: 'chmod_chown' };
-  if (/(^|\s)rm(\s|$)|curl\b.*\||wget\b.*\.(sh|run|bin|appimage)\b/.test(lower)) return { kind: 'confirm', category: 'system_command' };
-  if (/(?:^|\s)(?:\/etc\/|\/usr\/|\/boot\/|\.ssh(?:\/|\s|$)|\.gnupg(?:\/|\s|$)|\/proc\/|\/sys\/)/.test(lower)) return { kind: 'confirm', category: 'system_command' };
-  if (/(^|[^<])>{1,2}/.test(lower)) return { kind: 'confirm', category: 'shell_redirection' };
-  if (/[;|&]/.test(lower)) return { kind: 'confirm', category: 'shell_chaining' };
-  if (/^(git\s+(status|diff)(\s|$)|npm\s+run\s+(lint|typecheck|test|build)(\s|$)|pnpm\s+(lint|typecheck|test|build)(\s|$)|yarn\s+(lint|typecheck|test|build)(\s|$)|nvidia-smi(\s|$)|(pwd|whoami|uname|ls|find|rg|grep|cat|head|tail|echo)(\s|$)|gsettings\s+get(\s|$)|setxkbmap(\s|$)|mkdir\s+(?:-p\s+)?(?:~\/|\$home\/))/.test(lower)) return { kind: 'allow' };
-  return { kind: 'confirm', category: 'system_command' };
+  if (quote) return null;
+  stages.push(value.trim());
+  return stages;
+}
+
+function words(stage: string): string[] | null {
+  const tokens: string[] = []; let value = ''; let quote = '';
+  for (let index = 0; index < stage.length; index += 1) { const char = stage[index]; if (quote) { if (char === quote) quote = ''; else value += char; continue; } if (char === "'" || char === '"') { quote = char; continue; } if (/\s/.test(char)) { if (value) { tokens.push(value); value = ''; } continue; } if (char === '\\') { const next = stage[++index]; if (next === undefined) return null; value += next; continue; } value += char; }
+  if (quote) return null; if (value) tokens.push(value); return tokens;
+}
+function readOnlyStage(stage: string): boolean {
+  const tokens = words(stage); if (!tokens?.length || /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0])) return false;
+  const [bin, ...args] = tokens; const command = bin.replace(/^.*\//, '');
+  if (['pwd', 'whoami', 'uname', 'echo', 'printf', 'ls', 'find', 'grep', 'rg', 'cat', 'head', 'tail', 'wc', 'stat', 'file', 'du', 'sort', 'uniq'].includes(command)) return command !== 'find' || !args.some((arg) => ['-delete', '-exec', '-execdir', '-ok', '-okdir', '-fprint', '-fprint0'].includes(arg));
+  if (command === 'git') return ['status', 'diff', 'log', 'show', 'rev-parse', 'branch'].includes(args.find((arg) => !arg.startsWith('-')) ?? '');
+  if (['npm', 'pnpm', 'yarn'].includes(command)) {
+    const safeScripts = new Set(['lint', 'typecheck', 'test', 'build']);
+    return (args[0] === 'run' && safeScripts.has(args[1] ?? '')) || (command !== 'npm' && safeScripts.has(args[0] ?? ''));
+  }
+  if (command === 'nvidia-smi' || (command === 'gsettings' && args[0] === 'get') || command === 'setxkbmap') return true;
+  if (command === 'systemctl' && args[0] === '--user' && ['status', 'is-active', 'is-enabled', 'show'].includes(args[1] ?? '')) return true;
+  if (command === 'xargs') { let index = 0; while (index < args.length && args[index].startsWith('-')) { if (['-n', '-P', '-I', '-d', '-E'].includes(args[index])) index += 2; else index += 1; } return index < args.length && readOnlyStage(args.slice(index).join(' ')); }
+  return false;
 }
 
 function runTerminal(command: string, timeout: number, cwd: string, signal: AbortSignal): Promise<string> {
   return new Promise((resolve) => {
     const child = spawn('/bin/bash', ['-lc', command], { cwd, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
-    let stdout = ''; let stderr = ''; let finished = false;
+    let stdout = ''; let stderr = ''; let stdoutTruncated = false; let stderrTruncated = false; let finished = false;
+    const append = (current: string, chunk: string, limit: number): string => { if (current.length >= limit) return current; const next = `${current}${chunk}`; return next.length > limit ? next.slice(0, limit) : next; };
     const finish = (result: Record<string, unknown>) => { if (finished) return; finished = true; signal.removeEventListener('abort', abort); clearTimeout(timer); resolve(JSON.stringify(result)); };
     const abort = () => { if (child.pid) { try { process.kill(-child.pid, 'SIGTERM'); setTimeout(() => { try { process.kill(-child.pid!, 'SIGKILL'); } catch { /* Process already exited. */ } }, 2_000).unref(); } catch { child.kill('SIGTERM'); } } finish({ cancelled: true, reason: 'Generation cancelled' }); };
     const timer = setTimeout(() => abort(), timeout);
     signal.addEventListener('abort', abort, { once: true });
-    child.stdout.on('data', (chunk: Buffer) => { if (stdout.length < 80_000) stdout += chunk.toString(); }); child.stderr.on('data', (chunk: Buffer) => { if (stderr.length < 20_000) stderr += chunk.toString(); });
-    child.on('error', (error) => finish({ error: error.message, cwd })); child.on('close', (code, signalName) => finish({ command, cwd, exit_code: code, signal: signalName, stdout, stderr }));
+    child.stdout.on('data', (chunk: Buffer) => { const text = chunk.toString(); stdoutTruncated ||= stdout.length + text.length > 80_000; stdout = append(stdout, text, 80_000); }); child.stderr.on('data', (chunk: Buffer) => { const text = chunk.toString(); stderrTruncated ||= stderr.length + text.length > 20_000; stderr = append(stderr, text, 20_000); });
+    child.on('error', (error) => finish({ error: error.message, cwd })); child.on('close', (code, signalName) => finish({ command, cwd, exit_code: code, signal: signalName, stdout: stdoutTruncated ? `${stdout}\n[diagnostic output truncated]` : stdout, stderr: stderrTruncated ? `${stderr}\n[diagnostic output truncated]` : stderr }));
   });
 }
