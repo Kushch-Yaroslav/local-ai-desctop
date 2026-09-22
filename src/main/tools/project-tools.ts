@@ -322,10 +322,11 @@ export class TerminalTools {
 export function terminalPolicy(command: string): TerminalPolicy {
   const value = command.trim();
   if (!value || value.includes('\0')) return { kind: 'block' };
-  if (/[`$][(]|`|\n|;|&&|\|\||[<>]/.test(value)) return { kind: 'confirm', category: /[<>]/.test(value) ? 'shell_redirection' : 'shell_chaining' };
+  if (/[`$][(]|`|\n|;|&&|\|\||[<>]|(?:^|[^&])&(?!&)/.test(value)) return { kind: 'confirm', category: /[<>]/.test(value) ? 'shell_redirection' : 'shell_chaining' };
   const stages = splitPipeline(value);
   if (!stages) return { kind: 'confirm', category: 'shell_chaining' };
-  if (!stages.length || stages.some((stage) => !stage || !readOnlyStage(stage))) return { kind: 'confirm', category: 'system_command' };
+  const classifications = stages.map(classifyTerminalStage);
+  if (!stages.length || classifications.some((classification) => !classification) || (stages.length > 1 && classifications.includes('trusted_project_execution'))) return { kind: 'confirm', category: 'system_command' };
   return { kind: 'allow' };
 }
 
@@ -350,19 +351,41 @@ function words(stage: string): string[] | null {
   for (let index = 0; index < stage.length; index += 1) { const char = stage[index]; if (quote) { if (char === quote) quote = ''; else value += char; continue; } if (char === "'" || char === '"') { quote = char; continue; } if (/\s/.test(char)) { if (value) { tokens.push(value); value = ''; } continue; } if (char === '\\') { const next = stage[++index]; if (next === undefined) return null; value += next; continue; } value += char; }
   if (quote) return null; if (value) tokens.push(value); return tokens;
 }
+type TerminalStageClassification = 'read_only' | 'trusted_project_execution' | null;
+function classifyTerminalStage(stage: string): TerminalStageClassification {
+  return readOnlyStage(stage) ? 'read_only' : trustedProjectExecutionStage(stage) ? 'trusted_project_execution' : null;
+}
+function readOnlyGitBranch(args: string[]): boolean {
+  if (!args.length) return true;
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    if (argument === '--show-current' || argument === '--list' || argument === '-l' || argument.startsWith('--list=')) continue;
+    if (argument === '--contains' || argument === '--merged' || argument === '--no-merged') { if (args[index + 1] && !args[index + 1].startsWith('-')) index += 1; continue; }
+    if (argument.startsWith('--contains=') || argument.startsWith('--merged=') || argument.startsWith('--no-merged=')) continue;
+    return false;
+  }
+  return true;
+}
 function readOnlyStage(stage: string): boolean {
   const tokens = words(stage); if (!tokens?.length || /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0])) return false;
   const [bin, ...args] = tokens; const command = bin.replace(/^.*\//, '');
   if (['pwd', 'whoami', 'uname', 'echo', 'printf', 'ls', 'find', 'grep', 'rg', 'cat', 'head', 'tail', 'wc', 'stat', 'file', 'du', 'sort', 'uniq'].includes(command)) return command !== 'find' || !args.some((arg) => ['-delete', '-exec', '-execdir', '-ok', '-okdir', '-fprint', '-fprint0'].includes(arg));
-  if (command === 'git') return ['status', 'diff', 'log', 'show', 'rev-parse', 'branch'].includes(args.find((arg) => !arg.startsWith('-')) ?? '');
-  if (['npm', 'pnpm', 'yarn'].includes(command)) {
-    const safeScripts = new Set(['lint', 'typecheck', 'test', 'build']);
-    return (args[0] === 'run' && safeScripts.has(args[1] ?? '')) || (command !== 'npm' && safeScripts.has(args[0] ?? ''));
+  if (command === 'git') {
+    const subcommandIndex = args.findIndex((arg) => !arg.startsWith('-'));
+    const subcommand = args[subcommandIndex];
+    if (['status', 'diff', 'log', 'show', 'rev-parse'].includes(subcommand ?? '')) return true;
+    return subcommand === 'branch' && readOnlyGitBranch(args.slice(subcommandIndex + 1));
   }
-  if (command === 'nvidia-smi' || (command === 'gsettings' && args[0] === 'get') || command === 'setxkbmap') return true;
+  if (command === 'nvidia-smi' || (command === 'gsettings' && args[0] === 'get')) return true;
   if (command === 'systemctl' && args[0] === '--user' && ['status', 'is-active', 'is-enabled', 'show'].includes(args[1] ?? '')) return true;
   if (command === 'xargs') { let index = 0; while (index < args.length && args[index].startsWith('-')) { if (['-n', '-P', '-I', '-d', '-E'].includes(args[index])) index += 2; else index += 1; } return index < args.length && readOnlyStage(args.slice(index).join(' ')); }
   return false;
+}
+/** Project scripts may be auto-allowed for compatibility, but they are not read-only. */
+function trustedProjectExecutionStage(stage: string): boolean {
+  const tokens = words(stage); if (!tokens?.length) return false;
+  const [bin, ...args] = tokens; const command = bin.replace(/^.*\//, ''); const safeScripts = new Set(['lint', 'typecheck', 'test', 'build']);
+  return ['npm', 'pnpm', 'yarn'].includes(command) && ((args[0] === 'run' && safeScripts.has(args[1] ?? '')) || (command !== 'npm' && safeScripts.has(args[0] ?? '')));
 }
 
 function runTerminal(command: string, timeout: number, cwd: string, signal: AbortSignal): Promise<string> {
