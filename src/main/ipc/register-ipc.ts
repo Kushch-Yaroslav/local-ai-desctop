@@ -1,6 +1,6 @@
 import { BrowserWindow, dialog, ipcMain } from 'electron';
 import { randomUUID } from 'node:crypto';
-import type { AnalysisRun, ApprovalDecision, ApprovalStatus, ChatRequest, Conversation, ProjectReference, ProjectSuggestion, RiskCategory } from '../../shared/types';
+import type { AnalysisRun, ApprovalDecision, ApprovalStatus, ChatRequest, Conversation, ProjectReference, ProjectSuggestion, RiskCategory, ThinkingTimelineEvent } from '../../shared/types';
 import { Database } from '../services/database';
 import { getHardwareStats } from '../services/hardware';
 import { OllamaBackend } from '../backends/ollama-backend';
@@ -12,7 +12,7 @@ import { contextPresetsFor, getModelProfile, modelRegistry } from '../models/mod
 import { WebBrowserService } from '../web/web-tools';
 import { webToolDefinitions } from '../web/web-tools';
 import { WebChatService } from '../services/web-chat';
-import { capabilitySystemContext } from '../services/capabilities';
+import { chatMessagesWithSystemPrefix, chatSystemContext } from '../services/capabilities';
 import { projectToolDefinitions, ReadonlyProjectTools, reportProgressToolDefinition, terminalToolDefinition, type ApprovalResult, type ConfirmAction } from '../tools/project-tools';
 import { AttachmentService } from '../services/attachment-service';
 import { AttachmentPipeline } from '../services/attachment-pipeline';
@@ -226,7 +226,8 @@ export function registerIpc(): void {
     if (!current()) return;
     await backend.ensureModelAvailable(request.model);
     if (!current()) return;
-    let output = ''; let completed = false; let failed = false; let finishReason: 'stop' | 'length' = 'stop';
+    let output = ''; let thinking = ''; let messageDiagnostics: import('../../shared/types').GenerationDiagnostics | undefined; let completed = false; let failed = false; let finishReason: 'stop' | 'length' = 'stop';
+    const thinkingTimeline: ThinkingTimelineEvent[] = []; const activityTimelinePositions = new Map<string, number>(); let timelinePosition = 0; let lastTimelineKind: ThinkingTimelineEvent['kind'] | null = null;
     const agentProjects: AgentProject[] = mode === 'agent' ? [...selectedProjects] : [];
     const agentRoot = agentProjects[0]?.root ?? null;
     const enabledTools = mode === 'agent' ? [taskNotesToolDefinition.function.name, agentPlanToolDefinition.function.name, reportProgressToolDefinition.function.name, terminalToolDefinition.function.name, ...(agentProjects.length ? projectToolDefinitions.map((tool) => tool.function.name) : []), ...(conversation.webMode === 'auto' ? webToolDefinitions.map((tool) => tool.function.name) : [])] : conversation.webMode === 'auto' ? webToolDefinitions.map((tool) => tool.function.name) : [];
@@ -244,10 +245,18 @@ export function registerIpc(): void {
         ? projectChat.stream(request.model, history, agentProjects, abort.signal, context.active, conversation.reasoningMode, conversation.webMode, inlineConfirmation(event, request.conversationId, generation, agentRoot ?? homedir()), { generationId: generation.id, conversationId: request.conversationId })
         : conversation.webMode === 'auto'
           ? webChat.stream(request.model, history, abort.signal, context.active, conversation.reasoningMode)
-          : backend.streamChat(request.model, [{ id: `capability-${request.conversationId}`, conversationId: request.conversationId, role: 'system', content: capabilitySystemContext({ webAvailable: false }), createdAt: new Date().toISOString() }, ...history], abort.signal, context.active, conversation.reasoningMode);
-      for await (const chunk of stream) {
+          : backend.streamChat(request.model, chatMessagesWithSystemPrefix(history, [chatSystemContext({ webAvailable: false }, conversation.reasoningMode === 'deep' ? 'deep' : 'fast')], request.conversationId, `capability-${request.conversationId}`), abort.signal, context.active, conversation.reasoningMode);
+      for await (let chunk of stream) {
         if (!current()) break;
         if (chunk.type === 'token') output += chunk.content;
+        if (chunk.type === 'thinking') {
+          thinking += chunk.content;
+          if (mode === 'agent') {
+            if (lastTimelineKind !== 'reasoning') { timelinePosition += 1; thinkingTimeline.push({ id: randomUUID(), kind: 'reasoning', content: chunk.content, position: timelinePosition }); lastTimelineKind = 'reasoning'; }
+            else { const entry = thinkingTimeline.at(-1); if (entry?.kind === 'reasoning') entry.content += chunk.content; }
+            chunk = { ...chunk, timelinePosition };
+          }
+        }
         if (chunk.type === 'context-usage') {
           database.setContextUsage(request.conversationId, request.model, chunk.used);
           event.sender.send('chat:stream', { ...chunk, conversationId: request.conversationId, generationId: generation.id, modelId: request.model });
@@ -255,6 +264,7 @@ export function registerIpc(): void {
         }
         if (chunk.type === 'diagnostics') {
           const diagnostics = { ...chunk.diagnostics, generationId: generation.id, conversationId: request.conversationId, createdAt: new Date().toISOString() };
+          messageDiagnostics = diagnostics;
           saveGenerationDiagnosticsBestEffort((value) => database.saveGenerationDiagnostics(value), diagnostics);
           log('generation.diagnostics', diagnostics);
           event.sender.send('chat:stream', { type: 'diagnostics', conversationId: request.conversationId, generationId: generation.id, diagnostics });
@@ -263,8 +273,13 @@ export function registerIpc(): void {
         if (chunk.type === 'done') { completed = true; finishReason = chunk.finishReason === 'length' ? 'length' : 'stop'; continue; }
         if (chunk.type === 'error') failed = true;
         if (run && chunk.type === 'tool') {
-          const updated = database.addAnalysisAction(run.id, chunk.activity);
-          const visibleActivity = { ...chunk.activity };
+          const existingPosition = activityTimelinePositions.get(chunk.activity.id);
+          const position = existingPosition ?? (timelinePosition += 1);
+          if (existingPosition === undefined) { activityTimelinePositions.set(chunk.activity.id, position); thinkingTimeline.push({ id: randomUUID(), kind: 'activity', activityId: chunk.activity.id, position }); }
+          lastTimelineKind = 'activity';
+          const activity = { ...chunk.activity, timelinePosition: position };
+          const updated = database.addAnalysisAction(run.id, activity);
+          const visibleActivity = { ...activity };
           delete visibleActivity.rawOutput;
           event.sender.send('chat:stream', { ...chunk, activity: visibleActivity, runId: run.id, conversationId: request.conversationId, generationId: generation.id });
           event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run: updated });
@@ -272,7 +287,15 @@ export function registerIpc(): void {
       }
       if (!current()) { if (run) database.finishAnalysisRun(run.id, 'cancelled', null); return; }
       if (failed || !completed) { if (run) event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run: database.finishAnalysisRun(run.id, 'error', null) }); return; }
-      const assistant = output ? database.addMessage(request.conversationId, 'assistant', output) : null;
+      const inputTokens = messageDiagnostics?.promptEvalCount ?? messageDiagnostics?.inputTokens;
+      const generationStats = messageDiagnostics?.evalCount === undefined ? undefined : {
+        outputTokens: messageDiagnostics.evalCount,
+        ...(messageDiagnostics.tokensPerSecond !== undefined ? { tokensPerSecond: messageDiagnostics.tokensPerSecond } : {}),
+        ...(messageDiagnostics.evalDuration !== undefined ? { generationDurationMs: messageDiagnostics.evalDuration / 1_000_000 } : {}),
+        ...(messageDiagnostics.timeToFirstTokenMs !== undefined ? { timeToFirstTokenMs: messageDiagnostics.timeToFirstTokenMs } : {}),
+        ...(inputTokens !== undefined ? { inputTokens } : {}),
+      };
+      const assistant = output ? database.addMessage(request.conversationId, 'assistant', output, undefined, [], { ...(thinking.trim() ? { thinking } : {}), ...(thinkingTimeline.length ? { thinkingTimeline } : {}), ...(generationStats ? { generationStats } : {}) }) : null;
       if (run) event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run: database.finishAnalysisRun(run.id, 'completed', assistant?.id ?? null) });
       event.sender.send('chat:stream', { type: 'done', conversationId: request.conversationId, generationId: generation.id, assistant, finishReason });
     } catch (error) {

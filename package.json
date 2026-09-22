@@ -22,6 +22,8 @@
     "test:qwen-analysis": "npm run build && node dist/main/services/agent-qwen-analysis.manual.js",
     "test:qwen-working-memory": "npm run build && node dist/main/services/agent-qwen-working-memory.manual.js",
     "test:database-migration": "npm run build && node dist/main/services/database.test.js",
+    "test:web-chat": "npm run build && node dist/main/services/web-chat.test.js",
+    "test:thinking-timeline": "npm run build && node dist/shared/thinking-timeline.test.js",
     "test:diagnostics": "npm run build && node dist/main/services/generation-diagnostics.test.js",
     "test:regeneration": "npm run build && node dist/shared/generation-guard.test.js",
     "test:llama-cpp-backend": "npm run build && node dist/main/backends/llama-cpp-backend.test.js",

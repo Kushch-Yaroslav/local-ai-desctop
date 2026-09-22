@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { ChatMessage, ReasoningMode, StreamEvent } from '../../shared/types';
 import type { LlmBackend, ToolCall, ToolCallingBackend, ToolMessage } from '../backends/types';
-import { capabilitySystemContext } from './capabilities';
+import { capabilitySystemContext, chatCompletionGuidance, chatMessagesWithSystemPrefix, chatSystemContext } from './capabilities';
 import { WebBrowserService, activityForWebTool, webToolDefinitions } from '../web/web-tools';
 import type { ProjectToolCall } from '../tools/project-tools';
 
@@ -21,33 +21,41 @@ function parseInlineToolCalls(content: string): ProjectToolCall[] {
   }
   return calls;
 }
-const chunks = (content: string): string[] => content.match(/[\s\S]{1,96}/g) ?? [];
+const webDecisionInstruction = 'Сначала реши только, нужны ли для ответа live web-инструменты. Если нужны, вызови нужный инструмент. Если не нужны, ответь ровно NO_WEB. Не пиши итоговый ответ на этом шаге.';
 
 /** Tool loop for ordinary Chat mode when an isolated web capability is enabled. */
 export class WebChatService {
   constructor(private readonly backend: ToolCallingBackend & LlmBackend, private readonly web: WebBrowserService) {}
 
+  private async *finalStream(model: string, history: ChatMessage[], toolResults: ToolMessage[], signal: AbortSignal, contextWindow: number, reasoningMode: ReasoningMode): AsyncIterable<StreamEvent> {
+    const results = toolResults.filter((message) => message.role === 'tool').map((message) => `Инструмент ${message.tool_name ?? 'web'} вернул:\n${message.content}`).join('\n\n');
+    const finalMessages = chatMessagesWithSystemPrefix(history, [
+      chatCompletionGuidance(reasoningMode === 'deep' ? 'deep' : 'fast'),
+      ...(results ? [`Доступны следующие результаты web-инструментов. Используй их как evidence и сформулируй итоговый ответ без новых вызовов инструментов:\n\n${results}`] : []),
+    ], history[0]?.conversationId ?? 'web-final', randomUUID());
+    yield* this.backend.streamChat(model, finalMessages, signal, contextWindow, reasoningMode);
+  }
+
   async *stream(model: string, history: ChatMessage[], signal: AbortSignal, contextWindow: number, reasoningMode: ReasoningMode): AsyncIterable<StreamEvent> {
     let session;
     try { session = await this.web.openSession(); }
     catch {
-      const unavailable: ChatMessage = { id: randomUUID(), conversationId: history[0]?.conversationId ?? 'web-unavailable', role: 'system', content: capabilitySystemContext({ webAvailable: false }), createdAt: new Date().toISOString() };
-      yield* this.backend.streamChat(model, [unavailable, ...history], signal, contextWindow, reasoningMode);
+      yield* this.backend.streamChat(model, chatMessagesWithSystemPrefix(history, [chatSystemContext({ webAvailable: false }, reasoningMode === 'deep' ? 'deep' : 'fast')], history[0]?.conversationId ?? 'web-unavailable', randomUUID()), signal, contextWindow, reasoningMode);
       return;
     }
     const closeOnAbort = () => { void session.close(); };
     signal.addEventListener('abort', closeOnAbort, { once: true });
-    const messages: ToolMessage[] = [{ role: 'system', content: capabilitySystemContext({ webAvailable: true }) }, ...history.map(({ role, content, images }) => ({ role, content, ...(images?.length ? { images } : {}) }))];
+    // This is a narrow routing step. Keep it out of the user-visible reasoning
+    // and avoid spending the selected final-answer reasoning budget deciding
+    // whether a web lookup is needed.
+    const messages: ToolMessage[] = chatMessagesWithSystemPrefix(history, [`${capabilitySystemContext({ webAvailable: true })}\n${webDecisionInstruction}`], history[0]?.conversationId ?? 'web-routing', randomUUID()).map(({ role, content, images }) => ({ role, content, ...(images?.length ? { images } : {}) }));
     try {
       for (let actionCount = 0; !signal.aborted && actionCount < maxWebActions; actionCount += 1) {
-        const response = await this.backend.chatWithTools(model, messages, webToolDefinitions, signal, contextWindow, reasoningMode);
+        const response = await this.backend.chatWithTools(model, messages, webToolDefinitions, signal, contextWindow, 'fast');
         const calls = response.tool_calls?.length ? response.tool_calls.map(parseCall) : parseInlineToolCalls(response.content ?? '');
         messages.push({ role: 'assistant', content: response.content ?? '', tool_calls: response.tool_calls });
         if (calls.length === 0) {
-          if (typeof response.prompt_eval_count === 'number') yield { type: 'context-usage', used: response.prompt_eval_count, maximum: contextWindow };
-          for (const token of chunks(response.content ?? '')) { if (signal.aborted) return; yield { type: 'token', content: token }; }
-          if (response.inference) yield { type: 'diagnostics', diagnostics: { ...response.inference, agentStepCount: 0, finishReason: response.finish_reason ?? 'stop' } };
-          yield { type: 'done', finishReason: response.finish_reason ?? 'stop' }; return;
+          yield* this.finalStream(model, history, messages, signal, contextWindow, reasoningMode); return;
         }
         for (const call of calls) {
           if (signal.aborted) return;
@@ -59,12 +67,7 @@ export class WebChatService {
           messages.push({ role: 'tool', tool_name: call.name, content: await session.execute(call) });
         }
       }
-      messages.push({ role: 'system', content: 'Лимит web-действий в этом ответе исчерпан. Сформулируй итог по уже полученным источникам, не вызывая инструменты.' });
-      const response = await this.backend.chatWithTools(model, messages, undefined, signal, contextWindow, reasoningMode);
-      if (typeof response.prompt_eval_count === 'number') yield { type: 'context-usage', used: response.prompt_eval_count, maximum: contextWindow };
-      for (const token of chunks(response.content ?? '')) { if (signal.aborted) return; yield { type: 'token', content: token }; }
-      if (response.inference) yield { type: 'diagnostics', diagnostics: { ...response.inference, agentStepCount: 0, finishReason: response.finish_reason ?? 'stop' } };
-      yield { type: 'done', finishReason: response.finish_reason ?? 'stop' };
+      yield* this.finalStream(model, history, messages, signal, contextWindow, reasoningMode);
     } catch (error) {
       if (!signal.aborted) yield { type: 'error', message: 'Не удалось выполнить web-запрос', details: error instanceof Error ? error.message : String(error) };
     } finally { signal.removeEventListener('abort', closeOnAbort); await session.close(); }

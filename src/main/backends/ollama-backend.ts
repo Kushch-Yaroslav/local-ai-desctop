@@ -294,6 +294,7 @@ export class OllamaBackend implements LlmBackend, ToolCallingBackend {
           if (!line.trim()) continue;
           const item = JSON.parse(line) as OllamaChunk;
           if (item.error) { yield { type: 'error', message: 'Ошибка Ollama', details: item.error }; return; }
+          if (item.message?.thinking) yield { type: 'thinking', content: item.message.thinking };
           if (item.message?.content) {
             if (timeToFirstTokenMs === undefined) timeToFirstTokenMs = performance.now() - inferenceStartedAt;
             yield { type: 'token', content: item.message.content };

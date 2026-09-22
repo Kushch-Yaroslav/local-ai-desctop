@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { ActionApproval, AnalysisProgress, AnalysisRun, AppSettings, Attachment, AttachmentStatus, ApprovalDecision, ApprovalStatus, ChatMessage, Conversation, FinishReason, GenerationDiagnostics, HardwareStats, ModelInfo, ProjectReference, ToolActivity } from '../../shared/types';
+import type { ActionApproval, AnalysisProgress, AnalysisRun, AppSettings, Attachment, AttachmentStatus, ApprovalDecision, ApprovalStatus, ChatMessage, Conversation, FinishReason, GenerationDiagnostics, HardwareStats, ModelInfo, ProjectReference, ThinkingTimelineEvent, ToolActivity } from '../../shared/types';
 import { isCurrentGenerationEvent } from '../../shared/generation-guard';
 
 type State = {
@@ -34,7 +34,7 @@ type State = {
   editMessage: (message: ChatMessage, content: string) => Promise<boolean>;
   regenerateMessage: (message: ChatMessage) => Promise<boolean>;
   stop: () => Promise<void>;
-  handleStream: (event: { type: string; content?: string; message?: string; details?: string; activity?: ToolActivity; run?: AnalysisRun; progress?: AnalysisProgress; requested?: number; active?: number; supported?: number; used?: number; maximum?: number; conversationId: string; generationId: string; modelId?: string; assistant?: ChatMessage | null; finishReason?: FinishReason; diagnostics?: Omit<GenerationDiagnostics, 'generationId' | 'conversationId' | 'createdAt'>; actionId?: string; approval?: ActionApproval; approvalId?: string; status?: Exclude<ApprovalStatus, 'pending'> | AttachmentStatus }) => void;
+  handleStream: (event: { type: string; content?: string; message?: string; details?: string; activity?: ToolActivity; run?: AnalysisRun; progress?: AnalysisProgress; requested?: number; active?: number; supported?: number; used?: number; maximum?: number; timelinePosition?: number; conversationId: string; generationId: string; modelId?: string; assistant?: ChatMessage | null; finishReason?: FinishReason; diagnostics?: Omit<GenerationDiagnostics, 'generationId' | 'conversationId' | 'createdAt'>; actionId?: string; approval?: ActionApproval; approvalId?: string; status?: Exclude<ApprovalStatus, 'pending'> | AttachmentStatus }) => void;
 };
 
 const assistantId = (generationId: string) => `stream-${generationId}`;
@@ -43,16 +43,30 @@ const isImageFile = (file: File): boolean => file.type.startsWith('image/') || /
 
 export const useAppStore = create<State>((set, get) => {
   const pendingTokens = new Map<string, string>();
+  const pendingThinking = new Map<string, Array<{ content: string; timelinePosition?: number }>>();
   let animationFrame: number | null = null;
   let branchRegenerationPending = false;
-  const flushTokens = () => {
+  const drainStream = (immediate = false) => {
     animationFrame = null;
-    if (pendingTokens.size === 0) return;
-    const tokens = new Map(pendingTokens); pendingTokens.clear();
+    if (pendingTokens.size === 0 && pendingThinking.size === 0) return;
+    // Coalesce only until the next paint. The backend remains the pacing
+    // source; keeping a second presentation frame would feel laggy locally.
+    const take = (value: string): string => value;
+    const tokens = new Map<string, string>(); const thinking = new Map<string, Array<{ content: string; timelinePosition?: number }>>();
+    for (const [id, value] of pendingTokens) { const visible = take(value); tokens.set(id, visible); const rest = value.slice(visible.length); if (rest) pendingTokens.set(id, rest); else pendingTokens.delete(id); }
+    for (const [id, value] of pendingThinking) { thinking.set(id, value); pendingThinking.delete(id); }
     set((state) => ({ messages: state.messages.map((message) => {
       const token = tokens.get(get().generationId ?? '');
-      return token && message.id === assistantId(get().generationId ?? '') ? { ...message, content: message.content + token } : message;
+      const reasoning = thinking.get(get().generationId ?? '');
+      const timeline = reasoning?.reduce<ThinkingTimelineEvent[]>((entries, fragment) => {
+        if (fragment.timelinePosition === undefined) return entries;
+        const last = entries.at(-1);
+        if (last?.kind === 'reasoning' && last.position === fragment.timelinePosition) return [...entries.slice(0, -1), { ...last, content: last.content + fragment.content }];
+        return [...entries, { id: `reasoning-${fragment.timelinePosition}`, kind: 'reasoning', content: fragment.content, position: fragment.timelinePosition }];
+      }, message.thinkingTimeline ?? []);
+      return (token || reasoning?.length) && message.id === assistantId(get().generationId ?? '') ? { ...message, ...(token ? { content: message.content + token } : {}), ...(reasoning?.length ? { thinking: (message.thinking ?? '') + reasoning.map((fragment) => fragment.content).join(''), ...(timeline?.length ? { thinkingTimeline: timeline } : {}) } : {}) } : message;
     }) }));
+    if (!immediate && (pendingTokens.size || pendingThinking.size)) animationFrame = window.requestAnimationFrame(() => drainStream());
   };
   const regenerateSavedBranch = async (saved: ChatMessage[], errorMessage: string): Promise<boolean> => {
     const activeId = get().activeId; const chat = get().conversations.find((item) => item.id === activeId); const model = chat?.modelId ?? get().models[0]?.id;
@@ -150,7 +164,7 @@ export const useAppStore = create<State>((set, get) => {
     const accepted = await window.localAi.chat.approve({ conversationId: activeId, generationId, approvalId: pendingApproval.approval.approvalId, decision });
     if (!accepted) set((state) => state.generationId === generationId ? { approvalSubmitting: false } : {});
   },
-  stop: async () => { const { activeId, generationId } = get(); if (!activeId || !generationId) return; set({ generationState: 'stopping', pendingApproval: null, approvalSubmitting: false }); await window.localAi.chat.stop(activeId, generationId); set((state) => state.generationId === generationId ? { isGenerating: false, generationId: null, generationState: 'cancelled', messages: state.messages.filter((message) => message.id !== assistantId(generationId)), performance: null, pendingApproval: null, approvalSubmitting: false } : {}); },
+  stop: async () => { const { activeId, generationId } = get(); if (!activeId || !generationId) return; set({ generationState: 'stopping', pendingApproval: null, approvalSubmitting: false }); await window.localAi.chat.stop(activeId, generationId); pendingTokens.delete(generationId); pendingThinking.delete(generationId); if (animationFrame !== null) { window.cancelAnimationFrame(animationFrame); animationFrame = null; } set((state) => state.generationId === generationId ? { isGenerating: false, generationId: null, generationState: 'cancelled', messages: state.messages.filter((message) => message.id !== assistantId(generationId)), performance: null, pendingApproval: null, approvalSubmitting: false } : {}); },
   handleStream: (event) => {
     if (event.type === 'context-usage' && typeof event.used === 'number') {
       const used = event.used;
@@ -159,7 +173,12 @@ export const useAppStore = create<State>((set, get) => {
     if (!isCurrentGenerationEvent(event.conversationId, event.generationId, get().activeId, get().generationId)) return;
     if (event.type === 'token') {
       pendingTokens.set(event.generationId, (pendingTokens.get(event.generationId) ?? '') + (event.content ?? ''));
-      if (animationFrame === null) animationFrame = window.requestAnimationFrame(flushTokens);
+      if (animationFrame === null) animationFrame = window.requestAnimationFrame(() => drainStream());
+    }
+    if (event.type === 'thinking') {
+      pendingThinking.set(event.generationId, [...(pendingThinking.get(event.generationId) ?? []), { content: event.content ?? '', timelinePosition: event.timelinePosition }]);
+      if (animationFrame === null) animationFrame = window.requestAnimationFrame(() => drainStream());
+      set({ generationState: 'thinking' });
     }
     if ((event.type === 'tool' || event.type === 'attachment') && event.activity) set((state) => {
       const exists = state.toolActivities.some((activity) => activity.id === event.activity!.id);
@@ -167,7 +186,12 @@ export const useAppStore = create<State>((set, get) => {
       return {
         generationState: event.type === 'attachment' && event.activity!.status === 'processing' ? 'using-tool' : event.activity!.label === 'Запуск terminal' ? 'running-terminal' : 'using-tool',
         toolActivities: [...state.toolActivities.filter((activity) => activity.id !== event.activity!.id), event.activity!].slice(-100), toolActivityCount: exists || event.activity!.kind === 'progress' ? state.toolActivityCount : state.toolActivityCount + 1,
-        messages: attachmentId ? state.messages.map((message) => ({ ...message, attachments: message.attachments?.map((attachment) => attachment.id === attachmentId ? event.activity!.attachment ?? { ...attachment, status: event.activity!.status ?? attachment.status, error: event.activity!.status === 'error' ? event.activity!.detail : attachment.error, updatedAt: now() } : attachment) })) : state.messages,
+        messages: state.messages.map((message) => {
+          if (attachmentId) return { ...message, attachments: message.attachments?.map((attachment) => attachment.id === attachmentId ? event.activity!.attachment ?? { ...attachment, status: event.activity!.status ?? attachment.status, error: event.activity!.status === 'error' ? event.activity!.detail : attachment.error, updatedAt: now() } : attachment) };
+          if (event.activity!.timelinePosition === undefined || message.id !== assistantId(event.generationId)) return message;
+          const entries = message.thinkingTimeline ?? [];
+          return entries.some((entry) => entry.kind === 'activity' && entry.activityId === event.activity!.id) ? message : { ...message, thinkingTimeline: [...entries, { id: `activity-${event.activity!.id}`, kind: 'activity', activityId: event.activity!.id, position: event.activity!.timelinePosition }] };
+        }),
       };
     });
     if (event.type === 'approval-request' && event.actionId && event.approval) set((state) => ({ generationState: 'waiting-for-approval', pendingApproval: { actionId: event.actionId!, approval: event.approval! }, approvalSubmitting: false, toolActivities: state.toolActivities.map((activity) => activity.id === event.actionId ? { ...activity, approval: event.approval } : activity) }));
@@ -177,9 +201,9 @@ export const useAppStore = create<State>((set, get) => {
     if (event.type === 'context' && event.active) set({ activeContextWindow: event.active });
     if (event.type === 'diagnostics' && event.diagnostics) set({ performance: { ...event.diagnostics, generationId: event.generationId, conversationId: event.conversationId, createdAt: now() } });
     if (event.type === 'token') set({ generationState: 'generating' });
-    if (event.type === 'error') { flushTokens(); pendingTokens.delete(event.generationId); set((state) => ({ isGenerating: false, generationId: null, generationState: 'error', error: event.details ? `${event.message}: ${event.details}` : event.message ?? 'Ошибка генерации', messages: state.messages.filter((message) => message.id !== assistantId(event.generationId)), lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false })); }
-    if (event.type === 'cancelled') { flushTokens(); pendingTokens.delete(event.generationId); set((state) => ({ isGenerating: false, generationId: null, generationState: 'cancelled', messages: state.messages.filter((message) => message.id !== assistantId(event.generationId)), lastFinishReason: 'cancelled', performance: null, pendingApproval: null, approvalSubmitting: false })); }
-    if (event.type === 'done') { flushTokens(); set((state) => ({ isGenerating: false, generationId: null, generationState: 'idle', messages: state.messages.flatMap((message) => message.id === assistantId(event.generationId) ? (event.assistant ? [event.assistant] : []) : [message]), lastFinishReason: event.finishReason ?? 'stop' })); }
+    if (event.type === 'error') { drainStream(true); pendingTokens.delete(event.generationId); pendingThinking.delete(event.generationId); set((state) => ({ isGenerating: false, generationId: null, generationState: 'error', error: event.details ? `${event.message}: ${event.details}` : event.message ?? 'Ошибка генерации', messages: state.messages.filter((message) => message.id !== assistantId(event.generationId)), lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false })); }
+    if (event.type === 'cancelled') { drainStream(true); pendingTokens.delete(event.generationId); pendingThinking.delete(event.generationId); set((state) => ({ isGenerating: false, generationId: null, generationState: 'cancelled', messages: state.messages.filter((message) => message.id !== assistantId(event.generationId)), lastFinishReason: 'cancelled', performance: null, pendingApproval: null, approvalSubmitting: false })); }
+    if (event.type === 'done') { drainStream(true); set((state) => ({ isGenerating: false, generationId: null, generationState: 'idle', messages: state.messages.flatMap((message) => message.id === assistantId(event.generationId) ? (event.assistant ? [event.assistant] : []) : [message]), lastFinishReason: event.finishReason ?? 'stop' })); }
   },
 };
 });

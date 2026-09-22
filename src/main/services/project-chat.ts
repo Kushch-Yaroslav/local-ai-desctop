@@ -446,6 +446,7 @@ export class ProjectChatService {
       try {
         response = await this.inference(model, messages, toolDefinitions, signal, contextWindow, reasoningMode, actions, toolContext.stats(), runtime, initialInferencePending, recoveryPending, contextManager, workingMemory, onContextCompaction);
         while (runtimeActivities.length) yield { type: 'tool', activity: runtimeActivities.shift()! };
+        if (response.thinking?.trim()) yield { type: 'thinking', content: response.thinking };
         initialInferencePending = false;
         recoveryPending = false;
         // A response reached the normal Agent protocol, so a later malformed
@@ -679,6 +680,7 @@ export class ProjectChatService {
     try {
       const response = await this.finalRequest(model, messages, signal, contextWindow, reasoningMode, actions, toolContext, runtime, contextManager, workingMemory, onContextCompaction);
       while (runtimeActivities.length) yield { type: 'tool', activity: runtimeActivities.shift()! };
+      if (response.thinking?.trim()) yield { type: 'thinking', content: response.thinking };
       if (response.finish_reason === 'length') throw new OllamaRequestError('output_limit', 'Итоговый ответ Ollama был остановлен по лимиту длины', { causeDetail: 'done_reason=length' });
       if (response.tool_calls?.length) throw new OllamaRequestError('malformed_response', 'Ollama вернул tool call вместо итогового ответа', { causeDetail: 'final request did not allow tools' });
       if (/<tool_call>\s*<function=[a-z_]+>/i.test(response.content ?? '')) throw new OllamaRequestError('malformed_response', 'Ollama вернул текстовый tool call вместо итогового ответа', { causeDetail: 'final request did not allow tools' });

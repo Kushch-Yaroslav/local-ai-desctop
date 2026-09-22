@@ -72,6 +72,16 @@ export interface GenerationDiagnostics {
   createdAt: string;
 }
 
+/** Message-owned subset of backend-authoritative completion metrics. */
+export interface GenerationStats {
+  /** Completion tokens reported by the backend. Reasoning runtimes may count visible and thinking tokens together. */
+  outputTokens: number;
+  tokensPerSecond?: number;
+  generationDurationMs?: number;
+  timeToFirstTokenMs?: number;
+  inputTokens?: number;
+}
+
 export interface ModelInfo {
   id: string;
   name: string;
@@ -129,6 +139,12 @@ export interface ChatMessage {
   createdAt: string;
   attachments?: Attachment[];
   projectReferences?: ProjectReference[];
+  /** Native model reasoning, when the backend exposes it. It is never inferred from tool activity. */
+  thinking?: string;
+  /** Ordered reasoning/activity references for Agent turns. Older messages omit this. */
+  thinkingTimeline?: ThinkingTimelineEvent[];
+  /** Optional for conversations written before per-message generation statistics existed. */
+  generationStats?: GenerationStats;
   /** Ephemeral base64 image inputs for Ollama. These are rebuilt from managed attachment storage and are never persisted in SQLite. */
   images?: string[];
 }
@@ -181,7 +197,13 @@ export interface ToolActivity {
   attachment?: Attachment;
   /** Ephemeral current-run plan snapshot. Database persistence deliberately strips this field. */
   plan?: AgentPlan;
+  /** Monotonic event order within an Agent turn; assigned by the stream coordinator. */
+  timelinePosition?: number;
 }
+
+export type ThinkingTimelineEvent =
+  | { id: string; kind: 'reasoning'; content: string; position: number }
+  | { id: string; kind: 'activity'; activityId: string; position: number };
 
 export type AgentPlanStepStatus = 'pending' | 'in_progress' | 'completed';
 export interface AgentPlanStep { id: string; label: string; status: AgentPlanStepStatus; }
@@ -206,6 +228,7 @@ export interface AnalysisProgress {
 
 export type StreamEvent =
   | { type: 'token'; content: string }
+  | { type: 'thinking'; content: string; timelinePosition?: number }
   | { type: 'tool'; activity: ToolActivity; runId?: string }
   | { type: 'attachment'; activity: ToolActivity }
   | { type: 'approval-request'; actionId: string; approval: ActionApproval }

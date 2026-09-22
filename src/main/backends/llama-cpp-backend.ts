@@ -5,7 +5,7 @@ import { contextPresetsFor, getModelProfile, maxOutputTokens, modelInfo, outputB
 import type { ContextWindow } from './ollama-backend';
 import { log } from '../services/logger';
 
-type Choice = { finish_reason?: string | null; message?: { content?: string | null; reasoning_content?: string | null; tool_calls?: Array<{ id?: string; type?: string; function?: { name?: string; arguments?: string } }> }; delta?: { content?: string | null } };
+type Choice = { finish_reason?: string | null; message?: { content?: string | null; reasoning_content?: string | null; tool_calls?: Array<{ id?: string; type?: string; function?: { name?: string; arguments?: string } }> }; delta?: { content?: string | null; reasoning_content?: string | null } };
 type ChatResponse = { choices?: Choice[]; usage?: { prompt_tokens?: number; completion_tokens?: number }; timings?: { prompt_ms?: number; predicted_ms?: number; prompt_per_second?: number; predicted_per_second?: number } };
 type ModelsResponse = { data?: Array<{ meta?: { n_ctx?: number; size?: number } }> };
 type InputTokenResponse = { input_tokens?: unknown };
@@ -274,24 +274,32 @@ export class LlamaCppBackend implements LlmBackend, ToolCallingBackend {
   }
   async *streamChat(model: string, messages: ChatMessage[], signal: AbortSignal, contextWindow = 32_768, reasoningMode: ReasoningMode = 'auto'): AsyncIterable<StreamEvent> {
     try {
-      await this.ensureModelAvailable(model); const budget = await this.budget(model, messages, contextWindow, reasoningMode, undefined, signal);
+      await this.ensureModelAvailable(model); const sequenceError = validateLlamaMessageSequence(messages); if (sequenceError) throw new Error(`Некорректная последовательность Chat сообщений: ${sequenceError}`); const budget = await this.budget(model, messages, contextWindow, reasoningMode, undefined, signal);
       const endpoint = '/v1/chat/completions'; const response = await fetch(this.url(endpoint), { method: 'POST', signal, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...this.payload(model, messages, undefined, reasoningMode, budget.maxTokens, true), stream_options: { include_usage: true } }) });
       if (!response.ok) await this.failedRequest(model, messages, undefined, contextWindow, budget, response, endpoint);
       if (!response.body) { yield { type: 'error', message: 'llama.cpp не смог начать генерацию', details: 'llama.cpp не вернул тело stream-ответа' }; return; }
-      const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = '';
+      const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = ''; let finalData: ChatResponse | undefined; let finalReason: FinishReason | undefined; let diagnosticsEmitted = false;
+      const emitDiagnostics = function* (self: LlamaCppBackend): Generator<StreamEvent> {
+        if (diagnosticsEmitted || !finalReason) return;
+        diagnosticsEmitted = true; self.recordCalibration(budget, contextWindow, finalData ?? null);
+        yield { type: 'diagnostics', diagnostics: { ...self.diagnostics(reasoningMode, contextWindow, budget, finalData), agentStepCount: 0, finishReason: finalReason } };
+      };
       try {
         while (!signal.aborted) {
           const { done, value } = await reader.read(); buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
           const blocks = buffer.split('\n\n'); buffer = blocks.pop() ?? '';
           for (const raw of blocks) {
             if (!raw.startsWith('data: ')) continue; const valueText = raw.slice(6).trim();
-            if (valueText === '[DONE]') { yield { type: 'done', finishReason: 'stop' }; return; }
+            if (valueText === '[DONE]') { if (!finalReason) finalReason = 'stop'; yield* emitDiagnostics(this); yield { type: 'done', finishReason: finalReason }; return; }
             const data = JSON.parse(valueText) as ChatResponse; const choice = data.choices?.[0];
+            if (data.usage || data.timings) finalData = { ...finalData, ...data, usage: data.usage ?? finalData?.usage, timings: data.timings ?? finalData?.timings };
+            if (choice?.delta?.reasoning_content) yield { type: 'thinking', content: choice.delta.reasoning_content };
             if (choice?.delta?.content) yield { type: 'token', content: choice.delta.content };
-            if (choice?.finish_reason) { this.recordCalibration(budget, contextWindow, data); yield { type: 'diagnostics', diagnostics: { ...this.diagnostics(reasoningMode, contextWindow, budget, data), agentStepCount: 0, finishReason: finishReason(choice.finish_reason) } }; yield { type: 'done', finishReason: finishReason(choice.finish_reason) }; return; }
+            if (choice?.finish_reason) finalReason = finishReason(choice.finish_reason);
           }
           if (done) break;
         }
+        if (!signal.aborted && finalReason) { yield* emitDiagnostics(this); yield { type: 'done', finishReason: finalReason }; return; }
         if (!signal.aborted) yield { type: 'error', message: 'Поток llama.cpp завершился без итогового сообщения' };
       } finally { reader.releaseLock(); }
     } catch (error) { if (!signal.aborted) yield { type: 'error', message: 'Генерация llama.cpp прервана', details: error instanceof Error ? error.message : String(error) }; }

@@ -53,6 +53,20 @@ export async function runOllamaBackendRegression(): Promise<void> {
       globalThis.fetch = originalFetch;
     }
   }
+  {
+    let call = 0;
+    globalThis.fetch = (async () => {
+      call += 1;
+      if (call === 1) return new Response(JSON.stringify({ message: { role: 'assistant', content: '' }, prompt_eval_count: 12 }), { status: 200, headers: { 'content-type': 'application/json' } });
+      return new Response(`${JSON.stringify({ message: { thinking: 'First, inspect the stream.' } })}\n${JSON.stringify({ message: { content: 'Visible answer.' } })}\n${JSON.stringify({ done: true, done_reason: 'stop', prompt_eval_count: 12, eval_count: 4, eval_duration: 1_000_000_000 })}\n`, { status: 200, headers: { 'content-type': 'application/x-ndjson' } });
+    }) as typeof fetch;
+    try {
+      const events = [];
+      for await (const event of new OllamaBackend('http://unit.test').streamChat(model, [{ id: 'stream-user', conversationId: 'stream', role: 'user', content: 'hello', createdAt: new Date().toISOString() }], new AbortController().signal)) events.push(event);
+      assert.deepEqual(events.filter((event) => event.type === 'thinking').map((event) => event.content), ['First, inspect the stream.'], 'Ollama reasoning chunks were not forwarded as Thinking events');
+      assert.deepEqual(events.filter((event) => event.type === 'token').map((event) => event.content), ['Visible answer.'], 'Ollama answer chunks changed while forwarding Thinking');
+    } finally { globalThis.fetch = originalFetch; }
+  }
 }
 
 if (require.main === module) void runOllamaBackendRegression().catch((error: unknown) => { console.error(error); process.exitCode = 1; });

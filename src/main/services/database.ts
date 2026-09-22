@@ -1,6 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
-import type { AnalysisRun, Attachment, AttachmentKind, AttachmentStatus, ChatMessage, ChatMode, Conversation, GenerationDiagnostics, ProjectReference, ProjectReferenceKind, ReasoningMode, ToolActivity, WebMode } from '../../shared/types';
+import type { AnalysisRun, Attachment, AttachmentKind, AttachmentStatus, ChatMessage, ChatMode, Conversation, GenerationDiagnostics, GenerationStats, ProjectReference, ProjectReferenceKind, ReasoningMode, ThinkingTimelineEvent, ToolActivity, WebMode } from '../../shared/types';
 import { paths } from './paths';
 
 type ConversationRow = {
@@ -12,7 +12,7 @@ type ConversationRow = {
   web_mode: WebMode;
   created_at: string; updated_at: string;
 };
-type MessageRow = { id: string; conversation_id: string; role: ChatMessage['role']; content: string; created_at: string };
+type MessageRow = { id: string; conversation_id: string; role: ChatMessage['role']; content: string; thinking: string | null; thinking_timeline: string | null; generation_stats: string | null; created_at: string };
 type ProjectReferenceRow = { id: string; message_id: string; position: number; project_id: string; project_slot: 1 | 2; project_path: string; project_label: string; relative_path: string; kind: ProjectReferenceKind };
 type AttachmentRow = { id: string; message_id: string; position: number; kind: AttachmentKind; mime_type: string; filename: string; size: number; storage_ref: string; status: AttachmentStatus; extracted_text: string | null; structured_data: string | null; vision_analysis: string | null; error: string | null; metadata: string | null; created_at: string; updated_at: string };
 type AnalysisRunRow = { id: string; conversation_id: string; assistant_message_id: string | null; reasoning_mode: ReasoningMode; status: AnalysisRun['status']; action_count: number; created_at: string; completed_at: string | null };
@@ -20,7 +20,7 @@ type AnalysisActionRow = { id: string; run_id: string; label: string; detail: st
 
 const mapConversation = (row: ConversationRow): Conversation => ({
   id: row.id, title: row.title, modelId: row.model_id, mode: row.mode,
-  workingDirectory: row.working_directory, primaryProjectId: row.primary_project_id ?? null, secondaryWorkingDirectory: row.secondary_working_directory ?? null, secondaryProjectId: row.secondary_project_id ?? null, contextWindow: row.context_window ?? 32_768, reasoningMode: row.reasoning_mode === 'fast' || row.reasoning_mode === 'deep' ? row.reasoning_mode : 'auto', contextTokens: row.context_tokens ?? null, contextModelId: row.context_model_id ?? null, webMode: row.web_mode ?? 'auto', createdAt: row.created_at, updatedAt: row.updated_at,
+  workingDirectory: row.working_directory, primaryProjectId: row.primary_project_id ?? null, secondaryWorkingDirectory: row.secondary_working_directory ?? null, secondaryProjectId: row.secondary_project_id ?? null, contextWindow: row.context_window ?? 32_768, reasoningMode: row.reasoning_mode === 'deep' ? 'deep' : 'fast', contextTokens: row.context_tokens ?? null, contextModelId: row.context_model_id ?? null, webMode: row.web_mode ?? 'auto', createdAt: row.created_at, updatedAt: row.updated_at,
 });
 const mapAttachment = (row: AttachmentRow): Attachment => ({
   id: row.id, messageId: row.message_id, index: row.position, kind: row.kind, mimeType: row.mime_type, filename: row.filename, size: row.size, storageRef: row.storage_ref, status: row.status,
@@ -32,12 +32,37 @@ function parseAttachmentMetadata(value: string | null): Record<string, unknown> 
   try { const parsed = JSON.parse(value); return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : undefined; } catch { return undefined; }
 }
 const mapReference = (row: ProjectReferenceRow): ProjectReference => ({ id: row.id, projectId: row.project_id, projectSlot: row.project_slot, projectPath: row.project_path, projectLabel: row.project_label, relativePath: row.relative_path, kind: row.kind });
-const mapMessage = (row: MessageRow, attachments?: Attachment[], projectReferences?: ProjectReference[]): ChatMessage => ({
-  id: row.id, conversationId: row.conversation_id, role: row.role, content: row.content, createdAt: row.created_at,
-  attachments,
-  projectReferences,
-});
-const mapRun = (row: AnalysisRunRow, actions: AnalysisActionRow[]): AnalysisRun => ({ id: row.id, conversationId: row.conversation_id, assistantMessageId: row.assistant_message_id, reasoningMode: row.reasoning_mode === 'fast' || row.reasoning_mode === 'deep' ? row.reasoning_mode : 'auto', status: row.status, actionCount: row.action_count, actions: actions.map((action) => {
+function parseGenerationStats(value: string | null): GenerationStats | undefined {
+  if (!value) return undefined;
+  try {
+    const parsed = JSON.parse(value) as Partial<GenerationStats>;
+    if (!parsed || typeof parsed !== 'object' || !Number.isFinite(parsed.outputTokens) || parsed.outputTokens! < 0) return undefined;
+    return {
+      outputTokens: Math.round(parsed.outputTokens!),
+      ...(Number.isFinite(parsed.tokensPerSecond) && parsed.tokensPerSecond! > 0 ? { tokensPerSecond: parsed.tokensPerSecond } : {}),
+      ...(Number.isFinite(parsed.generationDurationMs) && parsed.generationDurationMs! >= 0 ? { generationDurationMs: parsed.generationDurationMs } : {}),
+      ...(Number.isFinite(parsed.timeToFirstTokenMs) && parsed.timeToFirstTokenMs! >= 0 ? { timeToFirstTokenMs: parsed.timeToFirstTokenMs } : {}),
+      ...(Number.isFinite(parsed.inputTokens) && parsed.inputTokens! >= 0 ? { inputTokens: Math.round(parsed.inputTokens!) } : {}),
+    };
+  } catch { return undefined; }
+}
+const mapMessage = (row: MessageRow, attachments?: Attachment[], projectReferences?: ProjectReference[]): ChatMessage => {
+  const generationStats = parseGenerationStats(row.generation_stats);
+  let thinkingTimeline: ThinkingTimelineEvent[] | undefined;
+  try {
+    const parsed = row.thinking_timeline ? JSON.parse(row.thinking_timeline) as unknown : undefined;
+    if (Array.isArray(parsed)) thinkingTimeline = parsed.filter((item): item is ThinkingTimelineEvent => Boolean(item) && typeof item === 'object' && typeof item.id === 'string' && typeof item.position === 'number' && ((item.kind === 'reasoning' && typeof item.content === 'string') || (item.kind === 'activity' && typeof item.activityId === 'string')));
+  } catch { /* Old or damaged timeline metadata remains optional. */ }
+  return {
+    id: row.id, conversationId: row.conversation_id, role: row.role, content: row.content, createdAt: row.created_at,
+    attachments,
+    projectReferences,
+    ...(row.thinking?.trim() ? { thinking: row.thinking } : {}),
+    ...(thinkingTimeline?.length ? { thinkingTimeline } : {}),
+    ...(generationStats ? { generationStats } : {}),
+  };
+};
+const mapRun = (row: AnalysisRunRow, actions: AnalysisActionRow[]): AnalysisRun => ({ id: row.id, conversationId: row.conversation_id, assistantMessageId: row.assistant_message_id, reasoningMode: row.reasoning_mode === 'deep' ? 'deep' : 'fast', status: row.status, actionCount: row.action_count, actions: actions.map((action) => {
   let stored: Partial<ToolActivity> = {};
   try { stored = action.data ? JSON.parse(action.data) as Partial<ToolActivity> : {}; } catch { /* Older or corrupt telemetry remains readable. */ }
   const visible = { ...stored };
@@ -54,11 +79,11 @@ export class Database {
       PRAGMA journal_mode = WAL;
       CREATE TABLE IF NOT EXISTS conversations (
         id TEXT PRIMARY KEY, title TEXT NOT NULL, model_id TEXT, mode TEXT NOT NULL,
-        working_directory TEXT, context_window INTEGER NOT NULL DEFAULT 32768, reasoning_mode TEXT NOT NULL DEFAULT 'auto', context_tokens INTEGER, context_model_id TEXT, web_mode TEXT NOT NULL DEFAULT 'auto', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        working_directory TEXT, context_window INTEGER NOT NULL DEFAULT 32768, reasoning_mode TEXT NOT NULL DEFAULT 'fast', context_tokens INTEGER, context_model_id TEXT, web_mode TEXT NOT NULL DEFAULT 'auto', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
       ) STRICT;
       CREATE TABLE IF NOT EXISTS messages (
         id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-        role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL
+        role TEXT NOT NULL, content TEXT NOT NULL, thinking TEXT, thinking_timeline TEXT, generation_stats TEXT, created_at TEXT NOT NULL
       ) STRICT;
       CREATE INDEX IF NOT EXISTS messages_conversation_idx ON messages(conversation_id, created_at);
       CREATE TABLE IF NOT EXISTS project_references (
@@ -75,12 +100,12 @@ export class Database {
         created_at TEXT NOT NULL, updated_at TEXT NOT NULL
       ) STRICT;
       CREATE INDEX IF NOT EXISTS attachments_message_idx ON attachments(message_id, position);
-      CREATE TABLE IF NOT EXISTS analysis_runs (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, assistant_message_id TEXT, reasoning_mode TEXT NOT NULL DEFAULT 'auto', status TEXT NOT NULL, action_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, completed_at TEXT) STRICT;
+      CREATE TABLE IF NOT EXISTS analysis_runs (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, assistant_message_id TEXT, reasoning_mode TEXT NOT NULL DEFAULT 'fast', status TEXT NOT NULL, action_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, completed_at TEXT) STRICT;
       CREATE TABLE IF NOT EXISTS analysis_actions (id TEXT PRIMARY KEY, run_id TEXT NOT NULL, label TEXT NOT NULL, detail TEXT, data TEXT, position INTEGER NOT NULL) STRICT;
       CREATE INDEX IF NOT EXISTS analysis_runs_conversation_idx ON analysis_runs(conversation_id, created_at);
       CREATE INDEX IF NOT EXISTS analysis_actions_run_idx ON analysis_actions(run_id, position);
       CREATE TABLE IF NOT EXISTS generation_diagnostics (
-        generation_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, reasoning_mode TEXT NOT NULL DEFAULT 'auto',
+        generation_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, reasoning_mode TEXT NOT NULL DEFAULT 'fast',
         requested_max_output_tokens INTEGER NOT NULL, effective_max_output_tokens INTEGER NOT NULL,
         context_limit INTEGER NOT NULL, input_tokens INTEGER NOT NULL, agent_step_count INTEGER NOT NULL,
         finish_reason TEXT NOT NULL, prompt_eval_count INTEGER, prompt_eval_duration INTEGER,
@@ -97,6 +122,9 @@ export class Database {
     try { this.db.exec('ALTER TABLE conversations ADD COLUMN primary_project_id TEXT'); } catch { /* Existing databases already have this column. */ }
     try { this.db.exec('ALTER TABLE conversations ADD COLUMN secondary_working_directory TEXT'); } catch { /* Existing databases already have this column. */ }
     try { this.db.exec('ALTER TABLE conversations ADD COLUMN secondary_project_id TEXT'); } catch { /* Existing databases already have this column. */ }
+    try { this.db.exec('ALTER TABLE messages ADD COLUMN thinking TEXT'); } catch { /* Existing databases already have this column. */ }
+    try { this.db.exec('ALTER TABLE messages ADD COLUMN thinking_timeline TEXT'); } catch { /* Existing databases already have this column. */ }
+    try { this.db.exec('ALTER TABLE messages ADD COLUMN generation_stats TEXT'); } catch { /* Existing databases already have this column. */ }
     this.db.exec("UPDATE conversations SET primary_project_id=lower(hex(randomblob(16))) WHERE working_directory IS NOT NULL AND primary_project_id IS NULL");
     try { this.db.exec('ALTER TABLE generation_diagnostics ADD COLUMN prompt_eval_count INTEGER'); } catch { /* Existing databases already have this column. */ }
     try { this.db.exec('ALTER TABLE generation_diagnostics ADD COLUMN prompt_eval_duration INTEGER'); } catch { /* Existing databases already have this column. */ }
@@ -110,8 +138,11 @@ export class Database {
     try { this.db.exec('ALTER TABLE generation_diagnostics ADD COLUMN reasoning_mode TEXT'); } catch { /* Existing databases already have this column. */ }
     // Map values persisted by the removed four-level control once. The legacy
     // columns stay in place for old SQLite files but are never read again.
-    try { this.db.exec("UPDATE conversations SET reasoning_mode=CASE analysis_depth WHEN 'fast' THEN 'fast' WHEN 'enhanced' THEN 'deep' WHEN 'deep' THEN 'deep' ELSE 'auto' END WHERE reasoning_mode IS NULL"); } catch { /* Fresh databases have no legacy column. */ }
-    try { this.db.exec("UPDATE generation_diagnostics SET reasoning_mode=CASE reasoning_preset WHEN 'fast' THEN 'fast' WHEN 'enhanced' THEN 'deep' WHEN 'deep' THEN 'deep' ELSE 'auto' END WHERE reasoning_mode IS NULL"); } catch { /* Fresh databases have no legacy column. */ }
+    try { this.db.exec("UPDATE conversations SET reasoning_mode=CASE analysis_depth WHEN 'enhanced' THEN 'deep' WHEN 'deep' THEN 'deep' ELSE 'fast' END WHERE reasoning_mode IS NULL"); } catch { /* Fresh databases have no legacy column. */ }
+    try { this.db.exec("UPDATE generation_diagnostics SET reasoning_mode=CASE reasoning_preset WHEN 'enhanced' THEN 'deep' WHEN 'deep' THEN 'deep' ELSE 'fast' END WHERE reasoning_mode IS NULL"); } catch { /* Fresh databases have no legacy column. */ }
+    this.db.exec("UPDATE conversations SET reasoning_mode='fast' WHERE reasoning_mode IS NULL OR reasoning_mode NOT IN ('fast', 'deep')");
+    this.db.exec("UPDATE analysis_runs SET reasoning_mode='fast' WHERE reasoning_mode IS NULL OR reasoning_mode NOT IN ('fast', 'deep')");
+    this.db.exec("UPDATE generation_diagnostics SET reasoning_mode='fast' WHERE reasoning_mode IS NULL OR reasoning_mode NOT IN ('fast', 'deep')");
     // A removed model must not remain selected in persisted chats.
     this.db.prepare("UPDATE conversations SET model_id=NULL WHERE model_id='qwen3-coder:30b'").run();
   }
@@ -124,18 +155,18 @@ export class Database {
     const columns = this.db.prepare('PRAGMA table_info(analysis_runs)').all() as Array<{ name: string }>;
     const names = new Set(columns.map((column) => column.name));
     if (!names.has('depth')) {
-      if (!names.has('reasoning_mode')) this.db.exec("ALTER TABLE analysis_runs ADD COLUMN reasoning_mode TEXT NOT NULL DEFAULT 'auto'");
+      if (!names.has('reasoning_mode')) this.db.exec("ALTER TABLE analysis_runs ADD COLUMN reasoning_mode TEXT NOT NULL DEFAULT 'fast'");
       this.db.exec('CREATE INDEX IF NOT EXISTS analysis_runs_conversation_idx ON analysis_runs(conversation_id, created_at)');
       return;
     }
     const reasoningMode = names.has('reasoning_mode')
-      ? "CASE WHEN reasoning_mode IN ('auto', 'fast', 'deep') THEN reasoning_mode WHEN depth='fast' THEN 'fast' WHEN depth IN ('enhanced', 'deep') THEN 'deep' ELSE 'auto' END"
-      : "CASE WHEN depth='fast' THEN 'fast' WHEN depth IN ('enhanced', 'deep') THEN 'deep' ELSE 'auto' END";
+      ? "CASE WHEN reasoning_mode='deep' OR depth IN ('enhanced', 'deep') THEN 'deep' ELSE 'fast' END"
+      : "CASE WHEN depth IN ('enhanced', 'deep') THEN 'deep' ELSE 'fast' END";
     this.db.exec('BEGIN IMMEDIATE');
     try {
       this.db.exec(`CREATE TABLE analysis_runs_migrating (
         id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, assistant_message_id TEXT,
-        reasoning_mode TEXT NOT NULL DEFAULT 'auto', status TEXT NOT NULL,
+        reasoning_mode TEXT NOT NULL DEFAULT 'fast', status TEXT NOT NULL,
         action_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, completed_at TEXT
       ) STRICT`);
       this.db.exec(`INSERT INTO analysis_runs_migrating
@@ -159,8 +190,8 @@ export class Database {
   createConversation(modelId: string | null = null): Conversation {
     const id = randomUUID(); const now = new Date().toISOString();
     const title = 'Новый чат';
-    this.db.prepare("INSERT INTO conversations (id, title, model_id, mode, working_directory, primary_project_id, secondary_working_directory, secondary_project_id, context_window, reasoning_mode, context_tokens, context_model_id, web_mode, created_at, updated_at) VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, NULL, NULL, 'auto', ?, ?)").run(id, title, modelId, 'chat', 32_768, 'auto', now, now);
-    return { id, title, modelId, mode: 'chat', workingDirectory: null, primaryProjectId: null, secondaryWorkingDirectory: null, secondaryProjectId: null, contextWindow: 32_768, reasoningMode: 'auto', contextTokens: null, contextModelId: null, webMode: 'auto', createdAt: now, updatedAt: now };
+    this.db.prepare("INSERT INTO conversations (id, title, model_id, mode, working_directory, primary_project_id, secondary_working_directory, secondary_project_id, context_window, reasoning_mode, context_tokens, context_model_id, web_mode, created_at, updated_at) VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, NULL, NULL, 'auto', ?, ?)").run(id, title, modelId, 'chat', 32_768, 'fast', now, now);
+    return { id, title, modelId, mode: 'chat', workingDirectory: null, primaryProjectId: null, secondaryWorkingDirectory: null, secondaryProjectId: null, contextWindow: 32_768, reasoningMode: 'fast', contextTokens: null, contextModelId: null, webMode: 'auto', createdAt: now, updatedAt: now };
   }
 
   updateConversation(id: string, patch: Partial<Pick<Conversation, 'title' | 'modelId' | 'mode' | 'workingDirectory' | 'secondaryWorkingDirectory' | 'contextWindow' | 'reasoningMode' | 'webMode'>>): Conversation {
@@ -170,7 +201,7 @@ export class Database {
     if (patch.workingDirectory !== undefined && patch.workingDirectory !== current.workingDirectory) next.primaryProjectId = patch.workingDirectory ? randomUUID() : null;
     if (patch.secondaryWorkingDirectory !== undefined && patch.secondaryWorkingDirectory !== current.secondaryWorkingDirectory) next.secondaryProjectId = patch.secondaryWorkingDirectory ? randomUUID() : null;
     const contextWindow = [16_384, 32_768, 65_536, 131_072, 262_144].includes(next.contextWindow) ? next.contextWindow : 32_768;
-    const reasoningMode: ReasoningMode = next.reasoningMode === 'fast' || next.reasoningMode === 'deep' ? next.reasoningMode : 'auto';
+    const reasoningMode: ReasoningMode = next.reasoningMode === 'deep' ? 'deep' : 'fast';
     const webMode: WebMode = next.webMode === 'off' ? 'off' : 'auto';
     this.db.prepare('UPDATE conversations SET title=?, model_id=?, mode=?, working_directory=?, primary_project_id=?, secondary_working_directory=?, secondary_project_id=?, context_window=?, reasoning_mode=?, web_mode=?, updated_at=? WHERE id=?')
       .run(next.title, next.modelId, next.mode, next.workingDirectory, next.primaryProjectId, next.secondaryWorkingDirectory, next.secondaryProjectId, contextWindow, reasoningMode, webMode, next.updatedAt, id);
@@ -212,9 +243,9 @@ export class Database {
     return row ? mapMessage(row, this.listAttachments(row.id), this.listProjectReferences(row.id)) : null;
   }
 
-  addMessage(conversationId: string, role: ChatMessage['role'], content: string, id: string = randomUUID(), projectReferences: ProjectReference[] = []): ChatMessage {
-    const message = { id, conversationId, role, content, createdAt: new Date().toISOString() };
-    this.db.prepare('INSERT INTO messages VALUES (?, ?, ?, ?, ?)').run(message.id, message.conversationId, message.role, message.content, message.createdAt);
+  addMessage(conversationId: string, role: ChatMessage['role'], content: string, id: string = randomUUID(), projectReferences: ProjectReference[] = [], response?: Pick<ChatMessage, 'thinking' | 'thinkingTimeline' | 'generationStats'>): ChatMessage {
+    const message: ChatMessage = { id, conversationId, role, content, createdAt: new Date().toISOString(), ...(response?.thinking?.trim() ? { thinking: response.thinking } : {}), ...(response?.thinkingTimeline?.length ? { thinkingTimeline: response.thinkingTimeline } : {}), ...(response?.generationStats ? { generationStats: response.generationStats } : {}) };
+    this.db.prepare('INSERT INTO messages (id, conversation_id, role, content, thinking, thinking_timeline, generation_stats, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(message.id, message.conversationId, message.role, message.content, message.thinking ?? null, message.thinkingTimeline ? JSON.stringify(message.thinkingTimeline) : null, message.generationStats ? JSON.stringify(message.generationStats) : null, message.createdAt);
     for (const [position, reference] of projectReferences.entries()) this.db.prepare('INSERT INTO project_references (id, message_id, position, project_id, project_slot, project_path, project_label, relative_path, kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run(reference.id, message.id, position, reference.projectId, reference.projectSlot, reference.projectPath, reference.projectLabel, reference.relativePath, reference.kind);
     this.db.prepare('UPDATE conversations SET updated_at=? WHERE id=?').run(message.createdAt, conversationId);
     return { ...message, projectReferences };
