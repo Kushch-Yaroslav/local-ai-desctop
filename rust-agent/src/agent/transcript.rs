@@ -38,6 +38,14 @@ impl Transcript {
     pub fn remind(&mut self, content: String) {
         self.events.push(Entry::Reminder(content));
     }
+    /// Runtime reminders are single-request control, never a second
+    /// conversation. Retiring them before the next request prevents stale
+    /// exploration, synthesis and closeout instructions from accumulating at
+    /// the system boundary and making a completed phase look active again.
+    pub fn clear_reminders(&mut self) {
+        self.events
+            .retain(|entry| !matches!(entry, Entry::Reminder(_)));
+    }
     pub fn entries(&self) -> &[Entry] {
         &self.events
     }
@@ -140,5 +148,20 @@ mod tests {
         assert_eq!(messages[1]["role"], "user");
         assert_eq!(messages[2]["role"], "assistant");
         assert_eq!(messages[2]["content"], "first complete section\n");
+    }
+
+    #[test]
+    fn runtime_reminders_are_scoped_to_one_request() {
+        let mut transcript = Transcript::default();
+        transcript.push_run_user(json!({"role":"user","content":"audit"}));
+        transcript.remind("old execute instruction".into());
+        transcript.remind("old synthesis instruction".into());
+        transcript.clear_reminders();
+        transcript.remind("current final instruction".into());
+        let messages = crate::context::projection::project(&transcript, "control", "");
+        let control = messages[0]["content"].as_str().unwrap();
+        assert!(!control.contains("old execute"));
+        assert!(!control.contains("old synthesis"));
+        assert!(control.contains("current final"));
     }
 }

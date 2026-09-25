@@ -886,6 +886,11 @@ pub fn run(config: Config) {
         for message in steering {
             transcript.push_steering(message);
         }
+        // Controls describe the request about to be made. Keeping old controls
+        // in the projected system prompt was causing Qwen to receive stale
+        // execute/synthesis/closeout instructions simultaneously and spend
+        // Deep reasoning re-litigating work it had already closed.
+        transcript.clear_reminders();
         emit(&config.run_id, Event::TurnStarted { index: turn + 1 });
         // Once a provider exhausts a final prefix, that continuation is a
         // final-output request even if an honest Plan closeout happened to be
@@ -897,8 +902,33 @@ pub fn run(config: Config) {
         } else {
             phase_for(&state, needs_plan, turn)
         };
-        if matches!(phase, "synthesis" | "final" | "final_continuation") {
-            transcript.remind("SYNTHESIS PHASE: investigation is complete. Consolidate the durable Task Notes and investigated evidence into the user-facing audit now. Do not rediscover the project, reconstruct raw files, or repeatedly draft the same outline internally. A focused retrieval is allowed only for one named unresolved fact; otherwise update the current Task Plan honestly and produce the final answer.".into());
+        let plan_closeout_turn = plan_closeout_due && state.plan.has_open();
+        let phase_checkpoint_turn =
+            needs_plan && !state.plan.phases.is_empty() && state.plan_checkpoint_due();
+        let planning_turn = !final_continuation_turn
+            && ((needs_plan && state.plan.phases.is_empty())
+                || plan_closeout_turn
+                || phase_checkpoint_turn);
+        if final_continuation_turn {
+            transcript.remind(format!(
+                "FINAL CONTINUATION: the provider exhausted the user-facing answer after {} characters. Continue exactly from that point; do not repeat completed sections, planning, or investigation.",
+                final_content.chars().count()
+            ));
+        } else if phase == "synthesis" {
+            transcript.remind("SYNTHESIS CHECKPOINT: exploration is complete. Consolidate only new durable findings into Task Notes and honestly close the Task Plan. Do not rediscover the project or draft the final answer in this checkpoint; the next final phase will present the audit.".into());
+        } else if phase == "final" {
+            transcript.remind("FINAL RESPONSE: exploration, Task Plan and Task Notes are complete. Write the user-facing answer directly from the durable evidence. Do not revisit planning, tool selection, or reconstruct the audit outline before answering.".into());
+        }
+        if plan_closeout_turn {
+            transcript.remind(format!(
+                "TASK PLAN CLOSEOUT: update the currently open work now. Mark completed work done or explicitly drop it; do not write the final answer in this request.\n{}",
+                state.plan.open_summary().unwrap_or_default()
+            ));
+        } else if phase_checkpoint_turn {
+            transcript.remind(format!(
+                "TASK PLAN PHASE CHECKPOINT: advance exactly one honest phase now. In one `task_plan` batch, mark the current completed item done and start only its immediate successor. Do not start a later task while an earlier item is still open.\n{}",
+                state.plan.open_summary().unwrap_or_default()
+            ));
         }
         emit(
             &config.run_id,
@@ -1105,13 +1135,6 @@ pub fn run(config: Config) {
         // first visible operation is real structured state, not an optional
         // prompt suggestion. After representative evidence exists, checkpoint
         // it once in Task Notes before allowing broader exploration again.
-        let plan_closeout_turn = plan_closeout_due && state.plan.has_open();
-        let phase_checkpoint_turn =
-            needs_plan && !state.plan.phases.is_empty() && state.plan_checkpoint_due();
-        let planning_turn = !final_continuation_turn
-            && ((needs_plan && state.plan.phases.is_empty())
-                || plan_closeout_turn
-                || phase_checkpoint_turn);
         let notes_checkpoint_turn = !final_continuation_turn
             && needs_plan
             && state.investigated.len() >= 3
@@ -1301,10 +1324,6 @@ pub fn run(config: Config) {
                     return;
                 }
                 final_continuations += 1;
-                transcript.remind(format!(
-                    "The user-facing final answer was interrupted by the provider output limit after {} characters. Continue exactly from that unfinished point. Do not repeat its introduction, outline, or completed sections. Finish naturally when complete.",
-                    final_content.chars().count()
-                ));
                 emit(
                     &config.run_id,
                     Event::FinalContinuation {
@@ -1331,7 +1350,6 @@ pub fn run(config: Config) {
             if state.plan.has_open() && closeout_attempts < plan_total.max(1) {
                 closeout_attempts += 1;
                 plan_closeout_due = true;
-                transcript.remind(format!("Task Plan remains open. This is a closeout turn: call task_plan now to mark the completed current item done, or explicitly drop work that is not needed. Do not write an answer yet.\n{}", state.plan.open_summary().unwrap_or_default()));
                 continue;
             }
             emit(
