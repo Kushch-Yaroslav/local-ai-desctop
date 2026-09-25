@@ -1,20 +1,25 @@
 import type { ChatMessage, FinishReason, ModelInfo, ReasoningMode, StreamEvent } from '../../shared/types';
 import { createHash } from 'node:crypto';
-import { wholeNanoseconds, type InferenceDiagnostics, type LlmBackend, type ToolCallingBackend, type ToolInferenceRequestContext, type ToolMessage } from './types';
+import { wholeNanoseconds, type InferenceDiagnostics, type LlmBackend, type ToolCallingBackend, type ToolInferenceRequestContext, type ToolInferenceStreamEvent, type ToolMessage } from './types';
 import { contextPresetsFor, getModelProfile, maxOutputTokens, modelInfo, outputBudget, outputSafetyReserveTokens } from '../models/model-registry';
 import type { ContextWindow } from './ollama-backend';
 import { log } from '../services/logger';
 
-type Choice = { finish_reason?: string | null; message?: { content?: string | null; reasoning_content?: string | null; tool_calls?: Array<{ id?: string; type?: string; function?: { name?: string; arguments?: string } }> }; delta?: { content?: string | null; reasoning_content?: string | null } };
+type NativeToolCall = { index?: number; id?: string; type?: string; function?: { name?: string; arguments?: string } };
+type Choice = { finish_reason?: string | null; message?: { content?: string | null; reasoning_content?: string | null; tool_calls?: NativeToolCall[] }; delta?: { content?: string | null; reasoning_content?: string | null; tool_calls?: NativeToolCall[] } };
 type ChatResponse = { choices?: Choice[]; usage?: { prompt_tokens?: number; completion_tokens?: number }; timings?: { prompt_ms?: number; predicted_ms?: number; prompt_per_second?: number; predicted_per_second?: number } };
 type ModelsResponse = { data?: Array<{ meta?: { n_ctx?: number; size?: number } }> };
 type InputTokenResponse = { input_tokens?: unknown };
 const qwenModel = 'qwen3.8:27b-q4_K_M';
 const glmFlashModel = 'glm-4.7-flash:q4_k';
-// Qwen3.8's bundled llama.cpp chat template accepts low and xhigh.
+// Qwen3.8's template supports a native think switch.  A mechanical Agent
+// continuation needs a direct tool decision, not another hidden design essay;
+// Deep is still enabled for planning, investigation and synthesis.
 function llamaCppReasoning(model: string, mode: ReasoningMode): Record<string, unknown> {
   if (mode === 'auto') return {};
-  if (model === qwenModel) return { reasoning_effort: mode === 'fast' ? 'low' : 'xhigh' };
+  if (model === qwenModel) return mode === 'fast'
+    ? { reasoning_effort: 'low', chat_template_kwargs: { enable_thinking: false } }
+    : { reasoning_effort: 'xhigh', chat_template_kwargs: { enable_thinking: true } };
   if (model === glmFlashModel) return { reasoning_effort: mode === 'fast' ? 'none' : 'xhigh', chat_template_kwargs: { enable_thinking: mode !== 'fast' } };
   return {};
 }
@@ -263,6 +268,66 @@ export class LlamaCppBackend implements LlmBackend, ToolCallingBackend {
         log('llama-cpp.agent.inference.failed', { ...agentDiagnostics, failedAt: new Date(failedAt).toISOString(), elapsedMs: failedAt - startedAt, signalAborted: signal.aborted, ...summary, health });
       }
       if (connectionError && !signal.aborted) throw new Error(`llama.cpp inference connection failed: ${summary.error}`, { cause: error });
+      throw error;
+    }
+  }
+  /** Streaming counterpart of chatWithTools. The response is assembled only at
+   * [DONE], so callers retain the same strict validation boundary as the
+   * non-streaming protocol. */
+  async *streamWithTools(model: string, messages: ToolMessage[], tools: unknown[] | undefined, signal: AbortSignal, contextWindow: number, reasoningMode: ReasoningMode, requestContext?: ToolInferenceRequestContext): AsyncIterable<ToolInferenceStreamEvent> {
+    const startedAt = Date.now(); const endpoint = '/v1/chat/completions';
+    const diagnostics = requestContext ? { generationId: requestContext.generationId, conversationId: requestContext.conversationId, agentStep: requestContext.agentStep, phase: requestContext.phase, messageCount: messages.length, toolResultCount: messages.filter((message) => message.role === 'tool').length, assistantToolCallCount: messages.reduce((count, message) => count + (message.tool_calls?.length ?? 0), 0), contextWindow } : undefined;
+    const first: Record<string, number | undefined> = { event: undefined, reasoning: undefined, content: undefined, tool: undefined };
+    const assembled = new Map<number, { id?: string; type?: string; name?: string; arguments: string }>();
+    let text = ''; let thinking = ''; let finalData: ChatResponse | undefined; let finalReason: FinishReason | undefined;
+    try {
+      await this.ensureModelAvailable(model);
+      const sequenceError = validateLlamaMessageSequence(messages); if (sequenceError) throw new Error(`Некорректная последовательность Agent сообщений: ${sequenceError}`);
+      const budget = await this.budget(model, messages, contextWindow, reasoningMode, tools, signal);
+      if (diagnostics) log('llama-cpp.agent.stream.started', { ...diagnostics, startedAt: new Date(startedAt).toISOString(), requestedMaxTokens: budget.requestedMaxTokens, maxTokens: budget.maxTokens, exactPromptTokens: budget.accounting.exactPromptTokens });
+      const response = await fetch(this.url(endpoint), { method: 'POST', signal, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...this.payload(model, messages, tools, reasoningMode, budget.maxTokens, true), stream_options: { include_usage: true } }) });
+      first.event = Date.now();
+      if (diagnostics) log('llama-cpp.agent.stream.headers', { ...diagnostics, latencyMs: first.event - startedAt, status: response.status });
+      if (!response.ok) { await this.failedRequest(model, messages, tools, contextWindow, budget, response, endpoint); return; }
+      if (!response.body) throw new Error('llama.cpp не вернул stream body для Agent turn');
+      const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = '';
+      try {
+        while (!signal.aborted) {
+          const { done, value } = await reader.read(); buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
+          const blocks = buffer.split('\n\n'); buffer = blocks.pop() ?? '';
+          for (const raw of blocks) {
+            if (!raw.startsWith('data: ')) continue;
+            const item = raw.slice(6).trim();
+            if (item === '[DONE]') {
+              finalReason ??= 'stop';
+              const calls = [...assembled.entries()].sort(([a], [b]) => a - b).flatMap(([, call]) => call.name ? [{ ...(call.id ? { id: call.id } : {}), ...(call.type === 'function' ? { type: 'function' as const } : {}), function: { name: call.name, arguments: call.arguments } }] : []);
+              this.recordCalibration(budget, contextWindow, finalData ?? null);
+              const inference = this.diagnostics(reasoningMode, contextWindow, budget, finalData);
+              if (diagnostics) log('llama-cpp.agent.stream.finished', { ...diagnostics, generationDurationMs: Date.now() - startedAt, finishReason: finalReason, firstEventMs: first.event === undefined ? undefined : first.event - startedAt, firstReasoningMs: first.reasoning === undefined ? undefined : first.reasoning - startedAt, firstContentMs: first.content === undefined ? undefined : first.content - startedAt, firstToolCallMs: first.tool === undefined ? undefined : first.tool - startedAt, reasoningChars: thinking.length, contentChars: text.length, toolCallsDetected: calls.length, completionTokens: inference.evalCount });
+              yield { type: 'response', response: { role: 'assistant', content: text, ...(thinking ? { thinking } : {}), tool_calls: calls, finish_reason: finalReason, prompt_eval_count: finalData?.usage?.prompt_tokens, inference } };
+              return;
+            }
+            const data = JSON.parse(item) as ChatResponse; const choice = data.choices?.[0];
+            if (data.usage || data.timings) finalData = { ...finalData, ...data, usage: data.usage ?? finalData?.usage, timings: data.timings ?? finalData?.timings };
+            const delta = choice?.delta;
+            if (delta?.reasoning_content) { first.reasoning ??= Date.now(); thinking += delta.reasoning_content; yield { type: 'thinking', content: delta.reasoning_content }; }
+            if (delta?.content) { first.content ??= Date.now(); text += delta.content; yield { type: 'token', content: delta.content }; }
+            for (const rawCall of delta?.tool_calls ?? []) {
+              first.tool ??= Date.now(); const index = rawCall.index ?? assembled.size; const current = assembled.get(index) ?? { arguments: '' };
+              if (rawCall.id) current.id = rawCall.id; if (rawCall.type) current.type = rawCall.type; if (rawCall.function?.name) current.name = rawCall.function.name;
+              const argumentsDelta = rawCall.function?.arguments; if (argumentsDelta) current.arguments += argumentsDelta;
+              assembled.set(index, current);
+              yield { type: 'tool_call_delta', index, ...(rawCall.id ? { id: rawCall.id } : {}), ...(rawCall.function?.name ? { name: rawCall.function.name } : {}), ...(argumentsDelta ? { argumentsDelta } : {}) };
+            }
+            if (choice?.finish_reason) finalReason = finishReason(choice.finish_reason);
+          }
+          if (done) break;
+        }
+      } finally { reader.releaseLock(); }
+      if (signal.aborted) return;
+      throw new Error('Agent stream завершился без [DONE]');
+    } catch (error) {
+      if (diagnostics) log('llama-cpp.agent.stream.failed', { ...diagnostics, elapsedMs: Date.now() - startedAt, signalAborted: signal.aborted, ...errorSummary(error) });
       throw error;
     }
   }

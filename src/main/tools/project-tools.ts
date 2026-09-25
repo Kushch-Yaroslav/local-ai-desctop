@@ -390,14 +390,19 @@ function trustedProjectExecutionStage(stage: string): boolean {
 
 function runTerminal(command: string, timeout: number, cwd: string, signal: AbortSignal): Promise<string> {
   return new Promise((resolve) => {
+    // The assistant call already retains the full command. Repeating a large
+    // heredoc in the tool result can consume the entire Agent context without
+    // adding evidence, so retain only a bounded diagnostic echo here.
+    const commandDiagnostic = command.length > 1_200 ? `${command.slice(0, 1_200)}\n[command diagnostic truncated]` : command;
     const child = spawn('/bin/bash', ['-lc', command], { cwd, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = ''; let stderr = ''; let stdoutTruncated = false; let stderrTruncated = false; let finished = false;
     const append = (current: string, chunk: string, limit: number): string => { if (current.length >= limit) return current; const next = `${current}${chunk}`; return next.length > limit ? next.slice(0, limit) : next; };
     const finish = (result: Record<string, unknown>) => { if (finished) return; finished = true; signal.removeEventListener('abort', abort); clearTimeout(timer); resolve(JSON.stringify(result)); };
-    const abort = () => { if (child.pid) { try { process.kill(-child.pid, 'SIGTERM'); setTimeout(() => { try { process.kill(-child.pid!, 'SIGKILL'); } catch { /* Process already exited. */ } }, 2_000).unref(); } catch { child.kill('SIGTERM'); } } finish({ cancelled: true, reason: 'Generation cancelled' }); };
-    const timer = setTimeout(() => abort(), timeout);
+    const terminate = () => { if (child.pid) { try { process.kill(-child.pid, 'SIGTERM'); setTimeout(() => { try { process.kill(-child.pid!, 'SIGKILL'); } catch { /* Process already exited. */ } }, 2_000).unref(); } catch { child.kill('SIGTERM'); } } };
+    const abort = () => { terminate(); finish({ cancelled: true, reason: 'Generation cancelled' }); };
+    const timer = setTimeout(() => { terminate(); finish({ timed_out: true, error: `Terminal command exceeded timeout of ${timeout}ms`, command: commandDiagnostic, cwd, stdout: stdoutTruncated ? `${stdout}\n[diagnostic output truncated]` : stdout, stderr: stderrTruncated ? `${stderr}\n[diagnostic output truncated]` : stderr }); }, timeout);
     signal.addEventListener('abort', abort, { once: true });
     child.stdout.on('data', (chunk: Buffer) => { const text = chunk.toString(); stdoutTruncated ||= stdout.length + text.length > 80_000; stdout = append(stdout, text, 80_000); }); child.stderr.on('data', (chunk: Buffer) => { const text = chunk.toString(); stderrTruncated ||= stderr.length + text.length > 20_000; stderr = append(stderr, text, 20_000); });
-    child.on('error', (error) => finish({ error: error.message, cwd })); child.on('close', (code, signalName) => finish({ command, cwd, exit_code: code, signal: signalName, stdout: stdoutTruncated ? `${stdout}\n[diagnostic output truncated]` : stdout, stderr: stderrTruncated ? `${stderr}\n[diagnostic output truncated]` : stderr }));
+    child.on('error', (error) => finish({ error: error.message, cwd })); child.on('close', (code, signalName) => finish({ command: commandDiagnostic, cwd, exit_code: code, signal: signalName, stdout: stdoutTruncated ? `${stdout}\n[diagnostic output truncated]` : stdout, stderr: stderrTruncated ? `${stderr}\n[diagnostic output truncated]` : stderr }));
   });
 }

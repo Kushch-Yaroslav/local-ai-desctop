@@ -6,6 +6,7 @@ import { getHardwareStats } from '../services/hardware';
 import { OllamaBackend } from '../backends/ollama-backend';
 import { LlamaCppBackend } from '../backends/llama-cpp-backend';
 import { ProjectChatService, type AgentProject } from '../services/project-chat';
+import { RustAgentRuntime } from '../services/rust-agent-runtime';
 import { paths } from '../services/paths';
 import { log } from '../services/logger';
 import { contextPresetsFor, getModelProfile, modelRegistry } from '../models/model-registry';
@@ -34,6 +35,9 @@ const llamaCpp = new LlamaCppBackend(process.env.LOCAL_AI_LLAMA_CPP_URL ?? 'http
 const backend = selectedBackend === 'llama-cpp' ? llamaCpp : ollama;
 const web = new WebBrowserService();
 const projectChat = new ProjectChatService(backend, web);
+// Agent V2 owns orchestration and tools. ProjectChatService remains only for
+// legacy compatibility until its code can be deleted after acceptance tests.
+const rustAgent = new RustAgentRuntime(process.env.LOCAL_AI_AGENT_ENDPOINT ?? (selectedBackend === 'llama-cpp' ? process.env.LOCAL_AI_LLAMA_CPP_URL ?? 'http://127.0.0.1:8081/v1/chat/completions' : 'http://127.0.0.1:11434/v1/chat/completions'));
 const webChat = new WebChatService(backend, web);
 const attachments = new AttachmentService(database);
 const attachmentPipeline = new AttachmentPipeline(database, attachments);
@@ -226,7 +230,7 @@ export function registerIpc(): void {
     if (!current()) return;
     await backend.ensureModelAvailable(request.model);
     if (!current()) return;
-    let output = ''; let thinking = ''; let messageDiagnostics: import('../../shared/types').GenerationDiagnostics | undefined; let completed = false; let failed = false; let finishReason: 'stop' | 'length' = 'stop';
+    let output = ''; let thinking = ''; let taskPlan: import('../../shared/types').AgentPlan | undefined; let messageDiagnostics: import('../../shared/types').GenerationDiagnostics | undefined; let completed = false; let failed = false; let finishReason: 'stop' | 'length' = 'stop';
     const thinkingTimeline: ThinkingTimelineEvent[] = []; const activityTimelinePositions = new Map<string, number>(); let timelinePosition = 0; let lastTimelineKind: ThinkingTimelineEvent['kind'] | null = null;
     const agentProjects: AgentProject[] = mode === 'agent' ? [...selectedProjects] : [];
     const agentRoot = agentProjects[0]?.root ?? null;
@@ -242,7 +246,7 @@ export function registerIpc(): void {
       let history = attachmentPipeline.buildContext(request.messages, !hasImages);
       if (nativeVision) history = await attachmentPipeline.prepareNativeImages(history, abort.signal);
       const stream = mode === 'agent'
-        ? projectChat.stream(request.model, history, agentProjects, abort.signal, context.active, conversation.reasoningMode, conversation.webMode, inlineConfirmation(event, request.conversationId, generation, agentRoot ?? homedir()), { generationId: generation.id, conversationId: request.conversationId })
+        ? rustAgent.stream(request.model, history, agentProjects, abort.signal, context.active, conversation.reasoningMode, conversation.webMode, generation.id)
         : conversation.webMode === 'auto'
           ? webChat.stream(request.model, history, abort.signal, context.active, conversation.reasoningMode)
           : backend.streamChat(request.model, chatMessagesWithSystemPrefix(history, [chatSystemContext({ webAvailable: false }, conversation.reasoningMode === 'deep' ? 'deep' : 'fast')], request.conversationId, `capability-${request.conversationId}`), abort.signal, context.active, conversation.reasoningMode);
@@ -252,10 +256,15 @@ export function registerIpc(): void {
         if (chunk.type === 'thinking') {
           thinking += chunk.content;
           if (mode === 'agent') {
-            if (lastTimelineKind !== 'reasoning') { timelinePosition += 1; thinkingTimeline.push({ id: randomUUID(), kind: 'reasoning', content: chunk.content, position: timelinePosition }); lastTimelineKind = 'reasoning'; }
+            if (lastTimelineKind !== 'reasoning') { timelinePosition += 1; thinkingTimeline.push({ id: randomUUID(), kind: 'reasoning', content: chunk.content, position: timelinePosition, startedAt: new Date().toISOString() }); lastTimelineKind = 'reasoning'; }
             else { const entry = thinkingTimeline.at(-1); if (entry?.kind === 'reasoning') entry.content += chunk.content; }
             chunk = { ...chunk, timelinePosition };
           }
+        }
+        if (chunk.type === 'task-plan') {
+          taskPlan = structuredClone(chunk.plan);
+          event.sender.send('chat:stream', { ...chunk, conversationId: request.conversationId, generationId: generation.id });
+          continue;
         }
         if (chunk.type === 'context-usage') {
           database.setContextUsage(request.conversationId, request.model, chunk.used);
@@ -273,6 +282,7 @@ export function registerIpc(): void {
         if (chunk.type === 'done') { completed = true; finishReason = chunk.finishReason === 'length' ? 'length' : 'stop'; continue; }
         if (chunk.type === 'error') failed = true;
         if (run && chunk.type === 'tool') {
+          if (lastTimelineKind === 'reasoning') { const prior = thinkingTimeline.at(-1); if (prior?.kind === 'reasoning') prior.completedAt = new Date().toISOString(); }
           const existingPosition = activityTimelinePositions.get(chunk.activity.id);
           const position = existingPosition ?? (timelinePosition += 1);
           if (existingPosition === undefined) { activityTimelinePositions.set(chunk.activity.id, position); thinkingTimeline.push({ id: randomUUID(), kind: 'activity', activityId: chunk.activity.id, position }); }
@@ -287,6 +297,7 @@ export function registerIpc(): void {
       }
       if (!current()) { if (run) database.finishAnalysisRun(run.id, 'cancelled', null); return; }
       if (failed || !completed) { if (run) event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run: database.finishAnalysisRun(run.id, 'error', null) }); return; }
+      if (lastTimelineKind === 'reasoning') { const prior = thinkingTimeline.at(-1); if (prior?.kind === 'reasoning') prior.completedAt = new Date().toISOString(); }
       const inputTokens = messageDiagnostics?.promptEvalCount ?? messageDiagnostics?.inputTokens;
       const generationStats = messageDiagnostics?.evalCount === undefined ? undefined : {
         outputTokens: messageDiagnostics.evalCount,
@@ -295,7 +306,7 @@ export function registerIpc(): void {
         ...(messageDiagnostics.timeToFirstTokenMs !== undefined ? { timeToFirstTokenMs: messageDiagnostics.timeToFirstTokenMs } : {}),
         ...(inputTokens !== undefined ? { inputTokens } : {}),
       };
-      const assistant = output ? database.addMessage(request.conversationId, 'assistant', output, undefined, [], { ...(thinking.trim() ? { thinking } : {}), ...(thinkingTimeline.length ? { thinkingTimeline } : {}), ...(generationStats ? { generationStats } : {}) }) : null;
+      const assistant = output ? database.addMessage(request.conversationId, 'assistant', output, undefined, [], { ...(thinking.trim() ? { thinking } : {}), ...(thinkingTimeline.length ? { thinkingTimeline } : {}), ...(taskPlan ? { taskPlan } : {}), ...(generationStats ? { generationStats } : {}) }) : null;
       if (run) event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run: database.finishAnalysisRun(run.id, 'completed', assistant?.id ?? null) });
       event.sender.send('chat:stream', { type: 'done', conversationId: request.conversationId, generationId: generation.id, assistant, finishReason });
     } catch (error) {

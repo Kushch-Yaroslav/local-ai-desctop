@@ -1,11 +1,11 @@
 import type { ThinkingTimelineEvent, ToolActivity } from './types';
 
 export type ThinkingTimelineItem =
-  | { id: string; kind: 'reasoning'; content: string; live: boolean; position?: number }
+  | { id: string; kind: 'reasoning'; content: string; live: boolean; position?: number; startedAt?: string; completedAt?: string }
   | { id: string; kind: 'activity'; activity: ToolActivity; position?: number };
 
 function reasoningItems(event: Extract<ThinkingTimelineEvent, { kind: 'reasoning' }>, live: boolean): ThinkingTimelineItem[] {
-  return event.content.split(/\n\s*\n/).map((content) => content.trim()).filter(Boolean).map((content, index, sections) => ({ id: `${event.id}-${index}`, kind: 'reasoning' as const, content, live: live && index === sections.length - 1, position: event.position }));
+  return event.content.split(/\n\s*\n/).map((content) => content.trim()).filter(Boolean).map((content, index, sections) => ({ id: `${event.id}-${index}`, kind: 'reasoning' as const, content, live: live && index === sections.length - 1, position: event.position, ...(index === 0 ? { startedAt: event.startedAt, completedAt: event.completedAt } : {}) }));
 }
 
 /**

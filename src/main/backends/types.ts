@@ -11,6 +11,13 @@ export type ToolInferenceRequestContext = {
   agentStep?: number;
   phase?: 'initial' | 'post_tool' | 'recovery' | 'final';
 };
+/** Incremental events for an Agent decision. Tool calls remain untrusted until
+ * the terminal `response` event, when the runtime applies protocol validation. */
+export type ToolInferenceStreamEvent =
+  | { type: 'thinking'; content: string }
+  | { type: 'token'; content: string }
+  | { type: 'tool_call_delta'; index: number; id?: string; name?: string; argumentsDelta?: string }
+  | { type: 'response'; response: ToolMessage };
 
 /** SQLite diagnostics columns use INTEGER nanoseconds, so backend timing values are canonicalized here. */
 export function wholeNanoseconds(value: number | undefined): number | undefined {
@@ -30,6 +37,8 @@ export interface ToolCallingBackend {
   chatWithTools(model: string, messages: ToolMessage[], tools: unknown[] | undefined, signal: AbortSignal, contextWindow: number, reasoningMode: ReasoningMode, requestContext?: ToolInferenceRequestContext): Promise<ToolMessage>;
   /** Same tokenizer/chat-template accounting used by the runtime request. */
   countInputTokens?(model: string, messages: ToolMessage[], tools: unknown[] | undefined, contextWindow: number, reasoningMode: ReasoningMode, signal: AbortSignal): Promise<number>;
+  /** Native streaming Agent transport when a provider can expose tool deltas. */
+  streamWithTools?(model: string, messages: ToolMessage[], tools: unknown[] | undefined, signal: AbortSignal, contextWindow: number, reasoningMode: ReasoningMode, requestContext?: ToolInferenceRequestContext): AsyncIterable<ToolInferenceStreamEvent>;
 }
 
 export interface LlmBackend {

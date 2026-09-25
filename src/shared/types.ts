@@ -82,6 +82,19 @@ export interface GenerationStats {
   inputTokens?: number;
 }
 
+export interface AgentTelemetry {
+  turn: number;
+  contextUsed?: number;
+  contextLimit?: number;
+  inputTokens: number;
+  outputTokens: number;
+  tokensPerSecond?: number;
+  actions: number;
+  compactions?: number;
+  startedAt: string;
+  finishedAt?: string;
+}
+
 export interface ModelInfo {
   id: string;
   name: string;
@@ -143,8 +156,14 @@ export interface ChatMessage {
   thinking?: string;
   /** Ordered reasoning/activity references for Agent turns. Older messages omit this. */
   thinkingTimeline?: ThinkingTimelineEvent[];
+  taskPlan?: AgentPlan;
   /** Optional for conversations written before per-message generation statistics existed. */
   generationStats?: GenerationStats;
+  /** V2 Agent terminal state kept in the flat activity timeline. It is never
+   * sent back to a model or persisted as a normal assistant completion. */
+  agentError?: string;
+  agentCancelled?: boolean;
+  agentFinishedAt?: string;
   /** Ephemeral base64 image inputs for Ollama. These are rebuilt from managed attachment storage and are never persisted in SQLite. */
   images?: string[];
 }
@@ -192,6 +211,10 @@ export interface ToolActivity {
   output?: string;
   /** Full raw tool result for SQLite run history. It is stripped before IPC/UI rendering. */
   rawOutput?: string;
+  /** Immutable execution identity plus streamed/final terminal diagnostics.
+   * Kept separately from generic tool output so a stdout delta can never erase
+   * the command that produced it. */
+  terminal?: TerminalExecution;
   approval?: ActionApproval;
   status?: AttachmentStatus;
   attachment?: Attachment;
@@ -201,8 +224,24 @@ export interface ToolActivity {
   timelinePosition?: number;
 }
 
+export interface TerminalExecution {
+  command?: string;
+  cwd?: string;
+  pid?: number;
+  pgid?: number;
+  sessionId?: number;
+  startedAt?: string;
+  finishedAt?: string;
+  exitCode?: number | null;
+  timedOut?: boolean;
+  cancelled?: boolean;
+  status?: 'running' | 'completed' | 'error' | 'cancelled' | 'timed_out';
+  stdout?: string;
+  stderr?: string;
+}
+
 export type ThinkingTimelineEvent =
-  | { id: string; kind: 'reasoning'; content: string; position: number }
+  | { id: string; kind: 'reasoning'; content: string; position: number; startedAt?: string; completedAt?: string }
   | { id: string; kind: 'activity'; activityId: string; position: number };
 
 export type AgentPlanStepStatus = 'pending' | 'in_progress' | 'completed';
@@ -229,6 +268,7 @@ export interface AnalysisProgress {
 export type StreamEvent =
   | { type: 'token'; content: string }
   | { type: 'thinking'; content: string; timelinePosition?: number }
+  | { type: 'task-plan'; plan: AgentPlan }
   | { type: 'tool'; activity: ToolActivity; runId?: string }
   | { type: 'attachment'; activity: ToolActivity }
   | { type: 'approval-request'; actionId: string; approval: ActionApproval }
@@ -237,6 +277,7 @@ export type StreamEvent =
   | { type: 'analysis'; progress: AnalysisProgress }
   | { type: 'context'; requested: number; active: number; supported?: number }
   | { type: 'context-usage'; used: number; maximum: number }
+  | { type: 'agent-telemetry'; telemetry: Partial<AgentTelemetry> }
   | { type: 'diagnostics'; diagnostics: Omit<GenerationDiagnostics, 'generationId' | 'conversationId' | 'createdAt'> }
   | { type: 'done'; assistant?: ChatMessage | null; finishReason?: FinishReason }
   | { type: 'cancelled' }

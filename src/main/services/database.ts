@@ -12,7 +12,7 @@ type ConversationRow = {
   web_mode: WebMode;
   created_at: string; updated_at: string;
 };
-type MessageRow = { id: string; conversation_id: string; role: ChatMessage['role']; content: string; thinking: string | null; thinking_timeline: string | null; generation_stats: string | null; created_at: string };
+type MessageRow = { id: string; conversation_id: string; role: ChatMessage['role']; content: string; thinking: string | null; thinking_timeline: string | null; task_plan: string | null; generation_stats: string | null; created_at: string };
 type ProjectReferenceRow = { id: string; message_id: string; position: number; project_id: string; project_slot: 1 | 2; project_path: string; project_label: string; relative_path: string; kind: ProjectReferenceKind };
 type AttachmentRow = { id: string; message_id: string; position: number; kind: AttachmentKind; mime_type: string; filename: string; size: number; storage_ref: string; status: AttachmentStatus; extracted_text: string | null; structured_data: string | null; vision_analysis: string | null; error: string | null; metadata: string | null; created_at: string; updated_at: string };
 type AnalysisRunRow = { id: string; conversation_id: string; assistant_message_id: string | null; reasoning_mode: ReasoningMode; status: AnalysisRun['status']; action_count: number; created_at: string; completed_at: string | null };
@@ -49,16 +49,19 @@ function parseGenerationStats(value: string | null): GenerationStats | undefined
 const mapMessage = (row: MessageRow, attachments?: Attachment[], projectReferences?: ProjectReference[]): ChatMessage => {
   const generationStats = parseGenerationStats(row.generation_stats);
   let thinkingTimeline: ThinkingTimelineEvent[] | undefined;
+  let taskPlan: import('../../shared/types').AgentPlan | undefined;
   try {
     const parsed = row.thinking_timeline ? JSON.parse(row.thinking_timeline) as unknown : undefined;
-    if (Array.isArray(parsed)) thinkingTimeline = parsed.filter((item): item is ThinkingTimelineEvent => Boolean(item) && typeof item === 'object' && typeof item.id === 'string' && typeof item.position === 'number' && ((item.kind === 'reasoning' && typeof item.content === 'string') || (item.kind === 'activity' && typeof item.activityId === 'string')));
+    if (Array.isArray(parsed)) thinkingTimeline = parsed.filter((item): item is ThinkingTimelineEvent => Boolean(item) && typeof item === 'object' && typeof item.id === 'string' && typeof item.position === 'number' && ((item.kind === 'reasoning' && typeof item.content === 'string' && (item.startedAt === undefined || typeof item.startedAt === 'string') && (item.completedAt === undefined || typeof item.completedAt === 'string')) || (item.kind === 'activity' && typeof item.activityId === 'string')));
   } catch { /* Old or damaged timeline metadata remains optional. */ }
+  try { const parsed = row.task_plan ? JSON.parse(row.task_plan) as unknown : undefined; if (parsed && typeof parsed === 'object' && Array.isArray((parsed as { steps?: unknown }).steps)) taskPlan = parsed as import('../../shared/types').AgentPlan; } catch { /* Old snapshot remains optional. */ }
   return {
     id: row.id, conversationId: row.conversation_id, role: row.role, content: row.content, createdAt: row.created_at,
     attachments,
     projectReferences,
     ...(row.thinking?.trim() ? { thinking: row.thinking } : {}),
     ...(thinkingTimeline?.length ? { thinkingTimeline } : {}),
+    ...(taskPlan ? { taskPlan } : {}),
     ...(generationStats ? { generationStats } : {}),
   };
 };
@@ -83,7 +86,7 @@ export class Database {
       ) STRICT;
       CREATE TABLE IF NOT EXISTS messages (
         id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-        role TEXT NOT NULL, content TEXT NOT NULL, thinking TEXT, thinking_timeline TEXT, generation_stats TEXT, created_at TEXT NOT NULL
+        role TEXT NOT NULL, content TEXT NOT NULL, thinking TEXT, thinking_timeline TEXT, task_plan TEXT, generation_stats TEXT, created_at TEXT NOT NULL
       ) STRICT;
       CREATE INDEX IF NOT EXISTS messages_conversation_idx ON messages(conversation_id, created_at);
       CREATE TABLE IF NOT EXISTS project_references (
@@ -124,6 +127,7 @@ export class Database {
     try { this.db.exec('ALTER TABLE conversations ADD COLUMN secondary_project_id TEXT'); } catch { /* Existing databases already have this column. */ }
     try { this.db.exec('ALTER TABLE messages ADD COLUMN thinking TEXT'); } catch { /* Existing databases already have this column. */ }
     try { this.db.exec('ALTER TABLE messages ADD COLUMN thinking_timeline TEXT'); } catch { /* Existing databases already have this column. */ }
+    try { this.db.exec('ALTER TABLE messages ADD COLUMN task_plan TEXT'); } catch { /* Existing databases already have this column. */ }
     try { this.db.exec('ALTER TABLE messages ADD COLUMN generation_stats TEXT'); } catch { /* Existing databases already have this column. */ }
     this.db.exec("UPDATE conversations SET primary_project_id=lower(hex(randomblob(16))) WHERE working_directory IS NOT NULL AND primary_project_id IS NULL");
     try { this.db.exec('ALTER TABLE generation_diagnostics ADD COLUMN prompt_eval_count INTEGER'); } catch { /* Existing databases already have this column. */ }
@@ -243,9 +247,9 @@ export class Database {
     return row ? mapMessage(row, this.listAttachments(row.id), this.listProjectReferences(row.id)) : null;
   }
 
-  addMessage(conversationId: string, role: ChatMessage['role'], content: string, id: string = randomUUID(), projectReferences: ProjectReference[] = [], response?: Pick<ChatMessage, 'thinking' | 'thinkingTimeline' | 'generationStats'>): ChatMessage {
-    const message: ChatMessage = { id, conversationId, role, content, createdAt: new Date().toISOString(), ...(response?.thinking?.trim() ? { thinking: response.thinking } : {}), ...(response?.thinkingTimeline?.length ? { thinkingTimeline: response.thinkingTimeline } : {}), ...(response?.generationStats ? { generationStats: response.generationStats } : {}) };
-    this.db.prepare('INSERT INTO messages (id, conversation_id, role, content, thinking, thinking_timeline, generation_stats, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(message.id, message.conversationId, message.role, message.content, message.thinking ?? null, message.thinkingTimeline ? JSON.stringify(message.thinkingTimeline) : null, message.generationStats ? JSON.stringify(message.generationStats) : null, message.createdAt);
+  addMessage(conversationId: string, role: ChatMessage['role'], content: string, id: string = randomUUID(), projectReferences: ProjectReference[] = [], response?: Pick<ChatMessage, 'thinking' | 'thinkingTimeline' | 'taskPlan' | 'generationStats'>): ChatMessage {
+    const message: ChatMessage = { id, conversationId, role, content, createdAt: new Date().toISOString(), ...(response?.thinking?.trim() ? { thinking: response.thinking } : {}), ...(response?.thinkingTimeline?.length ? { thinkingTimeline: response.thinkingTimeline } : {}), ...(response?.taskPlan ? { taskPlan: response.taskPlan } : {}), ...(response?.generationStats ? { generationStats: response.generationStats } : {}) };
+    this.db.prepare('INSERT INTO messages (id, conversation_id, role, content, thinking, thinking_timeline, task_plan, generation_stats, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run(message.id, message.conversationId, message.role, message.content, message.thinking ?? null, message.thinkingTimeline ? JSON.stringify(message.thinkingTimeline) : null, message.taskPlan ? JSON.stringify(message.taskPlan) : null, message.generationStats ? JSON.stringify(message.generationStats) : null, message.createdAt);
     for (const [position, reference] of projectReferences.entries()) this.db.prepare('INSERT INTO project_references (id, message_id, position, project_id, project_slot, project_path, project_label, relative_path, kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run(reference.id, message.id, position, reference.projectId, reference.projectSlot, reference.projectPath, reference.projectLabel, reference.relativePath, reference.kind);
     this.db.prepare('UPDATE conversations SET updated_at=? WHERE id=?').run(message.createdAt, conversationId);
     return { ...message, projectReferences };
@@ -286,7 +290,7 @@ export class Database {
   }
 
   editUserMessageAndTruncate(messageId: string, content: string): ChatMessage[] {
-    const target = this.db.prepare("SELECT rowid, conversation_id, role FROM messages WHERE id=?").get(messageId) as { rowid: number; conversation_id: string; role: ChatMessage['role'] } | undefined;
+    const target = this.db.prepare("SELECT rowid, conversation_id, role, created_at FROM messages WHERE id=?").get(messageId) as { rowid: number; conversation_id: string; role: ChatMessage['role']; created_at: string } | undefined;
     if (!target || target.role !== 'user') throw new Error('Можно редактировать только существующее пользовательское сообщение');
     const text = content.trim(); if (!text) throw new Error('Сообщение не может быть пустым');
     this.db.exec('BEGIN IMMEDIATE');
@@ -297,22 +301,23 @@ export class Database {
   }
 
   regenerateUserMessageAndTruncate(messageId: string): ChatMessage[] {
-    const target = this.db.prepare("SELECT rowid, conversation_id, role FROM messages WHERE id=?").get(messageId) as { rowid: number; conversation_id: string; role: ChatMessage['role'] } | undefined;
+    const target = this.db.prepare("SELECT rowid, conversation_id, role, created_at FROM messages WHERE id=?").get(messageId) as { rowid: number; conversation_id: string; role: ChatMessage['role']; created_at: string } | undefined;
     if (!target || target.role !== 'user') throw new Error('Можно перегенерировать ответ только для существующего сообщения пользователя');
     this.db.exec('BEGIN IMMEDIATE');
     try { return this.truncateAfterUserMessage(target, true); }
     catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
 
-  private truncateAfterUserMessage(target: { rowid: number; conversation_id: string }, commit: boolean): ChatMessage[] {
+  private truncateAfterUserMessage(target: { rowid: number; conversation_id: string; created_at?: string }, commit: boolean): ChatMessage[] {
     const downstream = this.db.prepare('SELECT id FROM messages WHERE conversation_id=? AND rowid>?').all(target.conversation_id, target.rowid) as Array<{ id: string }>;
     const assistantIds = downstream.map((row) => row.id);
-    if (assistantIds.length) {
-      const placeholders = assistantIds.map(() => '?').join(',');
-      const runIds = this.db.prepare(`SELECT id FROM analysis_runs WHERE conversation_id=? AND assistant_message_id IN (${placeholders})`).all(target.conversation_id, ...assistantIds) as Array<{ id: string }>;
-      for (const run of runIds) this.db.prepare('DELETE FROM analysis_actions WHERE run_id=?').run(run.id);
-      if (runIds.length) this.db.prepare(`DELETE FROM analysis_runs WHERE id IN (${runIds.map(() => '?').join(',')})`).run(...runIds.map((run) => run.id));
-    }
+    const assistantPredicate = assistantIds.length ? `assistant_message_id IN (${assistantIds.map(() => '?').join(',')})` : '0';
+    // Failed/cancelled Agent runs have no assistant_message_id. They still
+    // belong to the downstream branch when they began after the regenerated
+    // user turn, so remove their activities with that branch as well.
+    const runIds = this.db.prepare(`SELECT id FROM analysis_runs WHERE conversation_id=? AND (${assistantPredicate} OR (assistant_message_id IS NULL AND created_at>=?))`).all(target.conversation_id, ...assistantIds, target.created_at ?? '') as Array<{ id: string }>;
+    for (const run of runIds) this.db.prepare('DELETE FROM analysis_actions WHERE run_id=?').run(run.id);
+    if (runIds.length) this.db.prepare(`DELETE FROM analysis_runs WHERE id IN (${runIds.map(() => '?').join(',')})`).run(...runIds.map((run) => run.id));
     this.db.prepare('DELETE FROM attachments WHERE message_id IN (SELECT id FROM messages WHERE conversation_id=? AND rowid>?)').run(target.conversation_id, target.rowid);
     this.db.prepare('DELETE FROM project_references WHERE message_id IN (SELECT id FROM messages WHERE conversation_id=? AND rowid>?)').run(target.conversation_id, target.rowid);
     this.db.prepare('DELETE FROM messages WHERE conversation_id=? AND rowid>?').run(target.conversation_id, target.rowid);
@@ -340,9 +345,21 @@ export class Database {
   }
 
   addAnalysisAction(runId: string, activity: ToolActivity): AnalysisRun {
-    const existing = this.db.prepare('SELECT id FROM analysis_actions WHERE id=? AND run_id=?').get(activity.id, runId) as { id: string } | undefined;
+    const existing = this.db.prepare('SELECT id, data FROM analysis_actions WHERE id=? AND run_id=?').get(activity.id, runId) as { id: string; data: string | null } | undefined;
     const position = (this.db.prepare('SELECT COALESCE(MAX(position), -1) AS position FROM analysis_actions WHERE run_id=?').get(runId) as { position: number }).position + 1;
-    const data = JSON.stringify({ ...activity, approval: undefined, attachment: undefined });
+    let prior: Partial<ToolActivity> = {};
+    if (existing?.data) { try { prior = JSON.parse(existing.data) as Partial<ToolActivity>; } catch { /* Corrupt legacy activity remains replaceable. */ } }
+    const terminal = prior.terminal || activity.terminal
+      ? { ...prior.terminal, ...activity.terminal,
+        // Stream deltas append to their own channel. They never overwrite
+        // immutable process identity or the other output channel. A terminal
+        // result contains the runner's complete final buffers, so it replaces
+        // its streamed prefix rather than duplicating it.
+        ...(activity.terminal?.stdout !== undefined ? { stdout: activity.terminal.finishedAt ? activity.terminal.stdout : `${prior.terminal?.stdout ?? ''}${activity.terminal.stdout}` } : {}),
+        ...(activity.terminal?.stderr !== undefined ? { stderr: activity.terminal.finishedAt ? activity.terminal.stderr : `${prior.terminal?.stderr ?? ''}${activity.terminal.stderr}` } : {}),
+      }
+      : undefined;
+    const data = JSON.stringify({ ...prior, ...activity, ...(terminal ? { terminal } : {}), approval: undefined, attachment: undefined });
     if (existing) this.db.prepare('UPDATE analysis_actions SET label=?, detail=?, data=? WHERE id=? AND run_id=?').run(activity.label, activity.detail ?? null, data, activity.id, runId);
     else {
       this.db.prepare('INSERT INTO analysis_actions (id, run_id, label, detail, data, position) VALUES (?, ?, ?, ?, ?, ?)').run(activity.id, runId, activity.label, activity.detail ?? null, data, position);

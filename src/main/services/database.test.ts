@@ -85,15 +85,26 @@ export async function runDatabaseMigrationRegression(): Promise<void> {
       generationStats: { outputTokens: 4049, tokensPerSecond: 49, generationDurationMs: 82_600, timeToFirstTokenMs: 620, inputTokens: 1_200 },
     });
     const persistedRun = fresh.createAnalysisRun(freshChat.id, 'fast');
+    // Streaming terminal updates use the same action id. A partial stdout
+    // snapshot must append output without losing the immutable execution
+    // identity needed after an interrupted Electron/session shutdown.
+    fresh.addAnalysisAction(persistedRun.id, { id: 'terminal-interrupted', label: 'Terminal', kind: 'terminal', state: 'running', terminal: { command: 'printf ---AUTHORS---', cwd: '/project', pid: 4812, pgid: 4812, sessionId: 4812, startedAt: '2026-09-24T16:02:00.000Z', status: 'running' } });
+    fresh.addAnalysisAction(persistedRun.id, { id: 'terminal-interrupted', label: 'Terminal', kind: 'terminal', state: 'running', terminal: { stdout: '---AUTHORS---\n' } });
+    fresh.addAnalysisAction(persistedRun.id, { id: 'terminal-interrupted', label: 'Terminal', kind: 'terminal', state: 'running', terminal: { stdout: 'author@example.test\n' } });
+    // A normal completion supplies the runner's full buffer. It replaces the
+    // streamed prefix instead of repeating every line in persisted history.
+    fresh.addAnalysisAction(persistedRun.id, { id: 'terminal-final', label: 'Terminal', kind: 'terminal', state: 'running', terminal: { command: 'printf done', cwd: '/project', pid: 4813, pgid: 4813, sessionId: 4813, startedAt: '2026-09-24T16:02:01.000Z', status: 'running' } });
+    fresh.addAnalysisAction(persistedRun.id, { id: 'terminal-final', label: 'Terminal', kind: 'terminal', state: 'running', terminal: { stdout: 'done\n' } });
+    fresh.addAnalysisAction(persistedRun.id, { id: 'terminal-final', label: 'Terminal', kind: 'terminal', state: 'completed', terminal: { command: 'printf done', cwd: '/project', pid: 4813, pgid: 4813, sessionId: 4813, startedAt: '2026-09-24T16:02:01.000Z', finishedAt: '2026-09-24T16:02:02.000Z', exitCode: 0, timedOut: false, cancelled: false, status: 'completed', stdout: 'done\n', stderr: '' } });
     const finalPlan = { steps: [{ id: 'inspect', label: 'Inspect Project 1', status: 'completed' as const }, { id: 'implement', label: 'Implement Project 2 change', status: 'in_progress' as const }] };
     fresh.addAnalysisAction(persistedRun.id, { id: 'plan-update', label: 'Планирование', kind: 'planning', state: 'completed', plan: finalPlan, metadata: { steps: 2, completed_steps: 1 } });
     fresh.addAnalysisAction(persistedRun.id, { id: 'notes-update', label: 'Обновление Task Notes', kind: 'notes', state: 'completed', output: 'Known finding; next step is implementation.' });
     const actionCountedRun = fresh.addAnalysisAction(persistedRun.id, { id: 'context-1', label: 'Контекст оптимизирован', detail: '26 151 → 18 028 токенов', kind: 'context', state: 'completed', metadata: { context_window: 32_768, input_tokens_before: 26_151, input_tokens_after: 18_028, compacted_messages: 13, compacted_tool_results: 6, compaction_count: 1 } });
     const progressRun = fresh.addAnalysisAction(persistedRun.id, { id: 'progress-1', label: 'Проверка', kind: 'progress', state: 'completed' });
     const deduplicatedRun = fresh.addAnalysisAction(persistedRun.id, { id: 'context-1', label: 'Контекст оптимизирован', kind: 'context', state: 'completed', metadata: { input_tokens_after: 18_028 } });
-    assert.equal(actionCountedRun.actionCount, 3, 'structured Plan, Notes, and context activities were not counted exactly once');
-    assert.equal(progressRun.actionCount, 3, 'reasoning/progress activity was counted as an Agent action');
-    assert.equal(deduplicatedRun.actionCount, 3, 'updating a persisted activity counted the same action twice');
+    assert.equal(actionCountedRun.actionCount, 5, 'structured Plan, Notes, terminal, and context activities were not counted exactly once');
+    assert.equal(progressRun.actionCount, 5, 'reasoning/progress activity was counted as an Agent action');
+    assert.equal(deduplicatedRun.actionCount, 5, 'updating a persisted activity counted the same action twice');
     fresh.finishAnalysisRun(persistedRun.id, 'completed', null);
     fresh.close();
     const legacyMode = new DatabaseSync(freshPath);
@@ -112,7 +123,28 @@ export async function runDatabaseMigrationRegression(): Promise<void> {
     const context = loaded.actions.find((action) => action.id === 'context-1');
     assert.equal(context?.kind, 'context', 'context compaction semantic type was not preserved after restart');
     assert.equal(context?.metadata?.input_tokens_after, 18_028, 'context compaction details were not preserved after restart');
+    const interruptedTerminal = loaded.actions.find((action) => action.id === 'terminal-interrupted')?.terminal;
+    assert.deepEqual(interruptedTerminal, { command: 'printf ---AUTHORS---', cwd: '/project', pid: 4812, pgid: 4812, sessionId: 4812, startedAt: '2026-09-24T16:02:00.000Z', status: 'running', stdout: '---AUTHORS---\nauthor@example.test\n' }, 'stdout deltas overwrote terminal command/process identity');
+    const completedTerminal = loaded.actions.find((action) => action.id === 'terminal-final')?.terminal;
+    assert.deepEqual(completedTerminal, { command: 'printf done', cwd: '/project', pid: 4813, pgid: 4813, sessionId: 4813, startedAt: '2026-09-24T16:02:01.000Z', finishedAt: '2026-09-24T16:02:02.000Z', exitCode: 0, timedOut: false, cancelled: false, status: 'completed', stdout: 'done\n', stderr: '' }, 'final terminal buffer was appended to its streamed prefix');
     reopenedFresh.close();
+
+    // Regenerate removes failed downstream runs as well as runs already paired
+    // with deleted assistant messages. Failed runs have no assistant ID, but
+    // their action timeline must not leak into the new branch.
+    const regenerate = new Database(freshPath);
+    const regenerationChat = regenerate.createConversation('qwen3.8:27b-q4_K_M');
+    const regenerateUser = regenerate.addMessage(regenerationChat.id, 'user', 'Create a file');
+    const failedRun = regenerate.createAnalysisRun(regenerationChat.id, 'fast');
+    regenerate.addAnalysisAction(failedRun.id, { id: 'failed-tool', label: 'Malformed call', kind: 'other', state: 'error' });
+    regenerate.finishAnalysisRun(failedRun.id, 'error', null);
+    const successfulAssistant = regenerate.addMessage(regenerationChat.id, 'assistant', 'Old answer');
+    const successfulRun = regenerate.createAnalysisRun(regenerationChat.id, 'fast');
+    regenerate.finishAnalysisRun(successfulRun.id, 'completed', successfulAssistant.id);
+    const retained = regenerate.regenerateUserMessageAndTruncate(regenerateUser.id);
+    assert.equal(retained.length, 1, 'Regenerate did not preserve exactly the user prefix');
+    assert.equal(regenerate.listAnalysisRuns(regenerationChat.id).length, 0, 'Regenerate retained stale downstream failed or completed Agent runs');
+    regenerate.close();
   } finally { await rm(directory, { recursive: true, force: true }); }
 }
 
