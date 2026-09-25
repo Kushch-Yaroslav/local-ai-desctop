@@ -1,6 +1,18 @@
 node_modules/
 dist/
 local-cache/
-runtime/
+# Local application data. These are created by Electron/SQLite/launchers and
+# are intentionally not source-controlled.
+/runtime/app-data/
+/runtime/attachments/
+/runtime/cache/
+/runtime/logs/
+/runtime/sqlite/
+
+# One-shot real-model acceptance output only. Reusable fixtures belong under
+# test-fixtures/ and must remain visible to Git.
+/runtime/acceptance-*/
+/runtime/.tmp/
+/runtime/*.pid
 *.log
 .idea/

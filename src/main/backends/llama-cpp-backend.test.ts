@@ -6,7 +6,7 @@ import type { ToolMessage } from './types';
 import type { ChatMessage } from '../../shared/types';
 
 const model = 'qwen3.8:27b-q4_K_M';
-type Scenario = { tokenCounts?: number[]; lastTokenCount?: number; tokenCountStatus?: number; chatStatus?: number; chatError?: string; timings?: { prompt_ms?: number; predicted_ms?: number }; stream?: boolean; requestBodies: Array<Record<string, unknown>>; countBodies: Array<Record<string, unknown>> };
+type Scenario = { tokenCounts?: number[]; lastTokenCount?: number; tokenCountStatus?: number; chatStatus?: number; chatError?: string; timings?: { prompt_ms?: number; predicted_ms?: number }; stream?: boolean; toolStream?: boolean; requestBodies: Array<Record<string, unknown>>; countBodies: Array<Record<string, unknown>> };
 
 async function readBody(request: AsyncIterable<Uint8Array>): Promise<Record<string, unknown>> {
   const chunks: Uint8Array[] = [];
@@ -37,6 +37,14 @@ async function startServer(scenario: Scenario): Promise<{ server: Server; url: s
         response.write(`data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: scenario.lastTokenCount ?? 1_000, completion_tokens: 7 }, ...(scenario.timings ? { timings: scenario.timings } : {}) })}\n\n`);
         response.end('data: [DONE]\n\n'); return;
       }
+      if (scenario.toolStream) {
+        response.writeHead(200, { 'content-type': 'text/event-stream' });
+        response.write(`data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: 'Choose tool. ' } }] })}\n\n`);
+        response.write(`data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'call-write', type: 'function', function: { name: 'write_file', arguments: '{"path":"a' } }] } }] })}\n\n`);
+        response.write(`data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '.txt","content":"x"}' } }, { index: 1, id: 'call-read', type: 'function', function: { name: 'read_file', arguments: '{"path":"b.txt"}' } }] }, finish_reason: 'tool_calls' }] })}\n\n`);
+        response.write(`data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: scenario.lastTokenCount ?? 1_000, completion_tokens: 11 } })}\n\n`);
+        response.end('data: [DONE]\n\n'); return;
+      }
       reply(response, 200, { choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }], usage: { prompt_tokens: scenario.lastTokenCount ?? 1_000, completion_tokens: 1 }, ...(scenario.timings ? { timings: scenario.timings } : {}) }); return;
     }
     reply(response, 404, { error: { message: 'not found' } });
@@ -52,6 +60,20 @@ const toolSchema = [{ type: 'function', function: { name: 'read_file', descripti
 const call = (backend: LlamaCppBackend, messages: ToolMessage[], tools: unknown[] | undefined = toolSchema) => backend.chatWithTools(model, messages, tools, new AbortController().signal, 65_536, 'deep');
 
 export async function runLlamaCppBackendRegression(): Promise<void> {
+  {
+    const scenario: Scenario = { tokenCounts: [1_000], toolStream: true, requestBodies: [], countBodies: [] }; const { server, url } = await startServer(scenario);
+    try {
+      const events: import('./types').ToolInferenceStreamEvent[] = [];
+      for await (const event of new LlamaCppBackend(url).streamWithTools!(model, baseMessages(), toolSchema, new AbortController().signal, 65_536, 'fast')) events.push(event);
+      const response = events.find((event) => event.type === 'response');
+      assert(response && response.type === 'response');
+      assert.equal(response.response.thinking, 'Choose tool. ', 'streamed reasoning was not assembled');
+      assert.deepEqual(response.response.tool_calls?.map((call) => [call.id, call.function.name, call.function.arguments]), [['call-write', 'write_file', '{"path":"a.txt","content":"x"}'], ['call-read', 'read_file', '{"path":"b.txt"}']], 'fragmented native tool calls were not assembled in index order');
+      assert.equal(scenario.requestBodies[0].stream, true, 'Agent tool inference did not request streaming');
+      assert.deepEqual(scenario.requestBodies[0].chat_template_kwargs, { enable_thinking: false }, 'Qwen fast execution turn did not disable template thinking');
+      assert.equal(events.filter((event) => event.type === 'tool_call_delta').length, 3, 'tool deltas were not exposed for telemetry');
+    } finally { await stop(server); }
+  }
   {
     const scenario: Scenario = { tokenCounts: [1_000], timings: { prompt_ms: 2, predicted_ms: 500, predicted_per_second: 14 } as never, stream: true, requestBodies: [], countBodies: [] }; const { server, url } = await startServer(scenario);
     try {

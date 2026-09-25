@@ -103,6 +103,58 @@ export async function runProjectChatRegression(): Promise<void> {
     await assertZeroToolAnswer('Только объясни, ничего не выполняй: как настроить раскладку?', 'Объясняю без изменений.', 'explicit instruction-only request was forced into a tool call');
     await assertZeroToolAnswer('Переустанови ядро, но доступная policy блокирует эту операцию.', 'Операция требует недоступного подтверждения.', 'blocked action was presented as fictitious execution');
 
+    // Greenfield work uses the normal strict tool protocol without a special
+    // action output budget.
+    const greenfieldRoot = await mkdtemp(join(tmpdir(), 'local-ai-greenfield-'));
+    let greenfieldCalls = 0;
+    const greenfieldContexts: ToolInferenceRequestContext[] = [];
+    const greenfieldSnapshots: ToolMessage[][] = [];
+    const greenfieldAgent = new ProjectChatService({ chatWithTools: async (_model, messages, _tools, _signal, _context, _reasoning, requestContext) => {
+      greenfieldCalls += 1; greenfieldSnapshots.push(messages.map((message) => ({ ...message }))); if (requestContext) greenfieldContexts.push(requestContext);
+      if (greenfieldCalls === 1) return { role: 'assistant' as const, content: '', tool_calls: [{ function: { name: 'list_directory', arguments: {} } }] };
+      if (greenfieldCalls === 2) return { role: 'assistant' as const, content: '', tool_calls: [{ function: { name: 'create_file', arguments: { path: 'index.html', content: '<!doctype html><title>Checkers</title>' } } }] };
+      if (greenfieldCalls === 3) return { role: 'assistant' as const, content: 'Scaffold created.' };
+      return { role: 'assistant' as const, content: 'Greenfield complete.', finish_reason: 'stop' as const };
+    } }, new WebBrowserService());
+    const greenfieldHistory = [{ ...history[0], content: 'Создай один HTML-файл с простой игрой в пустой папке. Всё необходимое создай сам.' }];
+    const greenfieldEvents = await eventsFor(greenfieldAgent, greenfieldRoot, new AbortController().signal, greenfieldHistory);
+    assert(greenfieldCalls === 4 && greenfieldContexts.every((context) => context.phase !== undefined), 'greenfield strict tool cycle did not complete');
+    assert(await readFile(join(greenfieldRoot, 'index.html'), 'utf8') === '<!doctype html><title>Checkers</title>', 'greenfield recovery did not reach a concrete create action');
+    assert(greenfieldEvents.some((event) => event.type === 'tool' && event.activity.kind === 'mutation'), 'greenfield run did not expose concrete progress');
+    await rm(greenfieldRoot, { recursive: true, force: true });
+
+    // A Plan plus a completed inspection must not reopen the 32K decision
+    // window. The next no-tool answer is recovered into the concrete create.
+    const cadenceRoot = await mkdtemp(join(tmpdir(), 'local-ai-cadence-'));
+    let cadenceCalls = 0;
+    const cadenceContexts: ToolInferenceRequestContext[] = [];
+    const cadenceAgent = new ProjectChatService({ chatWithTools: async (_model, _messages, _tools, _signal, _context, _reasoning, requestContext) => {
+      cadenceCalls += 1; if (requestContext) cadenceContexts.push(requestContext);
+      if (cadenceCalls === 1) return { role: 'assistant' as const, content: '', tool_calls: [{ function: { name: 'task_plan', arguments: { action: 'create', steps: [{ id: 'inspect', label: 'Inspect directory', status: 'in_progress' }, { id: 'create', label: 'Create checkers.html', status: 'pending' }] } } }] };
+      if (cadenceCalls === 2) return { role: 'assistant' as const, content: '', tool_calls: [{ function: { name: 'list_directory', arguments: {} } }] };
+      if (cadenceCalls === 3) return { role: 'assistant' as const, content: 'I will reason about all rules before writing.', thinking: 'long design', finish_reason: 'stop' as const };
+      if (cadenceCalls === 4) return { role: 'assistant' as const, content: '', tool_calls: [{ function: { name: 'create_file', arguments: { path: 'checkers.html', content: '<!doctype html><title>Checkers</title>' } } }] };
+      if (cadenceCalls === 5) return { role: 'assistant' as const, content: '', tool_calls: [{ function: { name: 'task_plan', arguments: { action: 'update', step_id: 'inspect', status: 'completed' } } }] };
+      if (cadenceCalls === 6) return { role: 'assistant' as const, content: '', tool_calls: [{ function: { name: 'task_plan', arguments: { action: 'update', step_id: 'create', status: 'completed' } } }] };
+      if (cadenceCalls === 7) return { role: 'assistant' as const, content: 'Implementation completed.' };
+      return { role: 'assistant' as const, content: 'Cadence final answer with normal budget.', finish_reason: 'stop' as const };
+    } }, new WebBrowserService());
+    const cadenceEvents = await eventsFor(cadenceAgent, cadenceRoot, new AbortController().signal, [{ ...history[0], content: 'Создай checkers.html с нуля в этой папке.' }]);
+    assert(cadenceCalls === 7 && cadenceContexts.every((context) => context.phase !== undefined), 'Agent turns did not retain normal backend request contexts');
+    assert(cadenceContexts[3]?.phase === 'recovery' && await readFile(join(cadenceRoot, 'checkers.html'), 'utf8') === '<!doctype html><title>Checkers</title>', 'unfinished Plan did not receive one policy continuation into create_file');
+    assert(cadenceEvents.some((event) => event.type === 'tool' && event.activity.metadata?.failure === 'unfinished_plan_without_tool_call'), 'Plan continuation was not observable');
+    await rm(cadenceRoot, { recursive: true, force: true });
+
+    let exhaustedNoToolCalls = 0;
+    const exhaustedNoTool = new ProjectChatService({ chatWithTools: async () => ({ role: 'assistant' as const, content: `still planning ${++exhaustedNoToolCalls}`, finish_reason: 'stop' as const }) }, new WebBrowserService());
+    const exhaustedNoToolEvents = await eventsFor(exhaustedNoTool, root, new AbortController().signal, [{ ...history[0], content: 'Создай новый файл hello.txt.' }]);
+    assert(exhaustedNoToolCalls === 2 && exhaustedNoToolEvents.some((event) => event.type === 'token' && event.content.includes('still planning 2')), 'action task without a Plan did not finish through normal synthesis');
+
+    let analysisOnlyCalls = 0;
+    const analysisOnly = new ProjectChatService({ chatWithTools: async () => ({ role: 'assistant' as const, content: `analysis ${++analysisOnlyCalls}`, finish_reason: 'stop' as const }) }, new WebBrowserService());
+    const analysisOnlyEvents = await eventsFor(analysisOnly, root, new AbortController().signal, [{ ...history[0], content: 'Проанализируй проект, ничего не меняй.' }]);
+    assert(analysisOnlyCalls === 2 && !analysisOnlyEvents.some((event) => event.type === 'tool' && event.activity.metadata?.failure === 'response_without_tool_call'), 'analysis-only task was incorrectly forced through first-action recovery');
+
     let projectTerminalCalls = 0;
     const projectTerminalSnapshots: ToolMessage[][] = [];
     const projectTerminalAgent = new ProjectChatService({ chatWithTools: async (_model, messages) => {
@@ -155,8 +207,36 @@ export async function runProjectChatRegression(): Promise<void> {
       return { role: 'assistant' as const, content: '', thinking: 'tool decision was cut off before the call', finish_reason: 'length' as const };
     } }, new WebBrowserService());
     const truncatedDecisionEvents = await eventsFor(truncatedDecisionAgent, root);
-    assert(truncatedDecisionCalls === 1, 'an output-limited tool decision retried the identical request');
-    assert(truncatedDecisionEvents.some((event) => event.type === 'error' && event.message === 'Агент не завершил выбор действия'), 'an output-limited tool decision was not reported clearly');
+    assert(truncatedDecisionCalls === 2 && truncatedDecisionEvents.some((event) => event.type === 'error' && event.message === 'Не удалось сформировать итоговый ответ'), 'a no-tool truncated response did not remain outside tool execution');
+
+    // A visible native call on a length-truncated response is never executed,
+    // even when it has an ID and appears to contain most of a large write.
+    let truncatedWriteCalls = 0;
+    const truncatedWriteSnapshots: ToolMessage[][] = [];
+    const truncatedWriteAgent = new ProjectChatService({ chatWithTools: async (_model, messages) => {
+      truncatedWriteCalls += 1; truncatedWriteSnapshots.push(messages.map((message) => ({ ...message })));
+      if (truncatedWriteCalls === 1) return { role: 'assistant' as const, content: '', finish_reason: 'length' as const, tool_calls: [{ id: 'truncated-write', type: 'function' as const, function: { name: 'write_file', arguments: '{"path":"must-not-exist.html","content":"<html>' } }] };
+      if (truncatedWriteCalls === 2) return { role: 'assistant' as const, content: '', tool_calls: [{ id: 'repaired-write', type: 'function' as const, function: { name: 'write_file', arguments: { path: 'repaired.html', content: '<!doctype html>' } } }] };
+      if (truncatedWriteCalls === 3) return { role: 'assistant' as const, content: 'Repaired write completed.' };
+      return { role: 'assistant' as const, content: 'Truncated write final.', finish_reason: 'stop' as const };
+    } }, new WebBrowserService());
+    const truncatedWriteEvents = await eventsFor(truncatedWriteAgent, root);
+    await readFile(join(root, 'must-not-exist.html'), 'utf8').then(() => { throw new Error('truncated native write was executed'); }, () => undefined);
+    assert(truncatedWriteCalls === 4 && truncatedWriteSnapshots[1].some((message) => message.content.includes('kind="tool_protocol_repair"')) && !truncatedWriteSnapshots[1].some((message) => message.role === 'tool' && message.tool_call_id === 'truncated-write'), 'truncated native tool call entered the canonical transcript as an executable pair');
+    assert(await readFile(join(root, 'repaired.html'), 'utf8') === '<!doctype html>' && truncatedWriteEvents.some((event) => event.type === 'tool' && event.activity.metadata?.failure === 'truncated_tool_call'), 'protocol repair did not allow a subsequent complete write');
+
+    let malformedNativeCalls = 0;
+    const malformedNativeSnapshots: ToolMessage[][] = [];
+    const malformedNativeAgent = new ProjectChatService({ chatWithTools: async (_model, messages) => {
+      malformedNativeCalls += 1; malformedNativeSnapshots.push(messages.map((message) => ({ ...message })));
+      if (malformedNativeCalls === 1) return { role: 'assistant' as const, content: '', tool_calls: [{ id: 'broken-json', type: 'function' as const, function: { name: 'write_file', arguments: '{"path":"broken.txt"' } }] };
+      if (malformedNativeCalls === 2) return { role: 'assistant' as const, content: '', tool_calls: [{ id: 'fixed-json', type: 'function' as const, function: { name: 'write_file', arguments: { path: 'fixed-json.txt', content: 'fixed' } } }] };
+      if (malformedNativeCalls === 3) return { role: 'assistant' as const, content: 'Fixed JSON write completed.' };
+      return { role: 'assistant' as const, content: 'Malformed JSON final.', finish_reason: 'stop' as const };
+    } }, new WebBrowserService());
+    await eventsFor(malformedNativeAgent, root);
+    assert(malformedNativeCalls === 4 && malformedNativeSnapshots[1].some((message) => message.content.includes('kind="tool_protocol_repair"') && message.content.includes('malformed_tool_arguments')) && !malformedNativeSnapshots[1].some((message) => message.role === 'tool' && message.tool_call_id === 'broken-json'), 'malformed native JSON was silently converted into executable arguments');
+    assert(await readFile(join(root, 'fixed-json.txt'), 'utf8') === 'fixed', 'corrected native JSON call did not execute');
 
     const html = '<!doctype html>\n<html>\n<head><style>body { color: #123; }</style></head>\n<body><script>const title = `Local <tool_call> text`;</script><h1>Ready</h1></body>\n</html>\n';
     let textualCalls = 0;
@@ -182,26 +262,28 @@ export async function runProjectChatRegression(): Promise<void> {
     const unknownTextualAgent = new ProjectChatService({ chatWithTools: async () => {
       unknownCalls += 1;
       if (unknownCalls === 1) return { role: 'assistant' as const, content: '<tool_call><function=unknown_project_tool><parameter=path>ignored.txt</parameter></function></tool_call>' };
-      return unknownCalls === 2 ? { role: 'assistant' as const, content: 'I will not use that tool.' } : { role: 'assistant' as const, content: 'Corrected.', finish_reason: 'stop' as const };
+      if (unknownCalls === 2) return { role: 'assistant' as const, content: '', tool_calls: [{ function: { name: 'list_directory', arguments: {} } }] };
+      return unknownCalls === 3 ? { role: 'assistant' as const, content: 'I will not use that tool.' } : { role: 'assistant' as const, content: 'Corrected.', finish_reason: 'stop' as const };
     } }, new WebBrowserService());
     const unknownEvents = await eventsFor(unknownTextualAgent, root);
-    assert(unknownCalls === 3 && unknownEvents.some((event) => event.type === 'tool' && event.activity.metadata?.failure === 'unknown_tool') && unknownEvents.some((event) => event.type === 'token' && event.content.includes('Corrected.')), 'unknown textual tool call was not returned for bounded model correction');
+    assert(unknownCalls === 4 && unknownEvents.some((event) => event.type === 'token' && event.content.includes('Corrected.')), 'unknown textual tool call did not return a normal tool result and continue');
 
     let malformedCalls = 0;
     const malformedTextualAgent = new ProjectChatService({ chatWithTools: async () => {
       malformedCalls += 1;
       if (malformedCalls === 1) return { role: 'assistant' as const, content: '<tool_call><function=create_file><parameter=content>broken</parameter><parameter=file_path>broken.html</function></tool_call>' };
-      return malformedCalls === 2 ? { role: 'assistant' as const, content: 'I will correct the protocol.' } : { role: 'assistant' as const, content: 'Corrected protocol.', finish_reason: 'stop' as const };
+      if (malformedCalls === 2) return { role: 'assistant' as const, content: '', tool_calls: [{ function: { name: 'list_directory', arguments: {} } }] };
+      return malformedCalls === 3 ? { role: 'assistant' as const, content: 'I will correct the protocol.' } : { role: 'assistant' as const, content: 'Corrected protocol.', finish_reason: 'stop' as const };
     } }, new WebBrowserService());
     const malformedEvents = await eventsFor(malformedTextualAgent, root);
-    assert(malformedCalls === 3 && malformedEvents.some((event) => event.type === 'tool' && event.activity.metadata?.failure === 'malformed_textual_protocol') && malformedEvents.some((event) => event.type === 'token' && event.content.includes('Corrected protocol.')), 'malformed textual protocol was not returned for bounded model correction');
+    assert(malformedCalls === 4 && malformedEvents.some((event) => event.type === 'tool' && event.activity.metadata?.failure === 'invalid_tool_call') && malformedEvents.some((event) => event.type === 'token' && event.content.includes('Corrected protocol.')), 'malformed textual protocol was not returned through protocol repair');
 
     let proseCalls = 0;
     const proseTextualAgent = new ProjectChatService({ chatWithTools: async () => {
       proseCalls += 1;
       return proseCalls === 1 ? { role: 'assistant' as const, content: 'The documentation mentions the literal tag <tool_call>, but this is ordinary prose.' } : { role: 'assistant' as const, content: 'No tool needed.', finish_reason: 'stop' as const };
     } }, new WebBrowserService());
-    const proseEvents = await eventsFor(proseTextualAgent, root);
+    const proseEvents = await eventsFor(proseTextualAgent, root, new AbortController().signal, [{ ...history[0], content: 'Объясни, что означает буквальный тег <tool_call> в документации.' }]);
     assert(proseCalls === 2 && !proseEvents.some((event) => event.type === 'tool'), 'ordinary prose mentioning <tool_call> was interpreted as a tool call');
 
     let nativePreferenceCalls = 0;
@@ -224,8 +306,8 @@ export async function runProjectChatRegression(): Promise<void> {
     assert(invalidPathEvents.some((event) => event.type === 'tool' && event.activity.kind === 'mutation' && event.activity.state === 'error'), 'textual create_file bypassed project-root path validation');
     await readFile(join(root, '..', 'outside-textual-tool-call.html'), 'utf8').then(() => { throw new Error('textual create_file wrote outside the project root'); }, () => undefined);
 
-    // A. A local validation failure is a normal tool result. Qwen receives a
-    // compact reason and can create the corrected file in this same run.
+    // A. Missing schema fields are a protocol failure: the broken call is not
+    // executed and the corrected call can continue in the same run.
     let missingPathCalls = 0;
     const missingPathSnapshots: ToolMessage[][] = [];
     const missingPathAgent = new ProjectChatService({ chatWithTools: async (_model, messages) => {
@@ -236,8 +318,8 @@ export async function runProjectChatRegression(): Promise<void> {
       return { role: 'assistant' as const, content: 'Corrected final.', finish_reason: 'stop' as const };
     } }, new WebBrowserService());
     const missingPathEvents = await eventsFor(missingPathAgent, root);
-    const missingPathResult = missingPathSnapshots[1].find((message) => message.role === 'tool' && message.tool_name === 'create_file')?.content ?? '';
-    assert(missingPathCalls === 4 && missingPathResult.includes('Не указан обязательный параметр') && missingPathResult.includes('path') && missingPathResult.includes('tool_call_failed'), 'missing create_file path was not returned as a compact tool result');
+    const missingPathRepair = missingPathSnapshots[1].find((message) => message.content.includes('kind="tool_protocol_repair"'))?.content ?? '';
+    assert(missingPathCalls === 4 && missingPathRepair.includes('missing_required_arguments:path') && !missingPathSnapshots[1].some((message) => message.role === 'tool' && message.tool_name === 'create_file'), 'missing create_file path was not rejected before execution');
     assert(await readFile(join(root, 'corrected.txt'), 'utf8') === 'corrected', 'corrected create_file did not execute in the same Agent run');
     assert(missingPathEvents.some((event) => event.type === 'token' && event.content.includes('Corrected final.')), 'Agent did not complete after correcting create_file arguments');
 
@@ -300,12 +382,10 @@ export async function runProjectChatRegression(): Promise<void> {
     const multiWebAssistant = multiWebHistory.find((message) => message.role === 'assistant' && message.tool_calls?.some((call) => call.id === 'web-search-a'));
     const firstWebResult = multiWebHistory.find((message) => message.role === 'tool' && message.tool_call_id === 'web-search-a');
     const secondWebResult = multiWebHistory.find((message) => message.role === 'tool' && message.tool_call_id === 'web-search-b');
-    const secondResultIndex = multiWebHistory.indexOf(secondWebResult!);
-    const recoveryIndex = multiWebHistory.findIndex((message) => message.role === 'user' && message.content.includes('kind="tool_call_failed"'));
     assert(multiWebAssistant?.tool_calls?.map((call) => call.id).join(',') === 'web-search-a,web-search-b', 'native sibling tool-call IDs were not retained in Agent history');
-    assert(firstWebResult?.content.includes('Web-инструмент временно недоступен') && secondWebResult?.content.includes('tool_call_skipped'), 'failed and skipped sibling web calls did not receive explicit tool results');
-    assert(recoveryIndex > secondResultIndex && !validateLlamaMessageSequence(multiWebHistory), 'recovery context was inserted before all sibling tool results');
-    assert(executedWebCalls === 1 && multiWebEvents.some((event) => event.type === 'tool' && event.activity.kind === 'directory' && event.activity.state === 'completed'), 'a failed web batch either replayed siblings or did not continue safely');
+    assert(firstWebResult?.content.includes('Web-инструмент временно недоступен') && secondWebResult?.content.includes('Web-инструмент временно недоступен'), 'valid sibling calls did not receive their exact normal tool results');
+    assert(!validateLlamaMessageSequence(multiWebHistory), 'normal tool failures broke assistant/tool pairing');
+    assert(executedWebCalls === 2 && multiWebEvents.some((event) => event.type === 'tool' && event.activity.kind === 'directory' && event.activity.state === 'completed'), 'a failed web batch did not continue safely');
 
     // C. llama.cpp rejects malformed generated JSON before it returns a
     // ChatCompletion. The Agent asks for a corrected decision once, keeps its
@@ -322,7 +402,7 @@ export async function runProjectChatRegression(): Promise<void> {
     } }, new WebBrowserService());
     const malformedJsonEvents = await eventsFor(malformedJsonAgent, root);
     assert(malformedJsonCalls === 4 && malformedJsonContexts[1]?.phase === 'recovery', 'malformed llama.cpp tool JSON did not resume through the recovery phase');
-    assert(malformedJsonSnapshots[1].some((message) => message.content.includes('kind="malformed_tool_arguments"')), 'malformed llama.cpp tool JSON did not provide a compact correction notice');
+    assert(malformedJsonSnapshots[1].some((message) => message.content.includes('kind="tool_protocol_repair"')), 'malformed llama.cpp tool JSON did not provide a compact correction notice');
     assert(await readFile(join(root, 'after-json-recovery.txt'), 'utf8') === 'valid', 'corrected tool call after malformed llama.cpp JSON did not execute');
     assert(malformedJsonEvents.some((event) => event.type === 'tool' && event.activity.metadata?.failure === 'malformed_tool_arguments'), 'malformed llama.cpp JSON recovery was not visible in activity');
 
@@ -340,7 +420,7 @@ export async function runProjectChatRegression(): Promise<void> {
     } }, new WebBrowserService());
     const ollamaMalformedEvents = await eventsFor(ollamaMalformedAgent, root);
     assert(ollamaMalformedCalls === 4 && ollamaMalformedContexts[1]?.phase === 'recovery', 'Ollama malformed tool JSON did not resume through the recovery phase');
-    assert(ollamaMalformedSnapshots[1].some((message) => message.content.includes('kind="malformed_tool_arguments"')) && !ollamaMalformedSnapshots[1].some((message) => message.role === 'tool'), 'Ollama pre-response parser failure fabricated a tool result or omitted its correction notice');
+    assert(ollamaMalformedSnapshots[1].some((message) => message.content.includes('kind="tool_protocol_repair"')) && !ollamaMalformedSnapshots[1].some((message) => message.role === 'tool'), 'Ollama pre-response parser failure fabricated a tool result or omitted its correction notice');
     assert(await readFile(join(root, 'ollama-corrected.txt'), 'utf8') === 'valid', 'valid native tool call after Ollama malformed JSON did not execute');
     assert(ollamaMalformedEvents.some((event) => event.type === 'tool' && event.activity.metadata?.failure === 'malformed_tool_arguments'), 'Ollama malformed-tool recovery was not visible in activity');
 
@@ -362,7 +442,7 @@ export async function runProjectChatRegression(): Promise<void> {
     let exhaustedOllamaCalls = 0;
     const exhaustedOllama = new ProjectChatService({ chatWithTools: async () => { exhaustedOllamaCalls += 1; throw ollamaMalformedToolArgumentsError(); } }, new WebBrowserService());
     const exhaustedOllamaEvents = await eventsFor(exhaustedOllama, root);
-    assert(exhaustedOllamaCalls === 3 && exhaustedOllamaEvents.filter((event) => event.type === 'tool' && event.activity.metadata?.failure === 'malformed_tool_arguments').length === 2 && exhaustedOllamaEvents.some((event) => event.type === 'error' && event.message === 'Агент не смог сформировать корректный вызов инструмента'), 'Ollama malformed-tool recovery was not bounded at two attempts');
+    assert(exhaustedOllamaCalls === 4 && exhaustedOllamaEvents.filter((event) => event.type === 'tool' && event.activity.metadata?.failure === 'malformed_tool_arguments').length === 3 && exhaustedOllamaEvents.some((event) => event.type === 'error' && event.message === 'Агент не смог сформировать корректный вызов инструмента'), 'Ollama malformed-tool recovery was not bounded');
 
     // D. Other HTTP 500 responses remain normal inference errors, never an
     // unsafe malformed-tool retry.
@@ -381,7 +461,7 @@ export async function runProjectChatRegression(): Promise<void> {
       exhaustedMalformedCalls += 1; throw malformedToolArgumentsError();
     } }, new WebBrowserService());
     const exhaustedMalformedEvents = await eventsFor(exhaustedMalformed, root);
-    assert(exhaustedMalformedCalls === 3 && exhaustedMalformedEvents.filter((event) => event.type === 'tool' && event.activity.metadata?.failure === 'malformed_tool_arguments').length === 2 && exhaustedMalformedEvents.some((event) => event.type === 'error' && event.message === 'Агент не смог сформировать корректный вызов инструмента'), 'malformed tool JSON recovery was not bounded at two attempts');
+    assert(exhaustedMalformedCalls === 4 && exhaustedMalformedEvents.filter((event) => event.type === 'tool' && event.activity.metadata?.failure === 'malformed_tool_arguments').length === 3 && exhaustedMalformedEvents.some((event) => event.type === 'error' && event.message === 'Агент не смог сформировать корректный вызов инструмента'), 'malformed tool JSON recovery was not bounded');
 
     // F. Stop wins immediately while a malformed-tool recovery is being
     // considered; it cannot schedule another inference request.
@@ -415,7 +495,7 @@ export async function runProjectChatRegression(): Promise<void> {
       finalProtocolCalls += 1;
       return finalProtocolCalls === 1 ? { role: 'assistant' as const, content: 'Ready for final answer.' } : { role: 'assistant' as const, content: '<tool_call><function=run_terminal><parameter=command>pwd</parameter></function></tool_call>' };
     } }, new WebBrowserService());
-    const finalProtocolEvents = await eventsFor(finalProtocol, root);
+    const finalProtocolEvents = await eventsFor(finalProtocol, root, new AbortController().signal, [{ ...history[0], content: 'Объясни, как формируется итоговый ответ.' }]);
     assert(finalProtocolCalls === 2 && finalProtocolEvents.some((event) => event.type === 'error' && event.message === 'Не удалось сформировать итоговый ответ') && !finalProtocolEvents.some((event) => event.type === 'token' && event.content.includes('<tool_call>')), 'final synthesis leaked internal tool protocol');
 
     let repeatedCalls = 0;
@@ -469,7 +549,7 @@ export async function runProjectChatRegression(): Promise<void> {
         ? { role: 'assistant' as const, content: 'Ready to answer.' }
         : { role: 'assistant' as const, content: 'Normal final response.', finish_reason: 'stop' as const };
     } }, new WebBrowserService());
-    const normalEvents = await eventsFor(normal, root);
+    const normalEvents = await eventsFor(normal, root, new AbortController().signal, [{ ...history[0], content: 'Объясни, как работает Agent.' }]);
     assert(normalCalls === 2 && normalEvents.some((event) => event.type === 'token' && event.content.includes('Normal final response.')), 'successful normal Agent run added an unnecessary retry');
 
     let emptyCalls = 0;
@@ -477,7 +557,7 @@ export async function runProjectChatRegression(): Promise<void> {
       emptyCalls += 1;
       return { role: 'assistant' as const, content: '' };
     } }, new WebBrowserService());
-    const emptyEvents = await eventsFor(empty, root);
+    const emptyEvents = await eventsFor(empty, root, new AbortController().signal, [{ ...history[0], content: 'Объясни это кратко.' }]);
     assert(emptyCalls === 2, 'true empty final response did not reach final synthesis');
     assert(emptyEvents.some((event) => event.type === 'error' && event.details?.includes('без итогового текста')), 'true empty final response was not classified');
 
@@ -754,7 +834,7 @@ export async function runProjectChatRegression(): Promise<void> {
     const plannedStalledEvents = await eventsFor(plannedStalledAgent, root);
     const planReminder = stagnationContexts(plannedStalledSnapshots, 'stagnation_plan_guidance');
     assert(planReminder.length === 1 && planReminder[0].content.includes('Task Notes') && planReminder[0].content.includes('минимально необходимый следующий шаг'), 'stalled exploration with a Plan did not receive the Plan + Task Notes reminder');
-    assert(!plannedStalledEvents.some((event) => event.type === 'error'), 'Plan-aware stagnation reminder changed the existing hard-limit behavior');
+    assert(plannedStalledEvents.some((event) => event.type === 'tool' && event.activity.metadata?.failure === 'unfinished_plan_without_tool_call'), 'incomplete Plan did not receive its single higher-level continuation');
 
     let researchCalls = 0;
     const researchSnapshots: ToolMessage[][] = [];
