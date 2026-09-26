@@ -80,6 +80,24 @@ impl AgentState {
         }
     }
 
+    pub fn open_count(&self) -> usize {
+        self.plan.open_count()
+    }
+
+    /// Open plan items still need durable, `complete_for_task` evidence before
+    /// the audit may be synthesized. Metric over explicit model checkpoints,
+    /// not raw excerpt heuristics.
+    pub fn open_without_complete_evidence(&self) -> usize {
+        let complete = self
+            .investigated
+            .values()
+            .filter(|item| item.evidence_complete)
+            .count();
+        self
+            .open_count()
+            .saturating_sub(complete.min(self.open_count()))
+    }
+
     pub fn investigated_summary(&self) -> Vec<String> {
         self.investigated
             .values()
@@ -152,40 +170,62 @@ impl AgentState {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            if facts.is_empty() {
-                continue;
-            }
+            let relevance: Vec<String> = item
+                .get("relevance")
+                .and_then(serde_json::Value::as_array)
+                .map(|xs| {
+                    xs.iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let unresolved: Vec<String> = item
+                .get("unresolved")
+                .and_then(serde_json::Value::as_array)
+                .map(|xs| {
+                    xs.iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let complete = item
+                .get("complete_for_task")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+                && unresolved.is_empty();
             for investigated in self
                 .investigated
                 .values_mut()
                 .filter(|known| known.path == path)
             {
                 investigated.facts = facts.clone();
-                investigated.relevance = item
-                    .get("relevance")
-                    .and_then(serde_json::Value::as_array)
-                    .map(|xs| {
-                        xs.iter()
-                            .filter_map(serde_json::Value::as_str)
-                            .map(str::to_owned)
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                investigated.unresolved = item
-                    .get("unresolved")
-                    .and_then(serde_json::Value::as_array)
-                    .map(|xs| {
-                        xs.iter()
-                            .filter_map(serde_json::Value::as_str)
-                            .map(str::to_owned)
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                investigated.evidence_complete = item
-                    .get("complete_for_task")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false)
-                    && investigated.unresolved.is_empty();
+                investigated.relevance = relevance.clone();
+                investigated.unresolved = unresolved.clone();
+                investigated.evidence_complete = complete;
+            }
+            // Durable, model-authored facts survive even when the physical read
+            // that produced them has already left the active request (compaction
+            // handoff). Re-materialize the record in that case so the
+            // `complete_for_task` checkpoint is not silently dropped and the
+            // evidence gate never treats it as a missing fact.
+            if !self.investigated.contains_key(path) && (!facts.is_empty() || complete) {
+                self.investigated.insert(
+                    path.to_owned(),
+                    InvestigatedItem {
+                        kind: "notes".into(),
+                        path: path.to_owned(),
+                        finding: facts.join("; "),
+                        reads: 0,
+                        truncated: false,
+                        facts: facts.clone(),
+                        relevance,
+                        unresolved,
+                        evidence_complete: complete,
+                    },
+                );
+                self.evidence_revision += 1;
             }
         }
     }

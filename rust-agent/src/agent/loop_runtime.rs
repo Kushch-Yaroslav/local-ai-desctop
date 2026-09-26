@@ -246,12 +246,16 @@ fn requires_initial_plan(user: &str, has_project: bool) -> bool {
 }
 
 fn phase_for(state: &AgentState, needs_plan: bool, turn: usize) -> &'static str {
-    // Saturation is a state transition, not merely a reminder appended to an
-    // otherwise identical exploration request.  Keep Plan/Notes checkpoints
-    // available in the loop, but project the ordinary model turn as
-    // synthesis so the model consolidates durable evidence instead of
-    // reopening the audit.
+    // Saturation is a capability restriction, not a completion signal. As long
+    // as the Task Plan has items whose evidence is not yet `complete_for_task`,
+    // the audit is still investigation: keeping the turn in the investigate
+    // phase prevents the runtime from announcing "exploration is complete" to
+    // the model with material work still open (the Deep-mode closure
+    // regression).
     if state.saturation_round >= 2 {
+        if state.open_without_complete_evidence() > 0 {
+            return "investigate";
+        }
         return if !state.plan.phases.is_empty() && !state.plan.has_open() {
             "final"
         } else {
@@ -283,11 +287,19 @@ fn phase_for(state: &AgentState, needs_plan: bool, turn: usize) -> &'static str 
     }
 }
 
+/// Saturated turns may still retrieve one fact per open plan item. This is a
+/// capability boundary, not another advisory paragraph the model can ignore.
+/// The budget scales with the number of open items still lacking
+/// `complete_for_task` evidence so a large audit is not starved at 2 reads.
+pub fn post_saturation_read_budget(state: &AgentState) -> usize {
+    2 + state.open_without_complete_evidence().saturating_mul(3)
+}
+
 /// After the second evidence-saturation boundary, only an explicit Plan/Notes
 /// checkpoint or a narrowly justified source lookup may continue the loop.
 /// Keep this as a pure predicate so the capability registry and the execution
 /// defence cannot drift apart again.
-fn rejects_saturated_tool(state: &AgentState, tool: &ValidatedCall) -> bool {
+pub fn rejects_saturated_tool(state: &AgentState, tool: &ValidatedCall) -> bool {
     if state.saturation_round < 2 {
         return false;
     }
@@ -302,9 +314,19 @@ fn rejects_saturated_tool(state: &AgentState, tool: &ValidatedCall) -> bool {
             .is_none_or(|reason| reason.trim().is_empty())
             || (tool.arguments.get("start_line").is_none()
                 && tool.arguments.get("end_line").is_none())
-            || state.post_saturation_retrievals >= 2;
+            || state.post_saturation_retrievals >= post_saturation_read_budget(state);
     }
     true
+}
+
+/// The closeout valve forces the model to reconcile the plan only once its open
+/// work has no remaining evidence gap. While open items still lack
+/// `complete_for_task` evidence, the valve would pressure the model into
+/// closing work it has not finished investigating; the loop instead continues
+/// normal saturation turns (with a scaled targeted-read budget) until the
+/// evidence exists or the model explicitly drops the gap.
+pub fn closeout_due(state: &AgentState) -> bool {
+    state.plan.has_open() && state.open_without_complete_evidence() == 0
 }
 
 fn semantic_excerpt(value: &str, maximum: usize) -> String {
@@ -902,12 +924,15 @@ pub fn run(config: Config) {
         } else {
             phase_for(&state, needs_plan, turn)
         };
-        let plan_closeout_turn = plan_closeout_due && state.plan.has_open();
+        // The closeout valve fires only for genuinely closeable plans: open
+        // with no evidence gap. A saturated audit that still lacks
+        // `complete_for_task` evidence is open work, not a completed audit.
+        let closeout_due_turn = plan_closeout_due && closeout_due(&state);
         let phase_checkpoint_turn =
             needs_plan && !state.plan.phases.is_empty() && state.plan_checkpoint_due();
         let planning_turn = !final_continuation_turn
             && ((needs_plan && state.plan.phases.is_empty())
-                || plan_closeout_turn
+                || closeout_due_turn
                 || phase_checkpoint_turn);
         if final_continuation_turn {
             transcript.remind(format!(
@@ -915,11 +940,11 @@ pub fn run(config: Config) {
                 final_content.chars().count()
             ));
         } else if phase == "synthesis" {
-            transcript.remind("SYNTHESIS CHECKPOINT: exploration is complete. Consolidate only new durable findings into Task Notes and honestly close the Task Plan. Do not rediscover the project or draft the final answer in this checkpoint; the next final phase will present the audit.".into());
+            transcript.remind("SYNTHESIS CHECKPOINT: exploration is complete for the work that has complete_for_task evidence. Consolidate new durable findings into Task Notes and honestly close the plan items already covered by that evidence. Do not rediscover the project or draft the final answer in this checkpoint; the final phase will present the audit.".into());
         } else if phase == "final" {
             transcript.remind("FINAL RESPONSE: exploration, Task Plan and Task Notes are complete. Write the user-facing answer directly from the durable evidence. Do not revisit planning, tool selection, or reconstruct the audit outline before answering.".into());
         }
-        if plan_closeout_turn {
+        if closeout_due_turn {
             transcript.remind(format!(
                 "TASK PLAN CLOSEOUT: update the currently open work now. Mark completed work done or explicitly drop it; do not write the final answer in this request.\n{}",
                 state.plan.open_summary().unwrap_or_default()
@@ -1142,16 +1167,27 @@ pub fn run(config: Config) {
             && (state.notes.is_empty()
                 || state.uncheckpointed_evidence_count() >= 3
                 || checkpoint_before_compaction);
+        let saturation_deficit_turn = !final_continuation_turn
+            && state.saturation_round >= 2
+            && state.open_without_complete_evidence() > 0;
+        if saturation_deficit_turn {
+            transcript.remind(format!(
+                "EVIDENCE GAP: Task Plan items still lack complete_for_task evidence. Continue the audit: name one specific missing fact and retrieve it with a narrow `read_file` start_line/end_line range and `reason`, then checkpoint it with `task_plan` or `task_notes`. Do not bulk-mark unfinished items done, and do not close out the run while the gap remains.\n{}",
+                state.plan.open_summary().unwrap_or_default()
+            ));
+        }
         let tool_choice = if planning_turn {
             // llama.cpp/Qwen honours `required` more reliably for a later
             // closeout handoff than a named function after a long tool suffix.
             // The registry still contains exactly task_plan, so this remains a
             // real model-authored plan operation rather than runtime completion.
-            if plan_closeout_turn || phase_checkpoint_turn {
+            if closeout_due_turn || phase_checkpoint_turn {
                 json!("required")
             } else {
                 json!({"type":"function","function":{"name":"task_plan"}})
             }
+        } else if saturation_deficit_turn {
+            json!("auto")
         } else if notes_checkpoint_turn {
             json!({"type":"function","function":{"name":"task_notes"}})
         } else {
@@ -1344,10 +1380,22 @@ pub fn run(config: Config) {
             // `record_assistant_turn`), and it is not turned into an invented
             // recovery/user message.
             // Jan grants one closeout pass when model completion leaves an
-            // explicit Todo open. The reminder lives in runtime control context,
-            // preserving the canonical conversation and its tool pair invariants.
+            // explicit Todo open, but only when that open work is genuinely
+            // closeable: open with no remaining evidence gap. A saturated
+            // audit that still lacks `complete_for_task` evidence is not a
+            // completed audit: first give the model a closeout pass bounded by
+            // the remaining open item budget (fill the gap or explicitly drop
+            // it), then finalize whatever state is left. If the gap is never
+            // resolved, the audit still terminates — this is an escape valve,
+            // not a hard requirement to keep the run open.
             let (_, plan_total) = state.plan.progress();
-            if state.plan.has_open() && closeout_attempts < plan_total.max(1) {
+            let open_now = state.plan.open_count().max(1);
+            let gap_closeout = state.plan.has_open()
+                && !closeout_due(&state)
+                && closeout_attempts < open_now;
+            if state.plan.has_open() && (closeout_due(&state) || gap_closeout)
+                && closeout_attempts < plan_total.max(1)
+            {
                 closeout_attempts += 1;
                 plan_closeout_due = true;
                 continue;
@@ -1389,7 +1437,11 @@ pub fn run(config: Config) {
             // validation too for providers that emit an unadvertised cached
             // tool call. A named reason is the declared missing fact.
             if rejects_saturated_tool(&state, &tool) {
-                let message = "Coverage is already sufficient. This request is broader than one declared unresolved fact, or the focused-retrieval budget is exhausted. Resolve the existing fact in Task Notes/Task Plan or synthesize.".to_owned();
+                let message = format!(
+                    "Coverage is already sufficient for the audited scope, but Task Plan still has work with incomplete evidence. Use a `read_file` with `reason` naming the missing fact and a narrow line range; or use `task_plan`/`task_notes` to checkpoint the gap. Targeted reads left: {}/{}.",
+                    post_saturation_read_budget(&state) - state.post_saturation_retrievals.min(post_saturation_read_budget(&state)),
+                    post_saturation_read_budget(&state)
+                );
                 emit(
                     &config.run_id,
                     Event::ToolError {
@@ -2115,7 +2167,10 @@ mod projection_tests {
     }
 
     #[test]
-    fn second_saturation_enters_synthesis_and_terminal_plan_enters_finalization() {
+    fn second_saturation_stays_investigation_until_evidence_exists() {
+        // Deep-mode closure regression: saturation alone must not flip the
+        // runtime into synthesis/final while an open Task Plan item has no
+        // `complete_for_task` evidence behind it.
         let mut state = AgentState {
             saturation_round: 2,
             ..AgentState::default()
@@ -2130,9 +2185,115 @@ mod projection_tests {
                 }],
             }])
             .unwrap();
-        assert_eq!(phase_for(&state, true, 8), "synthesis");
+        assert_eq!(state.open_without_complete_evidence(), 1);
+        assert_eq!(phase_for(&state, true, 8), "investigate");
+        // The closeout valve must not force a premature completion handoff
+        // while an evidence gap remains: the audit continues as investigation
+        // instead.
+        assert!(!closeout_due(&state), "closeout valve must wait for evidence");
+
+        // Once the open item carries complete evidence, the gap is closed and
+        // the turn consolidates: the saturated audit leaves investigation.
+        state.checkpoint_source_evidence(&json!([{"path":"core","complete_for_task":true,"facts":["audit content settled"],"unresolved":[]}]));
+        assert_eq!(state.open_without_complete_evidence(), 0);
+        assert_eq!(phase_for(&state, true, 9), "synthesis");
+        // The closeout valve may now hand the plan to the model for an honest
+        // batch update: open work with no remaining evidence gap.
+        assert!(closeout_due(&state));
         state.plan.finish("write audit", false).unwrap();
-        assert_eq!(phase_for(&state, true, 9), "final");
+        assert!(!state.plan.has_open());
+        assert_eq!(phase_for(&state, true, 10), "final");
+    }
+
+    #[test]
+    fn saturated_audit_keeps_targeted_reads_while_open_items_lack_evidence() {
+        let mut state = AgentState {
+            saturation_round: 2,
+            ..AgentState::default()
+        };
+        state
+            .plan
+            .init(vec![
+                crate::agent::todo::Phase {
+                    name: "Analysis".into(),
+                    tasks: vec![
+                        crate::agent::todo::Item {
+                            content: "inspect core files".into(),
+                            status: crate::agent::todo::Status::Pending,
+                        },
+                        crate::agent::todo::Item {
+                            content: "assess architecture".into(),
+                            status: crate::agent::todo::Status::Pending,
+                        },
+                        crate::agent::todo::Item {
+                            content: "write audit".into(),
+                            status: crate::agent::todo::Status::Pending,
+                        },
+                    ],
+                },
+            ])
+            .unwrap();
+        assert_eq!(state.open_count(), 3);
+        // No evidence checkpoints at all: everything is still open work, so
+        // the saturated phase must keep the audit in investigation with a
+        // targeted-read budget that scales with the evidence gaps.
+        assert_eq!(state.open_without_complete_evidence(), 3);
+        assert_eq!(phase_for(&state, true, 8), "investigate");
+        assert!(!closeout_due(&state));
+        assert!(post_saturation_read_budget(&state) >= 8);
+
+        // A narrow, declared read is allowed; a wide tool is refused so a
+        // genuine loop still cannot reopen broad exploration.
+        let narrow_read = ValidatedCall {
+            id: "r1".into(),
+            name: "read_file".into(),
+            arguments: json!({"path":"src/api.ts","start_line":1,"end_line":120,"reason":"missing auth flow detail"}),
+        };
+        assert!(!rejects_saturated_tool(&state, &narrow_read), "narrow declared read must be allowed");
+        let wide_read = ValidatedCall {
+            id: "r2".into(),
+            name: "terminal".into(),
+            arguments: json!({"command":"find src -name '*.ts'"}),
+        };
+        assert!(rejects_saturated_tool(&state, &wide_read), "wide tool must stay refused in saturation");
+
+        // Filling the gaps unlocks consolidation, step by step.
+        state.checkpoint_source_evidence(&json!([{"path":"core","complete_for_task":true,"facts":["core layout mapped"],"unresolved":[]}]));
+        state.plan.finish("inspect core files", false).unwrap();
+        assert_eq!(state.open_without_complete_evidence(), 1);
+        state.checkpoint_source_evidence(&json!([{"path":"arch","complete_for_task":true,"facts":["architecture reviewed"],"unresolved":[]}]));
+        state.plan.finish("assess architecture", false).unwrap();
+        // Two complete checkpoints cover the one remaining open item's gap.
+        assert_eq!(state.open_without_complete_evidence(), 0);
+        assert_eq!(phase_for(&state, true, 9), "synthesis");
+        assert!(closeout_due(&state));
+        state.checkpoint_source_evidence(&json!([{"path":"audit","complete_for_task":true,"facts":["audit settled"],"unresolved":[]}]));
+        state.plan.finish("write audit", false).unwrap();
+        assert!(!state.plan.has_open());
+        assert_eq!(phase_for(&state, true, 10), "final");
+    }
+
+    #[test]
+    fn saturation_tools_stay_available_on_gap_turns() {
+        // On evidence-gap turns the saturation registry (used when the phase
+        // is not final/planning) must still carry the targeted capabilities so
+        // the scaled budget is actually usable.
+        let registry = saturation_tools();
+        let names: Vec<&str> = registry
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| {
+                tool.get("function")
+                    .unwrap()
+                    .get("name")
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+            })
+            .collect();
+        assert!(names.contains(&"read_file"), "targeted reads must stay available: {names:?}");
+        assert!(names.contains(&"task_notes"), "evidence checkpointing must stay available: {names:?}");
     }
 
     #[test]

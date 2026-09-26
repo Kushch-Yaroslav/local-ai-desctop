@@ -37,6 +37,9 @@ pub struct TaskPlan {
 }
 
 impl TaskPlan {
+    pub fn open_count(&self) -> usize {
+        self.items().filter(|task| task.status.open()).count()
+    }
     pub fn has_open(&self) -> bool {
         self.items().any(|task| task.status.open())
     }
