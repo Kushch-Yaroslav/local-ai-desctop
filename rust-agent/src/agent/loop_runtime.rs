@@ -149,7 +149,10 @@ fn tools() -> Value {
     json!([
         {"type":"function","function":{"name":"list_directory","description":"List a project directory. Treat its result as complete; do not repeat an unchanged listing without a concrete new question.","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}},
         {"type":"function","function":{"name":"read_file","description":"Read a project file. If an unchanged source already has evidence_complete=true, do not reread merely because raw content left context. For one specific missing fact (a concrete field, function, file, mechanism, or value), set reason to the exact fact you are looking for and pick a narrow start_line/end_line range that covers it. A full-range read is treated as broad exploration: it is only allowed before saturation.","parameters":{"type":"object","properties":{"path":{"type":"string"},"reason":{"type":"string","description":"Exact fact missing from durable evidence. Name it specifically: what field, function, value, mechanism, or file behaviour is still unresolved? Repeat fact claims are rejected."},"start_line":{"type":"integer","minimum":1,"description":"First line of the specific block covering the missing fact (1-based). Required after saturation."},"end_line":{"type":"integer","minimum":1,"description":"Last line of the specific block covering the missing fact (1-based). Required after saturation; the range should cover exactly the block of interest."}},"required":["path"]}}},
-        {"type":"function","function":{"name":"write_file","description":"Write a project file","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}},
+        {"type":"function","function":{"name":"write_file","description":"Create a new project file, or overwrite an existing one when the user asked to rewrite it in full. For surgical changes to an existing file prefer apply_patch so unchanged lines are untouched.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}},
+        {"type":"function","function":{"name":"create_file","description":"Create a new project file. Fails if the file already exists; use apply_patch to modify it.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}},
+        {"type":"function","function":{"name":"apply_patch","description":"Surgical file editing via a *** Begin Patch / *** End Patch block with *** Update File: / *** Add File: / *** Delete File: sections. Update bodies list context (' '), removed ('-') and added ('+') lines and must match the current file content exactly. Paths are relative to the project root. Prefer this over write_file for changes to existing files.","parameters":{"type":"object","properties":{"patch":{"type":"string"}},"required":["patch"]}}},
+        {"type":"function","function":{"name":"delete_file","description":"Delete one project file. Use only after the user explicitly asked for deletion or a replacement that removes a file.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}},
         {"type":"function","function":{"name":"run_terminal","description":"Run a project shell command and use its complete diagnostics to decide the next step","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout_ms":{"type":"integer"}},"required":["command"]}}},
         {"type":"function","function":{"name":"task_plan","description":"Manage the canonical Task Plan: init, start, done, drop, or batch. For a phase boundary, use batch to close completed tasks and start the next task in one honest update. Do not finalize with open work unless explicitly dropped. init accepts phases: [{name,tasks:[{content,status?]}]. batch accepts updates:[{action:start|done|drop,task}].","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["init","start","done","drop","batch"]},"phases":{"type":"array"},"task":{"type":"string"},"updates":{"type":"array","items":{"type":"object","properties":{"action":{"type":"string","enum":["start","done","drop"]},"task":{"type":"string"}},"required":["action","task"]}}},"required":["action"]}}},
         {"type":"function","function":{"name":"task_notes","description":"Checkpoint durable cross-source conclusions and source evidence; do not overwrite prior findings. `notes` contains concise business/architecture conclusions. `evidence` contains only sources whose facts are now sufficient: [{path,facts:[...],relevance:[...],unresolved:[...],complete_for_task:boolean}]. Set complete_for_task=true only when facts answer the current task without raw text. Update after major discoveries and before context optimization.","parameters":{"type":"object","properties":{"notes":{"type":"string"},"evidence":{"type":"array","items":{"type":"object","properties":{"path":{"type":"string"},"facts":{"type":"array","items":{"type":"string"}},"relevance":{"type":"array","items":{"type":"string"}},"unresolved":{"type":"array","items":{"type":"string"}},"complete_for_task":{"type":"boolean"}},"required":["path","facts","complete_for_task"]}}},"required":["notes"]}}}
@@ -196,9 +199,10 @@ fn notes_tools() -> Value {
     )
 }
 
-/// Once two independent saturation checks agree, only a single, declared
-/// fact may be retrieved. This is a capability boundary, rather than another
-/// advisory paragraph the model can ignore.
+/// Once two independent saturation checks agree, only an explicit
+/// Plan/Notes checkpoint, a narrowly justified source lookup, or a write the
+/// user asked for may continue the loop. The writing tools stay available
+/// because a saturated run is often an implementation run, not only an audit.
 fn saturation_tools() -> Value {
     let all = tools();
     let Some(items) = all.as_array() else {
@@ -210,7 +214,16 @@ fn saturation_tools() -> Value {
             .filter(|tool| {
                 matches!(
                     tool.pointer("/function/name").and_then(Value::as_str),
-                    Some("task_plan" | "task_notes" | "read_file")
+                    Some(
+                        "task_plan"
+                            | "task_notes"
+                            | "read_file"
+                            | "write_file"
+                            | "create_file"
+                            | "apply_patch"
+                            | "delete_file"
+                            | "run_terminal"
+                    )
                 )
             })
             .cloned()
@@ -338,7 +351,21 @@ pub fn rejects_saturated_tool(state: &AgentState, tool: &ValidatedCall) -> bool 
     if state.saturation_round < 2 {
         return false;
     }
-    if matches!(tool.name.as_str(), "task_plan" | "task_notes") {
+    // Writing tools are never evidence-gathering, so the saturation gate
+    // (which exists to force *targeted* reads) must not strip them: a
+    // saturated run still needs to implement the user's requested changes and
+    // drive its build/tests with run_terminal. This keep-list must stay in
+    // lockstep with the model-visible saturation_tools() registry above.
+    if matches!(
+        tool.name.as_str(),
+        "task_plan"
+            | "task_notes"
+            | "write_file"
+            | "create_file"
+            | "apply_patch"
+            | "delete_file"
+            | "run_terminal"
+    ) {
         return false;
     }
     if tool.name == "read_file" {
@@ -1771,9 +1798,17 @@ pub fn run(config: Config) {
                 Ok((value, diff)) => {
                     let material_new_evidence = (!reuses_existing_investigation)
                         && record_tool_evidence(&mut state, &tool.name, &tool.arguments, &value);
-                    if matches!(tool.name.as_str(), "write_file" | "edit_file" | "patch") {
+                    if matches!(tool.name.as_str(), "write_file" | "create_file" | "apply_patch" | "delete_file" | "edit_file" | "patch") {
                         if let Some(path) = tool.arguments.get("path").and_then(Value::as_str) {
                             state.invalidate_path(path);
+                        }
+                        // A patch or delete changes other files too; invalidate
+                        // whatever the tool reported as changed so stale
+                        // evidence for them is not treated as current.
+                        if let Some(files) = value.get("files").and_then(Value::as_array) {
+                            for file in files.iter().filter_map(Value::as_str) {
+                                state.invalidate_path(file);
+                            }
                         }
                     }
                     if material_new_evidence {
@@ -2185,7 +2220,7 @@ mod projection_tests {
     }
 
     #[test]
-    fn second_saturation_exposes_only_targeted_retrieval_capability() {
+    fn second_saturation_exposes_targeted_retrieval_and_write_capability() {
         let saturation = saturation_tools();
         let names = saturation
             .as_array()
@@ -2193,7 +2228,11 @@ mod projection_tests {
             .iter()
             .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
             .collect::<Vec<_>>();
-        assert_eq!(names, vec!["read_file", "task_plan", "task_notes"]);
+        assert_eq!(
+            names,
+            vec!["read_file", "write_file", "create_file", "apply_patch", "delete_file", "run_terminal", "task_plan", "task_notes"],
+            "saturation narrows broad exploration but keeps the sanctioned write toolset"
+        );
         let read = saturation
             .as_array()
             .unwrap()
@@ -2373,6 +2412,136 @@ mod projection_tests {
             .collect();
         assert!(names.contains(&"read_file"), "targeted reads must stay available: {names:?}");
         assert!(names.contains(&"task_notes"), "evidence checkpointing must stay available: {names:?}");
+        assert!(names.contains(&"task_plan"), "plan handoff must stay available: {names:?}");
+        // Implementation runs must not lose their write capability in
+        // saturation: the user asked for changes, not only for an audit.
+        for name in [
+            "write_file",
+            "create_file",
+            "apply_patch",
+            "delete_file",
+        ] {
+            assert!(
+                names.contains(&name),
+                "saturation must not strip the {name} write capability: {names:?}"
+            );
+        }
+    }
+
+    // ---- Agent mode write capability (Milestone 2) --------------------------
+
+    #[test]
+    fn agent_registry_exposes_full_write_toolset_in_every_non_final_phase() {
+        // The model-visible capability registry in Agent mode must carry the
+        // full write toolset (write_file, create_file, apply_patch,
+        // delete_file) in normal turns; saturation narrows reads, not writes.
+        fn registry_names(registry: &Value) -> Vec<String> {
+            registry
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|tool| {
+                    tool.pointer("/function/name")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .collect()
+        }
+        for (label, registry) in [
+            ("base", &tools()),
+            ("saturation", &saturation_tools()),
+        ] {
+            let names = registry_names(registry);
+            for required in [
+                "write_file",
+                "create_file",
+                "apply_patch",
+                "delete_file",
+                "run_terminal",
+                "task_plan",
+                "task_notes",
+            ] {
+                assert!(
+                    names.iter().any(|name| name == required),
+                    "{label} registry must expose {required}: {names:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn saturation_gate_never_strips_writing_tools() {
+        // The execution-side defence and the model-visible registry must not
+        // drift: in saturation the runtime used to reject *every* tool other
+        // than plan/notes/read, which is exactly the run shape where users
+        // saw only `read_file`/`task_plan`/`task_notes` even in Agent mode.
+        let state = AgentState {
+            saturation_round: 2,
+            ..AgentState::default()
+        };
+        let call = |name: &str, arguments: Value| ValidatedCall {
+            id: "t".into(),
+            name: name.into(),
+            arguments,
+        };
+        for (name, arguments) in [
+            ("write_file", json!({"path":"src/new.ts","content":"x"})),
+            ("create_file", json!({"path":"src/new.ts","content":"x"})),
+            ("apply_patch", json!({"patch":"*** Begin Patch\n*** Update File: src/a.ts\n-old\n+new\n*** End Patch"})),
+            ("delete_file", json!({"path":"src/old.ts"})),
+            ("run_terminal", json!({"command":"cargo build"})),
+            ("task_notes", json!({"notes":"checkpoint"})),
+            ("task_plan", json!({"action":"done","task":"implement"})),
+        ] {
+            assert!(
+                !rejects_saturated_tool(&state, &call(name, arguments)),
+                "{name} must stay available in saturation"
+            );
+        }
+        // Broad, untargeted reads remain refused exactly as before.
+        assert!(rejects_saturated_tool(
+            &state,
+            &call("read_file", json!({"path":"src/a.ts"}))
+        ), "broad saturated reads must stay refused");
+    }
+
+    #[test]
+    fn apply_patch_execute_updates_creates_deletes_and_invalidates() {
+        use std::fs;
+        let root = std::env::temp_dir().join(format!(
+            "local-ai-desktop-ms2-{:#x}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("clock").as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).expect("root");
+        fs::write(root.join("src/a.txt"), "alpha\nbeta\ngamma\n").expect("write");
+        fs::write(root.join("src/old.txt"), "gone\n").expect("write");
+
+        let patch = [
+            "*** Begin Patch",
+            "*** Update File: src/a.txt",
+            "-beta",
+            "+BETA",
+            "*** Add File: src/new.txt",
+            "+hello",
+            "*** Delete File: src/old.txt",
+            "*** End Patch",
+        ].join("\n");
+        let (value, diff) = crate::tools::filesystem::execute(
+            &root,
+            "apply_patch",
+            &json!({"patch": patch}),
+        )
+        .expect("patch must apply");
+        assert!(value["applied"] == true);
+        assert!(diff.is_some(), "patch should report a diff summary");
+        assert_eq!(
+            fs::read_to_string(root.join("src/a.txt")).expect("a.txt"),
+            "alpha\nBETA\ngamma\n"
+        );
+        assert_eq!(fs::read_to_string(root.join("src/new.txt")).expect("new.txt"), "hello\n");
+        assert!(!root.join("src/old.txt").exists());
+
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
