@@ -22,7 +22,7 @@ pub struct InvestigatedItem {
     pub evidence_complete: bool,
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct AgentState {
     pub notes: String,
     pub plan: TaskPlan,
@@ -39,9 +39,54 @@ pub struct AgentState {
     pub plan_checkpoint_evidence_revision: usize,
     pub post_saturation_retrievals: usize,
     pub resolved_missing_facts: Vec<String>,
+    /// Line ranges already covered by a targeted saturated read, keyed by file
+    /// path. A saturated re-read inside an already-covered range produces no
+    /// new evidence and is rejected even while reads of *other* ranges (or of
+    /// other files, or of genuinely new gaps) remain available. This decouples
+    /// the anti-loop guard from the budget counter so the budget can scale
+    /// honestly with unresolved work.
+    pub saturated_read_ranges: BTreeMap<String, Vec<(usize, usize)>>,
+    /// Gap-closeout escape valve: hard-caps repeated model no-tool closeout
+    /// passes on the same run so a saturated deep audit cannot cycle through
+    /// the planning handoff forever while claiming to want more evidence.
+    /// Distinct from `plan_closeout_due`, which is one-shot per gap-closeout
+    /// cycle and cleared by a plan mutation. This one counts *all* closeout
+    /// passes since the last material evidence record: after this many
+    /// hands-offs without new evidence being recorded, the run finalizes
+    /// whatever state is left. That is the termination guarantee the old
+    /// open-count budget (one pass per open task) did not provide, because
+    /// the model could repeat the same handoff indefinitely while never
+    /// recording a Notes checkpoint.
+    pub gap_closeout_passes: usize,
 }
 
+/// Hard cap on consecutive gap-closeout valve passes without any intervening
+/// evidence record (a saturated targeted read, a Notes checkpoint, or other
+/// material new observation). Beyond this we finalize the run instead of
+/// letting the planning handoff become an infinite loop.
+pub const MAX_GAP_CLOSEOUT_PASSES: usize = 3;
+
 impl AgentState {
+    /// Record a newly-performed saturated targeted read. Returns `true` if the
+    /// range does not overlap an already-covered saturated range on the same
+    /// file — i.e. this call is a distinct fact request, not a re-read. A
+    /// duplicate-range call yields no new evidence and must stay rejected even
+    /// while remaining budget or remaining files are still available.
+    pub fn record_saturated_range(&mut self, path: &str, start: usize, end: usize) -> bool {
+        let ranges = self.saturated_read_ranges.entry(path.to_owned()).or_insert_with(Vec::new);
+        let overlaps = ranges.iter().any(|(s, e)| start <= *e && end >= *s);
+        if !overlaps {
+            ranges.push((start, end));
+        }
+        !overlaps
+    }
+
+    pub fn saturated_range_seen(&self, path: &str, start: usize, end: usize) -> bool {
+        self.saturated_read_ranges
+            .get(path)
+            .is_some_and(|ranges| ranges.iter().any(|(s, e)| start <= *e && end >= *s))
+    }
+
     pub fn record_investigation(
         &mut self,
         kind: &str,

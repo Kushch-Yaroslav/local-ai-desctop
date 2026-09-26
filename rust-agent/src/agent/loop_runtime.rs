@@ -1,7 +1,7 @@
 use crate::agent::{
     events::Event,
     policy::{self, RunPolicy},
-    state::AgentState,
+    state::{AgentState, MAX_GAP_CLOSEOUT_PASSES},
     transcript::{validate_calls, Transcript, ValidatedCall},
 };
 use crate::context::projection::project;
@@ -148,7 +148,7 @@ fn compacted_working_state(transcript: &Transcript, covers: usize, state: &Agent
 fn tools() -> Value {
     json!([
         {"type":"function","function":{"name":"list_directory","description":"List a project directory. Treat its result as complete; do not repeat an unchanged listing without a concrete new question.","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}},
-        {"type":"function","function":{"name":"read_file","description":"Read a project file. If an unchanged source already has evidence_complete=true, do not reread merely because raw content left context. For a specific missing fact, provide reason and a narrow 1-based start_line/end_line range.","parameters":{"type":"object","properties":{"path":{"type":"string"},"reason":{"type":"string","description":"The exact fact missing from durable evidence"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1}},"required":["path"]}}},
+        {"type":"function","function":{"name":"read_file","description":"Read a project file. If an unchanged source already has evidence_complete=true, do not reread merely because raw content left context. For one specific missing fact (a concrete field, function, file, mechanism, or value), set reason to the exact fact you are looking for and pick a narrow start_line/end_line range that covers it. A full-range read is treated as broad exploration: it is only allowed before saturation.","parameters":{"type":"object","properties":{"path":{"type":"string"},"reason":{"type":"string","description":"Exact fact missing from durable evidence. Name it specifically: what field, function, value, mechanism, or file behaviour is still unresolved? Repeat fact claims are rejected."},"start_line":{"type":"integer","minimum":1,"description":"First line of the specific block covering the missing fact (1-based). Required after saturation."},"end_line":{"type":"integer","minimum":1,"description":"Last line of the specific block covering the missing fact (1-based). Required after saturation; the range should cover exactly the block of interest."}},"required":["path"]}}},
         {"type":"function","function":{"name":"write_file","description":"Write a project file","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}},
         {"type":"function","function":{"name":"run_terminal","description":"Run a project shell command and use its complete diagnostics to decide the next step","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout_ms":{"type":"integer"}},"required":["command"]}}},
         {"type":"function","function":{"name":"task_plan","description":"Manage the canonical Task Plan: init, start, done, drop, or batch. For a phase boundary, use batch to close completed tasks and start the next task in one honest update. Do not finalize with open work unless explicitly dropped. init accepts phases: [{name,tasks:[{content,status?]}]. batch accepts updates:[{action:start|done|drop,task}].","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["init","start","done","drop","batch"]},"phases":{"type":"array"},"task":{"type":"string"},"updates":{"type":"array","items":{"type":"object","properties":{"action":{"type":"string","enum":["start","done","drop"]},"task":{"type":"string"}},"required":["action","task"]}}},"required":["action"]}}},
@@ -295,10 +295,45 @@ pub fn post_saturation_read_budget(state: &AgentState) -> usize {
     2 + state.open_without_complete_evidence().saturating_mul(3)
 }
 
+/// Saturated targeted read is a loop when the requested range overlaps one
+/// we have already performed on the same file: that call yields no new
+/// evidence and must not consume the model's remaining budget either. This
+/// is the anti-loop guard that *replaces* the old fixed budget counter as the
+/// primary termination mechanism — the budget still hard-caps runaway turns
+/// but its size can now honestly scale with open work because re-reads no
+/// longer silently consume it.
+pub fn saturated_read_is_repeat(state: &AgentState, tool: &ValidatedCall) -> bool {
+    if tool.name != "read_file" || state.saturation_round < 2 {
+        return false;
+    }
+    let path = tool
+        .arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let start = tool
+        .arguments
+        .get("start_line")
+        .and_then(Value::as_u64)
+        .unwrap_or(1) as usize;
+    let end = tool
+        .arguments
+        .get("end_line")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    if end < start {
+        return false;
+    }
+    state.saturated_range_seen(path, start, end)
+}
+
 /// After the second evidence-saturation boundary, only an explicit Plan/Notes
 /// checkpoint or a narrowly justified source lookup may continue the loop.
-/// Keep this as a pure predicate so the capability registry and the execution
-/// defence cannot drift apart again.
+/// Keep this pure predicate so the capability registry and the execution
+/// defence cannot drift apart again. A saturated broad re-read (same path+range
+/// already fetched) is rejected *even while remaining budget is available*, so
+/// a model that keeps requesting the same range cannot silently consume the
+/// legitimate gap-fill budget of a different fact.
 pub fn rejects_saturated_tool(state: &AgentState, tool: &ValidatedCall) -> bool {
     if state.saturation_round < 2 {
         return false;
@@ -307,6 +342,9 @@ pub fn rejects_saturated_tool(state: &AgentState, tool: &ValidatedCall) -> bool 
         return false;
     }
     if tool.name == "read_file" {
+        if saturated_read_is_repeat(state, tool) {
+            return true;
+        }
         return tool
             .arguments
             .get("reason")
@@ -865,8 +903,8 @@ pub fn run(config: Config) {
     // Jan's Todo reminder is bounded and belongs to the model's own Todo
     // mutation path. Qwen needs a capability-scoped closeout turn to honour
     // that reminder reliably, otherwise it can publish a final while its plan
-    // still says 0/N.
-    let mut closeout_attempts = 0usize;
+    // still says 0/N. Closeout pass accounting lives in `state.gap_closeout_passes`
+    // (see AgentState docs) and is now capped by MAX_GAP_CLOSEOUT_PASSES.
     let mut final_started = false;
     let mut final_content = String::new();
     let mut final_continuations = 0usize;
@@ -1383,20 +1421,27 @@ pub fn run(config: Config) {
             // explicit Todo open, but only when that open work is genuinely
             // closeable: open with no remaining evidence gap. A saturated
             // audit that still lacks `complete_for_task` evidence is not a
-            // completed audit: first give the model a closeout pass bounded by
-            // the remaining open item budget (fill the gap or explicitly drop
-            // it), then finalize whatever state is left. If the gap is never
-            // resolved, the audit still terminates — this is an escape valve,
-            // not a hard requirement to keep the run open.
-            let (_, plan_total) = state.plan.progress();
-            let open_now = state.plan.open_count().max(1);
+            // completed audit: first give the model a bounded sequence of
+            // closeout passes (fill the gap or explicitly drop it), then
+            // finalize whatever state is left. If the gap is never resolved,
+            // the audit still terminates — this is an escape valve, not a hard
+            // requirement to keep the run open. The pass counter is a run-level
+            // value (`state.gap_closeout_passes`) and is reset whenever new
+            // material evidence is recorded (target saturated read, Notes
+            // checkpoint, or plan mutation).
+            let open_now = state.plan.open_count();
             let gap_closeout = state.plan.has_open()
                 && !closeout_due(&state)
-                && closeout_attempts < open_now;
-            if state.plan.has_open() && (closeout_due(&state) || gap_closeout)
-                && closeout_attempts < plan_total.max(1)
+                && state.gap_closeout_passes < MAX_GAP_CLOSEOUT_PASSES.max(open_now.max(1));
+            // Hard escape valve: once `MAX_GAP_CLOSEOUT_PASSES` gap closeout
+            // passes have been spent without a fresh evidence record, no
+            // further closeout arm is allowed; the run finalizes. A fresh
+            // closeout cycle may open again after new evidence (see the
+            // reset sites above in the read/Notes/plan paths).
+            let can_arm = closeout_due(&state) || state.gap_closeout_passes < MAX_GAP_CLOSEOUT_PASSES;
+            if state.plan.has_open() && (closeout_due(&state) || gap_closeout) && can_arm
             {
-                closeout_attempts += 1;
+                state.gap_closeout_passes += 1;
                 plan_closeout_due = true;
                 continue;
             }
@@ -1532,6 +1577,11 @@ pub fn run(config: Config) {
                             tool.arguments.get("evidence").unwrap_or(&Value::Null),
                         );
                         state.checkpoint_notes();
+                        // A Notes checkpoint is new material evidence for the run
+                        // and clears the gap-closeout escape valve so the next
+                        // closeout cycle can open fresh once the model wants to
+                        // move on.
+                        state.gap_closeout_passes = 0;
                         emit(
                             &config.run_id,
                             Event::TaskNoteUpdate {
@@ -1617,10 +1667,14 @@ pub fn run(config: Config) {
                                     .map_err(|e| e.to_string())?,
                             },
                         );
-                        // A successful plan mutation consumes the scoped
-                        // closeout handoff. A later final may arm the next
-                        // item, but it cannot silently reuse this one.
+                        // A successful plan mutation is new material evidence
+                        // for the run; it also clears the scoped closeout
+                        // handoff so a later final may arm the next item, but
+                        // it cannot silently reuse this one, and it resets the
+                        // gap-closeout pass counter so the next closeout cycle
+                        // starts fresh.
                         plan_closeout_due = false;
+                        state.gap_closeout_passes = 0;
                         state.mark_plan_checkpoint();
                         let (completed, total) = state.plan.progress();
                         if state
@@ -1735,6 +1789,31 @@ pub fn run(config: Config) {
                             .and_then(Value::as_str)
                             .unwrap_or_default()
                             .to_owned();
+                        // A successful saturated targeted read is new material evidence
+                        // for the run: it records the covered range (so a repeat
+                        // of the same range stays rejected even while remaining
+                        // budget is non-zero) and it resets the gap-closeout
+                        // escape valve so a closeout cycle that opens after this
+                        // read is fresh, not a continuation of a stalled one.
+                        let path = tool
+                            .arguments
+                            .get("path")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let start = tool
+                            .arguments
+                            .get("start_line")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(1) as usize;
+                        let end = tool
+                            .arguments
+                            .get("end_line")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0) as usize;
+                        if end >= start {
+                            state.record_saturated_range(path, start, end);
+                        }
+                        state.gap_closeout_passes = 0;
                         state.post_saturation_retrievals += 1;
                         if !state
                             .resolved_missing_facts
@@ -2311,5 +2390,210 @@ mod projection_tests {
         assert!(streamed.thinking_started);
         assert_eq!(streamed.reasoning_delta_count, 1);
         assert_eq!(streamed.reasoning, "inspect");
+    }
+
+    // ---- Deep-mode depth regression (Milestone 1) -----------------------------
+
+    fn saturated(state: &mut AgentState) -> &mut AgentState {
+        state.saturation_round = 2;
+        state
+    }
+
+    #[test]
+    fn saturated_targeted_reads_scale_with_open_work() {
+        // Deep-audit regression: a fixed 2-read budget physically starved a
+        // plan of 12 open items. The budget must now scale with the number of
+        // open items lacking `complete_for_task` evidence, and each targeted
+        // read must be counted as its own evidence record.
+        let mut state = AgentState::default();
+        saturated(&mut state);
+        state
+            .plan
+            .init(vec![crate::agent::todo::Phase {
+                name: "Analysis".into(),
+                tasks: (0..6)
+                    .map(|i| crate::agent::todo::Item {
+                        content: format!("item {i}"),
+                        status: crate::agent::todo::Status::Pending,
+                    })
+                    .collect(),
+            }])
+            .unwrap();
+        assert_eq!(state.open_without_complete_evidence(), 6);
+        // 2 (baseline) + 3 * 6 (open items without evidence) = 20 reads
+        assert_eq!(post_saturation_read_budget(&state), 20);
+        // After closing two of the six items with evidence the budget shrinks.
+        state.plan.finish("item 0", false).unwrap();
+        state.plan.finish("item 1", false).unwrap();
+    }
+
+    #[test]
+    fn saturated_read_repeat_is_rejected_even_with_budget_available() {
+        // Anti-loop guard: if the model has already performed `file: 10..20`,
+        // a second call for the same or overlapping range must stay rejected
+        // no matter how much targeted-read budget is left. The old fixed budget
+        // let the same call burn budget on every retry.
+        let mut state = AgentState::default();
+        saturated(&mut state);
+        let first = ValidatedCall {
+            id: "r1".into(),
+            name: "read_file".into(),
+            arguments: json!({"path":"src/core.rs","reason":"fact A","start_line":10,"end_line":20}),
+        };
+        assert!(!rejects_saturated_tool(&state, &first), "first targeted read must be allowed");
+        state.record_saturated_range("src/core.rs", 10, 20);
+        assert!(state.saturated_range_seen("src/core.rs", 10, 20));
+
+        let repeat = ValidatedCall {
+            id: "r2".into(),
+            name: "read_file".into(),
+            arguments: json!({"path":"src/core.rs","reason":"fact A","start_line":10,"end_line":20}),
+        };
+        assert!(
+            rejects_saturated_tool(&state, &repeat),
+            "same-range saturated read must be rejected even while budget remains"
+        );
+
+        // An overlapping range on the same file is also a repeat:
+        // the model already holds that evidence for the overlapping block.
+        let overlap = ValidatedCall {
+            id: "r3".into(),
+            name: "read_file".into(),
+            arguments: json!({"path":"src/core.rs","reason":"related fact","start_line":15,"end_line":25}),
+        };
+        assert!(rejects_saturated_tool(&state, &overlap), "overlap on the same file is a repeat");
+        // A range fully inside the covered block is likewise a repeat.
+        let inside = ValidatedCall {
+            id: "r3b".into(),
+            name: "read_file".into(),
+            arguments: json!({"path":"src/core.rs","reason":"narrower question","start_line":12,"end_line":18}),
+        };
+        assert!(rejects_saturated_tool(&state, &inside), "range inside a covered block is a repeat");
+
+        // A genuinely disjoint range on the same file remains legitimate.
+        let fresh_block = ValidatedCall {
+            id: "r4".into(),
+            name: "read_file".into(),
+            arguments: json!({"path":"src/core.rs","reason":"another fact","start_line":100,"end_line":120}),
+        };
+        assert!(!rejects_saturated_tool(&state, &fresh_block), "a disjoint range is new evidence");
+        state.record_saturated_range("src/core.rs", 100, 120);
+        // A range that touches but does not overlap an older one stays allowed.
+        let adjacent = ValidatedCall {
+            id: "r4b".into(),
+            name: "read_file".into(),
+            arguments: json!({"path":"src/core.rs","reason":"next block","start_line":60,"end_line":90}),
+        };
+        assert!(!rejects_saturated_tool(&state, &adjacent), "adjacent non-overlap is new evidence");
+
+        // A different file never inherits another file's coverage.
+        let other_file = ValidatedCall {
+            id: "r5".into(),
+            name: "read_file".into(),
+            arguments: json!({"path":"src/other.rs","reason":"its own fact","start_line":1,"end_line":10}),
+        };
+        assert!(!rejects_saturated_tool(&state, &other_file), "per-file coverage only");
+    }
+
+    #[test]
+    fn gap_closeout_valve_is_bounded_and_resets_on_new_evidence() {
+        // Termination guarantee: a saturated deep audit cannot cycle through
+        // the closeout handoff forever claiming to want more evidence. After
+        // MAX_GAP_CLOSEOUT_PASSES hands-offs without a fresh evidence record
+        // the run finalizes. New material evidence (a targeted read, a Notes
+        // checkpoint, a plan mutation) resets the counter so a later closeout
+        // can open again.
+        use crate::agent::state::MAX_GAP_CLOSEOUT_PASSES;
+        let mut state = AgentState::default();
+        state.plan.init(vec![crate::agent::todo::Phase {
+            name: "Analysis".into(),
+            tasks: vec![
+                crate::agent::todo::Item { content: "inspect core".into(), status: crate::agent::todo::Status::Pending },
+                crate::agent::todo::Item { content: "assess".into(), status: crate::agent::todo::Status::Pending },
+            ],
+        }]).unwrap();
+        assert!(state.plan.has_open());
+        assert!(!closeout_due(&state), "open item without complete evidence");
+
+        // The valve may arm up to MAX_GAP_CLOSEOUT_PASSES times in a row;
+        // beyond that no further closeout arm is allowed on the same cycle.
+        let mut arms = 0;
+        for _ in 0..MAX_GAP_CLOSEOUT_PASSES + 4 {
+            if state.plan.has_open()
+                && !closeout_due(&state)
+                && state.gap_closeout_passes < MAX_GAP_CLOSEOUT_PASSES
+            {
+                state.gap_closeout_passes += 1;
+                arms += 1;
+            }
+        }
+        assert_eq!(arms, MAX_GAP_CLOSEOUT_PASSES, "valve must not arm past the cap");
+        assert_eq!(state.gap_closeout_passes, MAX_GAP_CLOSEOUT_PASSES);
+
+        // A fresh targeted read is material new evidence: it clears the valve
+        // and lets the model start another closeout cycle.
+        state.saturation_round = 2;
+        state.record_saturated_range("src/core.rs", 10, 20);
+        state.gap_closeout_passes = 0;
+        let mut fresh_arms = 0;
+        for _ in 0..MAX_GAP_CLOSEOUT_PASSES + 4 {
+            if state.plan.has_open()
+                && !closeout_due(&state)
+                && state.gap_closeout_passes < MAX_GAP_CLOSEOUT_PASSES
+            {
+                state.gap_closeout_passes += 1;
+                fresh_arms += 1;
+            }
+        }
+        assert_eq!(fresh_arms, MAX_GAP_CLOSEOUT_PASSES, "fresh evidence restarts the valve");
+
+        // A plan mutation also resets the valve, so a closeout cycle that
+        // closes one item does not silently consume budget for the next.
+        state.gap_closeout_passes = MAX_GAP_CLOSEOUT_PASSES;
+        state.plan.finish("inspect core", false).unwrap();
+        state.gap_closeout_passes = 0;
+        assert_eq!(state.gap_closeout_passes, 0);
+    }
+
+    #[test]
+    fn compaction_preserves_complete_for_task_evidence() {
+        // Context handoff regression: when the transcript is compacted, the
+        // model-authored checkpoint facts must survive so the runtime still
+        // treats the source as `complete_for_task` and does not force a broad
+        // re-read. `InvestigatedItem::facts` and `evidence_complete` are the
+        // durable record; raw tool payloads may be summarized out of context.
+        let mut state = AgentState::default();
+        let big = "line\n".repeat(6_000);
+        state.record_investigation("read_file", "src/core.rs".into(), big.clone(), false);
+        state.checkpoint_source_evidence(
+            &json!([
+                {"path":"src/core.rs","facts":["fact A","fact B"],"relevance":["audit core"],"unresolved":[],"complete_for_task":true}
+            ]),
+        );
+        let item = state
+            .prior_investigation("read_file", "src/core.rs")
+            .expect("recorded investigation");
+        assert!(item.evidence_complete, "complete_for_task checkpoint must stick");
+        assert_eq!(item.facts, vec!["fact A", "fact B"]);
+
+        // A compaction handoff replaces the raw transcript with a summary; the
+        // runtime state must be the source of truth for the evidence gate.
+        let mut transcript = crate::agent::transcript::Transcript::default();
+        transcript.push_message(json!({"role":"assistant","content":"","tool_calls":[{"id":"c1","function":{"name":"read_file","arguments":"{}"}}]}));
+        transcript.push_message(json!({"role":"tool","tool_call_id":"c1","content":big}));
+        transcript.compact(json!("older evidence"), 1);
+        let projected = project(&transcript, "control", &working_control(&state));
+        let control = projected[0]["content"].as_str().unwrap();
+        assert!(control.contains("status: complete_for_task"));
+        assert!(control.contains("fact A"));
+        // The raw tool payload is projected out of the request but the
+        // checkpoint record it supports is still in the control block.
+        let raw = projected
+            .iter()
+            .find(|message| message.get("role") == Some(&json!("tool")))
+            .expect("tool message projected");
+        let content = raw["content"].as_str().unwrap();
+        assert!(content.contains("context_compacted") || content.chars().count() < big.chars().count(),
+            "raw payload must be summarized while checkpoint facts remain in control");
     }
 }
