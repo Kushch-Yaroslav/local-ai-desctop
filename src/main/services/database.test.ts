@@ -96,15 +96,22 @@ export async function runDatabaseMigrationRegression(): Promise<void> {
     fresh.addAnalysisAction(persistedRun.id, { id: 'terminal-final', label: 'Terminal', kind: 'terminal', state: 'running', terminal: { command: 'printf done', cwd: '/project', pid: 4813, pgid: 4813, sessionId: 4813, startedAt: '2026-09-24T16:02:01.000Z', status: 'running' } });
     fresh.addAnalysisAction(persistedRun.id, { id: 'terminal-final', label: 'Terminal', kind: 'terminal', state: 'running', terminal: { stdout: 'done\n' } });
     fresh.addAnalysisAction(persistedRun.id, { id: 'terminal-final', label: 'Terminal', kind: 'terminal', state: 'completed', terminal: { command: 'printf done', cwd: '/project', pid: 4813, pgid: 4813, sessionId: 4813, startedAt: '2026-09-24T16:02:01.000Z', finishedAt: '2026-09-24T16:02:02.000Z', exitCode: 0, timedOut: false, cancelled: false, status: 'completed', stdout: 'done\n', stderr: '' } });
-    const finalPlan = { steps: [{ id: 'inspect', label: 'Inspect Project 1', status: 'completed' as const }, { id: 'implement', label: 'Implement Project 2 change', status: 'in_progress' as const }] };
+    const finalPlan = {
+      milestones: [
+        { id: 'milestone-1', label: 'Inspect Project 1', status: 'completed' as const, workPlan: { tasks: [{ id: 'task-1', label: 'Map entry points', status: 'completed' as const }] } },
+        { id: 'milestone-2', label: 'Implement Project 2 change', status: 'in_progress' as const, workPlan: { tasks: [{ id: 'task-2', label: 'Apply change', status: 'in_progress' as const }] } },
+      ],
+      activeMilestoneId: 'milestone-2',
+      revision: 3,
+    };
     fresh.addAnalysisAction(persistedRun.id, { id: 'plan-update', label: 'Планирование', kind: 'planning', state: 'completed', plan: finalPlan, metadata: { steps: 2, completed_steps: 1 } });
-    fresh.addAnalysisAction(persistedRun.id, { id: 'notes-update', label: 'Обновление Task Notes', kind: 'notes', state: 'completed', output: 'Known finding; next step is implementation.' });
     const actionCountedRun = fresh.addAnalysisAction(persistedRun.id, { id: 'context-1', label: 'Контекст оптимизирован', detail: '26 151 → 18 028 токенов', kind: 'context', state: 'completed', metadata: { context_window: 32_768, input_tokens_before: 26_151, input_tokens_after: 18_028, compacted_messages: 13, compacted_tool_results: 6, compaction_count: 1 } });
     const progressRun = fresh.addAnalysisAction(persistedRun.id, { id: 'progress-1', label: 'Проверка', kind: 'progress', state: 'completed' });
     const deduplicatedRun = fresh.addAnalysisAction(persistedRun.id, { id: 'context-1', label: 'Контекст оптимизирован', kind: 'context', state: 'completed', metadata: { input_tokens_after: 18_028 } });
-    assert.equal(actionCountedRun.actionCount, 5, 'structured Plan, Notes, terminal, and context activities were not counted exactly once');
-    assert.equal(progressRun.actionCount, 5, 'reasoning/progress activity was counted as an Agent action');
-    assert.equal(deduplicatedRun.actionCount, 5, 'updating a persisted activity counted the same action twice');
+    assert.equal(actionCountedRun.actionCount, 4, 'plan, terminal, and context activities were not counted exactly once');
+    assert.equal(progressRun.actionCount, 4, 'reasoning/progress activity was counted as an Agent action');
+    assert.equal(deduplicatedRun.actionCount, 4, 'updating a persisted activity counted the same action twice');
+    fresh.saveAgentPlan(freshChat.id, finalPlan);
     fresh.finishAnalysisRun(persistedRun.id, 'completed', null);
     fresh.close();
     const legacyMode = new DatabaseSync(freshPath);
@@ -119,7 +126,7 @@ export async function runDatabaseMigrationRegression(): Promise<void> {
     assert.deepEqual(restoredResponse?.thinkingTimeline, [{ id: 'reasoning-1', kind: 'reasoning', content: 'I checked the backend timing fields first.', position: 1 }, { id: 'plan-event', kind: 'activity', activityId: 'plan-update', position: 2 }], 'message Thinking event order was not preserved after restart');
     assert.deepEqual(restoredResponse?.generationStats, { outputTokens: 4049, tokensPerSecond: 49, generationDurationMs: 82_600, timeToFirstTokenMs: 620, inputTokens: 1_200 }, 'message generation statistics were not preserved after restart');
     assert.deepEqual(loaded.actions.find((action) => action.id === 'plan-update')?.plan, finalPlan, 'last structured Agent Plan was not preserved after restart');
-    assert.equal(loaded.actions.find((action) => action.id === 'notes-update')?.kind, 'notes', 'Task Notes semantic type was not preserved after restart');
+    assert.deepEqual(reopenedFresh.getAgentPlan(freshChat.id), finalPlan, 'canonical Goal/Work Plan was not preserved after restart');
     const context = loaded.actions.find((action) => action.id === 'context-1');
     assert.equal(context?.kind, 'context', 'context compaction semantic type was not preserved after restart');
     assert.equal(context?.metadata?.input_tokens_after, 18_028, 'context compaction details were not preserved after restart');

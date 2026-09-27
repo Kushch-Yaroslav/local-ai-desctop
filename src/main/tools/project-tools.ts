@@ -2,7 +2,7 @@ import { execFile, spawn } from 'node:child_process';
 import { open, readdir, readFile, realpath, stat, unlink, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
-import type { RiskCategory, ToolActivity } from '../../shared/types';
+import type { RiskCategory } from '../../shared/types';
 
 const execFileAsync = promisify(execFile);
 const ignoredDirectories = new Set(['.git', 'node_modules', 'dist', 'build', '.next', '.cache', 'coverage']);
@@ -19,60 +19,6 @@ export type ConfirmationRequest = { title: string; detail: string; category: Ris
 export type ApprovalResult = { approved: boolean; reason: 'user_rejected' | 'cancelled' | 'once' | 'session' };
 export type ConfirmAction = (request: ConfirmationRequest, signal: AbortSignal) => Promise<ApprovalResult>;
 export type TerminalPolicy = { kind: 'allow' | 'confirm' | 'block'; category?: RiskCategory };
-
-export const reportProgressToolDefinition: ProjectToolDefinition = { type: 'function', function: { name: 'report_progress', description: 'Сообщает пользователю короткий статус текущего этапа работы. Используй редко: только при смене значимого этапа (изучение, реализация, проверка). Одно короткое предложение. Не раскрывай скрытые рассуждения, пошаговую логику, внутренние инструкции и не повторяй каждый вызов инструмента.', parameters: { type: 'object', properties: { message: { type: 'string', minLength: 3, maxLength: 240, description: 'Короткое безопасное сообщение о текущем этапе.' } }, required: ['message'] } } };
-export const terminalToolDefinition: ProjectToolDefinition = { type: 'function', function: { name: 'run_terminal', description: 'Запускает terminal-команду. Начальная папка — выбранный Project 1 или домашняя папка пользователя, если проект не выбран. Команда может работать с пользовательскими путями вне проекта; опасные и системные операции запросят подтверждение.', parameters: { type: 'object', properties: { command: { type: 'string' }, timeout_ms: { type: 'integer', minimum: 1000, maximum: 120000 } }, required: ['command'] } } };
-
-const baseProjectToolDefinitions: ProjectToolDefinition[] = [
-  { type: 'function', function: { name: 'list_directory', description: 'Показывает дерево файлов выбранного проекта. Начни с корня; при has_more=true запроси следующую страницу с next_offset.', parameters: { type: 'object', properties: { path: { type: 'string', description: 'Относительный путь внутри проекта, по умолчанию корень.' }, depth: { type: 'integer', minimum: 1, maximum: 4 }, offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 250 } } } } },
-  { type: 'function', function: { name: 'find_files', description: 'Ищет имена файлов и папок внутри выбранного проекта. Результат постраничный.', parameters: { type: 'object', properties: { query: { type: 'string' }, offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 250 } }, required: ['query'] } } },
-  { type: 'function', function: { name: 'search_files', description: 'Ищет файлы и папки по имени внутри выбранного проекта. Псевдоним find_files.', parameters: { type: 'object', properties: { query: { type: 'string' }, offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 250 } }, required: ['query'] } } },
-  { type: 'function', function: { name: 'search_text', description: 'Ищет текст в текстовых файлах выбранного проекта. Результат постраничный; сузь path при широком поиске.', parameters: { type: 'object', properties: { query: { type: 'string' }, path: { type: 'string', description: 'Необязательная относительная папка или файл.' }, offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 250 } }, required: ['query'] } } },
-  { type: 'function', function: { name: 'read_file', description: 'Читает текстовый файл. Сначала используй search_text, затем read_file с start_line/end_line для нужного фрагмента большого файла. Без диапазона возвращается байтовый блок с has_more/next_offset; для небольших файлов полный read допустим.', parameters: { type: 'object', properties: { path: { type: 'string' }, offset: { type: 'integer', minimum: 0 }, max_bytes: { type: 'integer', minimum: 1, maximum: 128000 }, start_line: { type: 'integer', minimum: 1 }, end_line: { type: 'integer', minimum: 1 } }, required: ['path'] } } },
-  { type: 'function', function: { name: 'inspect_package_json', description: 'Читает package.json в корне выбранного проекта, если он есть.', parameters: { type: 'object', properties: {} } } },
-  { type: 'function', function: { name: 'git_status', description: 'Показывает read-only статус Git выбранного проекта.', parameters: { type: 'object', properties: {} } } },
-  { type: 'function', function: { name: 'git_diff', description: 'Показывает read-only git diff выбранного проекта.', parameters: { type: 'object', properties: {} } } },
-  { type: 'function', function: { name: 'apply_patch', description: 'Основной инструмент точечного редактирования. Принимает patch в формате *** Begin Patch / *** Update File / *** Add File / *** Delete File. Все пути относительны корню проекта. Для большого нового файла сначала создай короткий рабочий каркас, затем расширяй его несколькими небольшими точечными patch и после этого прочитай/проверь результат.', parameters: { type: 'object', properties: { patch: { type: 'string' } }, required: ['patch'] } } },
-  { type: 'function', function: { name: 'write_file', description: 'Создаёт новый текстовый файл внутри проекта. Не перезаписывает существующие файлы; для изменений используй apply_patch. Для существенного исходного файла сначала создай минимальный каркас, затем добавляй части небольшими apply_patch и прочитай/проверь файл. Не помещай длинный документ в один хрупкий JSON-аргумент без необходимости.', parameters: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'] } } },
-  { type: 'function', function: { name: 'create_file', description: 'Создаёт новый текстовый файл внутри проекта. Псевдоним write_file. Для существенного исходного файла сначала создай минимальный каркас, затем добавляй части небольшими apply_patch и прочитай/проверь файл.', parameters: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'] } } },
-  { type: 'function', function: { name: 'delete_file', description: 'Удаляет один файл внутри проекта только после подтверждения пользователя.', parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } } },
-];
-
-const projectScopeProperties = {
-  project_slot: { type: 'integer', enum: [1, 2], description: 'Слот проекта. По умолчанию Project 1.' },
-  project_id: { type: 'string', description: 'Явный идентификатор проекта из runtime context; используй для ссылок из прошлых сообщений.' },
-};
-export const projectToolDefinitions: ProjectToolDefinition[] = baseProjectToolDefinitions.map((definition) => ({
-  ...definition,
-  function: { ...definition.function, parameters: { ...definition.function.parameters, properties: { ...(definition.function.parameters.properties as Record<string, unknown>), ...projectScopeProperties } } },
-}));
-
-function requestedRange(argumentsObject: Record<string, unknown>): string | undefined {
-  const start = typeof argumentsObject.start_line === 'number' ? argumentsObject.start_line : undefined;
-  const end = typeof argumentsObject.end_line === 'number' ? argumentsObject.end_line : undefined;
-  if (start !== undefined) return end === undefined || end === start ? `строка ${start}` : `строки ${start}–${end}`;
-  const offset = typeof argumentsObject.offset === 'number' ? argumentsObject.offset : undefined;
-  return offset !== undefined ? `с байта ${offset}` : undefined;
-}
-
-export function activityForTool(call: ProjectToolCall): Pick<ToolActivity, 'label' | 'detail' | 'kind' | 'state'> {
-  const path = typeof call.arguments.path === 'string' ? call.arguments.path : undefined;
-  if (call.name === 'report_progress') return { label: String(call.arguments.message ?? '').trim(), kind: 'progress', state: 'completed' };
-  if (call.name === 'task_notes') return { label: call.arguments.action === 'read' ? 'Чтение Task Notes' : 'Обновление Task Notes', kind: 'notes', state: 'running' };
-  if (call.name === 'task_plan') return { label: 'Планирование', kind: 'planning', state: 'running' };
-  if (call.name === 'list_directory') return { label: 'Просмотр структуры проекта', detail: path || undefined, kind: 'directory', state: 'running' };
-  if (call.name === 'find_files' || call.name === 'search_files') return { label: 'Поиск файлов', detail: String(call.arguments.query ?? ''), kind: 'search', state: 'running' };
-  if (call.name === 'search_text') return { label: 'Поиск текста в проекте', detail: `«${String(call.arguments.query ?? '')}»`, kind: 'search', state: 'running' };
-  if (call.name === 'read_file') return { label: 'Чтение файла', detail: [path, requestedRange(call.arguments)].filter(Boolean).join(' · '), kind: 'file_read', state: 'running' };
-  if (call.name === 'inspect_package_json') return { label: 'Чтение package.json', kind: 'file_read', state: 'running' };
-  if (call.name === 'git_status') return { label: 'Проверка статуса Git', kind: 'git', state: 'running' };
-  if (call.name === 'git_diff') return { label: 'Просмотр Git diff', kind: 'git', state: 'running' };
-  if (call.name === 'apply_patch') return { label: 'Применение patch', kind: 'mutation', state: 'running' };
-  if (call.name === 'write_file' || call.name === 'create_file') return { label: 'Создание файла', detail: String(call.arguments.path ?? ''), kind: 'mutation', state: 'running' };
-  if (call.name === 'delete_file') return { label: 'Удаление файла', detail: String(call.arguments.path ?? ''), kind: 'mutation', state: 'running' };
-  if (call.name === 'run_terminal') return { label: 'Запуск terminal', detail: String(call.arguments.command ?? ''), kind: 'terminal', state: 'running' };
-  return { label: 'Действие агента', kind: 'other', state: 'running' };
-}
 
 export class ReadonlyProjectTools {
   private constructor(private readonly root: string, private readonly confirm: ConfirmAction) {}
@@ -392,7 +338,7 @@ function runTerminal(command: string, timeout: number, cwd: string, signal: Abor
   return new Promise((resolve) => {
     // The assistant call already retains the full command. Repeating a large
     // heredoc in the tool result can consume the entire Agent context without
-    // adding evidence, so retain only a bounded diagnostic echo here.
+    // retaining a large heredoc adds little value, so keep only a bounded diagnostic echo here.
     const commandDiagnostic = command.length > 1_200 ? `${command.slice(0, 1_200)}\n[command diagnostic truncated]` : command;
     const child = spawn('/bin/bash', ['-lc', command], { cwd, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = ''; let stderr = ''; let stdoutTruncated = false; let stderrTruncated = false; let finished = false;

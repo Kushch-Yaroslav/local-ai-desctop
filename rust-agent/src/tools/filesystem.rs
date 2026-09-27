@@ -143,13 +143,24 @@ pub fn execute(root: &Path, name: &str, args: &Value) -> Result<(Value, Option<S
 /// round-trip against the same file content. A section failure leaves the file
 /// untouched because the rewrite happens in memory until the last byte is
 /// validated.
-fn apply_patch(root: &Path, object: &serde_json::Map<String, Value>) -> Result<(Value, Option<String>), String> {
+fn apply_patch(
+    root: &Path,
+    object: &serde_json::Map<String, Value>,
+) -> Result<(Value, Option<String>), String> {
     let patch = object
         .get("patch")
         .and_then(Value::as_str)
         .ok_or_else(|| "patch is required".to_owned())?;
-    let lines: Vec<String> = patch.replace("\r\n", "\n").split('\n').map(str::to_owned).collect();
-    if lines.first().map(|l| l.trim()).is_some_and(|h| h != "*** Begin Patch") {
+    let lines: Vec<String> = patch
+        .replace("\r\n", "\n")
+        .split('\n')
+        .map(str::to_owned)
+        .collect();
+    if lines
+        .first()
+        .map(|l| l.trim())
+        .is_some_and(|h| h != "*** Begin Patch")
+    {
         return Err("patch must start with *** Begin Patch".to_owned());
     }
     let mut cursor = 1;
@@ -196,21 +207,28 @@ fn apply_patch(root: &Path, object: &serde_json::Map<String, Value>) -> Result<(
         if let Some(rel) = header.strip_prefix("*** Update File: ") {
             let rel = rel.trim();
             let target = scoped(root, rel)?;
-            let before = fs::read_to_string(&target)
-                .map_err(|e| format!("cannot read {rel}: {e}"))?;
+            let before =
+                fs::read_to_string(&target).map_err(|e| format!("cannot read {rel}: {e}"))?;
             let body = collect_body(&lines, &mut cursor);
             let mut content = before.clone();
             for hunk in hunk_blocks(&body) {
                 let (old, new) = interpret_hunk(&hunk);
                 if old.trim().is_empty() {
-                    return Err(format!("patch for {rel} must remove or replace existing content"));
+                    return Err(format!(
+                        "patch for {rel} must remove or replace existing content"
+                    ));
                 }
                 // Apply each hunk against the latest in-memory content so a
                 // multi-hunk section edits the same file consistently.
                 let position = content
                     .find(&old)
                     .ok_or_else(|| format!("patch does not match current content: {rel}"))?;
-                content = format!("{}{}{}", &content[..position], new, &content[position + old.len()..]);
+                content = format!(
+                    "{}{}{}",
+                    &content[..position],
+                    new,
+                    &content[position + old.len()..]
+                );
             }
             fs::write(&target, &content).map_err(|e| e.to_string())?;
             changed.push(rel.to_owned());
@@ -221,7 +239,10 @@ fn apply_patch(root: &Path, object: &serde_json::Map<String, Value>) -> Result<(
     if changed.is_empty() {
         return Err("patch contains no file sections".to_owned());
     }
-    Ok((json!({"applied":true,"files":changed}), Some(changed.join(", "))))
+    Ok((
+        json!({"applied":true,"files":changed}),
+        Some(changed.join(", ")),
+    ))
 }
 
 /// Body lines run up to (and excluding) the next `*** ` header or `*** End
@@ -297,23 +318,34 @@ mod tests {
         fs::write(root.join("src/old.txt"), "gone\n").expect("write");
 
         let patch = [
-                "*** Begin Patch",
-                "*** Update File: src/a.txt",
-                "-beta",
-                "+BETA",
-                "*** Add File: src/new.txt",
-                "+hello",
-                "*** Delete File: src/old.txt",
-                "*** End Patch",
-            ]
-            .join("\n");
-        let result =
-            apply_patch(&root, &serde_json::json!({"patch": patch}).as_object().cloned().unwrap())
-                .expect("patch applies");
+            "*** Begin Patch",
+            "*** Update File: src/a.txt",
+            "-beta",
+            "+BETA",
+            "*** Add File: src/new.txt",
+            "+hello",
+            "*** Delete File: src/old.txt",
+            "*** End Patch",
+        ]
+        .join("\n");
+        let result = apply_patch(
+            &root,
+            &serde_json::json!({"patch": patch})
+                .as_object()
+                .cloned()
+                .unwrap(),
+        )
+        .expect("patch applies");
         assert!(result.0["applied"] == true);
 
-        assert_eq!(fs::read_to_string(root.join("src/a.txt")).unwrap(), "alpha\nBETA\ngamma\n");
-        assert_eq!(fs::read_to_string(root.join("src/new.txt")).unwrap(), "hello\n");
+        assert_eq!(
+            fs::read_to_string(root.join("src/a.txt")).unwrap(),
+            "alpha\nBETA\ngamma\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("src/new.txt")).unwrap(),
+            "hello\n"
+        );
         assert!(!root.join("src/old.txt").exists());
 
         let bad = apply_patch(
@@ -326,7 +358,10 @@ mod tests {
         .expect_err("mismatch must fail");
         assert!(bad.contains("does not match"), "{bad}");
         // File must remain untouched after a failed patch.
-        assert_eq!(fs::read_to_string(root.join("src/a.txt")).unwrap(), "alpha\nBETA\ngamma\n");
+        assert_eq!(
+            fs::read_to_string(root.join("src/a.txt")).unwrap(),
+            "alpha\nBETA\ngamma\n"
+        );
 
         fs::remove_dir_all(root).expect("cleanup");
     }

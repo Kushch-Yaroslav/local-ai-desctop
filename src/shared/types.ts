@@ -91,6 +91,10 @@ export interface AgentTelemetry {
   tokensPerSecond?: number;
   actions: number;
   compactions?: number;
+  /** Provider-reported prompt/KV cache reads, never a synthetic estimate. */
+  cachedTokens?: number;
+  /** Provider-reported prompt/KV cache writes. */
+  cacheWriteTokens?: number;
   startedAt: string;
   finishedAt?: string;
 }
@@ -244,9 +248,26 @@ export type ThinkingTimelineEvent =
   | { id: string; kind: 'reasoning'; content: string; position: number; startedAt?: string; completedAt?: string }
   | { id: string; kind: 'activity'; activityId: string; position: number };
 
-export type AgentPlanStepStatus = 'pending' | 'in_progress' | 'completed';
+export type AgentPlanStepStatus = 'pending' | 'in_progress' | 'completed' | 'abandoned';
+/** Kept optional for reading messages saved by the pre-milestone renderer. */
 export interface AgentPlanStep { id: string; label: string; status: AgentPlanStepStatus; }
-export interface AgentPlan { steps: AgentPlanStep[]; }
+export interface AgentWorkTask { id: string; label: string; status: AgentPlanStepStatus; revision?: number; }
+export interface AgentMilestone {
+  id: string;
+  label: string;
+  status: AgentPlanStepStatus;
+  revision?: number;
+  workPlan: { tasks: AgentWorkTask[]; revision?: number };
+}
+/** Persistent agent planning state: stable milestones plus only the active
+ * milestone's adaptive Work Plan in the primary UI. */
+export interface AgentPlan {
+  milestones?: AgentMilestone[];
+  activeMilestoneId?: string | null;
+  revision?: number;
+  /** Legacy persisted snapshots are normalized at the Electron boundary. */
+  steps?: AgentPlanStep[];
+}
 
 export interface AnalysisRun {
   id: string;
@@ -291,6 +312,7 @@ export interface LocalAiApi {
     delete(id: string): Promise<void>;
   };
   messages: { list(conversationId: string): Promise<ChatMessage[]>; edit(id: string, content: string, fallback?: Pick<ChatMessage, 'conversationId' | 'content'>): Promise<ChatMessage[]>; regenerate(id: string): Promise<ChatMessage[]> };
+  agentPlans: { get(conversationId: string): Promise<AgentPlan | null> };
   projects: { search(conversationId: string, query: string): Promise<ProjectSuggestion[]> };
   attachments: {
     import(input: AttachmentInput): Promise<Attachment>;

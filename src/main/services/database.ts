@@ -1,6 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
-import type { AnalysisRun, Attachment, AttachmentKind, AttachmentStatus, ChatMessage, ChatMode, Conversation, GenerationDiagnostics, GenerationStats, ProjectReference, ProjectReferenceKind, ReasoningMode, ThinkingTimelineEvent, ToolActivity, WebMode } from '../../shared/types';
+import type { AgentPlan, AnalysisRun, Attachment, AttachmentKind, AttachmentStatus, ChatMessage, ChatMode, Conversation, GenerationDiagnostics, GenerationStats, ProjectReference, ProjectReferenceKind, ReasoningMode, ThinkingTimelineEvent, ToolActivity, WebMode } from '../../shared/types';
 import { paths } from './paths';
 
 type ConversationRow = {
@@ -17,6 +17,7 @@ type ProjectReferenceRow = { id: string; message_id: string; position: number; p
 type AttachmentRow = { id: string; message_id: string; position: number; kind: AttachmentKind; mime_type: string; filename: string; size: number; storage_ref: string; status: AttachmentStatus; extracted_text: string | null; structured_data: string | null; vision_analysis: string | null; error: string | null; metadata: string | null; created_at: string; updated_at: string };
 type AnalysisRunRow = { id: string; conversation_id: string; assistant_message_id: string | null; reasoning_mode: ReasoningMode; status: AnalysisRun['status']; action_count: number; created_at: string; completed_at: string | null };
 type AnalysisActionRow = { id: string; run_id: string; label: string; detail: string | null; data: string | null; position: number };
+type AgentPlanRow = { plan: string };
 
 const mapConversation = (row: ConversationRow): Conversation => ({
   id: row.id, title: row.title, modelId: row.model_id, mode: row.mode,
@@ -54,7 +55,12 @@ const mapMessage = (row: MessageRow, attachments?: Attachment[], projectReferenc
     const parsed = row.thinking_timeline ? JSON.parse(row.thinking_timeline) as unknown : undefined;
     if (Array.isArray(parsed)) thinkingTimeline = parsed.filter((item): item is ThinkingTimelineEvent => Boolean(item) && typeof item === 'object' && typeof item.id === 'string' && typeof item.position === 'number' && ((item.kind === 'reasoning' && typeof item.content === 'string' && (item.startedAt === undefined || typeof item.startedAt === 'string') && (item.completedAt === undefined || typeof item.completedAt === 'string')) || (item.kind === 'activity' && typeof item.activityId === 'string')));
   } catch { /* Old or damaged timeline metadata remains optional. */ }
-  try { const parsed = row.task_plan ? JSON.parse(row.task_plan) as unknown : undefined; if (parsed && typeof parsed === 'object' && Array.isArray((parsed as { steps?: unknown }).steps)) taskPlan = parsed as import('../../shared/types').AgentPlan; } catch { /* Old snapshot remains optional. */ }
+  try {
+    const parsed = row.task_plan ? JSON.parse(row.task_plan) as unknown : undefined;
+    if (parsed && typeof parsed === 'object' && (Array.isArray((parsed as { milestones?: unknown }).milestones) || Array.isArray((parsed as { steps?: unknown }).steps))) {
+      taskPlan = parsed as import('../../shared/types').AgentPlan;
+    }
+  } catch { /* Old snapshot remains optional. */ }
   return {
     id: row.id, conversationId: row.conversation_id, role: row.role, content: row.content, createdAt: row.created_at,
     attachments,
@@ -89,6 +95,10 @@ export class Database {
         role TEXT NOT NULL, content TEXT NOT NULL, thinking TEXT, thinking_timeline TEXT, task_plan TEXT, generation_stats TEXT, created_at TEXT NOT NULL
       ) STRICT;
       CREATE INDEX IF NOT EXISTS messages_conversation_idx ON messages(conversation_id, created_at);
+      CREATE TABLE IF NOT EXISTS agent_plans (
+        conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+        plan TEXT NOT NULL, updated_at TEXT NOT NULL
+      ) STRICT;
       CREATE TABLE IF NOT EXISTS project_references (
         id TEXT PRIMARY KEY, message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
         position INTEGER NOT NULL, project_id TEXT NOT NULL, project_slot INTEGER NOT NULL,
@@ -221,6 +231,7 @@ export class Database {
     for (const run of runs) this.db.prepare('DELETE FROM analysis_actions WHERE run_id=?').run(run.id);
     this.db.prepare('DELETE FROM analysis_runs WHERE conversation_id=?').run(id);
     this.db.prepare('DELETE FROM generation_diagnostics WHERE conversation_id=?').run(id);
+    this.db.prepare('DELETE FROM agent_plans WHERE conversation_id=?').run(id);
     this.db.prepare('DELETE FROM attachments WHERE message_id IN (SELECT id FROM messages WHERE conversation_id=?)').run(id);
     this.db.prepare('DELETE FROM project_references WHERE message_id IN (SELECT id FROM messages WHERE conversation_id=?)').run(id);
     this.db.prepare('DELETE FROM messages WHERE conversation_id=?').run(id);
@@ -235,6 +246,24 @@ export class Database {
 
   listMessages(conversationId: string): ChatMessage[] {
     return (this.db.prepare('SELECT * FROM messages WHERE conversation_id=? ORDER BY created_at ASC').all(conversationId) as unknown as MessageRow[]).map((row) => mapMessage(row, this.listAttachments(row.id), this.listProjectReferences(row.id)));
+  }
+
+  /** Durable canonical planning state. Message snapshots remain a readable
+   * historical record; this row also survives an interrupted active run. */
+  getAgentPlan(conversationId: string): AgentPlan | null {
+    const stored = this.db.prepare('SELECT plan FROM agent_plans WHERE conversation_id=?').get(conversationId) as AgentPlanRow | undefined;
+    const raw = stored?.plan ?? (this.db.prepare('SELECT task_plan AS plan FROM messages WHERE conversation_id=? AND task_plan IS NOT NULL ORDER BY rowid DESC LIMIT 1').get(conversationId) as AgentPlanRow | undefined)?.plan;
+    if (!raw) return null;
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      return parsed && typeof parsed === 'object' && (Array.isArray((parsed as { milestones?: unknown }).milestones) || Array.isArray((parsed as { steps?: unknown }).steps)) ? parsed as AgentPlan : null;
+    } catch { return null; }
+  }
+
+  saveAgentPlan(conversationId: string, plan: AgentPlan): void {
+    const updatedAt = new Date().toISOString();
+    this.db.prepare('INSERT INTO agent_plans (conversation_id, plan, updated_at) VALUES (?, ?, ?) ON CONFLICT(conversation_id) DO UPDATE SET plan=excluded.plan, updated_at=excluded.updated_at').run(conversationId, JSON.stringify(plan), updatedAt);
+    this.db.prepare('UPDATE conversations SET updated_at=? WHERE id=?').run(updatedAt, conversationId);
   }
 
   getMessage(id: string): ChatMessage | null {

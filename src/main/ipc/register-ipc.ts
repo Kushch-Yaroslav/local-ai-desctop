@@ -5,24 +5,20 @@ import { Database } from '../services/database';
 import { getHardwareStats } from '../services/hardware';
 import { OllamaBackend } from '../backends/ollama-backend';
 import { LlamaCppBackend } from '../backends/llama-cpp-backend';
-import { ProjectChatService, type AgentProject } from '../services/project-chat';
-import { RustAgentRuntime } from '../services/rust-agent-runtime';
+import { RustAgentRuntime, type AgentProject } from '../services/rust-agent-runtime';
 import { paths } from '../services/paths';
 import { log } from '../services/logger';
 import { contextPresetsFor, getModelProfile, modelRegistry } from '../models/model-registry';
 import { WebBrowserService } from '../web/web-tools';
-import { webToolDefinitions } from '../web/web-tools';
 import { WebChatService } from '../services/web-chat';
 import { chatMessagesWithSystemPrefix, chatSystemContext } from '../services/capabilities';
-import { projectToolDefinitions, ReadonlyProjectTools, reportProgressToolDefinition, terminalToolDefinition, type ApprovalResult, type ConfirmAction } from '../tools/project-tools';
+import { ReadonlyProjectTools, type ApprovalResult, type ConfirmAction } from '../tools/project-tools';
 import { AttachmentService } from '../services/attachment-service';
 import { AttachmentPipeline } from '../services/attachment-pipeline';
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { ollamaErrorDiagnostics } from '../backends/ollama-errors';
 import { saveGenerationDiagnosticsBestEffort } from '../services/generation-diagnostics';
-import { taskNotesToolDefinition } from '../services/task-notes';
-import { agentPlanToolDefinition } from '../services/agent-plan';
 import { projectDirectoryName } from '../../shared/project-references';
 import { executionMode } from '../../shared/generation-mode';
 import { existingProjectDirectory } from '../services/project-picker';
@@ -34,9 +30,6 @@ const ollama = new OllamaBackend();
 const llamaCpp = new LlamaCppBackend(process.env.LOCAL_AI_LLAMA_CPP_URL ?? 'http://127.0.0.1:8081', 65_536, process.env.LOCAL_AI_LLAMA_CPP_VISION === '1', llamaRuntimeModelId);
 const backend = selectedBackend === 'llama-cpp' ? llamaCpp : ollama;
 const web = new WebBrowserService();
-const projectChat = new ProjectChatService(backend, web);
-// Agent V2 owns orchestration and tools. ProjectChatService remains only for
-// legacy compatibility until its code can be deleted after acceptance tests.
 const rustAgent = new RustAgentRuntime(process.env.LOCAL_AI_AGENT_ENDPOINT ?? (selectedBackend === 'llama-cpp' ? process.env.LOCAL_AI_LLAMA_CPP_URL ?? 'http://127.0.0.1:8081/v1/chat/completions' : 'http://127.0.0.1:11434/v1/chat/completions'));
 const webChat = new WebChatService(backend, web);
 const attachments = new AttachmentService(database);
@@ -129,6 +122,7 @@ export function registerIpc(): void {
   });
   ipcMain.handle('conversations:delete', async (_event, id: string) => { sessionApprovals.delete(id); await attachments.removeManagedFiles(database.deleteConversation(id)); });
   ipcMain.handle('messages:list', (_event, conversationId: string) => database.listMessages(conversationId));
+  ipcMain.handle('agent-plan:get', (_event, conversationId: string) => database.getAgentPlan(conversationId));
   ipcMain.handle('messages:edit', async (_event, messageId: string, content: string, fallback?: { conversationId: string; content: string }) => {
     const message = database.getMessage(messageId) ?? (fallback ? database.findUserMessage(fallback.conversationId, fallback.content) : null); if (!message) throw new Error('Сообщение не найдено');
     const before = database.listAttachmentsForConversation(message.conversationId);
@@ -234,7 +228,7 @@ export function registerIpc(): void {
     const thinkingTimeline: ThinkingTimelineEvent[] = []; const activityTimelinePositions = new Map<string, number>(); let timelinePosition = 0; let lastTimelineKind: ThinkingTimelineEvent['kind'] | null = null;
     const agentProjects: AgentProject[] = mode === 'agent' ? [...selectedProjects] : [];
     const agentRoot = agentProjects[0]?.root ?? null;
-    const enabledTools = mode === 'agent' ? [taskNotesToolDefinition.function.name, agentPlanToolDefinition.function.name, reportProgressToolDefinition.function.name, terminalToolDefinition.function.name, ...(agentProjects.length ? projectToolDefinitions.map((tool) => tool.function.name) : []), ...(conversation.webMode === 'auto' ? webToolDefinitions.map((tool) => tool.function.name) : [])] : conversation.webMode === 'auto' ? webToolDefinitions.map((tool) => tool.function.name) : [];
+    const enabledTools = mode === 'agent' ? ['apply_patch', 'create_file', 'delete_file', 'list_directory', 'read_file', 'run_terminal', 'task_plan', 'write_file'] : conversation.webMode === 'auto' ? ['web'] : [];
     log('generation.snapshot', { generationId: generation.id, chatId: request.conversationId, mode, storedMode: conversation.mode, requestedMode: request.mode, workingDirectory: conversation.workingDirectory, resolvedWorkingDirectory: agentRoot, projects: agentProjects.map((project) => ({ id: project.id, slot: project.slot })), webMode: conversation.webMode, modelId: request.model, contextSize: conversation.contextWindow, reasoningMode: conversation.reasoningMode, enabledTools });
     run = mode === 'agent' ? database.createAnalysisRun(request.conversationId, conversation.reasoningMode) : null;
     if (run && current()) event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run });
@@ -245,8 +239,9 @@ export function registerIpc(): void {
       // image payload is attached only to its owning user turn below.
       let history = attachmentPipeline.buildContext(request.messages, !hasImages);
       if (nativeVision) history = await attachmentPipeline.prepareNativeImages(history, abort.signal);
+      const persistedPlan = mode === 'agent' ? database.getAgentPlan(request.conversationId) : null;
       const stream = mode === 'agent'
-        ? rustAgent.stream(request.model, history, agentProjects, abort.signal, context.active, conversation.reasoningMode, conversation.webMode, generation.id)
+        ? rustAgent.stream(request.model, history, agentProjects, abort.signal, context.active, conversation.reasoningMode, conversation.webMode, generation.id, persistedPlan)
         : conversation.webMode === 'auto'
           ? webChat.stream(request.model, history, abort.signal, context.active, conversation.reasoningMode)
           : backend.streamChat(request.model, chatMessagesWithSystemPrefix(history, [chatSystemContext({ webAvailable: false }, conversation.reasoningMode === 'deep' ? 'deep' : 'fast')], request.conversationId, `capability-${request.conversationId}`), abort.signal, context.active, conversation.reasoningMode);
@@ -263,6 +258,7 @@ export function registerIpc(): void {
         }
         if (chunk.type === 'task-plan') {
           taskPlan = structuredClone(chunk.plan);
+          database.saveAgentPlan(request.conversationId, taskPlan);
           event.sender.send('chat:stream', { ...chunk, conversationId: request.conversationId, generationId: generation.id });
           continue;
         }

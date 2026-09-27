@@ -76,8 +76,21 @@ export function Composer() {
 }
 
 export function TaskPlanPanel({ plan, active = false }: { plan: AgentPlan; active?: boolean }) {
-  const completed = plan.steps.filter((step) => step.status === 'completed').length;
-  return <details className={`task-plan-panel${active ? ' active' : ''}`} open={active}><summary>Task Plan · {completed}/{plan.steps.length}{active && plan.steps.find((step) => step.status === 'in_progress') ? ` · ${plan.steps.find((step) => step.status === 'in_progress')!.label}` : ''}</summary><ol>{plan.steps.map((step) => <li className={step.status} key={step.id}>{step.status === 'completed' ? '✓' : step.status === 'in_progress' ? '●' : '○'} {step.label}</li>)}</ol></details>;
+  const legacy = plan.steps ?? [];
+  const milestones = plan.milestones ?? (legacy.length ? [{ id: 'legacy-plan', label: 'Previous plan', status: legacy.some((step) => step.status === 'in_progress') ? 'in_progress' as const : 'pending' as const, workPlan: { tasks: legacy } }] : []);
+  const activeMilestone = milestones.find((milestone) => milestone.id === plan.activeMilestoneId) ?? milestones.find((milestone) => milestone.status === 'in_progress') ?? milestones[0];
+  const terminal = (status: string) => status === 'completed' || status === 'abandoned';
+  const marker = (status: string) => status === 'completed' ? '✓' : status === 'abandoned' ? '–' : status === 'in_progress' ? '●' : '○';
+  const completed = milestones.filter((milestone) => terminal(milestone.status)).length;
+  if (!milestones.length) return null;
+  return <section className={`task-plan-panel milestone-plan${active ? ' active' : ''}`} aria-label="Task Planning">
+    <header><strong>Task Planning</strong><span>{completed}/{milestones.length} milestones</span></header>
+    <div className="milestone-plan-grid">
+      <section className="milestone-column"><h4>Goal / Milestones</h4><ol>{milestones.map((milestone) => <li key={milestone.id} className={`${milestone.status}${milestone.id === activeMilestone?.id ? ' active' : ''}`}><i>{marker(milestone.status)}</i><span>{milestone.label}</span>{milestone.id === activeMilestone?.id && <b>active</b>}</li>)}</ol></section>
+      <section className="work-plan-column"><h4>Adaptive Work Plan</h4>{activeMilestone ? <><p className="work-plan-milestone">{activeMilestone.label}</p>{activeMilestone.workPlan.tasks.length ? <ol>{activeMilestone.workPlan.tasks.map((task) => <li className={task.status} key={task.id}><i>{marker(task.status)}</i><span>{task.label}</span></li>)}</ol> : <p className="work-plan-empty">The model will add tasks after it has enough orientation.</p>}</> : <p className="work-plan-empty">No active milestone.</p>}</section>
+    </div>
+    {milestones.some((milestone) => milestone.id !== activeMilestone?.id && milestone.workPlan.tasks.length) && <details className="work-plan-history"><summary>Previous work plans</summary>{milestones.filter((milestone) => milestone.id !== activeMilestone?.id && milestone.workPlan.tasks.length).map((milestone) => <section key={milestone.id}><strong>{milestone.label}</strong><ol>{milestone.workPlan.tasks.map((task) => <li className={task.status} key={task.id}>{marker(task.status)} {task.label}</li>)}</ol></section>)}</details>}
+  </section>;
 }
 
 function ProjectReferenceChip({ reference, onRemove }: { reference: ProjectReference; onRemove: () => void }) {

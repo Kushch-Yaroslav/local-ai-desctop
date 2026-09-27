@@ -1,9 +1,15 @@
+//! Transcript-first local agent loop.
+//!
+//! The runtime owns transport, capability safety, durable planning and bounded
+//! recovery. It does not certify evidence, decide exploration coverage, or make
+//! semantic completion decisions for the model.
+
 use crate::agent::{
     events::Event,
-    policy::{self, RunPolicy},
-    state::{AgentState, MAX_GAP_CLOSEOUT_PASSES},
+    policy::{self, Reasoning, RunPolicy},
+    state::AgentState,
+    todo::GoalPlan,
     transcript::{validate_calls, Transcript, ValidatedCall},
-    todo::{Status, TaskPlan},
 };
 use crate::context::projection::project;
 use crate::protocol::emit;
@@ -28,831 +34,292 @@ pub struct Config {
     pub reasoning_mode: String,
     pub policy: RunPolicy,
     pub history: Vec<Value>,
+    pub plan: Option<Value>,
+    pub provider_max_output: Option<usize>,
     pub cancelled: Arc<AtomicBool>,
     pub steering: Arc<Mutex<Vec<String>>>,
 }
 
-// `context_limit` is the user-selected working context, not the llama.cpp
-// server ceiling. Reserve room for a complete streamed answer and template
-// overhead before projecting a request.
-const RESERVED_OUTPUT_TOKENS: usize = 8_192;
-const SAFETY_TOKENS: usize = 1_024;
-/// Escape hatch for a provider that repeatedly exhausts output while we are
-/// continuing one final answer. This is not a normal answer-length cap.
-const MAX_FINAL_CONTINUATIONS: usize = 3;
-/// Keep the exact end of a prior final in the continuation request. The full
-/// answer may no longer fit after compaction, but this is enough to continue
-/// from the actual sentence rather than guessing from a character count.
-const FINAL_CONTINUATION_TAIL_CHARS: usize = 12_000;
-// Avoid compaction churn: a small summary delta costs a turn but leaves the
-// next request above the same watermark. Hard-budget compaction still wins.
-const MIN_COMPACTION_GAIN_TOKENS: usize = 256;
+/// Initial values follow Jan's shape but are deliberately configurable at the
+/// helper boundary rather than pretending every local model has one window.
+pub const DEFAULT_COMPACTION_RATIO: f64 = 0.80;
+pub const DEFAULT_KEEP_RECENT: usize = 8;
+pub const SAFETY_RESERVE_TOKENS: usize = 1_024;
+pub const MIN_OUTPUT_HEADROOM_TOKENS: usize = 1_024;
+pub const APPLICATION_MAX_OUTPUT_TOKENS: usize = 32_768;
+pub const MAX_COMPACTION_ATTEMPTS: usize = 4;
+pub const MAX_CONTINUATION_TURNS: usize = 32;
+pub const MAX_LOGICAL_FINAL_CHARS: usize = 1_000_000;
+pub const PLAN_NUDGE_ACTION_THRESHOLD: usize = 12;
+pub const PLAN_NUDGE_MAX_PER_RUN: usize = 2;
+pub const SUMMARY_INPUT_CHARS: usize = 48_000;
+pub const SUMMARY_MAX_OUTPUT_TOKENS: usize = 4_096;
+pub const MIN_SUMMARY_OUTPUT_TOKENS: usize = 256;
 
-// Ported from Jan's always-on agent guidelines and adapted to Local's
-// Task Plan/Task Notes tools. This is runtime control context, not a synthetic
-// user turn: it remains at the system boundary across compaction.
 const AGENT_GUIDANCE: &str = r#"
-# Agent guidelines
-- Be concise and answer the user's actual question once sufficient evidence is available.
-- Tool output is complete unless it explicitly says it was truncated. Do not reread an unchanged file or rerun an inspection just to look for hidden output.
-- For a substantial multi-step project analysis, first create a Task Plan that covers inspection, business/architecture assessment, implementation assessment, and synthesis. Keep it current: complete or drop work as soon as it is resolved.
-- Successful project tools automatically create machine evidence IDs. For a material Task Plan item, use `task_checkpoint` with its stable task ID, relevant evidence IDs, and concise findings; this is the only required completion protocol. Task Notes are a readable scratchpad for conclusions and hypotheses, not a source-provenance form.
-- Trust the structured Current Task Memory across context optimization. Reread only for one named missing fact, using a narrow `read_file` start_line/end_line range. Never reread solely to reconstruct an entire file or to manufacture bookkeeping evidence.
-- Explore purposefully. After project structure and representative core files establish the requested facts, stop broad exploration. Continue only with a specific missing fact for an open Task Plan item. Synthesize only after material plan items have sufficient task-specific evidence or an unavailable fact has been explicitly recorded and bounded. Do not keep reading files "just in case".
-- A tool-free response is the normal way to finish. Do not call a tool merely because tools are available.
+# Local AI Desktop Agent
+- Work directly from the conversation and tool results. A tool-free response normally finishes the current agent run.
+- Use the plan when a task has several substantial stages. Keep it concise and update it honestly, but do not create a detailed Work Plan before you understand the active milestone.
+- Goal Plan milestones are stable user-request stages. Work Plan tasks belong only to the active milestone. Existing IDs are canonical: refine, append, split, complete, or drop them instead of replacing completed history.
+- After modifying project files, run the most relevant available validation before finishing when practical. Prefer targeted existing project commands. Inspect the diff when practical. If validation is unavailable, say why; never invent commands just to satisfy this guideline.
+- Tool output is evidence in the transcript. Do not reread unchanged files merely because old raw output was compacted.
+- Do not call a tool only because tools are available. Decide yourself when the task has enough information.
 "#;
 
-fn max_projected_input(context_limit: usize) -> usize {
-    context_limit.saturating_sub(RESERVED_OUTPUT_TOKENS + SAFETY_TOKENS)
+const SUMMARY_GUIDANCE: &str = "Summarize the earlier agent transcript as a dense factual handoff. Preserve the user's goals and constraints, decisions, relevant files, commands and outcomes, unresolved questions, and current implementation state. Omit pleasantries and redundant raw output. Write only the summary.";
+
+#[derive(Clone, Copy, Debug)]
+pub struct CompactionBudget {
+    pub context_window: usize,
+    pub ratio: f64,
+    pub reserve_tokens: usize,
 }
 
-/// Ordinary tool/reasoning turns reserve a stable budget. Final answers use
-/// the actual remaining selected-context capacity rather than inheriting the
-/// execution-turn 8K ceiling.
-fn final_output_budget(context_limit: usize, projected_input_tokens: usize) -> usize {
-    context_limit.saturating_sub(projected_input_tokens.saturating_add(SAFETY_TOKENS))
-}
-
-/// Provider `length` is a transport boundary, never a semantic completion.
-/// Keep the decision pure so its contract remains covered without a live SSE
-/// server: only a tool-free final prefix may be continued as prose.
-fn final_requires_continuation(finish_reason: &str, has_tool_calls: bool) -> bool {
-    finish_reason == "length" && !has_tool_calls
-}
-
-fn final_continuation_available(count: usize) -> bool {
-    count < MAX_FINAL_CONTINUATIONS
-}
-
-fn final_continuation_tail(content: &str) -> String {
-    let total = content.chars().count();
-    if total <= FINAL_CONTINUATION_TAIL_CHARS {
-        return content.to_owned();
+impl CompactionBudget {
+    pub fn trigger_tokens(self) -> usize {
+        let ratio = self.ratio.clamp(0.10, 0.99);
+        let by_ratio = (self.context_window as f64 * ratio) as usize;
+        let by_reserve = self.context_window.saturating_sub(self.reserve_tokens);
+        by_ratio.min(by_reserve)
     }
-    let tail = content
-        .chars()
-        .skip(total - FINAL_CONTINUATION_TAIL_CHARS)
-        .collect::<String>();
-    format!("[… earlier final content omitted; continue from this exact tail …]\n{tail}")
 }
 
-fn compaction_threshold(context_limit: usize) -> usize {
-    max_projected_input(context_limit).saturating_mul(4) / 5
+/// Computes a ceiling, not an instruction to use all available output.
+pub fn dynamic_output_limit(
+    context_window: usize,
+    projected_input_tokens: usize,
+    safety_reserve: usize,
+    provider_max_output: Option<usize>,
+    app_max_output: usize,
+) -> usize {
+    let available =
+        context_window.saturating_sub(projected_input_tokens.saturating_add(safety_reserve));
+    available
+        .min(provider_max_output.unwrap_or(app_max_output))
+        .min(app_max_output)
 }
 
-fn compaction_target(context_limit: usize) -> usize {
-    // Hysteresis: proactive compaction lands well below the trigger. Keeping
-    // the projected request near the trigger caused one compaction per turn.
-    max_projected_input(context_limit).saturating_mul(13) / 20
-}
-
-/// Deliberately conservative for JSON/tool payloads. The provider remains the
-/// source of exact usage; this budget exists to prevent an oversize request.
-fn estimate_projected_tokens(messages: &[Value]) -> usize {
-    serde_json::to_string(messages).unwrap_or_default().len() / 2
-}
-
-/// Preserve concise, model-useful evidence at a projection boundary even when
-/// a model has not yet written a Task Note. Canonical tool output is never
-/// deleted; this is only the Jan-style working-set handoff for older calls.
-fn compacted_working_state(transcript: &Transcript, covers: usize, state: &AgentState) -> Value {
-    let mut actions = Vec::new();
-    for entry in transcript.entries().iter().take(covers).rev() {
-        let crate::agent::transcript::Entry::Message(message) = entry else {
-            continue;
-        };
-        let Some(calls) = message.get("tool_calls").and_then(Value::as_array) else {
-            continue;
-        };
-        for call in calls.iter().rev() {
-            let name = call
-                .pointer("/function/name")
-                .and_then(Value::as_str)
-                .unwrap_or("tool");
-            let arguments = call
-                .pointer("/function/arguments")
-                .and_then(Value::as_str)
-                .unwrap_or("{}");
-            let detail = serde_json::from_str::<Value>(arguments)
-                .ok()
-                .and_then(|value| {
-                    value
-                        .get("path")
-                        .or_else(|| value.get("command"))
-                        .or_else(|| value.get("task"))
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                })
-                .unwrap_or_else(|| "completed".into());
-            actions.push(format!("{name}: {detail}"));
-            if actions.len() == 12 {
-                break;
-            }
-        }
-        if actions.len() == 12 {
-            break;
-        }
-    }
-    actions.reverse();
-    json!({
-        "kind":"runtime_compaction",
-        "completed_turns":"Earlier assistant/tool pairs remain canonical. Use the semantic state below and retained suffix before rereading any file.",
-        "already_investigated_or_executed": actions,
-        "verified_source_inventory":state.verified_source_inventory(2_000),
-        "current_task_memory":state.current_task_memory_projection(4_000),
-        "investigated_evidence":state.investigated_summary_bounded(12, 420),
-        "working_state_note":"Task Plan, Task Notes, and source-specific semantic evidence are projected separately as current runtime state. Complete evidence remains sufficient when raw source is intentionally omitted.",
-    })
-}
-fn tools() -> Value {
-    json!([
-        {"type":"function","function":{"name":"list_directory","description":"List a project directory. Treat its result as complete; do not repeat an unchanged listing without a concrete new question.","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}},
-        {"type":"function","function":{"name":"read_file","description":"Read a project file. If an unchanged source already has evidence_complete=true, do not reread merely because raw content left context. For one specific missing fact (a concrete field, function, file, mechanism, or value), set reason to the exact fact you are looking for and pick a narrow start_line/end_line range that covers it. A full-range read is treated as broad exploration: it is only allowed before saturation.","parameters":{"type":"object","properties":{"path":{"type":"string"},"reason":{"type":"string","description":"Exact fact missing from durable evidence. Name it specifically: what field, function, value, mechanism, or file behaviour is still unresolved? Repeat fact claims are rejected."},"start_line":{"type":"integer","minimum":1,"description":"First line of the specific block covering the missing fact (1-based). Required after saturation."},"end_line":{"type":"integer","minimum":1,"description":"Last line of the specific block covering the missing fact (1-based). Required after saturation; the range should cover exactly the block of interest."}},"required":["path"]}}},
-        {"type":"function","function":{"name":"write_file","description":"Create a new project file, or overwrite an existing one when the user asked to rewrite it in full. For surgical changes to an existing file prefer apply_patch so unchanged lines are untouched.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}},
-        {"type":"function","function":{"name":"create_file","description":"Create a new project file. Fails if the file already exists; use apply_patch to modify it.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}},
-        {"type":"function","function":{"name":"apply_patch","description":"Surgical file editing via a *** Begin Patch / *** End Patch block with *** Update File: / *** Add File: / *** Delete File: sections. Update bodies list context (' '), removed ('-') and added ('+') lines and must match the current file content exactly. Paths are relative to the project root. Prefer this over write_file for changes to existing files.","parameters":{"type":"object","properties":{"patch":{"type":"string"}},"required":["patch"]}}},
-        {"type":"function","function":{"name":"delete_file","description":"Delete one project file. Use only after the user explicitly asked for deletion or a replacement that removes a file.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}},
-        {"type":"function","function":{"name":"run_terminal","description":"Run a project shell command and use its complete diagnostics to decide the next step","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout_ms":{"type":"integer"}},"required":["command"]}}},
-        {"type":"function","function":{"name":"task_plan","description":"Manage the canonical Task Plan. For init supply labels/content only; runtime returns generated task-N IDs. For existing tasks use task_id only. refine may supply task_id with a changed label. Material done/drop requires a prior task_checkpoint, except runtime-owned Synthesis completion after final.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["init","refine","start","done","drop","batch"]},"phases":{"type":"array"},"task_id":{"type":"string"},"updates":{"type":"array","items":{"type":"object","properties":{"action":{"type":"string","enum":["start","done","drop"]},"task_id":{"type":"string"}},"required":["action","task_id"]}}},"required":["action"]}}},
-        {"type":"function","function":{"name":"task_checkpoint","description":"Create the simple semantic checkpoint for one material Task Plan item. Runtime already created evidence IDs from successful reads, inventories, terminal inspections, mutations and validation. Reference those IDs; do not repeat source paths or task labels. `complete=true` atomically completes this task and promotes its normal successor: do not call task_plan done afterward. `complete=false` preserves findings while keeping the task in progress.","parameters":{"type":"object","properties":{"task_id":{"type":"string"},"evidence_ids":{"type":"array","items":{"type":"string"},"minItems":1},"findings":{"type":"array","items":{"type":"string"}},"complete":{"type":"boolean"},"unresolved":{"type":"array","items":{"type":"string"}}},"required":["task_id","evidence_ids","findings","complete"]}}},
-        {"type":"function","function":{"name":"task_notes","description":"Checkpoint concise Task Notes plus structured current-task memory. `evidence` contains only source-grounded verified facts or unresolved gaps: [{path,tasks:[exact Task Plan labels],facts:[...],relevance:[...],unresolved:[...],bounded_reason?,complete_for_task:boolean}]. A fact must come from an already-read source; an unresolved entry records a concrete missing fact and attempted source. `hypotheses` are optional inferences and must cite existing verified fact IDs or exact statements in supporting_facts; never put an inference in facts. Set hypothesis status to invalidated when later evidence defeats it. Update after major discoveries and before context optimization.","parameters":{"type":"object","properties":{"notes":{"type":"string"},"evidence":{"type":"array","items":{"type":"object","properties":{"path":{"type":"string"},"tasks":{"type":"array","items":{"type":"string"}},"facts":{"type":"array","items":{"type":"string"}},"relevance":{"type":"array","items":{"type":"string"}},"unresolved":{"type":"array","items":{"type":"string"}},"bounded_reason":{"type":"string"},"complete_for_task":{"type":"boolean"}},"required":["path","tasks","facts","complete_for_task"]}},"hypotheses":{"type":"array","items":{"type":"object","properties":{"statement":{"type":"string"},"supporting_facts":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["active","invalidated"]}},"required":["statement","supporting_facts"]}}},"required":["notes"]}}}
-    ])
-}
-
-/// Jan's eager-goal Todo turn is not merely a prompt instruction: the first
-/// completion is scoped to the Todo capability.  Qwen through the current
-/// llama.cpp server can ignore a named `tool_choice` when unrelated tools are
-/// also advertised, so keep that same capability boundary for our Task Plan
-/// handoff.  The resulting plan is still wholly model-authored and validated
-/// by the normal tool path; this never fabricates a visible plan in runtime.
-fn planning_tools() -> Value {
-    let all = tools();
-    let Some(items) = all.as_array() else {
-        return json!([]);
-    };
-    Value::Array(
-        items
-            .iter()
-            .filter(|tool| {
-                tool.pointer("/function/name").and_then(Value::as_str) == Some("task_plan")
-            })
-            .cloned()
-            .collect(),
-    )
-}
-
-fn checkpoint_tools() -> Value {
-    let all = tools();
-    let Some(items) = all.as_array() else { return json!([]); };
-    Value::Array(items.iter().filter(|tool| {
-        matches!(tool.pointer("/function/name").and_then(Value::as_str), Some("task_notes" | "task_checkpoint"))
-    }).cloned().collect())
-}
-
-fn checkpoint_pending(state: &AgentState) -> bool {
-    state.plan.active_task().is_some_and(|task| {
-        !state.has_complete_checkpoint_for(&task.id) && !state.memory.evidence.is_empty()
-    })
-}
-
-fn ensure_required_tools(mut registry: Value, checkpoint_pending: bool, retrieval_needed: bool) -> Value {
-    let Some(current) = registry.as_array_mut() else { return registry; };
-    let all = tools();
-    let Some(available) = all.as_array() else { return registry; };
-    let mut required = vec!["task_plan"];
-    if checkpoint_pending { required.push("task_checkpoint"); }
-    if retrieval_needed { required.push("read_file"); }
-    for name in required {
-        if current.iter().any(|tool| tool.pointer("/function/name").and_then(Value::as_str) == Some(name)) {
-            continue;
-        }
-        if let Some(tool) = available.iter().find(|tool| tool.pointer("/function/name").and_then(Value::as_str) == Some(name)) {
-            current.push(tool.clone());
-        }
-    }
-    registry
-}
-
-/// Once two independent saturation checks agree, only an explicit
-/// Plan/Notes checkpoint, a narrowly justified source lookup, or a write the
-/// user asked for may continue the loop. The writing tools stay available
-/// because a saturated run is often an implementation run, not only an audit.
-fn saturation_tools() -> Value {
-    let all = tools();
-    let Some(items) = all.as_array() else {
-        return json!([]);
-    };
-    Value::Array(
-        items
-            .iter()
-            .filter(|tool| {
-                matches!(
-                    tool.pointer("/function/name").and_then(Value::as_str),
-                    Some(
-                        "task_plan"
-                            | "task_notes"
-                            | "task_checkpoint"
-                            | "read_file"
-                            | "write_file"
-                            | "create_file"
-                            | "apply_patch"
-                            | "delete_file"
-                            | "run_terminal"
-                    )
-                )
-            })
-            .cloned()
-            .map(|mut tool| {
-                if tool.pointer("/function/name").and_then(Value::as_str) == Some("read_file") {
-                    tool["function"]["parameters"]["required"] =
-                        json!(["path", "reason", "start_line", "end_line"]);
-                }
-                tool
-            })
-            .collect(),
-    )
-}
-
-fn requires_initial_plan(user: &str, has_project: bool) -> bool {
-    if !has_project {
-        return false;
-    }
-    let lower = user.to_lowercase();
-    user.chars().count() >= 140
-        || [
-            "анализ",
-            "проанализ",
-            "architecture",
-            "analy",
-            "business",
-            "плюсы",
-            "минусы",
-            "сравн",
-        ]
-        .iter()
-        .any(|needle| lower.contains(needle))
-}
-
-fn phase_for(state: &AgentState, needs_plan: bool, turn: usize) -> &'static str {
-    // Saturation is a capability restriction, not a completion signal. As long
-    // as the Task Plan has items whose evidence is not yet `complete_for_task`,
-    // the audit is still investigation: keeping the turn in the investigate
-    // phase prevents the runtime from announcing "exploration is complete" to
-    // the model with material work still open (the Deep-mode closure
-    // regression).
-    if state.saturation_round >= 2 {
-        if state.open_without_complete_evidence() > 0 && !only_synthesis_work_open(state) {
-            return "investigate";
-        }
-        if only_synthesis_work_open(state) {
-            return "final";
-        }
-        return if !state.plan.phases.is_empty() && !state.plan.has_open() {
-            "final"
-        } else {
-            "synthesis"
-        };
-    }
-    let active = state
-        .plan
-        .active_phase()
+fn estimate_tokens(value: &Value) -> usize {
+    // Conservative enough for JSON-heavy local tool prompts. Provider-reported
+    // usage remains authoritative telemetry.
+    serde_json::to_string(value)
         .unwrap_or_default()
-        .to_ascii_lowercase();
-    if active.contains("verify") || active.contains("провер") {
-        "verify"
-    } else if active.contains("setup")
-        || active.contains("analysis")
-        || active.contains("investig")
-        || active.contains("исслед")
-        || active.contains("анализ")
-    {
-        "investigate"
-    } else if !state.plan.phases.is_empty() && !state.plan.has_open() {
-        "final"
-    } else if needs_plan && state.plan.phases.is_empty() {
-        "plan"
-    } else if turn == 0 {
-        "plan"
-    } else {
-        "execute"
+        .chars()
+        .count()
+        / 3
+        + 8
+}
+
+fn stable_prefix(config: &Config) -> String {
+    let mut prefix = format!("{}\n{}", config.system.trim(), AGENT_GUIDANCE.trim());
+    if let Some(root) = &config.root {
+        prefix.push_str("\n<working_directory>");
+        prefix.push_str(root);
+        prefix.push_str("</working_directory>");
     }
+    prefix
 }
 
-fn is_synthesis_phase(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    name.contains("synth") || name.contains("итог") || name.contains("финал")
+fn dynamic_tail(state: &AgentState) -> String {
+    let mut tail = Vec::new();
+    if !state.plan.milestones.is_empty() {
+        tail.push(format!(
+            "<planning_state>{}</planning_state>",
+            serde_json::to_string(&state.plan).unwrap_or_default()
+        ));
+    }
+    tail.join("\n")
 }
 
-fn open_synthesis_tasks(state: &AgentState) -> Vec<String> {
-    state
-        .plan
-        .phases
+fn tool_schemas(has_project_root: bool) -> Vec<Value> {
+    let mut tools = vec![
+        json!({"type":"function","function":{"name":"task_plan","description":"Manage persistent Goal/Milestone Plan and the active milestone Work Plan. Goal init only creates an empty plan once; later use append/refine/done/drop with milestone_id. Work init creates tasks only for the active milestone; later use append/refine/split/start/done/drop with task_id. IDs returned by view are canonical. Completed history is retained.","parameters":{"type":"object","properties":{"scope":{"type":"string","enum":["goal","work"]},"action":{"type":"string","enum":["init","append","refine","split","start","done","drop","view"]},"milestones":{"type":"array","items":{"oneOf":[{"type":"string"},{"type":"object","properties":{"label":{"type":"string"}},"required":["label"]}]}},"tasks":{"type":"array","items":{"oneOf":[{"type":"string"},{"type":"object","properties":{"label":{"type":"string"}},"required":["label"]}]}},"milestone_id":{"type":"string"},"task_id":{"type":"string"},"label":{"type":"string"},"after_id":{"type":"string"}},"required":["action"]}}}),
+    ];
+    if has_project_root {
+        tools.extend([
+            json!({"type":"function","function":{"name":"apply_patch","description":"Apply a project patch.","parameters":{"type":"object","properties":{"patch":{"type":"string"}},"required":["patch"]}}}),
+            json!({"type":"function","function":{"name":"create_file","description":"Create a new project file.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}),
+            json!({"type":"function","function":{"name":"delete_file","description":"Delete a project file when allowed.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}),
+            json!({"type":"function","function":{"name":"list_directory","description":"List a project directory.","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}),
+            json!({"type":"function","function":{"name":"read_file","description":"Read a project file. Use a line range only when it helps answer a specific question.","parameters":{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1}},"required":["path"]}}}),
+            json!({"type":"function","function":{"name":"run_terminal","description":"Run an existing relevant project command. After code changes, prefer a focused test, typecheck, lint, build, or check when available.","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1}},"required":["command"]}}}),
+            json!({"type":"function","function":{"name":"write_file","description":"Write a project file.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}),
+        ]);
+    }
+    tools.sort_by(|left, right| tool_name(left).cmp(tool_name(right)));
+    tools
+}
+
+fn tool_name(tool: &Value) -> &str {
+    tool.pointer("/function/name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+}
+
+fn plan_labels(arguments: &Value, key: &str) -> Result<Vec<String>, String> {
+    let values = arguments
+        .get(key)
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("task_plan {key} must be an array"))?;
+    values
         .iter()
-        .filter(|phase| is_synthesis_phase(&phase.name))
-        .flat_map(|phase| phase.tasks.iter())
-        .filter(|task| {
-            matches!(
-                task.status,
-                crate::agent::todo::Status::Pending | crate::agent::todo::Status::InProgress
-            )
+        .map(|value| match value {
+            Value::String(label) => Ok(label.clone()),
+            Value::Object(_) => value
+                .get("label")
+                .or_else(|| value.get("content"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| format!("each {key} item needs label")),
+            _ => Err(format!("each {key} item must be a string or object")),
         })
-        .map(|task| task.content.clone())
         .collect()
 }
 
-fn only_synthesis_work_open(state: &AgentState) -> bool {
-    let synthesis = open_synthesis_tasks(state);
-    !synthesis.is_empty() && synthesis.len() == state.plan.open_count()
-}
-
-fn task_is_in_synthesis_phase(state: &AgentState, task: &str) -> bool {
-    state.plan.phases.iter().any(|phase| {
-        is_synthesis_phase(&phase.name)
-            && phase.tasks.iter().any(|candidate| candidate.id == task || candidate.content == task)
-    })
-}
-
-fn finish_synthesis_after_final(state: &mut AgentState, run_id: &str) {
-    let tasks = open_synthesis_tasks(state);
-    if tasks.is_empty() {
-        return;
-    }
-    for task in tasks {
-        state
-            .plan
-            .finish(&task, false)
-            .expect("open synthesis task must belong to the Task Plan");
-    }
-    emit(
-        run_id,
-        Event::PlanUpdate {
-            plan: serde_json::to_value(&state.plan).expect("Task Plan serializes"),
-        },
-    );
-}
-
-/// Saturated turns may still retrieve one fact per open plan item. This is a
-/// capability boundary, not another advisory paragraph the model can ignore.
-/// The budget scales with the number of open items still lacking
-/// `complete_for_task` evidence so a large audit is not starved at 2 reads.
-pub fn post_saturation_read_budget(state: &AgentState) -> usize {
-    2 + state.open_without_complete_evidence().saturating_mul(3)
-}
-
-const MAX_TARGETED_READ_LINES: usize = 240;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SaturatedReadRejection {
-    MissingReason,
-    MissingRange,
-    InvalidRange,
-    RangeTooBroad,
-    AlreadyCovered,
-    BudgetExhausted,
-}
-
-fn saturated_read_rejection(
-    state: &AgentState,
-    tool: &ValidatedCall,
-) -> Option<SaturatedReadRejection> {
-    if tool.name != "read_file" || state.saturation_round < 2 {
-        return None;
-    }
-    let reason = tool.arguments.get("reason").and_then(Value::as_str);
-    if reason.is_none_or(|reason| reason.trim().is_empty()) {
-        return Some(SaturatedReadRejection::MissingReason);
-    }
-    let (Some(start), Some(end)) = (
-        tool.arguments.get("start_line").and_then(Value::as_u64),
-        tool.arguments.get("end_line").and_then(Value::as_u64),
-    ) else {
-        return Some(SaturatedReadRejection::MissingRange);
-    };
-    let (start, end) = (start as usize, end as usize);
-    if end < start {
-        return Some(SaturatedReadRejection::InvalidRange);
-    }
-    if end.saturating_sub(start).saturating_add(1) > MAX_TARGETED_READ_LINES {
-        return Some(SaturatedReadRejection::RangeTooBroad);
-    }
-    let path = tool
-        .arguments
-        .get("path")
+fn required_id(arguments: &Value, key: &str) -> Result<String, String> {
+    arguments
+        .get(key)
         .and_then(Value::as_str)
-        .unwrap_or_default();
-    if state.saturated_range_seen(path, start, end) {
-        return Some(SaturatedReadRejection::AlreadyCovered);
-    }
-    (state.post_saturation_retrievals >= post_saturation_read_budget(state))
-        .then_some(SaturatedReadRejection::BudgetExhausted)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| format!("task_plan requires {key}"))
 }
 
-/// Saturated targeted read is a loop when the requested range overlaps one
-/// we have already performed on the same file: that call yields no new
-/// evidence and must not consume the model's remaining budget either. This
-/// is the anti-loop guard that *replaces* the old fixed budget counter as the
-/// primary termination mechanism — the budget still hard-caps runaway turns
-/// but its size can now honestly scale with open work because re-reads no
-/// longer silently consume it.
-pub fn saturated_read_is_repeat(state: &AgentState, tool: &ValidatedCall) -> bool {
-    saturated_read_rejection(state, tool) == Some(SaturatedReadRejection::AlreadyCovered)
-}
-
-/// After the second evidence-saturation boundary, only an explicit Plan/Notes
-/// checkpoint or a narrowly justified source lookup may continue the loop.
-/// Keep this pure predicate so the capability registry and the execution
-/// defence cannot drift apart again. A saturated broad re-read (same path+range
-/// already fetched) is rejected *even while remaining budget is available*, so
-/// a model that keeps requesting the same range cannot silently consume the
-/// legitimate gap-fill budget of a different fact.
-pub fn rejects_saturated_tool(state: &AgentState, tool: &ValidatedCall) -> bool {
-    if state.saturation_round < 2 {
-        return false;
-    }
-    // Writing tools are never evidence-gathering, so the saturation gate
-    // (which exists to force *targeted* reads) must not strip them: a
-    // saturated run still needs to implement the user's requested changes and
-    // drive its build/tests with run_terminal. This keep-list must stay in
-    // lockstep with the model-visible saturation_tools() registry above.
-    if matches!(
-        tool.name.as_str(),
-        "task_plan"
-            | "task_notes"
-            | "task_checkpoint"
-            | "write_file"
-            | "create_file"
-            | "apply_patch"
-            | "delete_file"
-            | "run_terminal"
-    ) {
-        return false;
-    }
-    if tool.name == "read_file" {
-        return saturated_read_rejection(state, tool).is_some();
-    }
-    true
-}
-
-fn saturated_rejection_message(state: &AgentState, tool: &ValidatedCall) -> String {
-    let budget = post_saturation_read_budget(state);
-    let remaining = budget.saturating_sub(state.post_saturation_retrievals);
-    let active = format!(
-        "Investigation is still active: Task Plan has {} item(s) without complete task-specific evidence. Targeted reads remaining: {remaining}/{budget}.",
-        state.open_without_complete_evidence()
-    );
-    match saturated_read_rejection(state, tool) {
-        Some(SaturatedReadRejection::RangeTooBroad) => format!(
-            "Targeted read rejected: requested range is too broad (maximum {MAX_TARGETED_READ_LINES} lines). {active} Retry with one concrete missing fact and a narrower range."
-        ),
-        Some(SaturatedReadRejection::AlreadyCovered) => format!(
-            "Targeted read rejected: requested range is already covered. {active} Choose another unresolved evidence gap."
-        ),
-        Some(SaturatedReadRejection::MissingReason) => format!(
-            "Targeted read rejected: reason does not identify one concrete missing fact. {active} Retry with a task-specific missing fact."
-        ),
-        Some(SaturatedReadRejection::MissingRange) => format!(
-            "Targeted read rejected: start_line and end_line are required after saturation. {active} Retry with a narrow range for the named fact."
-        ),
-        Some(SaturatedReadRejection::InvalidRange) => format!(
-            "Targeted read rejected: end_line must not precede start_line. {active} Retry with a valid narrow range."
-        ),
-        Some(SaturatedReadRejection::BudgetExhausted) => format!(
-            "Targeted read budget is exhausted ({remaining}/{budget} remaining). Record any unavailable fact as a task-specific limitation in task_notes before dropping that item."
-        ),
-        None => "Tool rejected after saturation: broad exploration is unavailable. Use a focused read_file request for a concrete evidence gap.".into(),
-    }
-}
-
-/// The closeout valve forces the model to reconcile the plan only once its open
-/// work has no remaining evidence gap. While open items still lack
-/// `complete_for_task` evidence, the valve would pressure the model into
-/// closing work it has not finished investigating; the loop instead continues
-/// normal saturation turns (with a scaled targeted-read budget) until the
-/// evidence exists or the model explicitly drops the gap.
-pub fn closeout_due(state: &AgentState) -> bool {
-    state.plan.has_open() && state.open_without_complete_evidence() == 0
-}
-
-/// At saturation, Plan state must not become a back door around the per-task
-/// evidence gate. `done` needs sufficient evidence for that exact item; `drop`
-/// needs an explicitly checkpointed unresolved limitation. Validate a batch
-/// before applying any update so a mixed batch cannot partially close the plan.
-fn plan_completion_error(state: &AgentState, tool: &ValidatedCall) -> Option<String> {
-    if tool.name != "task_plan" {
-        return None;
-    }
-    let action = tool.arguments.get("action").and_then(Value::as_str)?;
-    let updates: Vec<(&str, &str)> = match action {
-        "done" | "drop" => vec![(
-            action,
-            tool.arguments.get("task").and_then(Value::as_str)?,
-        )],
-        "batch" => tool
-            .arguments
-            .get("updates")
-            .and_then(Value::as_array)?
-            .iter()
-            .filter_map(|update| {
-                Some((
-                    update.get("action")?.as_str()?,
-                    update.get("task")?.as_str()?,
-                ))
-            })
-            .collect(),
-        _ => return None,
-    };
-    for (update_action, task) in updates {
-        if update_action == "done" && task_is_in_synthesis_phase(state, task) {
-            return Some(format!(
-                "Cannot mark Synthesis task '{task}' done before the final response. Keep it in progress; the runtime completes it after a successful terminal final."
-            ));
-        }
-        if update_action == "done" && !state.has_complete_evidence_for(task) {
-            return Some(state.checkpoint_guidance(task));
-        }
-        if update_action == "drop" && !state.has_bounded_gap_for(task) {
-            return Some(format!(
-                "Cannot drop '{task}' without a bounded task checkpoint. Create task_checkpoint with existing evidence IDs and unresolved facts after reasonable attempts."
-            ));
-        }
-    }
-    None
-}
-
-fn semantic_excerpt(value: &str, maximum: usize) -> String {
-    let compact = value
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .take(40)
-        .collect::<Vec<_>>()
-        .join(" ");
-    let clipped = compact.chars().take(maximum).collect::<String>();
-    if compact.chars().count() > maximum {
-        format!("{clipped} …")
-    } else {
-        clipped
-    }
-}
-
-fn record_tool_evidence(
-    state: &mut AgentState,
-    name: &str,
-    arguments: &Value,
-    result: &Value,
-) -> bool {
-    let path = arguments
-        .get("path")
+fn required_label(arguments: &Value) -> Result<String, String> {
+    arguments
+        .get("label")
         .and_then(Value::as_str)
-        .unwrap_or(".")
-        .to_owned();
-    match name {
-        "read_file" => {
-            let content = result
-                .get("content")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let changed = state.record_investigation(
-                "read_file",
-                path,
-                semantic_excerpt(content, 1_200),
-                content.contains("[output truncated"),
-            );
-            let range = arguments
-                .get("start_line")
-                .and_then(Value::as_u64)
-                .zip(arguments.get("end_line").and_then(Value::as_u64))
-                .map(|(start, end)| (start as usize, end as usize));
-            if let Some(path) = arguments.get("path").and_then(Value::as_str) {
-                state.record_source_range("read_file", path, range);
-            }
-            changed
-        }
-        "list_directory" => {
-            let entries = result
-                .get("entries")
-                .and_then(Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                })
-                .unwrap_or_default();
-            state.record_investigation(
-                "list_directory",
-                path,
-                semantic_excerpt(&entries, 720),
-                false,
-            )
-        }
-        _ => false,
-    }
+        .map(str::to_owned)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "task_plan requires label".into())
 }
 
-fn record_machine_evidence(state: &mut AgentState, name: &str, arguments: &Value, result: &Value) -> Option<String> {
-    use crate::agent::state::EvidenceKind;
-    let source = arguments
-        .get("path")
-        .or_else(|| arguments.get("command"))
-        .and_then(Value::as_str)
-        .unwrap_or("project")
-        .to_owned();
-    let range = arguments
-        .get("start_line")
-        .and_then(Value::as_u64)
-        .zip(arguments.get("end_line").and_then(Value::as_u64))
-        .map(|(start, end)| (start as usize, end as usize));
-    let kind = match name {
-        "read_file" if range.is_some() => EvidenceKind::SourceRange,
-        "read_file" => EvidenceKind::FileRead,
-        "list_directory" => EvidenceKind::DirectoryInventory,
-        "run_terminal" => {
-            let command = arguments.get("command").and_then(Value::as_str).unwrap_or_default().to_ascii_lowercase();
-            if command.contains(" test") || command.contains(" build") || command.contains(" check") {
-                EvidenceKind::ValidationResult
-            } else {
-                EvidenceKind::TerminalInspection
-            }
-        }
-        "write_file" | "create_file" | "apply_patch" | "delete_file" | "edit_file" | "patch" => EvidenceKind::ProjectMutation,
-        _ => return None,
-    };
-    Some(state.record_evidence(kind, source, range, name, &result.to_string()))
-}
-
-fn working_control(state: &AgentState) -> String {
-    let plan = clip_projection_text(
-        &serde_json::to_string(&state.plan).unwrap_or_default(),
-        3_600,
-    );
-    let notes = clip_projection_text(&state.notes, 4_000);
-    let memory = state.current_task_memory_projection(5_000);
-    let investigated = state.investigated_summary_bounded(12, 420).join("\n\n");
-    let verified_sources = state.verified_source_inventory(2_000);
-    [
-        (!memory.is_empty()).then(|| format!("<current_task_memory>{memory}\nContinue from this state. Do not redo project orientation unless a concrete missing fact requires a different scope.</current_task_memory>")),
-        (!notes.is_empty()).then(|| format!("<task_notes>{notes}</task_notes>")),
-        Some(format!("<task_plan>{plan}</task_plan>")),
-        (!verified_sources.is_empty()).then(|| format!("<verified_source_inventory>Every listed path was successfully read during this request. This is durable verified evidence of source presence; do not later claim such a source is absent without contrary evidence.\n{verified_sources}</verified_source_inventory>")),
-        (!investigated.is_empty())
-            .then(|| format!("<investigated_evidence>These are deterministic runtime records, not vague prose. `complete_for_task` means facts are sufficient for this user request even when raw source is absent. `partial` means only a specifically named fact may justify a targeted range read.\n{investigated}</investigated_evidence>")),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>()
-    .join("\n")
-}
-
-fn clip_projection_text(value: &str, maximum: usize) -> String {
-    let clipped = value.chars().take(maximum).collect::<String>();
-    if value.chars().count() > maximum {
-        format!("{clipped} …")
-    } else {
-        clipped
-    }
-}
-
-/// Jan's todo tool accepts concise task strings and initializes their status
-/// itself. Normalize Local's OpenAI JSON into the same tolerant shape before
-/// deserializing the ordered Task Plan.
-fn normalize_plan_phases(value: Value) -> Result<Value, String> {
-    let phases = value
-        .as_array()
-        .ok_or_else(|| "Task Plan init phases must be an array".to_owned())?;
-    let is_flat = phases
-        .first()
-        .is_some_and(|item| item.get("tasks").is_none());
-    let source = if is_flat {
-        vec![json!({"name":"Implementation","tasks":phases})]
-    } else {
-        phases.clone()
-    };
-    let normalized = source
-        .into_iter()
-        .map(|mut phase| {
-            let tasks = phase
-                .get("tasks")
-                .and_then(Value::as_array)
-                .ok_or_else(|| "Task Plan phase requires tasks".to_owned())?
-                .iter()
-                .map(|task| match task {
-                    Value::String(content) => Ok(json!({"content":content,"status":"pending"})),
-                    Value::Object(_) => {
-                        let content = task.get("content").or_else(|| task.get("label")).and_then(Value::as_str).ok_or_else(|| "Task Plan item requires content or label".to_owned())?;
-                        Ok(json!({"id":task.get("task_id").or_else(|| task.get("id")).cloned().unwrap_or_else(|| json!("")),"content":content,"status":task.get("status").cloned().unwrap_or_else(|| json!("pending"))}))
-                    }
-                    _ => Err("Task Plan item must be a string or object".to_owned()),
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            phase["tasks"] = json!(tasks);
-            Ok(phase)
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    Ok(json!(normalized))
-}
-
-/// Plan calls are transactional. Parse and validate the complete request on a
-/// clone, then let the caller replace the canonical plan only after success.
-/// This prevents a malformed trailing batch item from leaving an earlier item
-/// applied, and makes refinement an explicit operation instead of an `init`
-/// side effect.
-fn apply_task_plan_update(current: &TaskPlan, arguments: &Value) -> Result<(TaskPlan, String), String> {
+fn apply_plan(state: &mut AgentState, arguments: &Value) -> Result<(Value, bool), String> {
     let action = arguments
         .get("action")
         .and_then(Value::as_str)
-        .ok_or_else(|| "Task Plan requires an explicit action".to_owned())?;
-    let mut candidate = current.clone();
-    match action {
-        "init" | "refine" => {
-            if action == "init" && !current.phases.is_empty() {
-                return Err("Task Plan already exists; use explicit refine to restructure it. Existing progress was preserved.".into());
-            }
-            if action == "refine" && current.phases.is_empty() {
-                return Err("Task Plan refine requires an existing plan; use init first.".into());
-            }
-            let phases = arguments
-                .get("phases")
-                .cloned()
-                .or_else(|| arguments.get("steps").cloned())
-                .ok_or_else(|| format!("Task Plan {action} requires phases"))?;
-            let mut phases = normalize_plan_phases(phases)?;
-            // IDs belong to runtime. A fresh plan always gets generated IDs;
-            // refine may carry existing IDs to rename/reorder those tasks.
-            if action == "init" {
-                if let Some(phases) = phases.as_array_mut() {
-                    for phase in phases {
-                        if let Some(tasks) = phase.get_mut("tasks").and_then(Value::as_array_mut) {
-                            for task in tasks { task["id"] = json!(""); }
-                        }
-                    }
-                }
-            }
-            let phases = serde_json::from_value(phases)
-                .map_err(|e| format!("invalid Task Plan: {e}"))?;
-            candidate.init(phases)?;
-            if action == "refine" {
-                let retained = candidate
-                    .phases
-                    .iter()
-                    .flat_map(|phase| phase.tasks.iter())
-                    .map(|task| task.id.as_str())
-                    .collect::<std::collections::HashSet<_>>();
-                for old in current.phases.iter().flat_map(|phase| phase.tasks.iter()) {
-                    if matches!(old.status, Status::Completed | Status::Abandoned)
-                        && !retained.contains(old.id.as_str())
-                    {
-                        return Err(format!(
-                            "Task Plan refine would discard completed task '{}'; retain its stable id '{}' so progress remains auditable.",
-                            old.content, old.id
-                        ));
-                    }
-                }
-            }
-        }
-        "start" | "done" | "drop" => {
-            let task = arguments
-                .get("task_id")
-                .or_else(|| arguments.get("task"))
-                .and_then(Value::as_str)
-                .filter(|task| !task.trim().is_empty())
-                .ok_or_else(|| format!("Task Plan {action} requires task"))?;
-            if action == "start" {
-                candidate.start(task)?;
-            } else {
-                candidate.finish(task, action == "drop")?;
-            }
-        }
-        "batch" => {
-            let updates = arguments
-                .get("updates")
-                .and_then(Value::as_array)
-                .ok_or_else(|| "Task Plan batch requires updates".to_owned())?;
-            if updates.is_empty() {
-                return Err("Task Plan batch requires at least one update".into());
-            }
-            for update in updates {
-                let update_action = update
-                    .get("action")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| "Task Plan batch update requires action".to_owned())?;
-                let task = update
-                    .get("task_id")
-                    .or_else(|| update.get("task"))
-                    .and_then(Value::as_str)
-                    .filter(|task| !task.trim().is_empty())
-                    .ok_or_else(|| "Task Plan batch update requires task".to_owned())?;
-                match update_action {
-                    "start" => candidate.start(task)?,
-                    "done" | "drop" => candidate.finish(task, update_action == "drop")?,
-                    _ => return Err("Task Plan batch updates must be start, done, or drop".into()),
-                }
-            }
-        }
-        _ => return Err("Task Plan action must be init, refine, start, done, drop, or batch".into()),
+        .ok_or_else(|| "task_plan requires action".to_owned())?;
+    if action == "view" {
+        return Ok((json!({"plan": state.plan, "updated": false}), false));
     }
-    Ok((candidate, action.to_owned()))
+    let scope = arguments
+        .get("scope")
+        .and_then(Value::as_str)
+        .unwrap_or("work");
+    match (scope, action) {
+        ("goal", "init") => state.plan.init(plan_labels(arguments, "milestones")?)?,
+        ("goal", "append") => state.plan.append_milestone(
+            required_label(arguments)?,
+            arguments.get("after_id").and_then(Value::as_str),
+        )?,
+        ("goal", "refine") => state.plan.refine_milestone(
+            &required_id(arguments, "milestone_id")?,
+            required_label(arguments)?,
+        )?,
+        ("goal", "done") => state
+            .plan
+            .finish_milestone(&required_id(arguments, "milestone_id")?, false)?,
+        ("goal", "drop") => state
+            .plan
+            .drop_milestone(&required_id(arguments, "milestone_id")?)?,
+        ("work", "init") => state.plan.init_work(plan_labels(arguments, "tasks")?)?,
+        ("work", "append") => state.plan.append_work(
+            required_label(arguments)?,
+            arguments.get("after_id").and_then(Value::as_str),
+        )?,
+        ("work", "refine") => state.plan.refine_work(
+            &required_id(arguments, "task_id")?,
+            required_label(arguments)?,
+        )?,
+        ("work", "split") => state.plan.split_work(
+            &required_id(arguments, "task_id")?,
+            plan_labels(arguments, "tasks")?,
+        )?,
+        ("work", "start") => state.plan.start_work(&required_id(arguments, "task_id")?)?,
+        ("work", "done") => state
+            .plan
+            .finish_work(&required_id(arguments, "task_id")?, false)?,
+        ("work", "drop") => state
+            .plan
+            .finish_work(&required_id(arguments, "task_id")?, true)?,
+        _ => return Err("unsupported task_plan scope/action combination".into()),
+    }
+    state.plan_touched();
+    Ok((json!({"plan": state.plan, "updated": true}), true))
 }
+
+fn mutation_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "write_file" | "create_file" | "apply_patch" | "delete_file"
+    )
+}
+
+fn validation_command(command: &str) -> bool {
+    let command = command.to_ascii_lowercase();
+    [
+        " test",
+        "test ",
+        "cargo test",
+        "cargo check",
+        "typecheck",
+        "type-check",
+        " lint",
+        "lint ",
+        " build",
+        "build ",
+        " compile",
+        "compile ",
+        "clippy",
+        "vitest",
+        "jest",
+    ]
+    .iter()
+    .any(|needle| command.contains(needle))
+}
+
+fn continuation_tail(content: &str) -> String {
+    const TAIL: usize = 12_000;
+    let chars = content.chars().collect::<Vec<_>>();
+    if chars.len() <= TAIL {
+        content.to_owned()
+    } else {
+        chars[chars.len() - TAIL..].iter().collect()
+    }
+}
+
+fn append_final_text(accumulator: &mut String, delta: &str) {
+    accumulator.push_str(delta);
+}
+
+fn needs_compaction(
+    budget: CompactionBudget,
+    context_limit: usize,
+    projected_input_tokens: usize,
+    provider_max_output: Option<usize>,
+) -> bool {
+    projected_input_tokens > budget.trigger_tokens()
+        || dynamic_output_limit(
+            context_limit,
+            projected_input_tokens,
+            SAFETY_RESERVE_TOKENS,
+            provider_max_output,
+            APPLICATION_MAX_OUTPUT_TOKENS,
+        ) < MIN_OUTPUT_HEADROOM_TOKENS
+}
+
+fn retry_keep_recent(attempt: usize) -> usize {
+    (DEFAULT_KEEP_RECENT >> attempt).max(2)
+}
+
+fn turn_tools(schemas: &[Value], continuation_only: bool) -> Vec<Value> {
+    if continuation_only {
+        Vec::new()
+    } else {
+        schemas.to_vec()
+    }
+}
+
 #[derive(Default)]
 struct StreamedTurn {
     content: String,
@@ -864,179 +331,98 @@ struct StreamedTurn {
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
     total_tokens: Option<u64>,
+    cached_tokens: Option<u64>,
+    cache_write_tokens: Option<u64>,
     prompt_ms: Option<f64>,
     predicted_ms: Option<f64>,
     predicted_per_second: Option<f64>,
 }
 
-fn transcript_entry_is_tool(transcript: &Transcript, index: usize) -> bool {
-    matches!(transcript.entries().get(index), Some(crate::agent::transcript::Entry::Message(message)) if message.get("role").and_then(Value::as_str) == Some("tool"))
-}
-
-/// Select the smallest projection boundary that actually fits the selected
-/// input budget.  A fixed number of retained entries is not safe: one batch
-/// of `read_file` calls can already be larger than a 16K working context.
-/// Every candidate starts at an assistant/non-tool boundary, so no projected
-/// suffix can start with an orphan `role=tool` message.  If even the newest
-/// valid suffix is too large, the canonical transcript is still intact while
-/// the model receives the compact working-state handoff only.
-fn compaction_boundary_to_fit(
-    transcript: &Transcript,
-    state: &AgentState,
-    system: &str,
-    max_input: usize,
-) -> Option<(usize, usize)> {
-    let len = transcript.entries().len();
-    let before = estimate_projected_tokens(&project(transcript, system, &working_control(state)));
-    for covers in 1..=len {
-        if transcript_entry_is_tool(transcript, covers) {
-            continue;
-        }
-        let mut candidate = transcript.clone();
-        candidate.compact(compacted_working_state(transcript, covers, state), covers);
-        let after =
-            estimate_projected_tokens(&project(&candidate, system, &working_control(state)));
-        // A compaction boundary is meaningful only when it both fits the hard
-        // selected-context budget and materially reduces the projection.  A
-        // summary that costs as much as (or more than) the retained history is
-        // not an optimization and must not mutate canonical projection state.
-        if after <= max_input && before.saturating_sub(after) >= MIN_COMPACTION_GAIN_TOKENS {
-            return Some((covers, after));
-        }
-    }
-    None
-}
-
-fn emit_context_optimized(
-    run_id: &str,
-    trigger_reason: &str,
-    before: usize,
-    after: usize,
-    _covers: usize,
-    transcript: &Transcript,
-    state: &AgentState,
-) {
-    let control = working_control(state);
-    let plan = serde_json::to_string(&state.plan).unwrap_or_default();
-    let notes = &state.notes;
-    let evidence = state.investigated_summary_bounded(16, 560).join("\n");
-    emit(
-        run_id,
-        Event::ContextOptimized {
-            before,
-            after,
-            trigger_reason: trigger_reason.into(),
-            removed_transcript_tokens: before.saturating_sub(after),
-            retained_suffix_tokens: estimate_projected_tokens(&project(transcript, "", ""))
-                .min(after),
-            working_state_tokens: estimate_projected_tokens(&[
-                json!({"role":"system","content":control}),
-            ]),
-            plan_tokens: estimate_projected_tokens(&[json!({"role":"system","content":plan})]),
-            notes_tokens: estimate_projected_tokens(&[json!({"role":"system","content":notes})]),
-            evidence_tokens: estimate_projected_tokens(&[
-                json!({"role":"system","content":evidence}),
-            ]),
-        },
-    );
-}
-
-/// A safe, indexed representation of the exact `OpenAI` wire transcript. It is
-/// emitted before transport and included in an upstream error, so a provider
-/// template failure can be diagnosed without logging source code or prompts.
-fn request_shape(messages: &[Value], query: &str) -> Vec<String> {
-    messages
-        .iter()
-        .enumerate()
-        .map(|(index, message)| {
-            let role = message.get("role").and_then(Value::as_str).unwrap_or("?");
-            let calls = message
-                .get("tool_calls")
-                .and_then(Value::as_array)
-                .map(|calls| {
-                    calls
-                        .iter()
-                        .map(|call| {
-                            let id = call.get("id").and_then(Value::as_str).unwrap_or("?");
-                            let name = call
-                                .pointer("/function/name")
-                                .and_then(Value::as_str)
-                                .unwrap_or("?");
-                            format!("{id}:{name}")
-                        })
-                        .collect::<Vec<_>>()
-                        .join("|")
-                })
-                .filter(|calls| !calls.is_empty());
-            let result = message
-                .get("tool_call_id")
-                .and_then(Value::as_str)
-                .map(|id| format!(" result={id}"));
-            let current = (role == "user"
-                && message.get("content").and_then(Value::as_str) == Some(query))
-            .then_some(" current_user");
-            format!(
-                "{index}:{role}{}{}{}",
-                calls.map_or(String::new(), |v| format!(" calls={v}")),
-                result.unwrap_or_default(),
-                current.unwrap_or_default()
-            )
-        })
-        .collect()
-}
-
-/// Jan's request boundary always retains the current user query. Compaction may
-/// hide old history, never the turn that owns this run.
-fn ensure_current_user_query(messages: &[Value], query: &str) -> Result<(), String> {
-    if query.trim().is_empty() {
-        return Err("agent run has no current user query".into());
-    }
-    let present = messages.iter().rposition(|message| {
-        message.get("role").and_then(Value::as_str) == Some("user")
-            && message.get("content").and_then(Value::as_str) == Some(query)
-    });
-    // Do not append a late pseudo-user after a tool suffix. That was a
-    // self-healing shortcut unique to V2; it changes Qwen's multi-step tool
-    // state and is exactly the kind of malformed projection Jan avoids. The
-    // owning prompt is canonical and must already be in this projection.
-    present
-        .filter(|index| *index > 0)
-        .map(|_| ())
-        .ok_or_else(|| "projection omitted the canonical current user query".to_owned())
-}
-
-/// Dependency-free OpenAI-compatible SSE transport. It emits deltas before the
-/// response finishes and returns the assembled turn only for strict validation.
+/// Dependency-free OpenAI-compatible SSE transport. Visible content is emitted
+/// at the delta boundary; finalization never becomes the first visible output.
 fn stream_call(
     endpoint: &str,
     payload: &Value,
     run_id: &str,
     cancelled: &AtomicBool,
+    emit_visible: bool,
 ) -> Result<StreamedTurn, String> {
     let without = endpoint.trim_start_matches("http://");
     let (host_port, path) = without
         .split_once('/')
         .unwrap_or((without, "v1/chat/completions"));
     let path = format!("/{path}");
-    let mut stream = TcpStream::connect(host_port).map_err(|e| e.to_string())?;
+    let mut stream = TcpStream::connect(host_port).map_err(|error| error.to_string())?;
     let body = payload.to_string();
-    let request=format!("POST {path} HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body);
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(), body
+    );
     stream
         .write_all(request.as_bytes())
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| error.to_string())?;
+    // Install the timeout before status/header parsing too. Otherwise Stop
+    // cannot interrupt a provider that accepts the socket but never sends its
+    // first response byte.
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+        .map_err(|error| error.to_string())?;
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
-    reader.read_line(&mut line).map_err(|e| e.to_string())?;
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => return Err("upstream closed before HTTP status".into()),
+            Ok(_) => break,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) && cancelled.load(Ordering::Relaxed) =>
+            {
+                return Err("cancelled".into())
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                continue
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
     if !line.contains(" 200 ") {
         let status = line.trim().to_owned();
-        let mut body = String::new();
-        let _ = reader.read_to_string(&mut body);
-        return Err(format!("model HTTP status: {status}; {}", body.trim()));
+        let mut response = String::new();
+        let _ = reader.read_to_string(&mut response);
+        return Err(format!("model HTTP status: {status}; {}", response.trim()));
     }
     let mut chunked = false;
     loop {
         line.clear();
-        reader.read_line(&mut line).map_err(|e| e.to_string())?;
+        match reader.read_line(&mut line) {
+            Ok(0) => return Err("upstream closed while reading HTTP headers".into()),
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) && cancelled.load(Ordering::Relaxed) =>
+            {
+                return Err("cancelled".into())
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                continue
+            }
+            Err(error) => return Err(error.to_string()),
+        }
         if line == "\r\n" || line == "\n" {
             break;
         }
@@ -1047,14 +433,8 @@ fn stream_call(
             chunked = true;
         }
     }
-    // Providers may take seconds before first token; only poll with a short
-    // timeout once their streaming response has begun.
-    reader
-        .get_mut()
-        .set_read_timeout(Some(std::time::Duration::from_millis(250)))
-        .map_err(|e| e.to_string())?;
     let mut turn = StreamedTurn::default();
-    let mut sse = String::new();
+    let mut buffer = String::new();
     if chunked {
         loop {
             if cancelled.load(Ordering::Relaxed) {
@@ -1063,65 +443,90 @@ fn stream_call(
             line.clear();
             match reader.read_line(&mut line) {
                 Ok(_) => {}
-                Err(e)
+                Err(error)
                     if matches!(
-                        e.kind(),
+                        error.kind(),
                         std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
                     ) =>
                 {
                     continue
                 }
-                Err(e) => return Err(e.to_string()),
-            };
+                Err(error) => return Err(error.to_string()),
+            }
             let size = usize::from_str_radix(line.trim(), 16)
-                .map_err(|e| format!("invalid chunk size: {e}"))?;
+                .map_err(|error| format!("invalid chunk size: {error}"))?;
             if size == 0 {
                 break;
             }
             let mut bytes = vec![0; size];
-            reader.read_exact(&mut bytes).map_err(|e| e.to_string())?;
+            reader
+                .read_exact(&mut bytes)
+                .map_err(|error| error.to_string())?;
             let mut crlf = [0; 2];
-            reader.read_exact(&mut crlf).map_err(|e| e.to_string())?;
-            sse.push_str(&String::from_utf8_lossy(&bytes));
-            consume_sse(&mut sse, &mut turn, run_id)?;
+            reader
+                .read_exact(&mut crlf)
+                .map_err(|error| error.to_string())?;
+            buffer.push_str(&String::from_utf8_lossy(&bytes));
+            consume_sse(&mut buffer, &mut turn, run_id, emit_visible)?;
         }
     } else {
-        let mut bytes = [0; 8192];
+        let mut bytes = [0_u8; 8192];
         loop {
             if cancelled.load(Ordering::Relaxed) {
                 return Err("cancelled".into());
             }
             let count = match reader.read(&mut bytes) {
                 Ok(count) => count,
-                Err(e)
+                Err(error)
                     if matches!(
-                        e.kind(),
+                        error.kind(),
                         std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
                     ) =>
                 {
                     continue
                 }
-                Err(e) => return Err(e.to_string()),
+                Err(error) => return Err(error.to_string()),
             };
             if count == 0 {
                 break;
             }
-            sse.push_str(&String::from_utf8_lossy(&bytes[..count]));
-            consume_sse(&mut sse, &mut turn, run_id)?;
+            buffer.push_str(&String::from_utf8_lossy(&bytes[..count]));
+            consume_sse(&mut buffer, &mut turn, run_id, emit_visible)?;
         }
+    }
+    // Some OpenAI-compatible local servers close the connection immediately
+    // after the final data frame without a trailing blank event separator.
+    // Treat that final complete frame as SSE rather than silently losing its
+    // usage or finish reason.
+    if !buffer.trim().is_empty() {
+        if buffer.ends_with('\n') {
+            buffer.push('\n');
+        } else {
+            buffer.push_str("\n\n");
+        }
+        consume_sse(&mut buffer, &mut turn, run_id, emit_visible)?;
     }
     Ok(turn)
 }
-fn consume_sse(buffer: &mut String, turn: &mut StreamedTurn, run_id: &str) -> Result<(), String> {
+
+fn consume_sse(
+    buffer: &mut String,
+    turn: &mut StreamedTurn,
+    run_id: &str,
+    emit_visible: bool,
+) -> Result<(), String> {
     while let Some(end) = buffer.find("\n\n") {
         let block = buffer[..end].replace('\r', "");
         buffer.drain(..end + 2);
-        for line in block.lines().filter_map(|line| line.strip_prefix("data: ")) {
+        for line in block
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:").map(str::trim_start))
+        {
             if line == "[DONE]" {
                 continue;
             }
             let value: Value =
-                serde_json::from_str(line).map_err(|e| format!("invalid SSE JSON: {e}"))?;
+                serde_json::from_str(line).map_err(|error| format!("invalid SSE JSON: {error}"))?;
             if let Some(usage) = value.get("usage") {
                 turn.prompt_tokens = usage
                     .get("prompt_tokens")
@@ -1135,6 +540,20 @@ fn consume_sse(buffer: &mut String, turn: &mut StreamedTurn, run_id: &str) -> Re
                     .get("total_tokens")
                     .and_then(Value::as_u64)
                     .or(turn.total_tokens);
+                turn.cached_tokens = usage
+                    .pointer("/prompt_tokens_details/cached_tokens")
+                    .and_then(Value::as_u64)
+                    .or_else(|| usage.get("cache_read_input_tokens").and_then(Value::as_u64))
+                    .or(turn.cached_tokens);
+                turn.cache_write_tokens = usage
+                    .get("cache_creation_input_tokens")
+                    .and_then(Value::as_u64)
+                    .or_else(|| {
+                        usage
+                            .pointer("/prompt_tokens_details/cache_creation_tokens")
+                            .and_then(Value::as_u64)
+                    })
+                    .or(turn.cache_write_tokens);
             }
             if let Some(timings) = value.get("timings") {
                 turn.prompt_tokens = timings
@@ -1160,35 +579,44 @@ fn consume_sse(buffer: &mut String, turn: &mut StreamedTurn, run_id: &str) -> Re
             }
             let choice = value.pointer("/choices/0");
             let delta = choice.and_then(|choice| choice.get("delta"));
-            let reasoning_delta = delta.and_then(|d| {
+            if let Some(reasoning) = delta.and_then(|delta| {
                 ["reasoning_content", "reasoning", "thinking"]
                     .iter()
-                    .find_map(|field| d.get(*field).and_then(Value::as_str))
-            });
-            if let Some(text) = reasoning_delta {
+                    .find_map(|field| delta.get(*field).and_then(Value::as_str))
+            }) {
                 if !turn.thinking_started {
                     turn.thinking_started = true;
-                    emit(run_id, Event::ThinkingStarted);
+                    if emit_visible {
+                        emit(run_id, Event::ThinkingStarted);
+                    }
                 }
-                turn.reasoning.push_str(text);
+                turn.reasoning.push_str(reasoning);
                 turn.reasoning_delta_count += 1;
-                emit(
-                    run_id,
-                    Event::ThinkingDelta {
-                        content: text.to_owned(),
-                    },
-                );
+                if emit_visible {
+                    emit(
+                        run_id,
+                        Event::ThinkingDelta {
+                            content: reasoning.to_owned(),
+                        },
+                    );
+                }
             }
-            if let Some(text) = delta.and_then(|d| d.get("content")).and_then(Value::as_str) {
-                // Assistant prose on a tool turn (and a closeout candidate)
-                // is not a user-visible response. Keep it local until the
-                // terminal no-tool boundary decides whether it is the one
-                // final answer. This is what prevents a single logical final
-                // from being streamed once as deltas and again as FinalDelta.
-                turn.content.push_str(text);
+            if let Some(content) = delta
+                .and_then(|delta| delta.get("content"))
+                .and_then(Value::as_str)
+            {
+                turn.content.push_str(content);
+                if emit_visible {
+                    emit(
+                        run_id,
+                        Event::ContentDelta {
+                            content: content.to_owned(),
+                        },
+                    );
+                }
             }
             if let Some(calls) = delta
-                .and_then(|d| d.get("tool_calls"))
+                .and_then(|delta| delta.get("tool_calls"))
                 .and_then(Value::as_array)
             {
                 for call in calls {
@@ -1200,40 +628,18 @@ fn consume_sse(buffer: &mut String, turn: &mut StreamedTurn, run_id: &str) -> Re
                         || json!({"id":"","type":"function","function":{"name":"","arguments":""}}),
                     );
                     if let Some(id) = call.get("id") {
-                        entry["id"] = id.clone()
+                        entry["id"] = id.clone();
                     }
                     if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
-                        let new = entry
-                            .pointer("/function/name")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .is_empty();
                         entry["function"]["name"] = json!(name);
-                        if new {
-                            emit(
-                                run_id,
-                                Event::ToolCallStarted {
-                                    id: entry["id"].as_str().unwrap_or_default().to_owned(),
-                                    name: name.to_owned(),
-                                    arguments: json!({}),
-                                },
-                            );
-                        }
                     }
                     if let Some(part) = call.pointer("/function/arguments").and_then(Value::as_str)
                     {
-                        let previous = entry
+                        let before = entry
                             .pointer("/function/arguments")
                             .and_then(Value::as_str)
                             .unwrap_or_default();
-                        entry["function"]["arguments"] = json!(format!("{previous}{part}"));
-                        emit(
-                            run_id,
-                            Event::ToolCallDelta {
-                                id: entry["id"].as_str().unwrap_or_default().to_owned(),
-                                delta: part.to_owned(),
-                            },
-                        );
+                        entry["function"]["arguments"] = json!(format!("{before}{part}"));
                     }
                 }
             }
@@ -1247,50 +653,237 @@ fn consume_sse(buffer: &mut String, turn: &mut StreamedTurn, run_id: &str) -> Re
     }
     Ok(())
 }
+
+fn summarize_span(config: &Config, transcript: &Transcript, covers: usize) -> String {
+    // Summary generation is also a provider turn. Keep its input small enough
+    // to leave meaningful output headroom on the selected local context size.
+    let summary_input_chars = SUMMARY_INPUT_CHARS.min(
+        config
+            .context_limit
+            .saturating_sub(SAFETY_RESERVE_TOKENS + MIN_SUMMARY_OUTPUT_TOKENS)
+            .saturating_mul(2),
+    );
+    let dropped = transcript.render_span(covers, summary_input_chars);
+    if dropped.trim().is_empty() {
+        return "Earlier conversation was omitted to fit the selected context window.".into();
+    }
+    let messages = vec![
+        json!({"role":"system", "content": SUMMARY_GUIDANCE}),
+        json!({"role":"user", "content": dropped}),
+    ];
+    let max_tokens = dynamic_output_limit(
+        config.context_limit,
+        estimate_tokens(&Value::Array(messages.clone())),
+        SAFETY_RESERVE_TOKENS,
+        config.provider_max_output,
+        SUMMARY_MAX_OUTPUT_TOKENS,
+    );
+    if max_tokens < MIN_SUMMARY_OUTPUT_TOKENS {
+        return "Earlier conversation was compacted. Retained recent transcript and current planning state remain available.".into();
+    }
+    let payload = json!({
+        "model": config.model,
+        "messages": messages,
+        "stream": true,
+        "max_tokens": max_tokens,
+    });
+    match stream_call(&config.endpoint, &payload, &config.run_id, &config.cancelled, false) {
+        Ok(turn) if !turn.content.trim().is_empty() => turn.content.trim().to_owned(),
+        _ => "Earlier conversation was compacted. Retained recent transcript and current planning state remain available.".into(),
+    }
+}
+
+fn compact_once(
+    config: &Config,
+    transcript: &mut Transcript,
+    before: usize,
+    keep_recent: usize,
+    reason: &str,
+    dynamic_tail: &str,
+) -> bool {
+    let Some(covers) = transcript.compaction_plan(keep_recent) else {
+        return false;
+    };
+    let summary = summarize_span(config, transcript, covers);
+    transcript.compact(summary, covers);
+    let after = estimate_tokens(&Value::Array(project(
+        transcript,
+        &stable_prefix(config),
+        dynamic_tail,
+    )));
+    emit(
+        &config.run_id,
+        Event::ContextOptimized {
+            before,
+            after,
+            trigger_reason: reason.to_owned(),
+            removed_transcript_tokens: before.saturating_sub(after),
+            retained_suffix_tokens: after,
+        },
+    );
+    true
+}
+
+fn request_shape(messages: &[Value]) -> Vec<String> {
+    messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            let role = message.get("role").and_then(Value::as_str).unwrap_or("?");
+            let tool = message
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .map_or(String::new(), |id| format!(" result={id}"));
+            format!("{index}:{role}{tool}")
+        })
+        .collect()
+}
+
+fn run_tool(
+    config: &Config,
+    state: &mut AgentState,
+    tool: &ValidatedCall,
+) -> Result<(Value, Option<String>), String> {
+    match tool.name.as_str() {
+        "task_plan" => {
+            let (value, changed) = apply_plan(state, &tool.arguments)?;
+            if changed {
+                emit(
+                    &config.run_id,
+                    Event::PlanUpdate {
+                        plan: serde_json::to_value(&state.plan)
+                            .map_err(|error| error.to_string())?,
+                    },
+                );
+            }
+            Ok((value, None))
+        }
+        "run_terminal" => {
+            let root = config
+                .root
+                .as_ref()
+                .ok_or_else(|| "no project scope".to_owned())?;
+            let command = tool
+                .arguments
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let value = crate::tools::shell::execute(
+                &PathBuf::from(root),
+                &tool.arguments,
+                || config.cancelled.load(Ordering::Relaxed),
+                |pid, pgid, session_id, started_at| {
+                    emit(
+                        &config.run_id,
+                        Event::ToolProcessStarted {
+                            id: tool.id.clone(),
+                            command: command.clone(),
+                            cwd: root.clone(),
+                            pid,
+                            pgid,
+                            session_id,
+                            started_at,
+                        },
+                    )
+                },
+                |stream, content| {
+                    emit(
+                        &config.run_id,
+                        Event::ToolOutputDelta {
+                            id: tool.id.clone(),
+                            stream: stream.into(),
+                            content: content.into(),
+                        },
+                    )
+                },
+            )?;
+            let failed = value
+                .get("exit_code")
+                .and_then(Value::as_i64)
+                .is_some_and(|code| code != 0)
+                || value
+                    .get("timed_out")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                || value
+                    .get("cancelled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+            if failed {
+                return Err(value.to_string());
+            }
+            if validation_command(&command) {
+                state.record_validation();
+            }
+            Ok((value, None))
+        }
+        name => {
+            let root = config
+                .root
+                .as_ref()
+                .ok_or_else(|| "no project scope".to_owned())?;
+            let result =
+                crate::tools::filesystem::execute(&PathBuf::from(root), name, &tool.arguments)?;
+            if mutation_tool(name) {
+                state.record_mutation();
+            }
+            Ok(result)
+        }
+    }
+}
+
+fn add_soft_closeout_if_needed(state: &mut AgentState, transcript: &mut Transcript) -> bool {
+    let plan_open = state.plan.has_open_work();
+    let needs_validation = state.workspace_mutated_since_validation && !state.verification_nudged;
+    let needs_plan = plan_open && !state.closeout_nudged;
+    if !needs_validation && !needs_plan {
+        return false;
+    }
+    let mut reminder = Vec::new();
+    if needs_plan {
+        state.closeout_nudged = true;
+        reminder.push(format!("Before you stop, update the plan: complete finished work, drop work that is no longer needed, or continue the task. {}", state.plan.open_summary().unwrap_or_default()));
+    }
+    if needs_validation {
+        state.verification_nudged = true;
+        reminder.push("You changed project files but no meaningful validation has been observed since the latest mutation. Run the most relevant available check, or state why validation is unavailable. Inspect the diff when practical.".into());
+    }
+    transcript.remind(reminder.join("\n\n"));
+    true
+}
+
 pub fn run(config: Config) {
     let mut transcript = Transcript::default();
-    for message in config.history {
+    for message in config.history.clone() {
         transcript.push_message(message);
     }
-    transcript.push_run_user(json!({"role":"user","content":config.user}));
-    // This is the user turn that owns the whole autonomous run. A compaction
-    // boundary may summarize older conversation, but it must never project a
-    // suffix beginning with assistant/tool records and append this query only
-    // afterwards: Qwen's Jinja template then has no valid user query.
+    transcript.push_run_user(json!({"role":"user", "content":config.user}));
     let mut state = AgentState::default();
-    // Jan's Todo reminder is bounded and belongs to the model's own Todo
-    // mutation path. Qwen needs a capability-scoped closeout turn to honour
-    // that reminder reliably, otherwise it can publish a final while its plan
-    // still says 0/N. Closeout pass accounting lives in `state.gap_closeout_passes`
-    // (see AgentState docs) and is now capped by MAX_GAP_CLOSEOUT_PASSES.
-    let mut final_started = false;
+    state.plan = config
+        .plan
+        .as_ref()
+        .and_then(|plan| serde_json::from_value::<GoalPlan>(plan.clone()).ok())
+        .unwrap_or_default();
+    state.plan.normalize_active();
+    let budget = CompactionBudget {
+        context_window: config.context_limit,
+        ratio: DEFAULT_COMPACTION_RATIO,
+        reserve_tokens: SAFETY_RESERVE_TOKENS + MIN_OUTPUT_HEADROOM_TOKENS,
+    };
+    let stable = stable_prefix(&config);
+    let schemas = tool_schemas(config.root.is_some());
     let mut final_content = String::new();
-    let mut final_continuations = 0usize;
-    let mut plan_closeout_due = false;
-    let mut notes_nudged = false;
-    let needs_plan = requires_initial_plan(&config.user, config.root.is_some());
-    // Project scope is an execution boundary, but it is also essential model
-    // context.  Without this explicit control record Qwen can conclude that
-    // “this project” was never attached and answer instead of invoking the
-    // planning capability.
-    let system_control = format!(
-        "{}\n{}{}",
-        config.system,
-        AGENT_GUIDANCE,
-        config.root.as_ref().map_or_else(String::new, |root| format!(
-            "\n<project_scope root=\"{}\">A selected local project is attached. Use project tools with relative paths rooted here; inspect it rather than asking the user for a path.</project_scope>",
-            root
-        )),
-    );
+    let mut continuation_count = 0_usize;
+    let mut overflow_attempts = 0_usize;
+
     emit(
         &config.run_id,
         Event::AgentStarted {
             run_id: config.run_id.clone(),
         },
     );
-    // Jan's normal mode is not governed by a small action cap. The high guard
-    // only protects an unattended local process from a provider loop.
-    for turn in 0..512 {
+    for turn in 0..128_usize {
         if config.cancelled.load(Ordering::Relaxed) {
             emit(
                 &config.run_id,
@@ -1300,404 +893,229 @@ pub fn run(config: Config) {
             );
             return;
         }
-        let steering = std::mem::take(&mut *config.steering.lock().expect("steering lock"));
-        for message in steering {
-            transcript.push_steering(message);
+        if let Ok(mut steering) = config.steering.lock() {
+            for content in steering.drain(..) {
+                transcript.push_steering(content);
+            }
         }
-        // Controls describe the request about to be made. Keeping old controls
-        // in the projected system prompt was causing Qwen to receive stale
-        // execute/synthesis/closeout instructions simultaneously and spend
-        // Deep reasoning re-litigating work it had already closed.
-        transcript.clear_reminders();
-        emit(&config.run_id, Event::TurnStarted { index: turn + 1 });
-        // Once a provider exhausts a final prefix, that continuation is a
-        // final-output request even if an honest Plan closeout happened to be
-        // pending.  It must not fall back to the ordinary 8K execution budget
-        // or reopen tools between chunks.
-        let final_continuation_turn = final_started && final_continuations > 0;
-        let phase = if final_continuation_turn {
-            "final_continuation"
+        let continuation_only = continuation_count > 0;
+        let dynamic = if continuation_only {
+            String::new()
         } else {
-            phase_for(&state, needs_plan, turn)
+            dynamic_tail(&state)
         };
-        // The closeout valve fires only for genuinely closeable plans: open
-        // with no evidence gap. A saturated audit that still lacks
-        // `complete_for_task` evidence is open work, not a completed audit.
-        let closeout_due_turn = plan_closeout_due && closeout_due(&state);
-        let phase_checkpoint_turn =
-            needs_plan && !state.plan.phases.is_empty() && state.plan_checkpoint_due();
-        let planning_turn = !final_continuation_turn
-            && ((needs_plan && state.plan.phases.is_empty())
-                || closeout_due_turn
-                || phase_checkpoint_turn);
-        if final_continuation_turn {
-            transcript.remind(format!(
-                "FINAL CONTINUATION: continue the SAME user-facing answer immediately after the exact emitted text below. Do not restart, summarize, repeat completed sections, plan, or investigate. The partial final is not complete yet.\n<already_emitted_final_tail>\n{}\n</already_emitted_final_tail>",
-                final_continuation_tail(&final_content)
-            ));
-        } else if phase == "synthesis" {
-            transcript.remind("SYNTHESIS CHECKPOINT: consolidate durable findings, create task_checkpoint calls from existing machine evidence IDs for the covered material tasks, then close only those checkpointed tasks. Do not rediscover the project or draft the final answer in this checkpoint; the final phase will present the audit.".into());
-        } else if phase == "final" {
-            transcript.remind("FINAL RESPONSE: investigation is complete. Write the user-facing answer directly from the durable evidence. If the Task Plan has an open Synthesis item, it is completed only after this final response finishes. Do not revisit planning, tool selection, or reconstruct the audit outline before answering.".into());
-        }
-        if closeout_due_turn {
-            transcript.remind(format!(
-                "TASK PLAN CLOSEOUT: update the currently open work now. Mark completed work done or explicitly drop it; do not write the final answer in this request.\n{}",
-                state.plan.open_summary().unwrap_or_default()
-            ));
-        } else if phase_checkpoint_turn {
-            transcript.remind(format!(
-                "TASK PLAN PHASE CHECKPOINT: advance exactly one honest phase now. In one `task_plan` batch, mark the current completed item done and start only its immediate successor. Do not start a later task while an earlier item is still open.\n{}",
-                state.plan.open_summary().unwrap_or_default()
-            ));
-        }
-        emit(
-            &config.run_id,
-            Event::RunState {
-                state: if phase == "verify" {
-                    "verifying"
+        let mut messages = project(&transcript, &stable, &dynamic);
+        // The just-projected reminder expires before the following turn.
+        transcript.clear_reminders();
+        let mut projected = estimate_tokens(&Value::Array(messages.clone()));
+        if needs_compaction(
+            budget,
+            config.context_limit,
+            projected,
+            config.provider_max_output,
+        ) {
+            let before = projected;
+            if compact_once(
+                &config,
+                &mut transcript,
+                before,
+                DEFAULT_KEEP_RECENT,
+                "proactive_threshold",
+                &dynamic,
+            ) {
+                let dynamic = if continuation_only {
+                    String::new()
                 } else {
-                    "thinking"
-                }
-                .into(),
-            },
+                    dynamic_tail(&state)
+                };
+                messages = project(&transcript, &stable, &dynamic);
+                projected = estimate_tokens(&Value::Array(messages.clone()));
+            }
+        }
+        let output_limit = dynamic_output_limit(
+            config.context_limit,
+            projected,
+            SAFETY_RESERVE_TOKENS,
+            config.provider_max_output,
+            APPLICATION_MAX_OUTPUT_TOKENS,
         );
-        // Canonical history remains append-only. When a long autonomous task
-        // approaches its selected context we create a fresh projection boundary
-        // and retain a protocol-safe suffix (never a leading orphan tool result).
-        // The selected context is a hard per-request budget. llama.cpp's
-        // n_ctx is merely an upper ceiling; reserve the same completion room
-        // passed as max_tokens plus protocol slack before projecting input.
-        let max_projected_input = max_projected_input(config.context_limit);
-        // GGUF source/JSON payloads are routinely denser than chars/4. A
-        // conservative chars/2 estimate starts Jan-like compaction before an
-        // upstream rejection, not after it.
-        let provisional_notes = working_control(&state);
-        let estimated_before =
-            estimate_projected_tokens(&project(&transcript, &system_control, &provisional_notes));
-        let compaction_trigger = compaction_threshold(config.context_limit);
-        // Prefer a model-authored semantic checkpoint before the first
-        // compaction after a meaningful exploration group. If the transcript
-        // is already beyond the hard input budget we still compact defensively
-        // and checkpoint on the immediately following turn.
-        let checkpoint_before_compaction = needs_plan
-            && state.investigated.len() >= 3
-            && state.notes_checkpoint_due()
-            && state.uncheckpointed_evidence_count() >= 3
-            && estimated_before <= max_projected_input;
-        if estimated_before > compaction_trigger && !checkpoint_before_compaction {
-            let before = estimated_before;
-            // Keep the longest recent protocol-safe suffix that actually
-            // fits.  The former fixed 14-entry tail could preserve multiple
-            // large reads and make the compacted request *larger* than the
-            // original projection.
-            if let Some((covers, after)) = compaction_boundary_to_fit(
-                &transcript,
-                &state,
-                &system_control,
-                compaction_target(config.context_limit),
-            ) {
-                let summary = compacted_working_state(&transcript, covers, &state);
-                transcript.compact(summary, covers);
-                emit_context_optimized(
-                    &config.run_id,
-                    "proactive_threshold",
-                    before,
-                    after,
-                    covers,
-                    &transcript,
-                    &state,
-                );
-            }
-        }
-        if state.consecutive_repeated_exploration >= 3 && !state.synthesis_nudged {
-            state.synthesis_nudged = true;
-            transcript.remind(format!(
-                "Exploration has repeated files/listings without material new evidence. Review the Task Plan, Task Notes, and investigated state. Do not read another file unless you can name the specific missing fact. Record any established findings, close the exploration task, and synthesize the requested answer.\n{}",
-                state.investigated_summary_bounded(6, 160).join("\n")
-            ));
-        }
-        if state.consecutive_no_progress_turns >= 3 && !state.no_progress_nudged {
-            state.no_progress_nudged = true;
-            transcript.remind("NO PROGRESS DETECTED: recent turns did not add a successful tool result, durable evidence, Task Notes, or Task Plan state. Do not repeat the same rejected or empty strategy. Choose a different permitted action, use the durable evidence already available, or explicitly bound the unresolved fact.".into());
-        }
-        // Saturation is evidence-based rather than an action cap. It gives the
-        // model an explicit broad-exploration boundary once representative
-        // audit dimensions have durable support. This is deliberately not a
-        // task-completeness decision: open items still decide whether the
-        // agent investigates or synthesizes.
-        let coverage_likely_sufficient = needs_plan
-            && state.investigated.len() >= 6
-            && state.notes.chars().count() >= 500
-            && !state.notes_checkpoint_due();
-        if coverage_likely_sufficient && state.saturation_round < 2 {
-            state.saturation_round += 1;
-            state.synthesis_nudged = true;
-            transcript.remind(format!(
-                "Broad exploration is now saturated (round {}). {} investigated sources have durable evidence and Task Notes contain current findings. This does not complete open Task Plan items. Do not broaden the audit further; for each remaining item, either name one exact unresolved fact and use focused retrieval, or explicitly record why that fact cannot be verified before dropping the item. Synthesize only after material gaps are resolved or explicitly bounded.\n{}",
-                state.saturation_round,
-                state.investigated.len(),
-                state.plan.open_summary().unwrap_or_default()
-            ));
-        }
-        if state.saturation_round >= 2 {
-            transcript.remind(format!(
-                "Second saturation boundary: broad exploration capability is now withheld. Open Task Plan items with incomplete evidence remain in investigation. For one named missing fact, use a focused `read_file` with `reason` and a narrow line range, then checkpoint what it established. Continue with another focused retrieval only for a different unresolved fact; do not list directories, reconstruct whole files, repeat covered ranges, or request broad batches. If a fact cannot be verified after reasonable focused attempts, record that limitation and explicitly drop the affected item before synthesis. Focused retrievals used: {}.\n{}",
-                state.post_saturation_retrievals,
-                state.plan.open_summary().unwrap_or_default()
-            ));
-        }
-        if needs_plan
-            && !state.plan.phases.is_empty()
-            && state.notes.is_empty()
-            && state.investigated.len() >= 3
-            && !notes_nudged
-        {
-            notes_nudged = true;
-            transcript.remind("You have representative project evidence but no Task Notes. Before broadening exploration, call task_notes with concise factual findings and update the current Task Plan item.".into());
-        }
-        let control_notes = working_control(&state);
-        let mut messages = project(&transcript, &system_control, &control_notes);
-        // Reminders are system-boundary control rather than transcript turns.
-        // They are added after the normal threshold check above, so assess the
-        // final request shape too.  This is still proactive compaction, not an
-        // upstream retry: no oversize payload is sent to the provider.
-        if estimate_projected_tokens(&messages) > max_projected_input {
-            let before = estimate_projected_tokens(&messages);
-            if let Some((covers, after)) = compaction_boundary_to_fit(
-                &transcript,
-                &state,
-                &system_control,
-                max_projected_input,
-            ) {
-                transcript.compact(compacted_working_state(&transcript, covers, &state), covers);
-                emit_context_optimized(
-                    &config.run_id,
-                    "hard_input_budget",
-                    before,
-                    after,
-                    covers,
-                    &transcript,
-                    &state,
-                );
-                messages = project(&transcript, &system_control, &working_control(&state));
-            }
-        }
-        if let Err(message) = ensure_current_user_query(&messages, &config.user) {
-            emit(
-                &config.run_id,
-                Event::AgentError {
-                    code: "projection".into(),
-                    message,
-                },
-            );
-            return;
-        }
-        let projected_tokens = estimate_projected_tokens(&messages);
-        if projected_tokens > max_projected_input {
+        if output_limit < MIN_OUTPUT_HEADROOM_TOKENS {
             emit(
                 &config.run_id,
                 Event::AgentError {
                     code: "context_budget".into(),
-                    message: format!("projection is {projected_tokens} tokens; selected input budget is {max_projected_input}"),
+                    message: "context compaction could not leave enough output headroom".into(),
                 },
             );
             return;
         }
-        let roles = messages
-            .iter()
-            .map(|message| {
-                message
-                    .get("role")
-                    .and_then(Value::as_str)
-                    .unwrap_or("?")
-                    .to_owned()
-            })
-            .collect::<Vec<_>>();
-        let current_user_index = messages.iter().rposition(|message| {
-            message.get("role").and_then(Value::as_str) == Some("user")
-                && message.get("content").and_then(Value::as_str) == Some(config.user.as_str())
+        let reasoning = match policy::reasoning(&config.reasoning_mode, "agent") {
+            Reasoning::Off => json!({"chat_template_kwargs":{"enable_thinking":false}}),
+            Reasoning::Low => json!({"reasoning_effort":"low"}),
+            Reasoning::Deep => json!({"reasoning_effort":"xhigh"}),
+        };
+        // A prose continuation is deliberately tool-free. It receives the
+        // exact visible tail as a one-turn reminder and can only append text.
+        let mut payload = json!({
+            "model": config.model,
+            "messages": messages,
+            "stream": true,
+            "stream_options": {"include_usage": true},
+            "max_tokens": output_limit,
         });
-        let entries = request_shape(&messages, &config.user);
-        let compaction_boundary = transcript.compaction_boundary();
-        let last_request_shape = format!(
-            "turn={} messages={} roles={} current_user_index={current_user_index:?} system_first={} compaction_boundary={compaction_boundary:?} entries=[{}]",
-            turn + 1,
-            messages.len(),
-            roles.join(","),
-            messages.first().and_then(|message| message.get("role")).and_then(Value::as_str) == Some("system"),
-            entries.join("; "),
+        if !continuation_only {
+            payload["tools"] = json!(turn_tools(&schemas, false));
+            payload["tool_choice"] = json!("auto");
+        }
+        payload
+            .as_object_mut()
+            .expect("request payload")
+            .extend(reasoning.as_object().expect("reasoning payload").clone());
+        let payload_messages = payload
+            .get("messages")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        emit(&config.run_id, Event::TurnStarted { index: turn + 1 });
+        emit(
+            &config.run_id,
+            Event::RunState {
+                state: "thinking".into(),
+            },
         );
         emit(
             &config.run_id,
             Event::RequestShape {
                 turn: turn + 1,
-                message_count: messages.len(),
-                roles,
-                current_user_index,
-                system_first: messages
+                message_count: payload_messages.len(),
+                roles: payload_messages
+                    .iter()
+                    .filter_map(|message| {
+                        message
+                            .get("role")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .collect(),
+                current_user_index: payload_messages.iter().rposition(|message| {
+                    message.get("role").and_then(Value::as_str) == Some("user")
+                        && message.get("content").and_then(Value::as_str)
+                            == Some(config.user.as_str())
+                }),
+                system_first: payload_messages
                     .first()
                     .and_then(|message| message.get("role"))
                     .and_then(Value::as_str)
                     == Some("system"),
-                entries,
-                compaction_boundary,
+                entries: request_shape(&payload_messages),
+                compaction_boundary: transcript.compaction_boundary(),
             },
         );
-        emit(
-            &config.run_id,
-            Event::ContextStats {
-                used: projected_tokens,
-                limit: config.context_limit,
-            },
-        );
-        let reasoning = match policy::reasoning(&config.reasoning_mode, phase) {
-            policy::Reasoning::Off => json!({"chat_template_kwargs":{"enable_thinking":false}}),
-            policy::Reasoning::Low => json!({"reasoning_effort":"low"}),
-            policy::Reasoning::Deep => json!({"reasoning_effort":"xhigh"}),
-        };
-        // Mirrors Jan's eager-goal Todo turn: for a substantial analysis the
-        // first visible operation is real structured state, not an optional
-        // prompt suggestion. After representative evidence exists, checkpoint
-        // it once in Task Notes before allowing broader exploration again.
-        let notes_checkpoint_turn = !final_continuation_turn
-            && needs_plan
-            && state.investigated.len() >= 3
-            && state.notes_checkpoint_due()
-            && (state.notes.is_empty()
-                || state.uncheckpointed_evidence_count() >= 3
-                || checkpoint_before_compaction);
-        let saturation_deficit_turn = !final_continuation_turn
-            && state.saturation_round >= 2
-            && state.open_without_complete_evidence() > 0;
-        let checkpoint_pending_turn = !final_continuation_turn && checkpoint_pending(&state);
-        if saturation_deficit_turn {
-            transcript.remind(format!(
-                "EVIDENCE GAP: Task Plan items still lack valid task checkpoints. If relevant machine evidence IDs are already listed in Current Task Memory, create task_checkpoint now; do not retrieve more files merely for bookkeeping. Retrieve only when a concrete factual gap remains. Do not bulk-mark unfinished items done.\n{}",
-                state.plan.open_summary().unwrap_or_default()
-            ));
-        }
-        let tool_choice = if checkpoint_pending_turn {
-            json!("auto")
-        } else if planning_turn {
-            // llama.cpp/Qwen honours `required` more reliably for a later
-            // closeout handoff than a named function after a long tool suffix.
-            // The registry still contains exactly task_plan, so this remains a
-            // real model-authored plan operation rather than runtime completion.
-            if closeout_due_turn || phase_checkpoint_turn {
-                json!("required")
-            } else {
-                json!({"type":"function","function":{"name":"task_plan"}})
-            }
-        } else if saturation_deficit_turn {
-            json!("auto")
-        } else if notes_checkpoint_turn {
-            json!("auto")
-        } else {
-            json!("auto")
-        };
-        let visible_tools = if final_continuation_turn {
-            json!([])
-        } else if checkpoint_pending_turn {
-            if state.saturation_round >= 2 { saturation_tools() } else { tools() }
-        } else if planning_turn {
-            planning_tools()
-        } else if notes_checkpoint_turn {
-            checkpoint_tools()
-        } else if phase == "final" {
-            json!([])
-        } else if state.saturation_round >= 2 {
-            saturation_tools()
-        } else {
-            tools()
-        };
-        let retrieval_needed = !checkpoint_pending_turn
-            && state.open_without_complete_evidence() > 0
-            && state.memory.evidence.is_empty();
-        let visible_tools = ensure_required_tools(
-            visible_tools,
-            checkpoint_pending_turn,
-            retrieval_needed,
-        );
-        let request_output_budget = if matches!(phase, "final" | "final_continuation") {
-            final_output_budget(config.context_limit, projected_tokens)
-        } else {
-            RESERVED_OUTPUT_TOKENS
-        };
-        if request_output_budget == 0 {
-            emit(
-                &config.run_id,
-                Event::AgentError {
-                    code: "final_context_budget".into(),
-                    message: "no selected-context capacity remains for a final answer".into(),
-                },
-            );
-            return;
-        }
-        let mut payload = json!({"model":config.model,"messages":messages,"tools":visible_tools,"tool_choice":tool_choice,"stream":true,"stream_options":{"include_usage":true},"max_tokens":request_output_budget});
-        payload
-            .as_object_mut()
-            .expect("object")
-            .extend(reasoning.as_object().expect("object").clone());
         emit(
             &config.run_id,
             Event::RequestPolicy {
                 turn: turn + 1,
-                phase: phase.to_owned(),
+                phase: if continuation_only {
+                    "continuation".into()
+                } else {
+                    "agent".into()
+                },
                 reasoning_effort: payload
                     .get("reasoning_effort")
                     .and_then(Value::as_str)
                     .unwrap_or("thinking_off")
                     .to_owned(),
-                tool_choice: payload.get("tool_choice").cloned().unwrap_or(Value::Null),
+                tool_choice: payload
+                    .get("tool_choice")
+                    .cloned()
+                    .unwrap_or_else(|| json!("none")),
                 tools: payload
                     .get("tools")
                     .and_then(Value::as_array)
-                    .map(|tools| {
-                        tools
-                            .iter()
-                            .filter_map(|tool| {
-                                tool.pointer("/function/name")
-                                    .and_then(Value::as_str)
-                                    .map(str::to_owned)
-                            })
-                            .collect()
-                    })
+                    .map(|tools| tools.iter().map(tool_name).map(str::to_owned).collect())
                     .unwrap_or_default(),
-                max_tokens: request_output_budget,
+                max_tokens: output_limit,
                 context_limit: config.context_limit,
-                projected_input_tokens: projected_tokens,
-                reserved_output_tokens: request_output_budget,
+                projected_input_tokens: projected,
+                reserved_output_tokens: output_limit,
             },
         );
+        emit(
+            &config.run_id,
+            Event::ContextStats {
+                used: projected,
+                limit: config.context_limit,
+            },
+        );
+
         let streamed = match stream_call(
             &config.endpoint,
             &payload,
             &config.run_id,
             &config.cancelled,
+            true,
         ) {
-            Ok(v) => v,
-            Err(e) => {
-                if e == "cancelled" {
-                    emit(
-                        &config.run_id,
-                        Event::AgentStopped {
-                            reason: "cancelled".into(),
-                        },
-                    );
-                    return;
+            Ok(streamed) => {
+                overflow_attempts = 0;
+                streamed
+            }
+            Err(error) if error == "cancelled" => {
+                emit(
+                    &config.run_id,
+                    Event::AgentStopped {
+                        reason: "cancelled".into(),
+                    },
+                );
+                return;
+            }
+            Err(error)
+                if is_context_overflow(&error) && overflow_attempts < MAX_COMPACTION_ATTEMPTS =>
+            {
+                overflow_attempts += 1;
+                let before = projected;
+                let keep = retry_keep_recent(overflow_attempts);
+                if compact_once(
+                    &config,
+                    &mut transcript,
+                    before,
+                    keep,
+                    "context_overflow_retry",
+                    &dynamic,
+                ) {
+                    continue;
                 }
                 emit(
                     &config.run_id,
                     Event::AgentError {
+                        code: "context_overflow".into(),
+                        message: error,
+                    },
+                );
+                return;
+            }
+            Err(error) => {
+                emit(
+                    &config.run_id,
+                    Event::AgentError {
                         code: "upstream".into(),
-                        message: format!("{e}; request_shape: {last_request_shape}"),
+                        message: error,
                     },
                 );
                 return;
             }
         };
-        let finish = streamed.finish_reason.clone();
+        if streamed.thinking_started {
+            emit(&config.run_id, Event::ThinkingFinished);
+        }
+        emit(
+            &config.run_id,
+            Event::TurnReasoning {
+                turn: turn + 1,
+                started: streamed.thinking_started,
+                delta_count: streamed.reasoning_delta_count,
+                chars: streamed.reasoning.chars().count(),
+            },
+        );
         emit(
             &config.run_id,
             Event::TurnUsage {
@@ -1709,214 +1127,100 @@ pub fn run(config: Config) {
                         .zip(streamed.completion_tokens)
                         .map(|(prompt, completion)| prompt + completion)
                 }),
+                cached_tokens: streamed.cached_tokens,
+                cache_write_tokens: streamed.cache_write_tokens,
                 prompt_ms: streamed.prompt_ms,
                 predicted_ms: streamed.predicted_ms,
                 predicted_per_second: streamed.predicted_per_second,
-                finish_reason: finish.clone(),
+                finish_reason: streamed.finish_reason.clone(),
             },
         );
-        emit(
-            &config.run_id,
-            Event::TurnReasoning {
-                turn: turn + 1,
-                started: streamed.thinking_started,
-                delta_count: streamed.reasoning_delta_count,
-                chars: streamed.reasoning.chars().count(),
-            },
-        );
-        let content = streamed.content;
         let raw_calls = streamed.calls.into_values().collect::<Vec<_>>();
-        if !streamed.reasoning.is_empty() {
-            emit(&config.run_id, Event::ThinkingFinished);
-        }
-        let calls = match validate_calls(&raw_calls, Some(&finish)) {
-            Ok(c) => c,
-            Err(e) => {
+        let calls = match validate_calls(&raw_calls, Some(&streamed.finish_reason)) {
+            Ok(calls) => calls,
+            Err(error) => {
+                if !streamed.content.is_empty() {
+                    transcript.assistant_message(streamed.content);
+                }
                 emit(
                     &config.run_id,
                     Event::ToolError {
                         id: "protocol".into(),
                         name: "tool_protocol".into(),
-                        message: e.clone(),
+                        message: error.clone(),
                     },
                 );
-                // Keep invalid calls out of canonical assistant/tool history. This
-                // is a runtime protocol notice, never an invented user turn.
-                transcript.remind(format!("A tool call was rejected by the protocol: {e}. Emit a complete valid call or answer without tools."));
-                state.record_no_progress_turn();
+                transcript.remind(format!("The previous tool call was not executed because it was incomplete or malformed: {error}. Emit one complete valid tool call, or answer without tools."));
                 continue;
             }
         };
-        let evidence_before_turn = state.evidence_revision;
-        let notes_before_turn = state.notes.clone();
-        let plan_before_turn = state.plan.clone();
+        if continuation_only && !calls.is_empty() {
+            emit(
+                &config.run_id,
+                Event::ToolError {
+                    id: "continuation".into(),
+                    name: "tool_protocol".into(),
+                    message: "a prose continuation cannot execute tools".into(),
+                },
+            );
+            transcript.remind("Continue the previous visible prose only. Do not call tools, restart, or add a new plan.".into());
+            continue;
+        }
         if calls.is_empty() {
-            if final_requires_continuation(&finish, false) {
-                // A completion-exhausted prefix is never a successful final.
-                // Preserve it in canonical history and append its next chunk
-                // to the same visible assistant response on the next request.
-                if !final_started {
-                    final_started = true;
-                    emit(&config.run_id, Event::FinalStarted);
-                }
-                if !content.is_empty() {
-                    final_content.push_str(&content);
-                    transcript.assistant_final_partial(content.clone());
-                    emit(&config.run_id, Event::FinalDelta { content });
-                }
-                if !final_continuation_available(final_continuations) {
+            if streamed.finish_reason == "length" {
+                append_final_text(&mut final_content, &streamed.content);
+                transcript.assistant_message(streamed.content);
+                if continuation_count >= MAX_CONTINUATION_TURNS
+                    || final_content.chars().count() >= MAX_LOGICAL_FINAL_CHARS
+                {
                     emit(
                         &config.run_id,
-                        Event::AgentError {
-                            code: "final_output_exhausted".into(),
-                            message: format!(
-                                "final answer exhausted provider output capacity after {final_continuations} continuation(s); partial text was preserved but not marked complete"
-                            ),
+                        Event::Final {
+                            complete: false,
+                            continuation_count,
+                            chars: final_content.chars().count(),
+                            finish_reason: "length".into(),
                         },
                     );
                     return;
                 }
-                final_continuations += 1;
+                continuation_count += 1;
+                transcript.remind(format!(
+                    "Continue exactly from the previous emitted tail. Do not restart, summarize, repeat headings, plan, or investigate.\n<previous_tail>\n{}\n</previous_tail>",
+                    continuation_tail(&final_content)
+                ));
                 emit(
                     &config.run_id,
                     Event::FinalContinuation {
-                        continuation: final_continuations,
+                        continuation: continuation_count,
                         prior_chars: final_content.chars().count(),
-                        finish_reason: finish,
-                        next_max_tokens: final_output_budget(
-                            config.context_limit,
-                            projected_tokens,
-                        ),
+                        finish_reason: "length".into(),
+                        next_max_tokens: output_limit,
                     },
                 );
                 continue;
             }
-            // Jan's terminal boundary is tool-driven: a tool-free completion
-            // ends the cycle. Empty assistant content is deliberately not
-            // recorded in canonical history (matching Jan's
-            // `record_assistant_turn`), and it is not turned into an invented
-            // recovery/user message.
-            // A saturated audit with missing task-specific evidence stays in
-            // investigation while focused retrieval capacity remains. The old
-            // path armed a plan-only closeout after every tool-free response;
-            // that made one targeted read look like a cue to mark all open
-            // work done. Only after the bounded focused-retrieval budget is
-            // exhausted may the closeout valve ask the model to record an
-            // explicit limitation and drop the affected item.
-            let focused_retrieval_available = state.saturation_round >= 2
-                && state.post_saturation_retrievals < post_saturation_read_budget(&state);
-            if state.plan.has_open()
-                && !only_synthesis_work_open(&state)
-                && !closeout_due(&state)
-                && focused_retrieval_available
-            {
-                state.record_no_progress_turn();
+            append_final_text(&mut final_content, &streamed.content);
+            if add_soft_closeout_if_needed(&mut state, &mut transcript) {
+                transcript.assistant_message(streamed.content);
                 continue;
             }
-            let gap_closeout = state.plan.has_open()
-                && !only_synthesis_work_open(&state)
-                && !closeout_due(&state)
-                && state.gap_closeout_passes < MAX_GAP_CLOSEOUT_PASSES;
-            // Hard escape valve: once `MAX_GAP_CLOSEOUT_PASSES` gap closeout
-            // passes have been spent without a fresh evidence record, no
-            // further closeout arm is allowed; the run finalizes. A fresh
-            // closeout cycle may open again after new evidence (see the
-            // reset sites above in the read/Notes/plan paths).
-            let can_arm = state.gap_closeout_passes < MAX_GAP_CLOSEOUT_PASSES;
-            if state.plan.has_open() && (closeout_due(&state) || gap_closeout) && can_arm
-            {
-                state.gap_closeout_passes += 1;
-                plan_closeout_due = true;
-                state.record_no_progress_turn();
-                continue;
-            }
-            if state.plan.has_open() && !only_synthesis_work_open(&state) && !closeout_due(&state) {
-                emit(
-                    &config.run_id,
-                    Event::AgentError {
-                        code: "plan_unresolved".into(),
-                        message: "Task Plan still contains material items without task-specific complete evidence or a bounded dropped limitation; refusing to start a terminal final with unresolved plan state.".into(),
-                    },
-                );
-                return;
-            }
-            emit(
-                &config.run_id,
-                Event::RunState {
-                    state: "finalizing".into(),
-                },
-            );
-            if !final_started {
-                emit(&config.run_id, Event::FinalStarted);
-            }
-            if !content.is_empty() {
-                final_content.push_str(&content);
-                emit(&config.run_id, Event::FinalDelta { content })
-            }
-            if !final_content.trim().is_empty() {
-                finish_synthesis_after_final(&mut state, &config.run_id);
-            }
+            transcript.assistant_message(streamed.content);
             emit(
                 &config.run_id,
                 Event::Final {
-                    content: final_content.clone(),
                     complete: true,
-                    continuation_count: final_continuations,
+                    continuation_count,
                     chars: final_content.chars().count(),
-                    finish_reason: finish,
+                    finish_reason: streamed.finish_reason,
                 },
             );
             return;
         }
-        transcript.assistant_tool_turn(content, &calls);
-        let mut successful_tool_execution = false;
+        transcript.assistant_tool_turn(streamed.content, &calls);
         for tool in calls {
-            emit(
-                &config.run_id,
-                Event::RunState {
-                    state: "working".into(),
-                },
-            );
-            // Capability filtering is the normal enforcement path. Keep this
-            // validation too for providers that emit an unadvertised cached
-            // tool call. A named reason is the declared missing fact.
-            if rejects_saturated_tool(&state, &tool) {
-                let message = saturated_rejection_message(&state, &tool);
-                emit(
-                    &config.run_id,
-                    Event::ToolError {
-                        id: tool.id.clone(),
-                        name: tool.name.clone(),
-                        message: message.clone(),
-                    },
-                );
-                transcript.tool_result(&tool.id, &tool.name, format!("ERROR: {message}"));
-                continue;
-            }
-            if let Some(message) = plan_completion_error(&state, &tool) {
-                emit(
-                    &config.run_id,
-                    Event::ToolError {
-                        id: tool.id.clone(),
-                        name: tool.name.clone(),
-                        message: message.clone(),
-                    },
-                );
-                transcript.tool_result(&tool.id, &tool.name, format!("ERROR: {message}"));
-                continue;
-            }
-            if let Some(message) = state.repeated_strategy_message(&tool.name, &tool.arguments) {
-                emit(
-                    &config.run_id,
-                    Event::ToolError {
-                        id: tool.id.clone(),
-                        name: tool.name.clone(),
-                        message: message.clone(),
-                    },
-                );
-                transcript.tool_result(&tool.id, &tool.name, format!("ERROR: {message}"));
-                continue;
-            }
+            // Emit only after tool-call aggregation and validation, so every
+            // activity has the provider's actual id and complete arguments.
             emit(
                 &config.run_id,
                 Event::ToolCallStarted {
@@ -1925,13 +1229,23 @@ pub fn run(config: Config) {
                     arguments: tool.arguments.clone(),
                 },
             );
-            emit(
-                &config.run_id,
-                Event::ToolCall {
-                    id: tool.id.clone(),
-                    name: tool.name.clone(),
-                },
-            );
+            if config.cancelled.load(Ordering::Relaxed) {
+                transcript.tool_result(&tool.id, &tool.name, "ERROR: generation cancelled".into());
+                continue;
+            }
+            if !schemas.iter().any(|schema| tool_name(schema) == tool.name) {
+                let message = format!("tool '{}' is unavailable", tool.name);
+                emit(
+                    &config.run_id,
+                    Event::ToolError {
+                        id: tool.id.clone(),
+                        name: tool.name.clone(),
+                        message: message.clone(),
+                    },
+                );
+                transcript.tool_result(&tool.id, &tool.name, format!("ERROR: {message}"));
+                continue;
+            }
             if policy::requires_approval(config.policy, &tool.name, &tool.arguments) {
                 emit(
                     &config.run_id,
@@ -1953,1399 +1267,369 @@ pub fn run(config: Config) {
                 transcript.tool_result(&tool.id, &tool.name, "ERROR: approval required".into());
                 continue;
             }
-            let strategy_evidence_before = state.evidence_revision;
-            let targeted_read = tool.name == "read_file"
-                && (tool.arguments.get("start_line").is_some()
-                    || tool.arguments.get("end_line").is_some()
-                    || tool
-                        .arguments
-                        .get("reason")
-                        .and_then(Value::as_str)
-                        .is_some_and(|reason| !reason.trim().is_empty()));
-            let prior_investigation = ((!targeted_read)
-                && matches!(tool.name.as_str(), "read_file" | "list_directory"))
-            .then(|| tool.arguments.get("path").and_then(Value::as_str))
-            .flatten()
-            .and_then(|path| state.prior_investigation(&tool.name, path))
-            .filter(|item| item.evidence_complete)
-            .map(|item| (item.path.clone(), item.finding.clone(), item.reads));
-            let reuses_existing_investigation = prior_investigation.is_some();
-            let result = if let Some((path, finding, reads)) = prior_investigation {
-                Ok((
-                    json!({
-                        "reused_investigation": true,
-                        "path": path,
-                        "prior_reads": reads,
-                        "evidence_complete": true,
-                        "task_relevant_evidence": finding,
-                        "missing_facts": [],
-                        "instruction": "No physical read was performed. This unchanged source already has sufficient task-relevant evidence in working memory. Do not retry through terminal or a path variant. Only request a narrow read_file range with a named exact missing fact."
-                    }),
-                    None,
-                ))
-            } else {
-                match tool.name.as_str() {
-                    "task_notes" => {
-                        let incoming_notes = tool
-                            .arguments
-                            .get("notes")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_owned();
-                        let notes_changed = state.merge_notes(&incoming_notes);
-                        let evidence_changed = state.checkpoint_source_evidence(
-                            tool.arguments.get("evidence").unwrap_or(&Value::Null),
-                        );
-                        let hypotheses_changed = state.checkpoint_hypotheses(
-                            tool.arguments.get("hypotheses").unwrap_or(&Value::Null),
-                        );
-                        state.checkpoint_notes();
-                        if notes_changed || evidence_changed || hypotheses_changed {
-                            state.record_progress();
-                        }
-                        // A Notes checkpoint is new material evidence for the run
-                        // and clears the gap-closeout escape valve so the next
-                        // closeout cycle can open fresh once the model wants to
-                        // move on.
-                        state.gap_closeout_passes = 0;
-                        emit(
-                            &config.run_id,
-                            Event::TaskNoteUpdate {
-                                notes: state.notes.clone(),
-                            },
-                        );
-                        Ok((json!({"updated":true}), None))
-                    }
-                    "task_checkpoint" => (|| -> Result<(Value, Option<String>), String> {
-                        let task_id = tool.arguments.get("task_id").and_then(Value::as_str)
-                            .ok_or_else(|| "task_checkpoint requires task_id".to_owned())?;
-                        let evidence_ids = tool.arguments.get("evidence_ids").and_then(Value::as_array)
-                            .ok_or_else(|| "task_checkpoint requires evidence_ids".to_owned())?
-                            .iter().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>();
-                        let findings = tool.arguments.get("findings").and_then(Value::as_array)
-                            .map(|items| items.iter().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>())
-                            .unwrap_or_default();
-                        let unresolved = tool.arguments.get("unresolved").and_then(Value::as_array)
-                            .map(|items| items.iter().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>())
-                            .unwrap_or_default();
-                        let complete = tool.arguments.get("complete").and_then(Value::as_bool).unwrap_or(false);
-                        state.checkpoint_task(task_id, &evidence_ids, &findings, complete, &unresolved)?;
-                        state.gap_closeout_passes = 0;
-                        if complete {
-                            emit(&config.run_id, Event::PlanUpdate {
-                                plan: serde_json::to_value(&state.plan).map_err(|error| error.to_string())?,
-                            });
-                        }
-                        Ok((json!({"checkpointed":true,"task_id":task_id,"complete":complete,"evidence_ids":evidence_ids}), None))
-                    })(),
-                    "task_plan" => (|| -> Result<(Value, Option<String>), String> {
-                        let (candidate, action) = apply_task_plan_update(&state.plan, &tool.arguments)?;
-                        state.plan = candidate;
-                        emit(
-                            &config.run_id,
-                            Event::PlanUpdate {
-                                plan: serde_json::to_value(&state.plan)
-                                    .map_err(|e| e.to_string())?,
-                            },
-                        );
-                        // A successful plan mutation is new material evidence
-                        // for the run; it also clears the scoped closeout
-                        // handoff so a later final may arm the next item, but
-                        // it cannot silently reuse this one, and it resets the
-                        // gap-closeout pass counter so the next closeout cycle
-                        // starts fresh.
-                        plan_closeout_due = false;
-                        state.gap_closeout_passes = 0;
-                        state.record_progress();
-                        state.mark_plan_checkpoint();
-                        let (completed, total) = state.plan.progress();
-                        let task_ids = state.plan.phases.iter().flat_map(|phase| phase.tasks.iter()).map(|task| {
-                            json!({"task_id":task.id,"label":task.content})
-                        }).collect::<Vec<_>>();
-                        if state
-                            .plan
-                            .active_phase()
-                            .is_some_and(|name| name.eq_ignore_ascii_case("verify"))
-                        {
-                            emit(
-                                &config.run_id,
-                                Event::VerificationUpdate {
-                                    status: "active".into(),
-                                    detail: state.plan.open_summary().unwrap_or_default(),
-                                },
-                            );
-                        }
-                        Ok((
-                            json!({"updated":true,"action":action,"completed":completed,"total":total,"open":state.plan.open_summary(),"tasks":task_ids}),
-                            None,
-                        ))
-                    })(),
-                    "run_terminal" => config
-                        .root
-                        .as_ref()
-                        .ok_or_else(|| "no project scope".to_owned())
-                        .and_then(|r| {
-                            crate::tools::shell::execute(
-                                &PathBuf::from(r),
-                                &tool.arguments,
-                                || config.cancelled.load(Ordering::Relaxed),
-                                |pid, pgid, session_id, started_at| {
-                                    emit(
-                                        &config.run_id,
-                                        Event::ToolProcessStarted {
-                                            id: tool.id.clone(),
-                                            command: tool
-                                                .arguments
-                                                .get("command")
-                                                .and_then(Value::as_str)
-                                                .unwrap_or_default()
-                                                .to_owned(),
-                                            cwd: r.clone(),
-                                            pid,
-                                            pgid,
-                                            session_id,
-                                            started_at,
-                                        },
-                                    );
-                                },
-                                |stream, content| {
-                                    emit(
-                                        &config.run_id,
-                                        Event::ToolOutputDelta {
-                                            id: tool.id.clone(),
-                                            stream: stream.into(),
-                                            content: content.into(),
-                                        },
-                                    );
-                                },
-                            )
-                            .and_then(|value| {
-                                let failed = value
-                                    .get("exit_code")
-                                    .and_then(Value::as_i64)
-                                    .is_some_and(|code| code != 0)
-                                    || value
-                                        .get("timed_out")
-                                        .and_then(Value::as_bool)
-                                        .unwrap_or(false)
-                                    || value
-                                        .get("cancelled")
-                                        .and_then(Value::as_bool)
-                                        .unwrap_or(false);
-                                if failed {
-                                    Err(value.to_string())
-                                } else {
-                                    Ok((value, None))
-                                }
-                            })
-                        }),
-                    _ => config
-                        .root
-                        .as_ref()
-                        .ok_or_else(|| "no project scope".to_owned())
-                        .and_then(|r| {
-                            crate::tools::filesystem::execute(
-                                &PathBuf::from(r),
-                                &tool.name,
-                                &tool.arguments,
-                            )
-                        }),
-                }
-            };
-            match result {
-                Ok((mut value, diff)) => {
-                    let material_new_evidence = (!reuses_existing_investigation)
-                        && record_tool_evidence(&mut state, &tool.name, &tool.arguments, &value);
-                    let machine_evidence_id = (!reuses_existing_investigation)
-                        .then(|| record_machine_evidence(&mut state, &tool.name, &tool.arguments, &value))
-                        .flatten();
-                    if let Some(evidence_id) = machine_evidence_id {
-                        if let Some(object) = value.as_object_mut() {
-                            object.insert("evidence_id".into(), json!(evidence_id));
-                        }
-                    }
-                    state.record_strategy(&tool.name, &tool.arguments, strategy_evidence_before);
-                    if matches!(tool.name.as_str(), "write_file" | "create_file" | "apply_patch" | "delete_file" | "edit_file" | "patch") {
-                        if let Some(path) = tool.arguments.get("path").and_then(Value::as_str) {
-                            state.invalidate_path(path);
-                        }
-                        // A patch or delete changes other files too; invalidate
-                        // whatever the tool reported as changed so stale
-                        // evidence for them is not treated as current.
-                        if let Some(files) = value.get("files").and_then(Value::as_array) {
-                            for file in files.iter().filter_map(Value::as_str) {
-                                state.invalidate_path(file);
-                            }
-                        }
-                    }
-                    if material_new_evidence {
-                        // New evidence makes an earlier anti-repeat nudge stale;
-                        // the model may reasonably continue to the next focused
-                        // question rather than being forced to synthesize.
-                        state.synthesis_nudged = false;
-                    }
-                    if material_new_evidence
-                        || matches!(tool.name.as_str(), "write_file" | "create_file" | "apply_patch" | "delete_file" | "edit_file" | "patch")
-                    {
-                        successful_tool_execution = true;
-                    }
-                    if state.saturation_round >= 2 && tool.name == "read_file" {
-                        let reason = tool
-                            .arguments
-                            .get("reason")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_owned();
-                        // A successful saturated targeted read is new material evidence
-                        // for the run: it records the covered range (so a repeat
-                        // of the same range stays rejected even while remaining
-                        // budget is non-zero) and it resets the gap-closeout
-                        // escape valve so a closeout cycle that opens after this
-                        // read is fresh, not a continuation of a stalled one.
-                        let path = tool
-                            .arguments
-                            .get("path")
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
-                        let start = tool
-                            .arguments
-                            .get("start_line")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(1) as usize;
-                        let end = tool
-                            .arguments
-                            .get("end_line")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0) as usize;
-                        if end >= start {
-                            state.record_saturated_range(path, start, end);
-                        }
-                        state.gap_closeout_passes = 0;
-                        state.post_saturation_retrievals += 1;
-                        if !state
-                            .resolved_missing_facts
-                            .iter()
-                            .any(|known| known.eq_ignore_ascii_case(&reason))
-                        {
-                            state.resolved_missing_facts.push(reason);
-                        }
-                    }
-                    let text = value.to_string();
+            emit(
+                &config.run_id,
+                Event::RunState {
+                    state: "working".into(),
+                },
+            );
+            match run_tool(&config, &mut state, &tool) {
+                Ok((value, diff)) => {
+                    let content = value.to_string();
                     emit(
                         &config.run_id,
                         Event::ToolResult {
                             id: tool.id.clone(),
                             name: tool.name.clone(),
-                            content: text.clone(),
+                            content: content.clone(),
                             is_error: false,
                             diff,
                         },
                     );
-                    transcript.tool_result(&tool.id, &tool.name, text)
+                    transcript.tool_result(&tool.id, &tool.name, content);
+                    if tool.name != "task_plan" {
+                        state.action_completed();
+                    }
                 }
-                Err(error) => {
+                Err(message) => {
                     emit(
                         &config.run_id,
                         Event::ToolError {
                             id: tool.id.clone(),
                             name: tool.name.clone(),
-                            message: error.clone(),
+                            message: message.clone(),
                         },
                     );
-                    transcript.tool_result(&tool.id, &tool.name, format!("ERROR: {error}"))
+                    transcript.tool_result(&tool.id, &tool.name, format!("ERROR: {message}"));
                 }
             }
         }
-        if successful_tool_execution
-            || state.evidence_revision != evidence_before_turn
-            || state.notes != notes_before_turn
-            || state.plan != plan_before_turn
+        if state.plan.has_open_work()
+            && state.meaningful_actions_since_plan_update >= PLAN_NUDGE_ACTION_THRESHOLD
+            && state.plan_nudges < PLAN_NUDGE_MAX_PER_RUN
         {
-            state.record_progress();
-        } else {
-            state.record_no_progress_turn();
+            state.plan_nudges += 1;
+            state.meaningful_actions_since_plan_update = 0;
+            transcript.remind(format!("The plan still has open work. Update it if a task or milestone is complete or no longer needed; otherwise continue working. {}", state.plan.open_summary().unwrap_or_default()));
         }
     }
     emit(
         &config.run_id,
         Event::AgentError {
             code: "turn_limit".into(),
-            message: "agent reached turn limit".into(),
+            message: "agent turn safeguard reached; transcript and partial output were preserved"
+                .into(),
         },
     );
 }
 
+fn is_context_overflow(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("context") || error.contains("token limit") || error.contains("too many tokens")
+}
+
 #[cfg(test)]
-mod projection_tests {
+mod tests {
     use super::*;
-    use crate::agent::transcript::ValidatedCall;
-    #[test]
-    fn current_query_survives_all_request_boundaries() {
-        for query in [
-            "first request with Project 1",
-            "next request in this conversation",
-            "request after switching project",
-            "regenerate after agent error",
-            "request after completed response",
-            "request after context compaction",
-        ] {
-            let mut transcript = Transcript::default();
-            transcript.push_message(json!({"role":"user","content":"older request"}));
-            transcript.push_message(json!({"role":"assistant","content":"older answer"}));
-            if query.contains("compaction") {
-                transcript.compact(json!({"summary":"older work"}), 2);
+    use crate::agent::todo::GoalPlan;
+    use std::{
+        fs,
+        net::{TcpListener, TcpStream},
+        sync::mpsc,
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    };
+
+    fn sse_response(events: &[Value]) -> String {
+        let body = events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .chain(std::iter::once("data: [DONE]\n\n".to_owned()))
+            .collect::<String>();
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
+        )
+    }
+
+    fn read_mock_request(stream: &mut TcpStream) -> Value {
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let mut content_length = 0_usize;
+        loop {
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" || line == "\n" {
+                break;
             }
-            // The owning prompt is recorded before projection. A missing one
-            // is a programming error, not an excuse to append a user node
-            // after a tool suffix.
-            transcript.push_message(json!({"role":"user","content":query}));
-            let messages = project(&transcript, "control", "task note");
-            ensure_current_user_query(&messages, query).unwrap();
-            assert_eq!(messages.first().unwrap()["role"], "system");
-            assert!(messages
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    content_length = value.trim().parse().unwrap();
+                }
+            }
+        }
+        let mut body = vec![0_u8; content_length];
+        reader.read_exact(&mut body).unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    fn unique_temp_root(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("local-ai-agent-{name}-{nonce}"))
+    }
+
+    fn test_config(root: Option<&str>) -> Config {
+        Config {
+            run_id: "test".into(),
+            endpoint: "http://127.0.0.1:1".into(),
+            model: "test-model".into(),
+            system: "base system".into(),
+            user: "task".into(),
+            root: root.map(str::to_owned),
+            context_limit: 16_384,
+            reasoning_mode: "fast".into(),
+            policy: RunPolicy::Auto,
+            history: Vec::new(),
+            plan: None,
+            provider_max_output: Some(APPLICATION_MAX_OUTPUT_TOKENS),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            steering: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    #[test]
+    fn deterministic_tool_ordering() {
+        let first = tool_schemas(true);
+        let second = tool_schemas(true);
+        assert_eq!(first, second);
+        let names = first.iter().map(tool_name).collect::<Vec<_>>();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted);
+        assert_eq!(
+            tool_schemas(false)
                 .iter()
-                .any(|message| message["role"] == "user" && message["content"] == query));
-        }
-        assert!(ensure_current_user_query(&[], "").is_err());
-        assert!(
-            ensure_current_user_query(&[json!({"role":"system","content":"x"})], "missing")
-                .is_err()
+                .map(tool_name)
+                .collect::<Vec<_>>(),
+            vec!["task_plan"]
         );
     }
 
     #[test]
-    fn compaction_keeps_the_run_user_before_tool_suffix() {
-        let mut transcript = Transcript::default();
-        transcript.push_message(json!({"role":"user","content":"old"}));
-        transcript.push_message(json!({"role":"assistant","content":"old answer"}));
-        transcript.push_message(json!({"role":"user","content":"current"}));
-        transcript.assistant_tool_turn(
-            "".into(),
-            &[ValidatedCall {
-                id: "call_1".into(),
-                name: "read_file".into(),
-                arguments: json!({"path":"a"}),
-            }],
-        );
-        transcript.tool_result("call_1", "read_file", "ok".into());
-        let current_user_entry = 2;
-        transcript.compact(json!({"summary":"old"}), current_user_entry);
-        let projected = project(&transcript, "system", "");
-        assert_eq!(projected[1]["role"], "user");
-        assert_eq!(projected[1]["content"], "current");
-        assert_eq!(projected[2]["role"], "assistant");
-        assert_eq!(projected[3]["role"], "tool");
-    }
-
-    #[test]
-    fn selected_context_is_a_hard_projection_budget() {
-        assert_eq!(max_projected_input(32_768), 23_552);
-        assert_eq!(compaction_threshold(32_768), 18_841);
-        assert!(
-            estimate_projected_tokens(&[json!({"role":"user", "content":"x".repeat(50_000)})])
-                > max_projected_input(32_768)
-        );
-    }
-
-    #[test]
-    fn final_budget_uses_remaining_context_not_execution_turn_ceiling() {
-        // A final has 18K of projected input in a selected 32K window. It
-        // gets every safe remaining token, while normal execution remains at
-        // the stable 8K reservation.
-        let final_budget = final_output_budget(32_768, 18_304);
-        assert_eq!(final_budget, 13_440);
-        assert_eq!(18_304 + final_budget + SAFETY_TOKENS, 32_768);
-        assert!(final_budget > RESERVED_OUTPUT_TOKENS);
-    }
-
-    #[test]
-    fn output_exhaustion_is_not_a_successful_final() {
-        assert!(final_requires_continuation("length", false));
-        assert!(!final_requires_continuation("stop", false));
-        assert!(!final_requires_continuation("length", true));
-        assert!(final_continuation_available(0));
-        assert!(final_continuation_available(MAX_FINAL_CONTINUATIONS - 1));
-        assert!(!final_continuation_available(MAX_FINAL_CONTINUATIONS));
-    }
-
-    #[test]
-    fn final_continuation_includes_exact_emitted_tail() {
-        let content = format!("opening\n{}\nexact ending", "x".repeat(FINAL_CONTINUATION_TAIL_CHARS + 20));
-        let tail = final_continuation_tail(&content);
-        assert!(tail.contains("exact ending"));
-        assert!(tail.contains("earlier final content omitted"));
-        assert!(!tail.contains("opening"));
-    }
-
-    #[test]
-    fn task_plan_updates_are_atomic_and_refinement_preserves_terminal_work() {
-        let mut current = TaskPlan::default();
-        current
-            .init(vec![crate::agent::todo::Phase {
-                name: "Inspect".into(),
-                tasks: vec![
-                    crate::agent::todo::Item { id: String::new(), content: "structure".into(), status: Status::Pending },
-                    crate::agent::todo::Item { id: String::new(), content: "routing".into(), status: Status::Pending },
-                ],
-            }])
-            .unwrap();
-        current.finish("structure", false).unwrap();
-        let before = current.clone();
-        assert!(apply_task_plan_update(
-            &current,
-            &json!({"action":"batch","updates":[
-                {"action":"done","task":"routing"},
-                {"action":"done","task":"missing"}
-            ]})
-        )
-        .is_err());
-        assert_eq!(current, before);
-        assert!(apply_task_plan_update(
-            &current,
-            &json!({"action":"init","phases":[{"name":"Replacement","tasks":["new"]}]})
-        )
-        .is_err());
-        let (refined, _) = apply_task_plan_update(
-            &current,
-            &json!({"action":"refine","phases":[
-                {"name":"Inspect","tasks":["structure","routing"]},
-                {"name":"Synthesis","tasks":["write final"]}
-            ]}),
-        )
-        .unwrap();
-        assert_eq!(refined.progress().0, 1);
-        assert!(apply_task_plan_update(
-            &current,
-            &json!({"action":"refine","phases":[{"name":"Replacement","tasks":["new"]}]})
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn compaction_chooses_a_boundary_that_fits_large_early_tool_output() {
-        let mut transcript = Transcript::default();
-        transcript.push_run_user(json!({"role":"user","content":"analyze"}));
-        transcript.assistant_tool_turn(
-            String::new(),
-            &[
-                ValidatedCall {
-                    id: "read_a".into(),
-                    name: "read_file".into(),
-                    arguments: json!({"path":"src/App.tsx"}),
-                },
-                ValidatedCall {
-                    id: "read_b".into(),
-                    name: "read_file".into(),
-                    arguments: json!({"path":"src/Home.tsx"}),
-                },
-                ValidatedCall {
-                    id: "read_c".into(),
-                    name: "read_file".into(),
-                    arguments: json!({"path":"src/Routes.tsx"}),
-                },
-            ],
-        );
-        for id in ["read_a", "read_b", "read_c"] {
-            transcript.tool_result(id, "read_file", "x".repeat(40_000));
-        }
-        let state = AgentState::default();
-        let system = "system";
-        let before = estimate_projected_tokens(&project(&transcript, system, ""));
-        let (covers, after) =
-            compaction_boundary_to_fit(&transcript, &state, system, 2_000).unwrap();
-        assert!(covers > 0);
-        assert!(after <= 2_000, "after={after}");
-        assert!(after < before);
-    }
-
-    #[test]
-    fn compaction_refuses_a_noop_or_larger_projection() {
-        let mut transcript = Transcript::default();
-        transcript.push_run_user(json!({"role":"user","content":"short analysis"}));
-        let state = AgentState::default();
-        // The working-state handoff itself is larger than this tiny canonical
-        // transcript. It must not create a misleading ContextOptimized event.
-        assert!(compaction_boundary_to_fit(&transcript, &state, "system", 20_000).is_none());
-    }
-
-    #[test]
-    fn compaction_handoff_preserves_investigated_paths_and_notes() {
-        let mut transcript = Transcript::default();
-        transcript.assistant_tool_turn(
-            String::new(),
-            &[ValidatedCall {
-                id: "read".into(),
-                name: "read_file".into(),
-                arguments: json!({"path":"src/App.tsx"}),
-            }],
-        );
+    fn stable_prefix_is_byte_stable_and_plan_stays_in_the_dynamic_tail() {
+        let config = test_config(Some("/project"));
+        assert_eq!(stable_prefix(&config), stable_prefix(&config));
         let mut state = AgentState::default();
-        state.notes = "App is a Vite entry point".into();
-        let summary = compacted_working_state(&transcript, 1, &state);
-        assert!(summary["already_investigated_or_executed"]
-            .to_string()
-            .contains("src/App.tsx"));
-        assert!(summary["working_state_note"]
-            .as_str()
-            .unwrap()
-            .contains("source-specific semantic evidence"));
-        assert!(working_control(&state).contains("App is a Vite entry point"));
+        state.plan.init(vec!["Inspect".into()]).unwrap();
+        assert!(!stable_prefix(&config).contains("planning_state"));
+        assert!(dynamic_tail(&state).contains("planning_state"));
     }
 
     #[test]
-    fn substantial_project_analysis_requires_plan_and_notes_checkpoint() {
-        assert!(requires_initial_plan(
-            "Проанализируй этот проект: бизнес, архитектуру, плюсы, минусы и признаки AI-стиля.",
-            true
-        ));
-        assert!(!requires_initial_plan("прочитай package.json", true));
-        let phases = normalize_plan_phases(json!([
-            {"name":"Setup","tasks":["inspect structure", {"content":"identify flow"}]},
-            {"name":"Synthesis","tasks":["write final"]}
-        ]))
-        .unwrap();
-        let mut state = AgentState::default();
-        state
-            .plan
-            .init(serde_json::from_value(phases).unwrap())
-            .unwrap();
-        assert!(state.plan.has_open());
-        assert_eq!(phase_for(&state, true, 1), "investigate");
-    }
-
-    #[test]
-    fn eager_planning_turn_exposes_only_the_real_plan_capability() {
-        let plan_tools = planning_tools();
-        let names = plan_tools
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
-            .collect::<Vec<_>>();
-        assert_eq!(names, vec!["task_plan"]);
-    }
-
-    #[test]
-    fn checkpoint_turn_exposes_notes_and_simple_task_checkpoint() {
-        let note_tools = checkpoint_tools();
-        let names = note_tools
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
-            .collect::<Vec<_>>();
-        assert_eq!(names, vec!["task_checkpoint", "task_notes"]);
-    }
-
-    #[test]
-    fn investigated_semantic_evidence_survives_compactions_and_repeats_nudge() {
-        let mut state = AgentState::default();
-        let args = json!({"path":"src/App.tsx"});
-        let output =
-            json!({"path":"src/App.tsx","content":"export function App() { return <Home />; }"});
-        assert!(record_tool_evidence(
-            &mut state,
-            "read_file",
-            &args,
-            &output
-        ));
-        assert!(!record_tool_evidence(
-            &mut state,
-            "read_file",
-            &args,
-            &output
-        ));
-        assert!(!record_tool_evidence(
-            &mut state,
-            "read_file",
-            &args,
-            &output
-        ));
-        assert!(!record_tool_evidence(
-            &mut state,
-            "read_file",
-            &args,
-            &output
-        ));
-        assert_eq!(state.consecutive_repeated_exploration, 3);
-        state.notes = "Business: landing flow. Architecture: React Home route.".into();
-        state.checkpoint_source_evidence(&json!([{"path":"src/App.tsx","facts":["renders Home route"],"relevance":["architecture"],"unresolved":[],"complete_for_task":true}]));
-        let mut transcript = Transcript::default();
-        transcript.push_run_user(json!({"role":"user","content":"analyze"}));
-        transcript.compact(compacted_working_state(&transcript, 1, &state), 1);
-        let controls = working_control(&state);
-        let projected = project(&transcript, "system", &controls);
-        assert!(projected[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("src/App.tsx"));
-        assert!(projected[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("landing flow"));
-        assert!(projected[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("complete_for_task"));
-    }
-
-    #[test]
-    fn complete_evidence_reuses_memory_but_targeted_reads_remain_available() {
-        let mut state = AgentState::default();
-        let args = json!({"path":"src/pixels.ts"});
-        let output = json!({"content":"export const purchase = () => redirectAfter(250);"});
-        assert!(record_tool_evidence(
-            &mut state,
-            "read_file",
-            &args,
-            &output
-        ));
-        assert!(
-            !state
-                .prior_investigation("read_file", "src/pixels.ts")
-                .unwrap()
-                .evidence_complete
-        );
-        state.checkpoint_source_evidence(&json!([{"path":"src/pixels.ts","facts":["redirects after 250ms"],"relevance":["conversion flow"],"unresolved":[],"complete_for_task":true}]));
-        assert!(
-            state
-                .prior_investigation("read_file", "src/pixels.ts")
-                .unwrap()
-                .evidence_complete
-        );
-        assert!(
-            !state
-                .prior_investigation("read_file", "src/pixels.ts")
-                .unwrap()
-                .truncated
-        );
-        assert!(state
-            .prior_investigation("read_file", "src/pixels.ts")
-            .unwrap()
-            .finding
-            .contains("redirectAfter"));
-        assert!(!args.get("start_line").is_some());
-        let targeted = json!({"path":"src/pixels.ts", "reason":"exact redirect timeout", "start_line":10, "end_line":20});
-        assert!(targeted.get("reason").is_some());
-        assert!(targeted.get("start_line").is_some());
-    }
-
-    #[test]
-    fn only_checkpointed_facts_make_source_complete_after_compaction() {
-        let mut state = AgentState::default();
-        record_tool_evidence(
-            &mut state,
-            "read_file",
-            &json!({"path":"src/App.tsx"}),
-            &json!({"content":"export default function App() { return <Routes/> }"}),
-        );
-        assert!(
-            !state
-                .prior_investigation("read_file", "src/App.tsx")
-                .unwrap()
-                .evidence_complete
-        );
-        state.checkpoint_source_evidence(&json!([{"path":"src/App.tsx","facts":["uses BrowserRouter route shell","renders AppRoutes"],"relevance":["application architecture"],"unresolved":[],"complete_for_task":true}]));
-        let projected = project(&Transcript::default(), "control", &working_control(&state));
-        let control = projected[0]["content"].as_str().unwrap();
-        assert!(control.contains("SOURCE: src/App.tsx"));
-        assert!(control.contains("status: complete_for_task"));
-        assert!(control.contains("uses BrowserRouter route shell"));
-    }
-
-    #[test]
-    fn final_projection_contains_structured_verified_memory_after_compaction() {
-        let mut state = AgentState::default();
-        state.plan.init(vec![crate::agent::todo::Phase {
-            name: "Analysis".into(),
-            tasks: vec![crate::agent::todo::Item { id: String::new(), content: "architecture".into(), status: Status::Pending }],
-        }]).unwrap();
-        let task_id = state.plan.active_task().unwrap().id.clone();
-        record_tool_evidence(
-            &mut state,
-            "read_file",
-            &json!({"path":"public/api.php", "start_line":1, "end_line":80}),
-            &json!({"content":"<?php handleOrderForm();"}),
-        );
-        let evidence = record_machine_evidence(
-            &mut state, "read_file", &json!({"path":"public/api.php", "start_line":1, "end_line":80}),
-            &json!({"content":"<?php handleOrderForm();"}),
-        ).unwrap();
-        state.checkpoint_task(&task_id, &[evidence], &["public/api.php exists and contains an order handler".into()], true, &[]).unwrap();
-        for index in 0..32 {
-            record_tool_evidence(
-                &mut state,
-                "read_file",
-                &json!({"path":format!("src/{index}.tsx")}),
-                &json!({"content":"export default null"}),
-            );
-        }
-        let mut transcript = Transcript::default();
-        transcript.push_run_user(json!({"role":"user","content":"write final audit"}));
-        transcript.compact(compacted_working_state(&transcript, 1, &state), 1);
-        let final_projection = project(&transcript, "FINAL RESPONSE", &working_control(&state));
-        let control = final_projection[0]["content"].as_str().unwrap();
-        assert!(control.contains("CURRENT TASK MEMORY"));
-        assert!(control.contains("ev-1"));
-        assert!(control.contains("public/api.php exists and contains an order handler"));
-    }
-
-    #[test]
-    fn completion_gate_requires_checkpoint_before_saturation_and_accepts_machine_evidence() {
-        let mut state = AgentState::default();
-        state.plan.init(vec![crate::agent::todo::Phase {
-            name: "Analysis".into(),
-            tasks: vec![crate::agent::todo::Item { id: String::new(), content: "trace backend".into(), status: Status::Pending }],
-        }]).unwrap();
-        let task_id = state.plan.active_task().unwrap().id.clone();
-        let call = |task: &str| ValidatedCall { id: "plan".into(), name: "task_plan".into(), arguments: json!({"action":"done","task":task}) };
-        assert!(plan_completion_error(&state, &call(&task_id)).unwrap().contains("task_checkpoint"));
-        let evidence = state.record_evidence(crate::agent::state::EvidenceKind::FileRead, "public/api.php".into(), None, "read_file", "handler");
-        state.checkpoint_task(&task_id, &[evidence], &["backend handler exists".into()], true, &[]).unwrap();
-        assert!(plan_completion_error(&state, &call(&task_id)).is_none());
-    }
-
-    #[test]
-    fn checkpoint_pending_repairs_plan_only_registry_before_and_after_compaction() {
-        let mut state = AgentState::default();
-        state.plan.init(vec![crate::agent::todo::Phase {
-            name: "Analysis".into(),
-            tasks: vec![crate::agent::todo::Item { id: String::new(), content: "trace backend".into(), status: Status::Pending }],
-        }]).unwrap();
-        state.record_evidence(crate::agent::state::EvidenceKind::FileRead, "public/api.php".into(), None, "read_file", "handler");
-        assert!(checkpoint_pending(&state));
-        let before = ensure_required_tools(planning_tools(), true, false);
-        let mut transcript = Transcript::default();
-        transcript.push_run_user(json!({"role":"user","content":"audit"}));
-        transcript.compact(compacted_working_state(&transcript, 1, &state), 1);
-        let after = ensure_required_tools(planning_tools(), checkpoint_pending(&state), false);
-        for registry in [before, after] {
-            assert!(registry.as_array().unwrap().iter().any(|tool| tool.pointer("/function/name").and_then(Value::as_str) == Some("task_checkpoint")));
-        }
-    }
-
-    #[test]
-    fn complete_checkpoint_closes_current_task_and_promotes_successor() {
-        let mut state = AgentState::default();
-        state.plan.init(vec![crate::agent::todo::Phase {
-            name: "Analysis".into(),
-            tasks: vec![
-                crate::agent::todo::Item { id: String::new(), content: "first".into(), status: Status::Pending },
-                crate::agent::todo::Item { id: String::new(), content: "second".into(), status: Status::Pending },
-            ],
-        }]).unwrap();
-        let first = state.plan.active_task().unwrap().id.clone();
-        let evidence = state.record_evidence(crate::agent::state::EvidenceKind::FileRead, "src/a.rs".into(), None, "read_file", "fact");
-        state.checkpoint_task(&first, &[evidence], &["first is established".into()], true, &[]).unwrap();
-        assert_eq!(state.plan.progress(), (1, 2));
-        assert_eq!(state.plan.active_task().unwrap().content, "second");
-    }
-
-    #[test]
-    fn fresh_init_generates_ids_and_existing_operations_accept_task_id_only() {
-        let current = TaskPlan::default();
-        let (plan, _) = apply_task_plan_update(&current, &json!({
-            "action":"init", "phases":[{"name":"Inspect","tasks":[{"label":"map project"}]}]
-        })).unwrap();
-        let task_id = plan.active_task().unwrap().id.clone();
-        assert_eq!(task_id, "task-1");
-        let (started, _) = apply_task_plan_update(&plan, &json!({"action":"start","task_id":task_id})).unwrap();
-        assert_eq!(started.active_task().unwrap().id, "task-1");
-        assert!(apply_task_plan_update(&plan, &json!({"action":"start","task_id":"task-999"})).is_err());
-    }
-
-    #[test]
-    fn successful_read_registers_machine_evidence_without_notes_schema() {
-        let mut state = AgentState::default();
-        let first = record_machine_evidence(
-            &mut state, "read_file", &json!({"path":"public/api.php","start_line":1,"end_line":40}),
-            &json!({"content":"handleOrder();"}),
-        ).unwrap();
-        let repeated = record_machine_evidence(
-            &mut state, "read_file", &json!({"path":"public/api.php","start_line":1,"end_line":40}),
-            &json!({"content":"handleOrder();"}),
-        ).unwrap();
-        assert_eq!(first, repeated);
-        assert_eq!(state.memory.evidence.len(), 1);
-    }
-
-    #[test]
-    fn second_saturation_exposes_targeted_retrieval_and_write_capability() {
-        let saturation = saturation_tools();
-        let names = saturation
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
-            .collect::<Vec<_>>();
+    fn dynamic_output_uses_real_remaining_context() {
         assert_eq!(
-            names,
-            vec!["read_file", "write_file", "create_file", "apply_patch", "delete_file", "run_terminal", "task_plan", "task_checkpoint", "task_notes"],
-            "saturation narrows broad exploration but keeps the sanctioned write toolset"
+            dynamic_output_limit(32_768, 4_000, 1_024, Some(20_000), 32_768),
+            20_000
         );
-        let read = saturation
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|tool| {
-                tool.pointer("/function/name").and_then(Value::as_str) == Some("read_file")
-            })
-            .unwrap();
         assert_eq!(
-            read.pointer("/function/parameters/required").unwrap(),
-            &json!(["path", "reason", "start_line", "end_line"])
+            dynamic_output_limit(16_384, 15_000, 1_024, None, 32_768),
+            360
         );
     }
 
     #[test]
-    fn second_saturation_keeps_plan_and_notes_closeout_calls_executable() {
-        let state = AgentState {
-            saturation_round: 2,
-            ..AgentState::default()
+    fn low_remaining_context_compacts_before_a_tiny_output_budget() {
+        let budget = CompactionBudget {
+            context_window: 16_384,
+            ratio: DEFAULT_COMPACTION_RATIO,
+            reserve_tokens: SAFETY_RESERVE_TOKENS + MIN_OUTPUT_HEADROOM_TOKENS,
         };
-        for name in ["task_plan", "task_checkpoint", "task_notes"] {
-            assert!(
-                !rejects_saturated_tool(
-                    &state,
-                    &ValidatedCall {
-                        id: name.into(),
-                        name: name.into(),
-                        arguments: json!({}),
-                    },
-                ),
-                "{name} must be the sanctioned closeout path"
-            );
-        }
-        assert!(rejects_saturated_tool(
-            &state,
-            &ValidatedCall {
-                id: "broad".into(),
-                name: "list_directory".into(),
-                arguments: json!({"path":"src"}),
-            },
-        ));
-        assert!(!rejects_saturated_tool(
-            &state,
-            &ValidatedCall {
-                id: "focused".into(),
-                name: "read_file".into(),
-                arguments: json!({"path":"src/App.tsx","reason":"exact route order","start_line":10,"end_line":20}),
-            },
-        ));
+        assert!(needs_compaction(budget, 16_384, 14_500, Some(32_768)));
+        assert!(!needs_compaction(budget, 16_384, 4_000, Some(32_768)));
     }
 
     #[test]
-    fn second_saturation_stays_investigation_until_evidence_exists() {
-        // Deep-mode closure regression: saturation alone must not flip the
-        // runtime into synthesis/final while an open Task Plan item has no
-        // `complete_for_task` evidence behind it.
-        let mut state = AgentState {
-            saturation_round: 2,
-            ..AgentState::default()
-        };
-        state
-            .plan
-            .init(vec![crate::agent::todo::Phase {
-                name: "Analysis".into(),
-                tasks: vec![crate::agent::todo::Item {
-                    id: String::new(),
-                    content: "write audit".into(),
-                    status: crate::agent::todo::Status::Pending,
-                }],
-            }])
-            .unwrap();
-        assert_eq!(state.open_without_complete_evidence(), 1);
-        assert_eq!(phase_for(&state, true, 8), "investigate");
-        // The closeout valve must not force a premature completion handoff
-        // while an evidence gap remains: the audit continues as investigation
-        // instead.
-        assert!(!closeout_due(&state), "closeout valve must wait for evidence");
-
-        // Once the open item carries complete evidence, the gap is closed and
-        // the turn consolidates: the saturated audit leaves investigation.
-        state.checkpoint_source_evidence(&json!([{"path":"core","tasks":["write audit"],"complete_for_task":true,"facts":["audit content settled"],"unresolved":[]}]));
-        assert_eq!(state.open_without_complete_evidence(), 0);
-        assert_eq!(phase_for(&state, true, 9), "synthesis");
-        // The closeout valve may now hand the plan to the model for an honest
-        // batch update: open work with no remaining evidence gap.
-        assert!(closeout_due(&state));
-        state.plan.finish("write audit", false).unwrap();
-        assert!(!state.plan.has_open());
-        assert_eq!(phase_for(&state, true, 10), "final");
+    fn overflow_recovery_shrinks_tail_and_stays_bounded() {
+        assert_eq!(retry_keep_recent(1), 4);
+        assert_eq!(retry_keep_recent(2), 2);
+        assert_eq!(retry_keep_recent(MAX_COMPACTION_ATTEMPTS), 2);
     }
 
     #[test]
-    fn saturated_audit_keeps_targeted_reads_while_open_items_lack_evidence() {
-        let mut state = AgentState {
-            saturation_round: 2,
-            ..AgentState::default()
-        };
-        state
-            .plan
-            .init(vec![
-                crate::agent::todo::Phase {
-                    name: "Analysis".into(),
-                    tasks: vec![
-                        crate::agent::todo::Item {
-                            id: String::new(),
-                            content: "inspect core files".into(),
-                            status: crate::agent::todo::Status::Pending,
-                        },
-                        crate::agent::todo::Item {
-                            id: String::new(),
-                            content: "assess architecture".into(),
-                            status: crate::agent::todo::Status::Pending,
-                        },
-                        crate::agent::todo::Item {
-                            id: String::new(),
-                            content: "write audit".into(),
-                            status: crate::agent::todo::Status::Pending,
-                        },
-                    ],
-                },
-            ])
-            .unwrap();
-        assert_eq!(state.open_count(), 3);
-        // No evidence checkpoints at all: everything is still open work, so
-        // the saturated phase must keep the audit in investigation with a
-        // targeted-read budget that scales with the evidence gaps.
-        assert_eq!(state.open_without_complete_evidence(), 3);
-        assert_eq!(phase_for(&state, true, 8), "investigate");
-        assert!(!closeout_due(&state));
-        assert!(post_saturation_read_budget(&state) >= 8);
-
-        // A narrow, declared read is allowed; a wide tool is refused so a
-        // genuine loop still cannot reopen broad exploration.
-        let narrow_read = ValidatedCall {
-            id: "r1".into(),
-            name: "read_file".into(),
-            arguments: json!({"path":"src/api.ts","start_line":1,"end_line":120,"reason":"missing auth flow detail"}),
-        };
-        assert!(!rejects_saturated_tool(&state, &narrow_read), "narrow declared read must be allowed");
-        let wide_read = ValidatedCall {
-            id: "r2".into(),
-            name: "terminal".into(),
-            arguments: json!({"command":"find src -name '*.ts'"}),
-        };
-        assert!(rejects_saturated_tool(&state, &wide_read), "wide tool must stay refused in saturation");
-
-        // Filling the gaps unlocks consolidation, step by step.
-        state.checkpoint_source_evidence(&json!([{"path":"core","tasks":["inspect core files"],"complete_for_task":true,"facts":["core layout mapped"],"unresolved":[]}]));
-        state.plan.finish("inspect core files", false).unwrap();
-        assert_eq!(state.open_without_complete_evidence(), 2);
-        state.checkpoint_source_evidence(&json!([{"path":"arch","tasks":["assess architecture"],"complete_for_task":true,"facts":["architecture reviewed"],"unresolved":[]}]));
-        state.plan.finish("assess architecture", false).unwrap();
-        // Evidence for closed tasks cannot cover the remaining audit task.
-        assert_eq!(state.open_without_complete_evidence(), 1);
-        state.checkpoint_source_evidence(&json!([{"path":"audit","tasks":["write audit"],"complete_for_task":true,"facts":["audit settled"],"unresolved":[]}]));
-        assert_eq!(state.open_without_complete_evidence(), 0);
-        assert_eq!(phase_for(&state, true, 9), "synthesis");
-        assert!(closeout_due(&state));
-        state.plan.finish("write audit", false).unwrap();
-        assert!(!state.plan.has_open());
-        assert_eq!(phase_for(&state, true, 10), "final");
+    fn one_combined_soft_reminder_is_bounded() {
+        let mut state = AgentState::default();
+        state.plan = GoalPlan::default();
+        state.plan.init(vec!["Implement".into()]).unwrap();
+        state.workspace_mutated_since_validation = true;
+        let mut transcript = Transcript::default();
+        assert!(add_soft_closeout_if_needed(&mut state, &mut transcript));
+        assert!(!add_soft_closeout_if_needed(&mut state, &mut transcript));
     }
 
     #[test]
-    fn saturation_tools_stay_available_on_gap_turns() {
-        // On evidence-gap turns the saturation registry (used when the phase
-        // is not final/planning) must still carry the targeted capabilities so
-        // the scaled budget is actually usable.
-        let registry = saturation_tools();
-        let names: Vec<&str> = registry
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|tool| {
-                tool.get("function")
-                    .unwrap()
-                    .get("name")
-                    .unwrap()
+    fn a_tool_free_response_normally_needs_no_gate() {
+        let mut state = AgentState::default();
+        let mut transcript = Transcript::default();
+        assert!(!add_soft_closeout_if_needed(&mut state, &mut transcript));
+    }
+
+    #[test]
+    fn validation_clears_verification_requirement() {
+        let mut state = AgentState::default();
+        state.record_mutation();
+        state.record_validation();
+        let mut transcript = Transcript::default();
+        assert!(!add_soft_closeout_if_needed(&mut state, &mut transcript));
+    }
+
+    #[test]
+    fn continuation_is_append_only_and_has_a_bounded_tail() {
+        let mut final_text = String::from("first part ");
+        append_final_text(&mut final_text, "second part");
+        assert_eq!(final_text, "first part second part");
+        let long = "x".repeat(13_000);
+        assert_eq!(continuation_tail(&long).chars().count(), 12_000);
+        assert!(turn_tools(&tool_schemas(true), true).is_empty());
+    }
+
+    #[test]
+    fn tool_call_result_is_replayed_on_the_next_model_turn() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            {
+                let (mut first, _) = listener.accept().unwrap();
+                requests.push(read_mock_request(&mut first));
+                let tool_turn = json!({
+                    "choices":[{"delta":{"tool_calls":[{
+                        "index":0,
+                        "id":"directory-1",
+                        "type":"function",
+                        "function":{"name":"list_directory","arguments":"{\"path\":\".\"}"}
+                    }]},"finish_reason":"tool_calls"}]
+                });
+                first
+                    .write_all(sse_response(&[tool_turn]).as_bytes())
+                    .unwrap();
+            }
+
+            let (mut second, _) = listener.accept().unwrap();
+            requests.push(read_mock_request(&mut second));
+            let final_turn = json!({
+                "choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]
+            });
+            second
+                .write_all(sse_response(&[final_turn]).as_bytes())
+                .unwrap();
+            requests
+        });
+        let root = unique_temp_root("tool-loop");
+        fs::create_dir_all(&root).unwrap();
+        let mut config = test_config(Some(root.to_str().unwrap()));
+        config.endpoint = endpoint;
+        run(config);
+        let requests = server.join().unwrap();
+        let second_messages = requests[1]["messages"].as_array().unwrap();
+        assert!(second_messages.iter().any(|message| {
+            message["role"] == "assistant"
+                && message["tool_calls"]
+                    .as_array()
+                    .is_some_and(|calls| calls[0]["id"] == "directory-1")
+        }));
+        assert!(second_messages.iter().any(|message| {
+            message["role"] == "tool"
+                && message["tool_call_id"] == "directory-1"
+                && message["content"]
                     .as_str()
-                    .unwrap()
-            })
-            .collect();
-        assert!(names.contains(&"read_file"), "targeted reads must stay available: {names:?}");
-        assert!(names.contains(&"task_notes"), "evidence checkpointing must stay available: {names:?}");
-        assert!(names.contains(&"task_checkpoint"), "simple task checkpointing must stay available: {names:?}");
-        assert!(names.contains(&"task_plan"), "plan handoff must stay available: {names:?}");
-        // Implementation runs must not lose their write capability in
-        // saturation: the user asked for changes, not only for an audit.
-        for name in [
-            "write_file",
-            "create_file",
-            "apply_patch",
-            "delete_file",
-        ] {
-            assert!(
-                names.contains(&name),
-                "saturation must not strip the {name} write capability: {names:?}"
-            );
-        }
-    }
-
-    // ---- Agent mode write capability (Milestone 2) --------------------------
-
-    #[test]
-    fn agent_registry_exposes_full_write_toolset_in_every_non_final_phase() {
-        // The model-visible capability registry in Agent mode must carry the
-        // full write toolset (write_file, create_file, apply_patch,
-        // delete_file) in normal turns; saturation narrows reads, not writes.
-        fn registry_names(registry: &Value) -> Vec<String> {
-            registry
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter_map(|tool| {
-                    tool.pointer("/function/name")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                })
-                .collect()
-        }
-        for (label, registry) in [
-            ("base", &tools()),
-            ("saturation", &saturation_tools()),
-        ] {
-            let names = registry_names(registry);
-            for required in [
-                "write_file",
-                "create_file",
-                "apply_patch",
-                "delete_file",
-                "run_terminal",
-                "task_plan",
-                "task_notes",
-            ] {
-                assert!(
-                    names.iter().any(|name| name == required),
-                    "{label} registry must expose {required}: {names:?}"
-                );
-            }
-        }
+                    .is_some_and(|content| content.contains("entries"))
+        }));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn saturation_gate_never_strips_writing_tools() {
-        // The execution-side defence and the model-visible registry must not
-        // drift: in saturation the runtime used to reject *every* tool other
-        // than plan/notes/read, which is exactly the run shape where users
-        // saw only `read_file`/`task_plan`/`task_notes` even in Agent mode.
-        let state = AgentState {
-            saturation_round: 2,
-            ..AgentState::default()
-        };
-        let call = |name: &str, arguments: Value| ValidatedCall {
-            id: "t".into(),
-            name: name.into(),
-            arguments,
-        };
-        for (name, arguments) in [
-            ("write_file", json!({"path":"src/new.ts","content":"x"})),
-            ("create_file", json!({"path":"src/new.ts","content":"x"})),
-            ("apply_patch", json!({"patch":"*** Begin Patch\n*** Update File: src/a.ts\n-old\n+new\n*** End Patch"})),
-            ("delete_file", json!({"path":"src/old.ts"})),
-            ("run_terminal", json!({"command":"cargo build"})),
-            ("task_notes", json!({"notes":"checkpoint"})),
-            ("task_plan", json!({"action":"done","task":"implement"})),
-        ] {
-            assert!(
-                !rejects_saturated_tool(&state, &call(name, arguments)),
-                "{name} must stay available in saturation"
-            );
-        }
-        // Broad, untargeted reads remain refused exactly as before.
-        assert!(rejects_saturated_tool(
-            &state,
-            &call("read_file", json!({"path":"src/a.ts"}))
-        ), "broad saturated reads must stay refused");
-    }
-
-    #[test]
-    fn apply_patch_execute_updates_creates_deletes_and_invalidates() {
-        use std::fs;
-        let root = std::env::temp_dir().join(format!(
-            "local-ai-desktop-ms2-{:#x}",
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("clock").as_nanos()
-        ));
-        fs::create_dir_all(root.join("src")).expect("root");
-        fs::write(root.join("src/a.txt"), "alpha\nbeta\ngamma\n").expect("write");
-        fs::write(root.join("src/old.txt"), "gone\n").expect("write");
-
-        let patch = [
-            "*** Begin Patch",
-            "*** Update File: src/a.txt",
-            "-beta",
-            "+BETA",
-            "*** Add File: src/new.txt",
-            "+hello",
-            "*** Delete File: src/old.txt",
-            "*** End Patch",
-        ].join("\n");
-        let (value, diff) = crate::tools::filesystem::execute(
-            &root,
-            "apply_patch",
-            &json!({"patch": patch}),
-        )
-        .expect("patch must apply");
-        assert!(value["applied"] == true);
-        assert!(diff.is_some(), "patch should report a diff summary");
-        assert_eq!(
-            fs::read_to_string(root.join("src/a.txt")).expect("a.txt"),
-            "alpha\nBETA\ngamma\n"
+    fn length_continuation_keeps_one_logical_response_and_hides_tools() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
         );
-        assert_eq!(fs::read_to_string(root.join("src/new.txt")).expect("new.txt"), "hello\n");
-        assert!(!root.join("src/old.txt").exists());
-
-        fs::remove_dir_all(root).expect("cleanup");
-    }
-
-    #[test]
-    fn compaction_hysteresis_targets_below_trigger() {
-        assert!(compaction_target(32_768) < compaction_threshold(32_768));
-        assert!(compaction_target(32_768) < max_projected_input(32_768));
-    }
-
-    #[test]
-    fn accepts_reasoning_aliases_from_openai_compatible_sse() {
-        let mut buffer =
-            "data: {\"choices\":[{\"delta\":{\"reasoning\":\"inspect\"}}]}\n\n".to_owned();
-        let mut streamed = StreamedTurn::default();
-        consume_sse(&mut buffer, &mut streamed, "test").unwrap();
-        assert!(streamed.thinking_started);
-        assert_eq!(streamed.reasoning_delta_count, 1);
-        assert_eq!(streamed.reasoning, "inspect");
-    }
-
-    // ---- Deep-mode depth regression (Milestone 1) -----------------------------
-
-    fn saturated(state: &mut AgentState) -> &mut AgentState {
-        state.saturation_round = 2;
-        state
-    }
-
-    #[test]
-    fn saturated_targeted_reads_scale_with_open_work() {
-        // Deep-audit regression: a fixed 2-read budget physically starved a
-        // plan of 12 open items. The budget must now scale with the number of
-        // open items lacking `complete_for_task` evidence, and each targeted
-        // read must be counted as its own evidence record.
-        let mut state = AgentState::default();
-        saturated(&mut state);
-        state
-            .plan
-            .init(vec![crate::agent::todo::Phase {
-                name: "Analysis".into(),
-                tasks: (0..6)
-                    .map(|i| crate::agent::todo::Item {
-                        id: String::new(),
-                        content: format!("item {i}"),
-                        status: crate::agent::todo::Status::Pending,
-                    })
-                    .collect(),
-            }])
-            .unwrap();
-        assert_eq!(state.open_without_complete_evidence(), 6);
-        // 2 (baseline) + 3 * 6 (open items without evidence) = 20 reads
-        assert_eq!(post_saturation_read_budget(&state), 20);
-        // After closing two of the six items with evidence the budget shrinks.
-        state.plan.finish("item 0", false).unwrap();
-        state.plan.finish("item 1", false).unwrap();
-    }
-
-    #[test]
-    fn saturated_read_repeat_is_rejected_even_with_budget_available() {
-        // Anti-loop guard: if the model has already performed `file: 10..20`,
-        // a second call for the same or overlapping range must stay rejected
-        // no matter how much targeted-read budget is left. The old fixed budget
-        // let the same call burn budget on every retry.
-        let mut state = AgentState::default();
-        saturated(&mut state);
-        let first = ValidatedCall {
-            id: "r1".into(),
-            name: "read_file".into(),
-            arguments: json!({"path":"src/core.rs","reason":"fact A","start_line":10,"end_line":20}),
-        };
-        assert!(!rejects_saturated_tool(&state, &first), "first targeted read must be allowed");
-        state.record_saturated_range("src/core.rs", 10, 20);
-        assert!(state.saturated_range_seen("src/core.rs", 10, 20));
-
-        let repeat = ValidatedCall {
-            id: "r2".into(),
-            name: "read_file".into(),
-            arguments: json!({"path":"src/core.rs","reason":"fact A","start_line":10,"end_line":20}),
-        };
-        assert!(
-            rejects_saturated_tool(&state, &repeat),
-            "same-range saturated read must be rejected even while budget remains"
-        );
-
-        // A partly overlapping range still exposes new lines, so it is a
-        // valid targeted lookup for a different missing fact.
-        let overlap = ValidatedCall {
-            id: "r3".into(),
-            name: "read_file".into(),
-            arguments: json!({"path":"src/core.rs","reason":"related fact","start_line":15,"end_line":25}),
-        };
-        assert!(!rejects_saturated_tool(&state, &overlap), "overlap with new lines must stay available");
-        state.record_saturated_range("src/core.rs", 15, 25);
-        // A range fully inside the covered block is likewise a repeat.
-        let inside = ValidatedCall {
-            id: "r3b".into(),
-            name: "read_file".into(),
-            arguments: json!({"path":"src/core.rs","reason":"narrower question","start_line":12,"end_line":18}),
-        };
-        assert!(rejects_saturated_tool(&state, &inside), "range inside a covered block is a repeat");
-
-        // A genuinely disjoint range on the same file remains legitimate.
-        let fresh_block = ValidatedCall {
-            id: "r4".into(),
-            name: "read_file".into(),
-            arguments: json!({"path":"src/core.rs","reason":"another fact","start_line":100,"end_line":120}),
-        };
-        assert!(!rejects_saturated_tool(&state, &fresh_block), "a disjoint range is new evidence");
-        state.record_saturated_range("src/core.rs", 100, 120);
-        // A range that touches but does not overlap an older one stays allowed.
-        let adjacent = ValidatedCall {
-            id: "r4b".into(),
-            name: "read_file".into(),
-            arguments: json!({"path":"src/core.rs","reason":"next block","start_line":60,"end_line":90}),
-        };
-        assert!(!rejects_saturated_tool(&state, &adjacent), "adjacent non-overlap is new evidence");
-
-        // A different file never inherits another file's coverage.
-        let other_file = ValidatedCall {
-            id: "r5".into(),
-            name: "read_file".into(),
-            arguments: json!({"path":"src/other.rs","reason":"its own fact","start_line":1,"end_line":10}),
-        };
-        assert!(!rejects_saturated_tool(&state, &other_file), "per-file coverage only");
-    }
-
-    #[test]
-    fn complete_evidence_must_name_the_open_task_it_covers() {
-        let mut state = AgentState::default();
-        state.saturation_round = 2;
-        state.plan.init(vec![crate::agent::todo::Phase {
-            name: "Analysis".into(),
-            tasks: vec![
-                crate::agent::todo::Item { id: String::new(), content: "trace requests".into(), status: crate::agent::todo::Status::Pending },
-                crate::agent::todo::Item { id: String::new(), content: "assess persistence".into(), status: crate::agent::todo::Status::Pending },
-            ],
-        }]).unwrap();
-        state.checkpoint_source_evidence(&json!([
-            {"path":"src/http.rs","tasks":["trace requests"],"facts":["client retries once"],"unresolved":[],"complete_for_task":true},
-            {"path":"src/other.rs","tasks":["obsolete task"],"facts":["unrelated"],"unresolved":[],"complete_for_task":true}
-        ]));
-        assert_eq!(state.open_without_complete_evidence(), 1);
-        assert_eq!(phase_for(&state, true, 8), "investigate");
-
-        state.checkpoint_source_evidence(&json!([
-            {"path":"src/db.rs","tasks":["assess persistence"],"facts":["writes are transactional"],"unresolved":[],"complete_for_task":true}
-        ]));
-        assert_eq!(state.open_without_complete_evidence(), 0);
-        assert_eq!(phase_for(&state, true, 9), "synthesis");
-    }
-
-    #[test]
-    fn gap_closeout_valve_is_bounded_and_resets_on_new_evidence() {
-        // Termination guarantee: a saturated deep audit cannot cycle through
-        // the closeout handoff forever claiming to want more evidence. After
-        // MAX_GAP_CLOSEOUT_PASSES hands-offs without a fresh evidence record
-        // the run finalizes. New material evidence (a targeted read, a Notes
-        // checkpoint, a plan mutation) resets the counter so a later closeout
-        // can open again.
-        use crate::agent::state::MAX_GAP_CLOSEOUT_PASSES;
-        let mut state = AgentState::default();
-        state.plan.init(vec![crate::agent::todo::Phase {
-            name: "Analysis".into(),
-            tasks: vec![
-                crate::agent::todo::Item { id: String::new(), content: "inspect core".into(), status: crate::agent::todo::Status::Pending },
-                crate::agent::todo::Item { id: String::new(), content: "assess".into(), status: crate::agent::todo::Status::Pending },
-            ],
-        }]).unwrap();
-        assert!(state.plan.has_open());
-        assert!(!closeout_due(&state), "open item without complete evidence");
-
-        // The valve may arm up to MAX_GAP_CLOSEOUT_PASSES times in a row;
-        // beyond that no further closeout arm is allowed on the same cycle.
-        let mut arms = 0;
-        for _ in 0..MAX_GAP_CLOSEOUT_PASSES + 4 {
-            if state.plan.has_open()
-                && !closeout_due(&state)
-                && state.gap_closeout_passes < MAX_GAP_CLOSEOUT_PASSES
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
             {
-                state.gap_closeout_passes += 1;
-                arms += 1;
+                let (mut first, _) = listener.accept().unwrap();
+                requests.push(read_mock_request(&mut first));
+                let prefix = json!({
+                    "choices":[{"delta":{"content":"First visible prefix. "},"finish_reason":"length"}]
+                });
+                first.write_all(sse_response(&[prefix]).as_bytes()).unwrap();
             }
-        }
-        assert_eq!(arms, MAX_GAP_CLOSEOUT_PASSES, "valve must not arm past the cap");
-        assert_eq!(state.gap_closeout_passes, MAX_GAP_CLOSEOUT_PASSES);
-
-        // A fresh targeted read is material new evidence: it clears the valve
-        // and lets the model start another closeout cycle.
-        state.saturation_round = 2;
-        state.record_saturated_range("src/core.rs", 10, 20);
-        state.gap_closeout_passes = 0;
-        let mut fresh_arms = 0;
-        for _ in 0..MAX_GAP_CLOSEOUT_PASSES + 4 {
-            if state.plan.has_open()
-                && !closeout_due(&state)
-                && state.gap_closeout_passes < MAX_GAP_CLOSEOUT_PASSES
-            {
-                state.gap_closeout_passes += 1;
-                fresh_arms += 1;
-            }
-        }
-        assert_eq!(fresh_arms, MAX_GAP_CLOSEOUT_PASSES, "fresh evidence restarts the valve");
-
-        // A plan mutation also resets the valve, so a closeout cycle that
-        // closes one item does not silently consume budget for the next.
-        state.gap_closeout_passes = MAX_GAP_CLOSEOUT_PASSES;
-        state.plan.finish("inspect core", false).unwrap();
-        state.gap_closeout_passes = 0;
-        assert_eq!(state.gap_closeout_passes, 0);
-    }
-
-    #[test]
-    fn compaction_preserves_complete_for_task_evidence() {
-        // Context handoff regression: when the transcript is compacted, the
-        // model-authored checkpoint facts must survive so the runtime still
-        // treats the source as `complete_for_task` and does not force a broad
-        // re-read. `InvestigatedItem::facts` and `evidence_complete` are the
-        // durable record; raw tool payloads may be summarized out of context.
-        let mut state = AgentState::default();
-        let big = "line\n".repeat(6_000);
-        state.record_investigation("read_file", "src/core.rs".into(), big.clone(), false);
-        state.checkpoint_source_evidence(
-            &json!([
-                {"path":"src/core.rs","tasks":["audit core"],"facts":["fact A","fact B"],"relevance":["audit core"],"unresolved":[],"complete_for_task":true}
-            ]),
-        );
-        let item = state
-            .prior_investigation("read_file", "src/core.rs")
-            .expect("recorded investigation");
-        assert!(item.evidence_complete, "complete_for_task checkpoint must stick");
-        assert_eq!(item.facts, vec!["fact A", "fact B"]);
-
-        // A compaction handoff replaces the raw transcript with a summary; the
-        // runtime state must be the source of truth for the evidence gate.
-        let mut transcript = crate::agent::transcript::Transcript::default();
-        transcript.push_message(json!({"role":"assistant","content":"","tool_calls":[{"id":"c1","function":{"name":"read_file","arguments":"{}"}}]}));
-        transcript.push_message(json!({"role":"tool","tool_call_id":"c1","content":big}));
-        transcript.compact(json!("older evidence"), 1);
-        let projected = project(&transcript, "control", &working_control(&state));
-        let control = projected[0]["content"].as_str().unwrap();
-        assert!(control.contains("status: complete_for_task"));
-        assert!(control.contains("fact A"));
-        // The raw tool payload is projected out of the request but the
-        // checkpoint record it supports is still in the control block.
-        let raw = projected
+            let (mut second, _) = listener.accept().unwrap();
+            requests.push(read_mock_request(&mut second));
+            let suffix = json!({
+                "choices":[{"delta":{"content":"Second visible suffix."},"finish_reason":"stop"}]
+            });
+            second
+                .write_all(sse_response(&[suffix]).as_bytes())
+                .unwrap();
+            requests
+        });
+        let mut config = test_config(None);
+        config.endpoint = endpoint;
+        run(config);
+        let requests = server.join().unwrap();
+        assert!(requests[0].get("tools").is_some());
+        assert!(requests[1].get("tools").is_none());
+        assert!(requests[1].get("tool_choice").is_none());
+        let second_messages = requests[1]["messages"].as_array().unwrap();
+        assert!(second_messages
             .iter()
-            .find(|message| message.get("role") == Some(&json!("tool")))
-            .expect("tool message projected");
-        let content = raw["content"].as_str().unwrap();
-        assert!(content.contains("context_compacted") || content.chars().count() < big.chars().count(),
-            "raw payload must be summarized while checkpoint facts remain in control");
+            .any(|message| message["role"] == "assistant"
+                && message["content"] == "First visible prefix. "));
+        assert!(second_messages.iter().any(|message| {
+            message["role"] == "user"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("<previous_tail>"))
+        }));
+    }
+
+    #[test]
+    fn cancellation_interrupts_an_active_stream_read() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let (request_started, request_received) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_mock_request(&mut stream);
+            request_started.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(700));
+        });
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut config = test_config(None);
+        config.endpoint = endpoint;
+        config.cancelled = Arc::clone(&cancelled);
+        let (finished, done) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            run(config);
+            finished.send(()).unwrap();
+        });
+        request_received
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let cancelled_at = Instant::now();
+        cancelled.store(true, Ordering::Relaxed);
+        done.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(cancelled_at.elapsed() < Duration::from_millis(500));
+        worker.join().unwrap();
+        server.join().unwrap();
     }
 }

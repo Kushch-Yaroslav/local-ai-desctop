@@ -62,14 +62,6 @@ pub enum Event {
         name: String,
         arguments: Value,
     },
-    ToolCallDelta {
-        id: String,
-        delta: String,
-    },
-    ToolCall {
-        id: String,
-        name: String,
-    },
     ToolOutputDelta {
         id: String,
         stream: String,
@@ -101,13 +93,6 @@ pub enum Event {
     PlanUpdate {
         plan: Value,
     },
-    TaskNoteUpdate {
-        notes: String,
-    },
-    VerificationUpdate {
-        status: String,
-        detail: String,
-    },
     ContextStats {
         used: usize,
         limit: usize,
@@ -119,6 +104,11 @@ pub enum Event {
         prompt_tokens: Option<u64>,
         completion_tokens: Option<u64>,
         total_tokens: Option<u64>,
+        /// Provider-reported prompt/KV cache read tokens. Absent means the
+        /// provider did not report this metric; it is never inferred.
+        cached_tokens: Option<u64>,
+        /// Provider-reported prompt/KV cache write tokens.
+        cache_write_tokens: Option<u64>,
         prompt_ms: Option<f64>,
         predicted_ms: Option<f64>,
         predicted_per_second: Option<f64>,
@@ -130,29 +120,20 @@ pub enum Event {
         trigger_reason: String,
         removed_transcript_tokens: usize,
         retained_suffix_tokens: usize,
-        working_state_tokens: usize,
-        plan_tokens: usize,
-        notes_tokens: usize,
-        evidence_tokens: usize,
     },
     ApprovalRequired {
         id: String,
         category: String,
         detail: String,
     },
-    FinalStarted,
-    FinalDelta {
-        content: String,
-    },
     Final {
-        content: String,
         complete: bool,
         continuation_count: usize,
         chars: usize,
         finish_reason: String,
     },
     /// Diagnostics-only lifecycle marker. The UI receives all chunks through
-    /// one logical final response via `final_delta`.
+    /// the same `content_delta` stream as the original response.
     FinalContinuation {
         continuation: usize,
         prior_chars: usize,

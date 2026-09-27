@@ -60,6 +60,8 @@ fn main() {
                 web_mode: _,
                 policy,
                 history,
+                plan,
+                provider_max_output,
             } => {
                 if controls.contains_key(&run_id) {
                     continue;
@@ -86,6 +88,8 @@ fn main() {
                             RunPolicy::Auto
                         },
                         history,
+                        plan,
+                        provider_max_output,
                         cancelled: control.cancelled,
                         steering: control.steering,
                     });

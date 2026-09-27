@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import type { ChatMessage } from '../../shared/types';
-import { isCompleteRuntimeFinal, shouldProjectToolResult, splitAgentRunHistory } from './rust-agent-runtime';
+import { splitAgentRunHistory, taskPlan } from './rust-agent-runtime';
 
 const message = (role: ChatMessage['role'], content: string): ChatMessage => ({
   id: `${role}-${content}`, conversationId: 'test', role, content, createdAt: '2026-01-01T00:00:00.000Z',
@@ -25,13 +25,12 @@ export function runRustAgentRuntimeRegression(): void {
     assert(!split.prior.includes(expected));
   }
   assert.throws(() => splitAgentRunHistory([message('system', 'no prompt')]));
-  assert.equal(shouldProjectToolResult({ type: 'tool_result', name: 'task_notes', is_error: false }), false);
-  assert.equal(shouldProjectToolResult({ type: 'tool_error', name: 'task_notes', is_error: true }), true);
-  assert.equal(shouldProjectToolResult({ type: 'tool_result', name: 'read_file', is_error: false }), true);
-  assert.equal(isCompleteRuntimeFinal({ type: 'final', complete: true }), true);
-  assert.equal(isCompleteRuntimeFinal({ type: 'final' }), true);
-  assert.equal(isCompleteRuntimeFinal({ type: 'final', complete: false }), false);
-  assert.equal(isCompleteRuntimeFinal({ type: 'agent_error' }), false);
+  const plan = taskPlan({ milestones: [{ id: 'goal-1', label: 'Inspect', status: 'in_progress', work_plan: { tasks: [{ id: 'work-1', label: 'Read runtime', status: 'completed' }, { id: 'work-2', label: 'Map IPC', status: 'in_progress' }] } }], active_milestone_id: 'goal-1' });
+  assert.equal(plan.activeMilestoneId, 'goal-1');
+  assert.equal(plan.milestones?.[0]?.id, 'goal-1');
+  assert.equal(plan.milestones?.[0]?.workPlan.tasks[1]?.id, 'work-2');
+  const legacy = taskPlan({ steps: [{ id: 'legacy-task', label: 'Old item', status: 'completed' }] });
+  assert.equal(legacy.milestones?.[0]?.workPlan.tasks[0]?.id, 'legacy-task');
 }
 
 if (require.main === module) runRustAgentRuntimeRegression();

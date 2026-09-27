@@ -1,9 +1,6 @@
 import { Database } from './database';
 import { AttachmentService, MAX_EXTRACTED_CHARACTERS, MAX_IMAGES_PER_MESSAGE, attachmentDisplayName } from './attachment-service';
 import { AttachmentPipeline, MAX_ATTACHMENT_CONTEXT_CHARACTERS } from './attachment-pipeline';
-import { ProjectChatService } from './project-chat';
-import { WebBrowserService } from '../web/web-tools';
-import type { ToolMessage } from '../backends/types';
 import type { ProjectReference } from '../../shared/types';
 import { projectDirectoryName, removeProjectReferenceQuery } from '../../shared/project-references';
 import { existingProjectDirectory } from './project-picker';
@@ -61,17 +58,6 @@ export async function runAttachmentPipelineRegression(): Promise<void> {
     const nativeOnlyHistory = await nativePipeline.prepareNativeImages(nativePipeline.buildContext([nativeTurn], false), new AbortController().signal);
     assert(nativeOnlyHistory.length === 1 && nativeOnlyHistory[0].images?.length === 1, 'native image was not attached to its user turn');
     assert(!nativeOnlyHistory.some((entry) => entry.role === 'system' && entry.content.includes('Image 1')), 'native image was duplicated into attachment text context');
-
-    // Agent transport must preserve the same turn-bound native image input while
-    // retaining its independent project-tool registry.
-    const agentRequests: ToolMessage[][] = [];
-    const captureBackend = { chatWithTools: async (_model: string, messages: ToolMessage[]) => {
-      agentRequests.push(messages);
-      return { role: 'assistant' as const, content: 'Native vision is available.', prompt_eval_count: 1, finish_reason: 'stop' as const };
-    } };
-    const agent = new ProjectChatService(captureBackend, new WebBrowserService());
-    for await (const event of agent.stream('qwen3.8:27b-q4_K_M', nativeOnlyHistory, process.cwd(), new AbortController().signal, 16_384, 'fast', 'off', async () => ({ approved: false, reason: 'cancelled' }))) { void event; }
-    assert(agentRequests[0]?.some((entry) => entry.role === 'user' && entry.images?.length === 1), 'Agent mode dropped the native image input');
 
     const mixedNative = await nativePipeline.prepareNativeImages(nativePipeline.buildContext([turn, nativeTurn], false), new AbortController().signal);
     const mixedDocumentBlock = mixedNative.find((entry) => entry.id === `attachments-${turn.id}`);
