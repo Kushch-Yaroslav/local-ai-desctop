@@ -54,9 +54,12 @@ pub const MAX_LOGICAL_FINAL_CHARS: usize = 1_000_000;
 pub const PLAN_NUDGE_ACTION_THRESHOLD: usize = 12;
 pub const PLAN_NUDGE_MAX_PER_RUN: usize = 2;
 pub const SUMMARY_INPUT_CHARS: usize = 48_000;
-pub const SUMMARY_MAX_OUTPUT_TOKENS: usize = 1_024;
+pub const SUMMARY_MAX_OUTPUT_TOKENS: usize = 2_048;
 pub const MIN_SUMMARY_OUTPUT_TOKENS: usize = 64;
-const SUMMARY_MAX_CHARS: usize = 3_072;
+const ROLLING_SUMMARY_MAX_CHARS: usize = 3_600;
+const MIN_CONTINUATION_OVERLAP_CHARS: usize = 32;
+const MIN_FULL_RESTART_PREFIX_CHARS: usize = 96;
+const MAX_CONTINUATION_OVERLAP_CHARS: usize = 24_000;
 
 const AGENT_GUIDANCE: &str = r#"
 # Local AI Desktop Agent
@@ -68,7 +71,15 @@ const AGENT_GUIDANCE: &str = r#"
 - Do not call a tool only because tools are available. Decide yourself when the task has enough information.
 "#;
 
-const SUMMARY_GUIDANCE: &str = "Summarize the earlier agent transcript as a dense factual handoff. Preserve the user's goals and constraints, decisions, relevant files, commands and outcomes, unresolved questions, and current implementation state. Omit pleasantries and redundant raw output. Write only the summary.";
+const SUMMARY_GUIDANCE: &str = r#"Create a concise but information-dense semantic handoff for continuing the same Agent task.
+Priority order:
+1. The user's goal and constraints.
+2. Concrete findings already established, including important file paths AND what was learned from each; preserve exact technical details and relationships, not merely that a file was read.
+3. Important commands/tools and their meaningful outcomes.
+4. Current milestone/work-task intent and stable IDs.
+5. Decisions, what is verified versus unverified, unresolved questions/gaps, and hypotheses explicitly labeled as hypotheses.
+6. Investigations already completed that should not be repeated.
+Preserve concrete evidence from tool output and assistant reasoning. Never replace findings with an activity log such as "read App.tsx". Distinguish verified facts from hypotheses; do not invent or imply access to omitted raw output. Drop pleasantries, repeated requests, and redundant raw output before dropping findings. Write only the handoff summary."#;
 
 #[derive(Clone, Copy, Debug)]
 pub struct CompactionBudget {
@@ -113,7 +124,6 @@ fn request_payload(
     config: &Config,
     messages: &[Value],
     schemas: &[Value],
-    continuation_only: bool,
     max_tokens: usize,
 ) -> Value {
     let mut payload = json!({
@@ -123,10 +133,8 @@ fn request_payload(
         "stream_options": {"include_usage": true},
         "max_tokens": max_tokens,
     });
-    if !continuation_only {
-        payload["tools"] = json!(turn_tools(schemas, false));
-        payload["tool_choice"] = json!("auto");
-    }
+    payload["tools"] = json!(schemas);
+    payload["tool_choice"] = json!("auto");
     payload.as_object_mut().expect("request payload").extend(
         request_reasoning(config)
             .as_object()
@@ -156,13 +164,8 @@ struct RequestBudget {
     dynamic_tail_tokens: usize,
 }
 
-fn request_budget(
-    config: &Config,
-    messages: &[Value],
-    schemas: &[Value],
-    continuation_only: bool,
-) -> RequestBudget {
-    let payload = request_payload(config, messages, schemas, continuation_only, 0);
+fn request_budget(config: &Config, messages: &[Value], schemas: &[Value]) -> RequestBudget {
+    let payload = request_payload(config, messages, schemas, 0);
     let mut transcript = Vec::new();
     let mut dynamic = Vec::new();
     for message in messages.iter().skip(1) {
@@ -181,11 +184,7 @@ fn request_budget(
         stable_prefix_tokens: messages
             .first()
             .map_or(0, |message| estimate_tokens(&json!([message]))),
-        tool_schemas_tokens: if continuation_only {
-            0
-        } else {
-            estimate_tokens(&Value::Array(schemas.to_vec()))
-        },
+        tool_schemas_tokens: estimate_tokens(&Value::Array(schemas.to_vec())),
         transcript_history_tokens: estimate_tokens(&Value::Array(transcript)),
         dynamic_tail_tokens: estimate_tokens(&Value::Array(dynamic)),
     }
@@ -203,13 +202,16 @@ fn summary_size_chars(transcript: &Transcript) -> usize {
         .map_or(0, |(summary, _)| summary.chars().count())
 }
 
-fn cap_summary(summary: &str) -> String {
+fn cap_rolling_summary(summary: &str) -> String {
     let summary = summary.trim();
-    if summary.chars().count() <= SUMMARY_MAX_CHARS {
+    if summary.chars().count() <= ROLLING_SUMMARY_MAX_CHARS {
         return summary.to_owned();
     }
-    let bounded = summary.chars().take(SUMMARY_MAX_CHARS).collect::<String>();
-    format!("{bounded}\n[summary truncated to preserve context budget]")
+    let bounded = summary
+        .chars()
+        .take(ROLLING_SUMMARY_MAX_CHARS)
+        .collect::<String>();
+    format!("{bounded}\n[rolling summary truncated to preserve context budget]")
 }
 
 fn retained_tail_tokens(messages: &[Value]) -> usize {
@@ -474,8 +476,149 @@ fn continuation_tail(content: &str) -> String {
     }
 }
 
+fn continuation_reminder(content: &str) -> String {
+    format!(
+        "Continue immediately after the exact ending below. Do not restart, repeat headings, summarize, or reproduce earlier text. If more investigation is needed, use the available tools normally.\n<previous_tail>\n{}\n</previous_tail>",
+        continuation_tail(content)
+    )
+}
+
 fn append_final_text(accumulator: &mut String, delta: &str) {
     accumulator.push_str(delta);
+}
+
+#[derive(Default)]
+struct NormalizedText {
+    chars: Vec<char>,
+    byte_ends: Vec<usize>,
+}
+
+fn normalize_for_overlap(text: &str) -> NormalizedText {
+    let mut normalized = NormalizedText::default();
+    for (index, ch) in text.char_indices() {
+        if ch.is_whitespace() {
+            if normalized.chars.last() != Some(&' ') && !normalized.chars.is_empty() {
+                normalized.chars.push(' ');
+                normalized.byte_ends.push(index + ch.len_utf8());
+            }
+        } else {
+            normalized.chars.push(ch);
+            normalized.byte_ends.push(index + ch.len_utf8());
+        }
+    }
+    if normalized.chars.last() == Some(&' ') {
+        normalized.chars.pop();
+        normalized.byte_ends.pop();
+    }
+    normalized
+}
+
+fn longest_prefix_suffix_overlap(prefix: &[char], text: &[char], limit: usize) -> usize {
+    let pattern = prefix.iter().take(limit).copied().collect::<Vec<_>>();
+    if pattern.is_empty() {
+        return 0;
+    }
+    let mut failure = vec![0; pattern.len()];
+    for index in 1..pattern.len() {
+        let mut matched = failure[index - 1];
+        while matched > 0 && pattern[index] != pattern[matched] {
+            matched = failure[matched - 1];
+        }
+        if pattern[index] == pattern[matched] {
+            matched += 1;
+        }
+        failure[index] = matched;
+    }
+
+    let start = text.len().saturating_sub(limit);
+    let mut matched = 0;
+    for ch in &text[start..] {
+        while matched > 0 && (matched == pattern.len() || *ch != pattern[matched]) {
+            matched = failure[matched - 1];
+        }
+        if *ch == pattern[matched] {
+            matched += 1;
+        }
+    }
+    matched
+}
+
+fn longest_common_prefix(left: &[char], right: &[char], limit: usize) -> usize {
+    left.iter()
+        .zip(right)
+        .take(limit)
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+fn repeated_heading_prefix(existing: &str, continuation: &str) -> Option<usize> {
+    let previous_heading = existing
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())?
+        .trim();
+    let first_line_end = continuation.find('\n').unwrap_or(continuation.len());
+    let first_line = continuation[..first_line_end].trim();
+    if previous_heading.starts_with('#')
+        && first_line == previous_heading
+        && first_line.starts_with('#')
+    {
+        Some(if first_line_end < continuation.len() {
+            first_line_end + 1
+        } else {
+            first_line_end
+        })
+    } else {
+        None
+    }
+}
+
+fn continuation_text_to_append(existing: &str, continuation: &str) -> String {
+    if existing.is_empty() || continuation.is_empty() {
+        return continuation.to_owned();
+    }
+    if let Some(overlap) = repeated_heading_prefix(existing, continuation) {
+        return continuation[overlap..].to_owned();
+    }
+
+    let existing_normalized = normalize_for_overlap(existing);
+    let continuation_normalized = normalize_for_overlap(continuation);
+    let restart_overlap = longest_common_prefix(
+        &existing_normalized.chars,
+        &continuation_normalized.chars,
+        MAX_CONTINUATION_OVERLAP_CHARS,
+    );
+    let suffix_overlap = longest_prefix_suffix_overlap(
+        &continuation_normalized.chars,
+        &existing_normalized.chars,
+        MAX_CONTINUATION_OVERLAP_CHARS,
+    );
+
+    let is_restart = restart_overlap >= MIN_FULL_RESTART_PREFIX_CHARS;
+    let overlap = if is_restart {
+        restart_overlap
+    } else if suffix_overlap >= MIN_CONTINUATION_OVERLAP_CHARS {
+        suffix_overlap
+    } else {
+        return continuation.to_owned();
+    };
+    let mut end = continuation_normalized
+        .byte_ends
+        .get(overlap.saturating_sub(1))
+        .copied();
+    if is_restart {
+        end = end.and_then(|end| continuation[..end].rfind('\n').map(|line_end| line_end + 1));
+    }
+    end.map_or_else(
+        || continuation.to_owned(),
+        |end| continuation[end..].to_owned(),
+    )
+}
+
+fn append_continuation_text(accumulator: &mut String, continuation: &str) -> String {
+    let accepted = continuation_text_to_append(accumulator, continuation);
+    accumulator.push_str(&accepted);
+    accepted
 }
 
 fn needs_compaction(
@@ -489,14 +632,6 @@ fn needs_compaction(
 
 fn retry_keep_recent(attempt: usize) -> usize {
     (DEFAULT_KEEP_RECENT >> attempt).max(1)
-}
-
-fn turn_tools(schemas: &[Value], continuation_only: bool) -> Vec<Value> {
-    if continuation_only {
-        Vec::new()
-    } else {
-        schemas.to_vec()
-    }
 }
 
 #[derive(Default)]
@@ -833,7 +968,12 @@ fn consume_sse(
     Ok(())
 }
 
-fn summarize_span(config: &Config, transcript: &Transcript, covers: usize) -> String {
+fn summarize_span(
+    config: &Config,
+    plan: &GoalPlan,
+    transcript: &Transcript,
+    covers: usize,
+) -> String {
     // Summary generation is also a provider turn. Keep its input small enough
     // to leave meaningful output headroom on the selected local context size.
     let summary_input_chars = SUMMARY_INPUT_CHARS.min(
@@ -842,13 +982,13 @@ fn summarize_span(config: &Config, transcript: &Transcript, covers: usize) -> St
             .saturating_sub(SAFETY_RESERVE_TOKENS + MIN_SUMMARY_OUTPUT_TOKENS)
             .saturating_mul(2),
     );
-    let dropped = transcript.render_span(covers, summary_input_chars);
-    if dropped.trim().is_empty() {
+    let summary_source = summary_source(config, plan, transcript, covers, summary_input_chars);
+    if summary_source.trim().is_empty() {
         return "Earlier conversation was omitted to fit the selected context window.".into();
     }
     let messages = vec![
         json!({"role":"system", "content": SUMMARY_GUIDANCE}),
-        json!({"role":"user", "content": dropped}),
+        json!({"role":"user", "content": summary_source}),
     ];
     let max_tokens = dynamic_output_limit(
         config.context_limit,
@@ -858,7 +998,7 @@ fn summarize_span(config: &Config, transcript: &Transcript, covers: usize) -> St
         SUMMARY_MAX_OUTPUT_TOKENS,
     );
     if max_tokens < MIN_SUMMARY_OUTPUT_TOKENS {
-        return "Earlier conversation was compacted. Retained recent transcript and current planning state remain available.".into();
+        return "Earlier conversation was compacted; the current prompt contains the usable summary and retained recent transcript.".into();
     }
     let payload = json!({
         "model": config.model,
@@ -867,16 +1007,42 @@ fn summarize_span(config: &Config, transcript: &Transcript, covers: usize) -> St
         "max_tokens": max_tokens,
     });
     match stream_call(&config.endpoint, &payload, &config.run_id, &config.cancelled, false) {
-        Ok(turn) if !turn.content.trim().is_empty() => cap_summary(&turn.content),
-        _ => "Earlier conversation was compacted. Retained recent transcript and current planning state remain available.".into(),
+        Ok(turn) if !turn.content.trim().is_empty() => cap_rolling_summary(&turn.content),
+        _ => "Earlier conversation was compacted; the current prompt contains the usable summary and retained recent transcript.".into(),
     }
+}
+
+fn summary_source(
+    config: &Config,
+    plan: &GoalPlan,
+    transcript: &Transcript,
+    covers: usize,
+    max_chars: usize,
+) -> String {
+    let current_user_budget = max_chars.min(12_000);
+    let current_user = config
+        .user
+        .chars()
+        .take(current_user_budget)
+        .collect::<String>();
+    let plan_snapshot = serde_json::to_string(plan).unwrap_or_default();
+    let plan_budget = max_chars
+        .saturating_sub(current_user.chars().count())
+        .min(6_000);
+    let plan_snapshot = plan_snapshot.chars().take(plan_budget).collect::<String>();
+    let labels = format!(
+        "[CURRENT USER GOAL AND CONSTRAINTS]\n{current_user}\n\n[CURRENT CANONICAL GOAL / MILESTONE / WORK PLAN]\n{plan_snapshot}\n\n[EARLIER TRANSCRIPT TO SUMMARIZE]\n"
+    );
+    let transcript_budget = max_chars.saturating_sub(labels.chars().count());
+    let earlier = transcript.render_span(covers, transcript_budget);
+    format!("{labels}{earlier}")
 }
 
 fn compact_once(
     config: &Config,
     transcript: &mut Transcript,
+    plan: &GoalPlan,
     schemas: &[Value],
-    continuation_only: bool,
     before: usize,
     keep_recent: usize,
     reason: &str,
@@ -885,11 +1051,10 @@ fn compact_once(
     let Some(covers) = transcript.compaction_plan(keep_recent) else {
         return false;
     };
-    let summary = summarize_span(config, transcript, covers);
+    let summary = summarize_span(config, plan, transcript, covers);
     transcript.compact(summary, covers);
     let messages = project(transcript, &stable_prefix(config), dynamic_tail);
-    let after =
-        request_budget(config, &messages, schemas, continuation_only).projected_input_tokens;
+    let after = request_budget(config, &messages, schemas).projected_input_tokens;
     emit(
         &config.run_id,
         Event::ContextOptimized {
@@ -1054,6 +1219,7 @@ pub fn run(config: Config) {
     let schemas = tool_schemas(config.root.is_some());
     let mut final_content = String::new();
     let mut continuation_count = 0_usize;
+    let mut continuation_pending = false;
     let mut overflow_attempts = 0_usize;
 
     emit(
@@ -1077,16 +1243,11 @@ pub fn run(config: Config) {
                 transcript.push_steering(content);
             }
         }
-        let continuation_only = continuation_count > 0;
-        let dynamic = if continuation_only {
-            String::new()
-        } else {
-            dynamic_tail(&state)
-        };
+        let dynamic = dynamic_tail(&state);
         let mut messages = project(&transcript, &stable, &dynamic);
         // The just-projected reminder expires before the following turn.
         transcript.clear_reminders();
-        let before_budget = request_budget(&config, &messages, &schemas, continuation_only);
+        let before_budget = request_budget(&config, &messages, &schemas);
         let requested_max_output = config
             .provider_max_output
             .unwrap_or(APPLICATION_MAX_OUTPUT_TOKENS)
@@ -1109,16 +1270,12 @@ pub fn run(config: Config) {
                 } else {
                     retry_keep_recent(attempt)
                 };
-                let current_dynamic = if continuation_only {
-                    String::new()
-                } else {
-                    dynamic_tail(&state)
-                };
+                let current_dynamic = dynamic_tail(&state);
                 if !compact_once(
                     &config,
                     &mut transcript,
+                    &state.plan,
                     &schemas,
-                    continuation_only,
                     current_budget.projected_input_tokens,
                     keep_recent,
                     if attempt == 0 {
@@ -1131,8 +1288,8 @@ pub fn run(config: Config) {
                     break;
                 }
                 compaction_attempts += 1;
-                messages = project(&transcript, &stable, &current_dynamic);
-                current_budget = request_budget(&config, &messages, &schemas, continuation_only);
+                messages = project(&transcript, &stable, &dynamic_tail(&state));
+                current_budget = request_budget(&config, &messages, &schemas);
                 output_limit = dynamic_output_limit(
                     config.context_limit,
                     current_budget.projected_input_tokens,
@@ -1167,15 +1324,7 @@ pub fn run(config: Config) {
             return;
         }
         let projected = current_budget.projected_input_tokens;
-        // A prose continuation is deliberately tool-free. It receives the
-        // exact visible tail as a one-turn reminder and can only append text.
-        let payload = request_payload(
-            &config,
-            &messages,
-            &schemas,
-            continuation_only,
-            output_limit,
-        );
+        let payload = request_payload(&config, &messages, &schemas, output_limit);
         let payload_messages = payload
             .get("messages")
             .and_then(Value::as_array)
@@ -1220,11 +1369,7 @@ pub fn run(config: Config) {
             &config.run_id,
             Event::RequestPolicy {
                 turn: turn + 1,
-                phase: if continuation_only {
-                    "continuation".into()
-                } else {
-                    "agent".into()
-                },
+                phase: "agent".into(),
                 reasoning_effort: payload
                     .get("reasoning_effort")
                     .and_then(Value::as_str)
@@ -1253,12 +1398,12 @@ pub fn run(config: Config) {
             },
         );
 
-        let streamed = match stream_call(
+        let mut streamed = match stream_call(
             &config.endpoint,
             &payload,
             &config.run_id,
             &config.cancelled,
-            true,
+            !continuation_pending,
         ) {
             Ok(streamed) => {
                 overflow_attempts = 0;
@@ -1282,13 +1427,16 @@ pub fn run(config: Config) {
                 if compact_once(
                     &config,
                     &mut transcript,
+                    &state.plan,
                     &schemas,
-                    continuation_only,
                     before,
                     keep,
                     "context_overflow_retry",
                     &dynamic,
                 ) {
+                    if continuation_pending {
+                        transcript.remind(continuation_reminder(&final_content));
+                    }
                     continue;
                 }
                 emit(
@@ -1311,6 +1459,15 @@ pub fn run(config: Config) {
                 return;
             }
         };
+        let was_continuation = continuation_pending;
+        if was_continuation {
+            let accepted = append_continuation_text(&mut final_content, &streamed.content);
+            streamed.content = accepted.clone();
+            if !accepted.is_empty() {
+                emit(&config.run_id, Event::ContentDelta { content: accepted });
+            }
+            continuation_pending = false;
+        }
         if streamed.thinking_started {
             emit(&config.run_id, Event::ThinkingFinished);
         }
@@ -1361,21 +1518,11 @@ pub fn run(config: Config) {
                 continue;
             }
         };
-        if continuation_only && !calls.is_empty() {
-            emit(
-                &config.run_id,
-                Event::ToolError {
-                    id: "continuation".into(),
-                    name: "tool_protocol".into(),
-                    message: "a prose continuation cannot execute tools".into(),
-                },
-            );
-            transcript.remind("Continue the previous visible prose only. Do not call tools, restart, or add a new plan.".into());
-            continue;
-        }
         if calls.is_empty() {
             if streamed.finish_reason == "length" {
-                append_final_text(&mut final_content, &streamed.content);
+                if !was_continuation {
+                    append_final_text(&mut final_content, &streamed.content);
+                }
                 transcript.assistant_message(streamed.content);
                 if continuation_count >= MAX_CONTINUATION_TURNS
                     || final_content.chars().count() >= MAX_LOGICAL_FINAL_CHARS
@@ -1392,10 +1539,8 @@ pub fn run(config: Config) {
                     return;
                 }
                 continuation_count += 1;
-                transcript.remind(format!(
-                    "Continue exactly from the previous emitted tail. Do not restart, summarize, repeat headings, plan, or investigate.\n<previous_tail>\n{}\n</previous_tail>",
-                    continuation_tail(&final_content)
-                ));
+                continuation_pending = true;
+                transcript.remind(continuation_reminder(&final_content));
                 emit(
                     &config.run_id,
                     Event::FinalContinuation {
@@ -1407,7 +1552,9 @@ pub fn run(config: Config) {
                 );
                 continue;
             }
-            append_final_text(&mut final_content, &streamed.content);
+            if !was_continuation {
+                append_final_text(&mut final_content, &streamed.content);
+            }
             if add_soft_closeout_if_needed(&mut state, &mut transcript) {
                 transcript.assistant_message(streamed.content);
                 continue;
@@ -1494,8 +1641,8 @@ pub fn run(config: Config) {
                         },
                     );
                     transcript.tool_result(&tool.id, &tool.name, content);
-                    if tool.name != "task_plan" {
-                        state.action_completed();
+                    if matches!(tool.name.as_str(), "run_terminal") || mutation_tool(&tool.name) {
+                        state.mutation_action_completed();
                     }
                 }
                 Err(message) => {
@@ -1512,12 +1659,15 @@ pub fn run(config: Config) {
             }
         }
         if state.plan.has_open_work()
-            && state.meaningful_actions_since_plan_update >= PLAN_NUDGE_ACTION_THRESHOLD
+            && state.mutations_since_plan_update >= PLAN_NUDGE_ACTION_THRESHOLD
             && state.plan_nudges < PLAN_NUDGE_MAX_PER_RUN
         {
             state.plan_nudges += 1;
-            state.meaningful_actions_since_plan_update = 0;
-            transcript.remind(format!("The plan still has open work. Update it if a task or milestone is complete or no longer needed; otherwise continue working. {}", state.plan.open_summary().unwrap_or_default()));
+            state.mutations_since_plan_update = 0;
+            transcript.remind(format!(
+                "The plan still has open work. If you finished a task since the last plan update, mark it complete now (or drop it if skipped) so progress stays visible; otherwise continue working. {}",
+                state.plan.open_summary().unwrap_or_default()
+            ));
         }
     }
     emit(
@@ -1799,11 +1949,196 @@ mod tests {
     }
 
     #[test]
-    fn summary_output_is_bounded_before_it_returns_to_the_transcript() {
-        let bounded = cap_summary(&"s".repeat(SUMMARY_MAX_CHARS + 5_000));
-        assert!(bounded.chars().count() <= SUMMARY_MAX_CHARS + 64);
-        assert!(bounded.ends_with("[summary truncated to preserve context budget]"));
-        assert_eq!(cap_summary(" concise summary "), "concise summary");
+    fn rolling_summary_output_is_bounded_before_it_returns_to_the_transcript() {
+        let bounded = cap_rolling_summary(&"s".repeat(ROLLING_SUMMARY_MAX_CHARS + 5_000));
+        assert!(bounded.chars().count() <= ROLLING_SUMMARY_MAX_CHARS + 72);
+        assert!(bounded.ends_with("[rolling summary truncated to preserve context budget]"));
+        assert_eq!(cap_rolling_summary(" concise summary "), "concise summary");
+    }
+
+    #[test]
+    fn jan_style_todo_upkeep_counts_mutating_work_and_plan_touch_resets_it() {
+        let mut state = AgentState::default();
+        state.plan.init(vec!["Audit".into()]).unwrap();
+        state
+            .plan
+            .init_work(vec!["Implement change".into()])
+            .unwrap();
+        for _ in 0..PLAN_NUDGE_ACTION_THRESHOLD {
+            state.mutation_action_completed();
+        }
+        assert_eq!(
+            state.mutations_since_plan_update,
+            PLAN_NUDGE_ACTION_THRESHOLD
+        );
+        state.plan_nudges += 1;
+        state.mutations_since_plan_update = 0;
+        assert_eq!(state.plan_nudges, 1);
+        state.plan_touched();
+        assert_eq!(state.mutations_since_plan_update, 0);
+        assert_eq!(state.plan_nudges, 1, "Jan caps nudges per run cycle");
+    }
+
+    #[test]
+    fn summary_contract_and_source_preserve_concrete_research_findings() {
+        let config = test_config(None);
+        let mut plan = GoalPlan::default();
+        plan.init(vec!["Audit routes".into()]).unwrap();
+        plan.init_work(vec!["Trace route composition".into()])
+            .unwrap();
+        let mut transcript = Transcript::default();
+        transcript.push_message(json!({
+            "role":"user",
+            "content":"Audit routing and report concrete findings."
+        }));
+        transcript.push_message(json!({
+            "role":"assistant",
+            "content":"App.tsx uses BrowserRouter and renders PurchaseToast, AppRoutes, and ScrollToTopButton. Routes.tsx uses LangGate plus ProductShell and routes product/:id, products-page, confirm, and legal pages."
+        }));
+        let source = summary_source(&config, &plan, &transcript, 2, SUMMARY_INPUT_CHARS);
+        assert!(SUMMARY_GUIDANCE.contains("what was learned from each"));
+        assert!(SUMMARY_GUIDANCE.contains("not merely that a file was read"));
+        assert!(source.contains("Audit routes"));
+        assert!(source.contains("Trace route composition"));
+        assert!(source.contains("App.tsx uses BrowserRouter"));
+        assert!(source.contains("Routes.tsx uses LangGate"));
+    }
+
+    #[test]
+    fn mocked_compaction_returns_a_semantic_handoff_not_an_activity_log() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_mock_request(&mut stream);
+            let source = request["messages"][1]["content"].as_str().unwrap();
+            assert!(source.contains("App.tsx uses BrowserRouter"));
+            assert!(source.contains("Routes.tsx uses LangGate"));
+            let response = json!({"choices":[{"delta":{"content":"App.tsx uses BrowserRouter and renders PurchaseToast, AppRoutes, and ScrollToTopButton. Routes.tsx composes LangGate with ProductShell and defines product/:id, products-page, confirm, and legal routes. These are verified source findings; finish checking api.php and robots.txt."},"finish_reason":"stop"}]});
+            stream
+                .write_all(sse_response(&[response]).as_bytes())
+                .unwrap();
+        });
+        let mut config = test_config(None);
+        config.endpoint = endpoint;
+        let mut plan = GoalPlan::default();
+        plan.init(vec!["Audit routing".into(), "Inspect API and SEO".into()])
+            .unwrap();
+        plan.init_work(vec!["Trace route composition".into()])
+            .unwrap();
+        let mut transcript = Transcript::default();
+        transcript.push_message(
+            json!({"role":"user","content":"Audit route architecture and endpoints."}),
+        );
+        transcript.push_message(json!({"role":"assistant","content":"App.tsx uses BrowserRouter and renders PurchaseToast, AppRoutes, and ScrollToTopButton."}));
+        transcript.push_message(json!({"role":"assistant","content":"Routes.tsx uses LangGate plus ProductShell and defines product/:id and legal routes."}));
+        transcript.push_message(
+            json!({"role":"assistant","content":"Need inspect api.php, .htaccess, robots.txt."}),
+        );
+        let covers = transcript.entries().len();
+
+        let summary = summarize_span(&config, &plan, &transcript, covers);
+        transcript.compact(summary, covers);
+        let projected = project(
+            &transcript,
+            &stable_prefix(&config),
+            &dynamic_tail(&AgentState {
+                plan,
+                ..AgentState::default()
+            }),
+        );
+        let summary_message = projected
+            .iter()
+            .find(|message| {
+                message["content"].as_str().is_some_and(|content| {
+                    content.starts_with("[RUNTIME SUMMARY — NOT USER CONTENT]")
+                })
+            })
+            .unwrap();
+        let handoff = summary_message["content"].as_str().unwrap();
+        assert!(handoff.contains("App.tsx uses BrowserRouter"));
+        assert!(handoff.contains("product/:id"));
+        assert!(handoff.contains("verified source findings"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn continuation_appends_exact_next_text_without_modification() {
+        let mut final_text = String::from("Earlier findings end here.");
+        let accepted = append_continuation_text(&mut final_text, " Next finding starts here.");
+        assert_eq!(accepted, " Next finding starts here.");
+        assert_eq!(
+            final_text,
+            "Earlier findings end here. Next finding starts here."
+        );
+    }
+
+    #[test]
+    fn continuation_strips_substantial_suffix_overlap_once() {
+        let repeated = "Verified finding from the route audit. ".repeat(5);
+        let mut final_text = format!("Earlier text. {repeated}");
+        let continuation = format!("{repeated}New finding.");
+        let accepted = append_continuation_text(&mut final_text, &continuation);
+        assert_eq!(accepted, " New finding.");
+        assert!(final_text.ends_with("New finding."));
+        assert_eq!(final_text.matches("Verified finding").count(), 5);
+    }
+
+    #[test]
+    fn continuation_strips_a_restart_from_the_answer_beginning() {
+        let beginning = "## 1. Scope\n".to_owned() + &"Concrete route finding.\n".repeat(12);
+        let already_emitted = format!("{beginning}## 7. Summary\nPartial ending.");
+        let restarted = format!("{beginning}## 2. API findings\nAdditional details.");
+        assert_eq!(
+            continuation_text_to_append(&already_emitted, &restarted),
+            "## 2. API findings\nAdditional details."
+        );
+    }
+
+    #[test]
+    fn continuation_strips_a_repeated_markdown_heading_only() {
+        let existing = "Prior section details.\n## 7. Architecture\n";
+        assert_eq!(
+            continuation_text_to_append(existing, "## 7. Architecture\nNew details."),
+            "New details."
+        );
+    }
+
+    #[test]
+    fn continuation_without_overlap_is_preserved() {
+        let existing = "Earlier answer about routing.";
+        let new = "A distinct database finding.";
+        assert_eq!(continuation_text_to_append(existing, new), new);
+    }
+
+    #[test]
+    fn multiple_continuations_form_one_deduplicated_final_string() {
+        let first = "Opening. ".to_owned() + &"Repeated audit phrase. ".repeat(5);
+        let second_novel = "Second continuation adds verified details.";
+        let third_novel = "Third continuation closes the report.";
+        let repeated_second = format!(
+            "{}{}",
+            first
+                .chars()
+                .rev()
+                .take(80)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>(),
+            second_novel
+        );
+        let mut final_text = first;
+        let accepted_second = append_continuation_text(&mut final_text, &repeated_second);
+        let repeated_third = format!("{second_novel}{third_novel}");
+        let accepted_third = append_continuation_text(&mut final_text, &repeated_third);
+        assert!(accepted_second.contains(second_novel));
+        assert_eq!(accepted_third, third_novel);
+        assert_eq!(final_text.matches(second_novel).count(), 1);
+        assert_eq!(final_text.matches(third_novel).count(), 1);
     }
 
     #[test]
@@ -1875,7 +2210,7 @@ mod tests {
                     request["messages"][0]["content"]
                         .as_str()
                         .is_some_and(|content| {
-                            content.contains("Summarize the earlier agent transcript")
+                            content.contains("Create a concise but information-dense")
                         });
                 requests.push(request);
                 let response = if is_summary {
@@ -1915,7 +2250,7 @@ mod tests {
                 request["messages"][0]["content"]
                     .as_str()
                     .is_some_and(|content| {
-                        content.contains("Summarize the earlier agent transcript")
+                        content.contains("Create a concise but information-dense")
                     })
             })
             .collect::<Vec<_>>();
@@ -1941,6 +2276,136 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn compaction_preserves_agent_tool_capabilities_on_the_next_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            loop {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_mock_request(&mut stream);
+                let is_summary =
+                    request["messages"][0]["content"]
+                        .as_str()
+                        .is_some_and(|content| {
+                            content.contains("Create a concise but information-dense")
+                        });
+                let response = if requests.is_empty() {
+                    json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"large-read","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"large.txt\"}"}}]},"finish_reason":"tool_calls"}]})
+                } else if is_summary {
+                    json!({"choices":[{"delta":{"content":"Preserve prior findings and active task."},"finish_reason":"stop"}]})
+                } else {
+                    json!({"choices":[{"delta":{"content":"Continuing with tools available."},"finish_reason":"stop"}]})
+                };
+                requests.push(request);
+                stream
+                    .write_all(sse_response(&[response]).as_bytes())
+                    .unwrap();
+                if !requests.is_empty() && !is_summary && requests.len() > 1 {
+                    return requests;
+                }
+            }
+        });
+        let root = unique_temp_root("post-compaction-tools");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("large.txt"),
+            "verified source result ".repeat(1_600),
+        )
+        .unwrap();
+        let mut config = test_config(Some(root.to_str().unwrap()));
+        config.endpoint = endpoint;
+        config.context_limit = 32_768;
+        config.history = (0..12)
+            .map(|index| {
+                json!({
+                    "role": if index % 2 == 0 {"user"} else {"assistant"},
+                    "content": format!("prior turn {index}")
+                })
+            })
+            .collect();
+        config
+            .history
+            .push(json!({"role":"user","content":"x".repeat(72_000)}));
+        let initial_transcript = {
+            let mut transcript = Transcript::default();
+            for message in config.history.clone() {
+                transcript.push_message(message);
+            }
+            transcript.push_run_user(json!({"role":"user","content":config.user}));
+            transcript
+        };
+        let initial_messages = project(&initial_transcript, &stable_prefix(&config), "");
+        let initial_budget =
+            request_budget(&config, &initial_messages, &tool_schemas(true)).projected_input_tokens;
+        assert!(initial_budget < 32_768 * 80 / 100);
+        assert!(
+            dynamic_output_limit(
+                config.context_limit,
+                initial_budget,
+                SAFETY_RESERVE_TOKENS,
+                config.provider_max_output,
+                APPLICATION_MAX_OUTPUT_TOKENS
+            ) >= PREFERRED_OUTPUT_HEADROOM_TOKENS
+        );
+
+        run(config);
+        let requests = server.join().unwrap();
+        let agent_requests = requests
+            .iter()
+            .filter(|request| {
+                request["messages"][0]["content"]
+                    .as_str()
+                    .is_some_and(|content| content.starts_with("base system"))
+            })
+            .collect::<Vec<_>>();
+        assert!(agent_requests.len() >= 2);
+        assert!(requests.iter().any(|request| {
+            request["messages"][0]["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("Create a concise but information-dense"))
+        }));
+        let first_agent = agent_requests[0];
+        let after_compaction = agent_requests.last().unwrap();
+        assert_eq!(first_agent["tools"], after_compaction["tools"]);
+        assert_eq!(agent_requests[0]["tool_choice"], "auto");
+        assert_eq!(after_compaction["tool_choice"], "auto");
+        let names = after_compaction["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(tool_name)
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"read_file"));
+        assert!(names.contains(&"run_terminal"));
+        assert!(names.contains(&"task_plan"));
+        assert!(after_compaction["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|message| message["role"].as_str())
+            .enumerate()
+            .all(|(index, role)| role != "system" || index == 0));
+        assert!(after_compaction["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|message| message["content"].as_str())
+            .all(|content| !content.contains("Do not call tools")));
+        assert!(requests.iter().any(|request| {
+            request["messages"].as_array().is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message["role"] == "tool" && message["tool_call_id"] == "large-read"
+                })
+            })
+        }));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2000,7 +2465,7 @@ mod tests {
             "",
         );
         let projected =
-            request_budget(&config, &messages, &tool_schemas(false), false).projected_input_tokens;
+            request_budget(&config, &messages, &tool_schemas(false)).projected_input_tokens;
         config.context_limit = projected + SAFETY_RESERVE_TOKENS + 600;
 
         run(config);
@@ -2071,13 +2536,24 @@ mod tests {
     }
 
     #[test]
-    fn continuation_is_append_only_and_has_a_bounded_tail() {
+    fn continuation_is_deduplicated_and_has_a_bounded_tail() {
         let mut final_text = String::from("first part ");
         append_final_text(&mut final_text, "second part");
         assert_eq!(final_text, "first part second part");
         let long = "x".repeat(13_000);
         assert_eq!(continuation_tail(&long).chars().count(), 12_000);
-        assert!(turn_tools(&tool_schemas(true), true).is_empty());
+        assert_eq!(
+            request_payload(
+                &test_config(Some("/project")),
+                &[],
+                &tool_schemas(true),
+                1_000
+            )["tools"]
+                .as_array()
+                .unwrap()
+                .len(),
+            tool_schemas(true).len()
+        );
     }
 
     #[test]
@@ -2181,7 +2657,7 @@ mod tests {
     }
 
     #[test]
-    fn length_continuation_keeps_one_logical_response_and_hides_tools() {
+    fn length_continuation_keeps_one_logical_response_and_preserves_tools() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!(
             "http://{}/v1/chat/completions",
@@ -2212,8 +2688,8 @@ mod tests {
         run(config);
         let requests = server.join().unwrap();
         assert!(requests[0].get("tools").is_some());
-        assert!(requests[1].get("tools").is_none());
-        assert!(requests[1].get("tool_choice").is_none());
+        assert_eq!(requests[1]["tools"], requests[0]["tools"]);
+        assert_eq!(requests[1]["tool_choice"], "auto");
         let second_messages = requests[1]["messages"].as_array().unwrap();
         let systems = second_messages
             .iter()

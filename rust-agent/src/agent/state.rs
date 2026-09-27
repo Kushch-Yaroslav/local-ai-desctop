@@ -10,7 +10,9 @@ use super::todo::GoalPlan;
 pub struct AgentState {
     pub plan: GoalPlan,
     pub workspace_mutated_since_validation: bool,
-    pub meaningful_actions_since_plan_update: usize,
+    /// Jan-style Todo upkeep counts mutation-capable work, not reads. The
+    /// Local hierarchical plan remains the Todo adapter.
+    pub mutations_since_plan_update: usize,
     pub plan_nudges: usize,
     pub closeout_nudged: bool,
     pub verification_nudged: bool,
@@ -18,12 +20,11 @@ pub struct AgentState {
 
 impl AgentState {
     pub fn plan_touched(&mut self) {
-        self.meaningful_actions_since_plan_update = 0;
+        self.mutations_since_plan_update = 0;
     }
 
-    pub fn action_completed(&mut self) {
-        self.meaningful_actions_since_plan_update =
-            self.meaningful_actions_since_plan_update.saturating_add(1);
+    pub fn mutation_action_completed(&mut self) {
+        self.mutations_since_plan_update = self.mutations_since_plan_update.saturating_add(1);
     }
 
     pub fn record_mutation(&mut self) {
