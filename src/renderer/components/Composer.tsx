@@ -1,5 +1,5 @@
-import { File, Folder, Paperclip, Send, Square, X } from 'lucide-react';
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { ChevronDown, File, Folder, Paperclip, Send, Square, X } from 'lucide-react';
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import { useAppStore } from '../store/app-store';
 import { ContextUsage } from './ContextUsage';
 import type { AgentPlan, ProjectReference, ProjectSuggestion } from '../../shared/types';
@@ -65,7 +65,7 @@ export function Composer() {
     resizeHandle.current = false;
     window.requestAnimationFrame(() => { if (ref.current) { manualHeight.current = ref.current.offsetHeight; ref.current.style.overflowY = 'auto'; } });
   };
-  return <div className="composer-wrap">{activeTaskPlan && <TaskPlanPanel plan={activeTaskPlan} active />}<div className="composer" onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); addFiles([...event.dataTransfer.files]); }}>
+  return <div className="composer-wrap">{activeTaskPlan && <TaskPlanPanel key={activeId ?? 'active'} plan={activeTaskPlan} active />}<div className="composer" onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); addFiles([...event.dataTransfer.files]); }}>
     {(files.length > 0 || projectReferences.length > 0) && <div className="attachment-draft">{projectReferences.map((reference) => <ProjectReferenceChip key={reference.id} reference={reference} onRemove={() => setProjectReferences((items) => items.filter((item) => item.id !== reference.id))} />)}{files.map((file, index) => <DraftAttachment key={`${file.name}-${index}`} file={file} index={isImageFile(file) ? files.slice(0, index + 1).filter(isImageFile).length - 1 : index} onRemove={() => { setFiles((items) => items.filter((_, itemIndex) => itemIndex !== index)); setAttachmentError(null); }} />)}</div>}
     <input ref={inputRef} className="attachment-input" type="file" multiple accept=".png,.jpg,.jpeg,.webp,.txt,.md,.json,.csv,.log,.js,.ts,.jsx,.tsx,.html,.css,.yaml,.yml,.xml,.docx,.xlsx,.xls,.pdf" onChange={(event) => { addFiles([...(event.target.files ?? [])]); event.currentTarget.value = ''; }} />
     <button className="attach-button" type="button" disabled={isGenerating} title="Прикрепить файлы" onClick={() => inputRef.current?.click()}><Paperclip size={18} /></button>
@@ -76,6 +76,8 @@ export function Composer() {
 }
 
 export function TaskPlanPanel({ plan, active = false }: { plan: AgentPlan; active?: boolean }) {
+  const [collapsed, setCollapsed] = useState(false);
+  const contentId = useId();
   const legacy = plan.steps ?? [];
   const milestones = plan.milestones ?? (legacy.length ? [{ id: 'legacy-plan', label: 'Previous plan', status: legacy.some((step) => step.status === 'in_progress') ? 'in_progress' as const : 'pending' as const, workPlan: { tasks: legacy } }] : []);
   const activeMilestone = milestones.find((milestone) => milestone.id === plan.activeMilestoneId) ?? milestones.find((milestone) => milestone.status === 'in_progress') ?? milestones[0];
@@ -83,13 +85,21 @@ export function TaskPlanPanel({ plan, active = false }: { plan: AgentPlan; activ
   const marker = (status: string) => status === 'completed' ? '✓' : status === 'abandoned' ? '–' : status === 'in_progress' ? '●' : '○';
   const completed = milestones.filter((milestone) => terminal(milestone.status)).length;
   if (!milestones.length) return null;
-  return <section className={`task-plan-panel milestone-plan${active ? ' active' : ''}`} aria-label="Task Planning">
-    <header><strong>Task Planning</strong><span>{completed}/{milestones.length} milestones</span></header>
-    <div className="milestone-plan-grid">
-      <section className="milestone-column"><h4>Goal / Milestones</h4><ol>{milestones.map((milestone) => <li key={milestone.id} className={`${milestone.status}${milestone.id === activeMilestone?.id ? ' active' : ''}`}><i>{marker(milestone.status)}</i><span>{milestone.label}</span>{milestone.id === activeMilestone?.id && <b>active</b>}</li>)}</ol></section>
-      <section className="work-plan-column"><h4>Adaptive Work Plan</h4>{activeMilestone ? <><p className="work-plan-milestone">{activeMilestone.label}</p>{activeMilestone.workPlan.tasks.length ? <ol>{activeMilestone.workPlan.tasks.map((task) => <li className={task.status} key={task.id}><i>{marker(task.status)}</i><span>{task.label}</span></li>)}</ol> : <p className="work-plan-empty">The model will add tasks after it has enough orientation.</p>}</> : <p className="work-plan-empty">No active milestone.</p>}</section>
+  return <section className={`task-plan-panel milestone-plan${active ? ' active' : ''}${collapsed ? ' collapsed' : ''}`} aria-label="Task Planning">
+    <header>
+      <button type="button" className="task-plan-toggle" aria-expanded={!collapsed} aria-controls={contentId} onClick={() => setCollapsed((value) => !value)}>
+        <strong>Task Planning</strong><span>{completed}/{milestones.length} milestones</span><ChevronDown size={15} aria-hidden="true" />
+      </button>
+    </header>
+    <div id={contentId} className="task-plan-collapse" inert={collapsed}>
+      <div className="task-plan-content">
+        <div className="milestone-plan-grid">
+          <section className="milestone-column"><h4>Goal / Milestones</h4><ol>{milestones.map((milestone) => <li key={milestone.id} className={`${milestone.status}${milestone.id === activeMilestone?.id ? ' active' : ''}`}><i>{marker(milestone.status)}</i><span>{milestone.label}</span>{milestone.id === activeMilestone?.id && <b>active</b>}</li>)}</ol></section>
+          <section className="work-plan-column"><h4>Adaptive Work Plan</h4>{activeMilestone ? <><p className="work-plan-milestone">{activeMilestone.label}</p>{activeMilestone.workPlan.tasks.length ? <ol>{activeMilestone.workPlan.tasks.map((task) => <li className={task.status} key={task.id}><i>{marker(task.status)}</i><span>{task.label}</span></li>)}</ol> : <p className="work-plan-empty">The model will add tasks after it has enough orientation.</p>}</> : <p className="work-plan-empty">No active milestone.</p>}</section>
+        </div>
+        {milestones.some((milestone) => milestone.id !== activeMilestone?.id && milestone.workPlan.tasks.length) && <details className="work-plan-history"><summary>Previous work plans</summary>{milestones.filter((milestone) => milestone.id !== activeMilestone?.id && milestone.workPlan.tasks.length).map((milestone) => <section key={milestone.id}><strong>{milestone.label}</strong><ol>{milestone.workPlan.tasks.map((task) => <li className={task.status} key={task.id}><i>{marker(task.status)}</i><span>{task.label}</span></li>)}</ol></section>)}</details>}
+      </div>
     </div>
-    {milestones.some((milestone) => milestone.id !== activeMilestone?.id && milestone.workPlan.tasks.length) && <details className="work-plan-history"><summary>Previous work plans</summary>{milestones.filter((milestone) => milestone.id !== activeMilestone?.id && milestone.workPlan.tasks.length).map((milestone) => <section key={milestone.id}><strong>{milestone.label}</strong><ol>{milestone.workPlan.tasks.map((task) => <li className={task.status} key={task.id}>{marker(task.status)} {task.label}</li>)}</ol></section>)}</details>}
   </section>;
 }
 
