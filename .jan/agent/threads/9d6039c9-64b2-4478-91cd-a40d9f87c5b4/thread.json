@@ -1,0 +1,87 @@
+{
+  "id": "9d6039c9-64b2-4478-91cd-a40d9f87c5b4",
+  "object": "thread",
+  "title": "Работай над этой задачей автономно. Это большая з…",
+  "created": 1790423146.6564553,
+  "updated": 1790430703.0471566,
+  "model": {
+    "id": "qwen3.8:27b-q4_K_M",
+    "provider": ""
+  },
+  "metadata": {
+    "base_snapshot": "cb7729f32a3f7fd3642a43054731eec84accd97a",
+    "checkpoints": [
+      {
+        "user_index": 0,
+        "preview": "Работай над этой задачей автономно. Это большая задача из...",
+        "sha": "aead84cbbb4f9b216d68fdc5b2b1eb8029a5d7ad"
+      },
+      {
+        "user_index": 0,
+        "preview": "",
+        "sha": "08aa88dea77651883ad702ee4f85ebf27b343d57"
+      },
+      {
+        "user_index": 0,
+        "preview": "Continue from the current state. Finish Milestone 2 exact...",
+        "sha": "5b8ebbf56ec4c61d68b32d621c513c18d33035db"
+      },
+      {
+        "user_index": 1,
+        "preview": "Continue from the current state. Proceed with Milestone 3...",
+        "sha": "f11edd266ebe288a485870cba091cb9c5945cd51"
+      },
+      {
+        "user_index": 2,
+        "preview": "Continue Milestone 3. Do not restart or summarize previou...",
+        "sha": "4f5011f37605a3ccaca4ad78f984a6a072d16776"
+      },
+      {
+        "user_index": 3,
+        "preview": "Continue Milestone 3 from the current Todo state. Resume ...",
+        "sha": "079e0056ea48e37a9f5c6abf5d423563c18da246"
+      }
+    ],
+    "todos": {
+      "phases": [
+        {
+          "name": "Milestone 3 (progress-narration UX)",
+          "tasks": [
+            {
+              "content": "Map existing event pipeline (runtime → IPC → store → UI)",
+              "status": "completed"
+            },
+            {
+              "content": "Add ProgressNarration event type + ordering in Rust runtime",
+              "status": "completed"
+            },
+            {
+              "content": "Extend IPC transport + TS types",
+              "status": "in_progress"
+            },
+            {
+              "content": "Persist narration in session store",
+              "status": "pending"
+            },
+            {
+              "content": "UI: collapsible Thought display preserving stream order + auto-scroll",
+              "status": "pending"
+            },
+            {
+              "content": "Update agent system prompt to emit narration",
+              "status": "pending"
+            },
+            {
+              "content": "Add event-ordering tests, run full test suite",
+              "status": "pending"
+            },
+            {
+              "content": "Commit Milestone 3, write final report",
+              "status": "pending"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

@@ -3,6 +3,7 @@ use crate::agent::{
     policy::{self, RunPolicy},
     state::{AgentState, MAX_GAP_CLOSEOUT_PASSES},
     transcript::{validate_calls, Transcript, ValidatedCall},
+    todo::{Status, TaskPlan},
 };
 use crate::context::projection::project;
 use crate::protocol::emit;
@@ -39,6 +40,10 @@ const SAFETY_TOKENS: usize = 1_024;
 /// Escape hatch for a provider that repeatedly exhausts output while we are
 /// continuing one final answer. This is not a normal answer-length cap.
 const MAX_FINAL_CONTINUATIONS: usize = 3;
+/// Keep the exact end of a prior final in the continuation request. The full
+/// answer may no longer fit after compaction, but this is enough to continue
+/// from the actual sentence rather than guessing from a character count.
+const FINAL_CONTINUATION_TAIL_CHARS: usize = 12_000;
 // Avoid compaction churn: a small summary delta costs a turn but leaves the
 // next request above the same watermark. Hard-budget compaction still wins.
 const MIN_COMPACTION_GAIN_TOKENS: usize = 256;
@@ -51,9 +56,9 @@ const AGENT_GUIDANCE: &str = r#"
 - Be concise and answer the user's actual question once sufficient evidence is available.
 - Tool output is complete unless it explicitly says it was truncated. Do not reread an unchanged file or rerun an inspection just to look for hidden output.
 - For a substantial multi-step project analysis, first create a Task Plan that covers inspection, business/architecture assessment, implementation assessment, and synthesis. Keep it current: complete or drop work as soon as it is resolved.
-- For a substantial analysis, keep Task Notes updated at major evidence checkpoints with concise facts, conclusions, business/architecture relevance, risks, unanswered questions, and whether each source is sufficient for this task. Task Notes and investigated-state survive context optimization. They are durable evidence, not a list of paths.
-- `complete_for_task` evidence means model-authored facts sufficient for this user's task survive even though raw source text is no longer active. Trust it. A physical read with only a partial excerpt is explicitly `partial`, not complete. Reread only for one named missing fact, using a narrow `read_file` start_line/end_line range. Never reread solely to reconstruct an entire file.
-- Explore purposefully. After project structure and representative core files establish the requested facts, stop broad exploration. Either identify one specific missing fact, or update Task Plan/Task Notes and synthesize the final response. Do not keep reading files "just in case".
+- Successful project tools automatically create machine evidence IDs. For a material Task Plan item, use `task_checkpoint` with its stable task ID, relevant evidence IDs, and concise findings; this is the only required completion protocol. Task Notes are a readable scratchpad for conclusions and hypotheses, not a source-provenance form.
+- Trust the structured Current Task Memory across context optimization. Reread only for one named missing fact, using a narrow `read_file` start_line/end_line range. Never reread solely to reconstruct an entire file or to manufacture bookkeeping evidence.
+- Explore purposefully. After project structure and representative core files establish the requested facts, stop broad exploration. Continue only with a specific missing fact for an open Task Plan item. Synthesize only after material plan items have sufficient task-specific evidence or an unavailable fact has been explicitly recorded and bounded. Do not keep reading files "just in case".
 - A tool-free response is the normal way to finish. Do not call a tool merely because tools are available.
 "#;
 
@@ -77,6 +82,18 @@ fn final_requires_continuation(finish_reason: &str, has_tool_calls: bool) -> boo
 
 fn final_continuation_available(count: usize) -> bool {
     count < MAX_FINAL_CONTINUATIONS
+}
+
+fn final_continuation_tail(content: &str) -> String {
+    let total = content.chars().count();
+    if total <= FINAL_CONTINUATION_TAIL_CHARS {
+        return content.to_owned();
+    }
+    let tail = content
+        .chars()
+        .skip(total - FINAL_CONTINUATION_TAIL_CHARS)
+        .collect::<String>();
+    format!("[… earlier final content omitted; continue from this exact tail …]\n{tail}")
 }
 
 fn compaction_threshold(context_limit: usize) -> usize {
@@ -141,7 +158,9 @@ fn compacted_working_state(transcript: &Transcript, covers: usize, state: &Agent
         "kind":"runtime_compaction",
         "completed_turns":"Earlier assistant/tool pairs remain canonical. Use the semantic state below and retained suffix before rereading any file.",
         "already_investigated_or_executed": actions,
-        "investigated_evidence":state.investigated_summary_bounded(16, 560),
+        "verified_source_inventory":state.verified_source_inventory(2_000),
+        "current_task_memory":state.current_task_memory_projection(4_000),
+        "investigated_evidence":state.investigated_summary_bounded(12, 420),
         "working_state_note":"Task Plan, Task Notes, and source-specific semantic evidence are projected separately as current runtime state. Complete evidence remains sufficient when raw source is intentionally omitted.",
     })
 }
@@ -154,8 +173,9 @@ fn tools() -> Value {
         {"type":"function","function":{"name":"apply_patch","description":"Surgical file editing via a *** Begin Patch / *** End Patch block with *** Update File: / *** Add File: / *** Delete File: sections. Update bodies list context (' '), removed ('-') and added ('+') lines and must match the current file content exactly. Paths are relative to the project root. Prefer this over write_file for changes to existing files.","parameters":{"type":"object","properties":{"patch":{"type":"string"}},"required":["patch"]}}},
         {"type":"function","function":{"name":"delete_file","description":"Delete one project file. Use only after the user explicitly asked for deletion or a replacement that removes a file.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}},
         {"type":"function","function":{"name":"run_terminal","description":"Run a project shell command and use its complete diagnostics to decide the next step","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout_ms":{"type":"integer"}},"required":["command"]}}},
-        {"type":"function","function":{"name":"task_plan","description":"Manage the canonical Task Plan: init, start, done, drop, or batch. For a phase boundary, use batch to close completed tasks and start the next task in one honest update. Do not finalize with open work unless explicitly dropped. init accepts phases: [{name,tasks:[{content,status?]}]. batch accepts updates:[{action:start|done|drop,task}].","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["init","start","done","drop","batch"]},"phases":{"type":"array"},"task":{"type":"string"},"updates":{"type":"array","items":{"type":"object","properties":{"action":{"type":"string","enum":["start","done","drop"]},"task":{"type":"string"}},"required":["action","task"]}}},"required":["action"]}}},
-        {"type":"function","function":{"name":"task_notes","description":"Checkpoint durable cross-source conclusions and source evidence; do not overwrite prior findings. `notes` contains concise business/architecture conclusions. `evidence` contains only sources whose facts are now sufficient: [{path,facts:[...],relevance:[...],unresolved:[...],complete_for_task:boolean}]. Set complete_for_task=true only when facts answer the current task without raw text. Update after major discoveries and before context optimization.","parameters":{"type":"object","properties":{"notes":{"type":"string"},"evidence":{"type":"array","items":{"type":"object","properties":{"path":{"type":"string"},"facts":{"type":"array","items":{"type":"string"}},"relevance":{"type":"array","items":{"type":"string"}},"unresolved":{"type":"array","items":{"type":"string"}},"complete_for_task":{"type":"boolean"}},"required":["path","facts","complete_for_task"]}}},"required":["notes"]}}}
+        {"type":"function","function":{"name":"task_plan","description":"Manage the canonical Task Plan. For init supply labels/content only; runtime returns generated task-N IDs. For existing tasks use task_id only. refine may supply task_id with a changed label. Material done/drop requires a prior task_checkpoint, except runtime-owned Synthesis completion after final.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["init","refine","start","done","drop","batch"]},"phases":{"type":"array"},"task_id":{"type":"string"},"updates":{"type":"array","items":{"type":"object","properties":{"action":{"type":"string","enum":["start","done","drop"]},"task_id":{"type":"string"}},"required":["action","task_id"]}}},"required":["action"]}}},
+        {"type":"function","function":{"name":"task_checkpoint","description":"Create the simple semantic checkpoint for one material Task Plan item. Runtime already created evidence IDs from successful reads, inventories, terminal inspections, mutations and validation. Reference those IDs; do not repeat source paths or task labels. `complete=true` atomically completes this task and promotes its normal successor: do not call task_plan done afterward. `complete=false` preserves findings while keeping the task in progress.","parameters":{"type":"object","properties":{"task_id":{"type":"string"},"evidence_ids":{"type":"array","items":{"type":"string"},"minItems":1},"findings":{"type":"array","items":{"type":"string"}},"complete":{"type":"boolean"},"unresolved":{"type":"array","items":{"type":"string"}}},"required":["task_id","evidence_ids","findings","complete"]}}},
+        {"type":"function","function":{"name":"task_notes","description":"Checkpoint concise Task Notes plus structured current-task memory. `evidence` contains only source-grounded verified facts or unresolved gaps: [{path,tasks:[exact Task Plan labels],facts:[...],relevance:[...],unresolved:[...],bounded_reason?,complete_for_task:boolean}]. A fact must come from an already-read source; an unresolved entry records a concrete missing fact and attempted source. `hypotheses` are optional inferences and must cite existing verified fact IDs or exact statements in supporting_facts; never put an inference in facts. Set hypothesis status to invalidated when later evidence defeats it. Update after major discoveries and before context optimization.","parameters":{"type":"object","properties":{"notes":{"type":"string"},"evidence":{"type":"array","items":{"type":"object","properties":{"path":{"type":"string"},"tasks":{"type":"array","items":{"type":"string"}},"facts":{"type":"array","items":{"type":"string"}},"relevance":{"type":"array","items":{"type":"string"}},"unresolved":{"type":"array","items":{"type":"string"}},"bounded_reason":{"type":"string"},"complete_for_task":{"type":"boolean"}},"required":["path","tasks","facts","complete_for_task"]}},"hypotheses":{"type":"array","items":{"type":"object","properties":{"statement":{"type":"string"},"supporting_facts":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["active","invalidated"]}},"required":["statement","supporting_facts"]}}},"required":["notes"]}}}
     ])
 }
 
@@ -181,22 +201,36 @@ fn planning_tools() -> Value {
     )
 }
 
-/// Scope the one-shot Notes checkpoint exactly like Jan scopes its Todo
-/// handoff. This remains a model-authored tool call, never a synthetic note.
-fn notes_tools() -> Value {
+fn checkpoint_tools() -> Value {
     let all = tools();
-    let Some(items) = all.as_array() else {
-        return json!([]);
-    };
-    Value::Array(
-        items
-            .iter()
-            .filter(|tool| {
-                tool.pointer("/function/name").and_then(Value::as_str) == Some("task_notes")
-            })
-            .cloned()
-            .collect(),
-    )
+    let Some(items) = all.as_array() else { return json!([]); };
+    Value::Array(items.iter().filter(|tool| {
+        matches!(tool.pointer("/function/name").and_then(Value::as_str), Some("task_notes" | "task_checkpoint"))
+    }).cloned().collect())
+}
+
+fn checkpoint_pending(state: &AgentState) -> bool {
+    state.plan.active_task().is_some_and(|task| {
+        !state.has_complete_checkpoint_for(&task.id) && !state.memory.evidence.is_empty()
+    })
+}
+
+fn ensure_required_tools(mut registry: Value, checkpoint_pending: bool, retrieval_needed: bool) -> Value {
+    let Some(current) = registry.as_array_mut() else { return registry; };
+    let all = tools();
+    let Some(available) = all.as_array() else { return registry; };
+    let mut required = vec!["task_plan"];
+    if checkpoint_pending { required.push("task_checkpoint"); }
+    if retrieval_needed { required.push("read_file"); }
+    for name in required {
+        if current.iter().any(|tool| tool.pointer("/function/name").and_then(Value::as_str) == Some(name)) {
+            continue;
+        }
+        if let Some(tool) = available.iter().find(|tool| tool.pointer("/function/name").and_then(Value::as_str) == Some(name)) {
+            current.push(tool.clone());
+        }
+    }
+    registry
 }
 
 /// Once two independent saturation checks agree, only an explicit
@@ -217,6 +251,7 @@ fn saturation_tools() -> Value {
                     Some(
                         "task_plan"
                             | "task_notes"
+                            | "task_checkpoint"
                             | "read_file"
                             | "write_file"
                             | "create_file"
@@ -266,8 +301,11 @@ fn phase_for(state: &AgentState, needs_plan: bool, turn: usize) -> &'static str 
     // the model with material work still open (the Deep-mode closure
     // regression).
     if state.saturation_round >= 2 {
-        if state.open_without_complete_evidence() > 0 {
+        if state.open_without_complete_evidence() > 0 && !only_synthesis_work_open(state) {
             return "investigate";
+        }
+        if only_synthesis_work_open(state) {
+            return "final";
         }
         return if !state.plan.phases.is_empty() && !state.plan.has_open() {
             "final"
@@ -300,12 +338,113 @@ fn phase_for(state: &AgentState, needs_plan: bool, turn: usize) -> &'static str 
     }
 }
 
+fn is_synthesis_phase(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.contains("synth") || name.contains("итог") || name.contains("финал")
+}
+
+fn open_synthesis_tasks(state: &AgentState) -> Vec<String> {
+    state
+        .plan
+        .phases
+        .iter()
+        .filter(|phase| is_synthesis_phase(&phase.name))
+        .flat_map(|phase| phase.tasks.iter())
+        .filter(|task| {
+            matches!(
+                task.status,
+                crate::agent::todo::Status::Pending | crate::agent::todo::Status::InProgress
+            )
+        })
+        .map(|task| task.content.clone())
+        .collect()
+}
+
+fn only_synthesis_work_open(state: &AgentState) -> bool {
+    let synthesis = open_synthesis_tasks(state);
+    !synthesis.is_empty() && synthesis.len() == state.plan.open_count()
+}
+
+fn task_is_in_synthesis_phase(state: &AgentState, task: &str) -> bool {
+    state.plan.phases.iter().any(|phase| {
+        is_synthesis_phase(&phase.name)
+            && phase.tasks.iter().any(|candidate| candidate.id == task || candidate.content == task)
+    })
+}
+
+fn finish_synthesis_after_final(state: &mut AgentState, run_id: &str) {
+    let tasks = open_synthesis_tasks(state);
+    if tasks.is_empty() {
+        return;
+    }
+    for task in tasks {
+        state
+            .plan
+            .finish(&task, false)
+            .expect("open synthesis task must belong to the Task Plan");
+    }
+    emit(
+        run_id,
+        Event::PlanUpdate {
+            plan: serde_json::to_value(&state.plan).expect("Task Plan serializes"),
+        },
+    );
+}
+
 /// Saturated turns may still retrieve one fact per open plan item. This is a
 /// capability boundary, not another advisory paragraph the model can ignore.
 /// The budget scales with the number of open items still lacking
 /// `complete_for_task` evidence so a large audit is not starved at 2 reads.
 pub fn post_saturation_read_budget(state: &AgentState) -> usize {
     2 + state.open_without_complete_evidence().saturating_mul(3)
+}
+
+const MAX_TARGETED_READ_LINES: usize = 240;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SaturatedReadRejection {
+    MissingReason,
+    MissingRange,
+    InvalidRange,
+    RangeTooBroad,
+    AlreadyCovered,
+    BudgetExhausted,
+}
+
+fn saturated_read_rejection(
+    state: &AgentState,
+    tool: &ValidatedCall,
+) -> Option<SaturatedReadRejection> {
+    if tool.name != "read_file" || state.saturation_round < 2 {
+        return None;
+    }
+    let reason = tool.arguments.get("reason").and_then(Value::as_str);
+    if reason.is_none_or(|reason| reason.trim().is_empty()) {
+        return Some(SaturatedReadRejection::MissingReason);
+    }
+    let (Some(start), Some(end)) = (
+        tool.arguments.get("start_line").and_then(Value::as_u64),
+        tool.arguments.get("end_line").and_then(Value::as_u64),
+    ) else {
+        return Some(SaturatedReadRejection::MissingRange);
+    };
+    let (start, end) = (start as usize, end as usize);
+    if end < start {
+        return Some(SaturatedReadRejection::InvalidRange);
+    }
+    if end.saturating_sub(start).saturating_add(1) > MAX_TARGETED_READ_LINES {
+        return Some(SaturatedReadRejection::RangeTooBroad);
+    }
+    let path = tool
+        .arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if state.saturated_range_seen(path, start, end) {
+        return Some(SaturatedReadRejection::AlreadyCovered);
+    }
+    (state.post_saturation_retrievals >= post_saturation_read_budget(state))
+        .then_some(SaturatedReadRejection::BudgetExhausted)
 }
 
 /// Saturated targeted read is a loop when the requested range overlaps one
@@ -316,28 +455,7 @@ pub fn post_saturation_read_budget(state: &AgentState) -> usize {
 /// but its size can now honestly scale with open work because re-reads no
 /// longer silently consume it.
 pub fn saturated_read_is_repeat(state: &AgentState, tool: &ValidatedCall) -> bool {
-    if tool.name != "read_file" || state.saturation_round < 2 {
-        return false;
-    }
-    let path = tool
-        .arguments
-        .get("path")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let start = tool
-        .arguments
-        .get("start_line")
-        .and_then(Value::as_u64)
-        .unwrap_or(1) as usize;
-    let end = tool
-        .arguments
-        .get("end_line")
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as usize;
-    if end < start {
-        return false;
-    }
-    state.saturated_range_seen(path, start, end)
+    saturated_read_rejection(state, tool) == Some(SaturatedReadRejection::AlreadyCovered)
 }
 
 /// After the second evidence-saturation boundary, only an explicit Plan/Notes
@@ -360,6 +478,7 @@ pub fn rejects_saturated_tool(state: &AgentState, tool: &ValidatedCall) -> bool 
         tool.name.as_str(),
         "task_plan"
             | "task_notes"
+            | "task_checkpoint"
             | "write_file"
             | "create_file"
             | "apply_patch"
@@ -369,19 +488,39 @@ pub fn rejects_saturated_tool(state: &AgentState, tool: &ValidatedCall) -> bool 
         return false;
     }
     if tool.name == "read_file" {
-        if saturated_read_is_repeat(state, tool) {
-            return true;
-        }
-        return tool
-            .arguments
-            .get("reason")
-            .and_then(Value::as_str)
-            .is_none_or(|reason| reason.trim().is_empty())
-            || (tool.arguments.get("start_line").is_none()
-                && tool.arguments.get("end_line").is_none())
-            || state.post_saturation_retrievals >= post_saturation_read_budget(state);
+        return saturated_read_rejection(state, tool).is_some();
     }
     true
+}
+
+fn saturated_rejection_message(state: &AgentState, tool: &ValidatedCall) -> String {
+    let budget = post_saturation_read_budget(state);
+    let remaining = budget.saturating_sub(state.post_saturation_retrievals);
+    let active = format!(
+        "Investigation is still active: Task Plan has {} item(s) without complete task-specific evidence. Targeted reads remaining: {remaining}/{budget}.",
+        state.open_without_complete_evidence()
+    );
+    match saturated_read_rejection(state, tool) {
+        Some(SaturatedReadRejection::RangeTooBroad) => format!(
+            "Targeted read rejected: requested range is too broad (maximum {MAX_TARGETED_READ_LINES} lines). {active} Retry with one concrete missing fact and a narrower range."
+        ),
+        Some(SaturatedReadRejection::AlreadyCovered) => format!(
+            "Targeted read rejected: requested range is already covered. {active} Choose another unresolved evidence gap."
+        ),
+        Some(SaturatedReadRejection::MissingReason) => format!(
+            "Targeted read rejected: reason does not identify one concrete missing fact. {active} Retry with a task-specific missing fact."
+        ),
+        Some(SaturatedReadRejection::MissingRange) => format!(
+            "Targeted read rejected: start_line and end_line are required after saturation. {active} Retry with a narrow range for the named fact."
+        ),
+        Some(SaturatedReadRejection::InvalidRange) => format!(
+            "Targeted read rejected: end_line must not precede start_line. {active} Retry with a valid narrow range."
+        ),
+        Some(SaturatedReadRejection::BudgetExhausted) => format!(
+            "Targeted read budget is exhausted ({remaining}/{budget} remaining). Record any unavailable fact as a task-specific limitation in task_notes before dropping that item."
+        ),
+        None => "Tool rejected after saturation: broad exploration is unavailable. Use a focused read_file request for a concrete evidence gap.".into(),
+    }
 }
 
 /// The closeout valve forces the model to reconcile the plan only once its open
@@ -392,6 +531,52 @@ pub fn rejects_saturated_tool(state: &AgentState, tool: &ValidatedCall) -> bool 
 /// evidence exists or the model explicitly drops the gap.
 pub fn closeout_due(state: &AgentState) -> bool {
     state.plan.has_open() && state.open_without_complete_evidence() == 0
+}
+
+/// At saturation, Plan state must not become a back door around the per-task
+/// evidence gate. `done` needs sufficient evidence for that exact item; `drop`
+/// needs an explicitly checkpointed unresolved limitation. Validate a batch
+/// before applying any update so a mixed batch cannot partially close the plan.
+fn plan_completion_error(state: &AgentState, tool: &ValidatedCall) -> Option<String> {
+    if tool.name != "task_plan" {
+        return None;
+    }
+    let action = tool.arguments.get("action").and_then(Value::as_str)?;
+    let updates: Vec<(&str, &str)> = match action {
+        "done" | "drop" => vec![(
+            action,
+            tool.arguments.get("task").and_then(Value::as_str)?,
+        )],
+        "batch" => tool
+            .arguments
+            .get("updates")
+            .and_then(Value::as_array)?
+            .iter()
+            .filter_map(|update| {
+                Some((
+                    update.get("action")?.as_str()?,
+                    update.get("task")?.as_str()?,
+                ))
+            })
+            .collect(),
+        _ => return None,
+    };
+    for (update_action, task) in updates {
+        if update_action == "done" && task_is_in_synthesis_phase(state, task) {
+            return Some(format!(
+                "Cannot mark Synthesis task '{task}' done before the final response. Keep it in progress; the runtime completes it after a successful terminal final."
+            ));
+        }
+        if update_action == "done" && !state.has_complete_evidence_for(task) {
+            return Some(state.checkpoint_guidance(task));
+        }
+        if update_action == "drop" && !state.has_bounded_gap_for(task) {
+            return Some(format!(
+                "Cannot drop '{task}' without a bounded task checkpoint. Create task_checkpoint with existing evidence IDs and unresolved facts after reasonable attempts."
+            ));
+        }
+    }
+    None
 }
 
 fn semantic_excerpt(value: &str, maximum: usize) -> String {
@@ -426,12 +611,21 @@ fn record_tool_evidence(
                 .get("content")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            state.record_investigation(
+            let changed = state.record_investigation(
                 "read_file",
                 path,
                 semantic_excerpt(content, 1_200),
                 content.contains("[output truncated"),
-            )
+            );
+            let range = arguments
+                .get("start_line")
+                .and_then(Value::as_u64)
+                .zip(arguments.get("end_line").and_then(Value::as_u64))
+                .map(|(start, end)| (start as usize, end as usize));
+            if let Some(path) = arguments.get("path").and_then(Value::as_str) {
+                state.record_source_range("read_file", path, range);
+            }
+            changed
         }
         "list_directory" => {
             let entries = result
@@ -456,16 +650,51 @@ fn record_tool_evidence(
     }
 }
 
+fn record_machine_evidence(state: &mut AgentState, name: &str, arguments: &Value, result: &Value) -> Option<String> {
+    use crate::agent::state::EvidenceKind;
+    let source = arguments
+        .get("path")
+        .or_else(|| arguments.get("command"))
+        .and_then(Value::as_str)
+        .unwrap_or("project")
+        .to_owned();
+    let range = arguments
+        .get("start_line")
+        .and_then(Value::as_u64)
+        .zip(arguments.get("end_line").and_then(Value::as_u64))
+        .map(|(start, end)| (start as usize, end as usize));
+    let kind = match name {
+        "read_file" if range.is_some() => EvidenceKind::SourceRange,
+        "read_file" => EvidenceKind::FileRead,
+        "list_directory" => EvidenceKind::DirectoryInventory,
+        "run_terminal" => {
+            let command = arguments.get("command").and_then(Value::as_str).unwrap_or_default().to_ascii_lowercase();
+            if command.contains(" test") || command.contains(" build") || command.contains(" check") {
+                EvidenceKind::ValidationResult
+            } else {
+                EvidenceKind::TerminalInspection
+            }
+        }
+        "write_file" | "create_file" | "apply_patch" | "delete_file" | "edit_file" | "patch" => EvidenceKind::ProjectMutation,
+        _ => return None,
+    };
+    Some(state.record_evidence(kind, source, range, name, &result.to_string()))
+}
+
 fn working_control(state: &AgentState) -> String {
     let plan = clip_projection_text(
         &serde_json::to_string(&state.plan).unwrap_or_default(),
         3_600,
     );
-    let notes = clip_projection_text(&state.notes, 6_000);
-    let investigated = state.investigated_summary_bounded(24, 900).join("\n\n");
+    let notes = clip_projection_text(&state.notes, 4_000);
+    let memory = state.current_task_memory_projection(5_000);
+    let investigated = state.investigated_summary_bounded(12, 420).join("\n\n");
+    let verified_sources = state.verified_source_inventory(2_000);
     [
+        (!memory.is_empty()).then(|| format!("<current_task_memory>{memory}\nContinue from this state. Do not redo project orientation unless a concrete missing fact requires a different scope.</current_task_memory>")),
         (!notes.is_empty()).then(|| format!("<task_notes>{notes}</task_notes>")),
         Some(format!("<task_plan>{plan}</task_plan>")),
+        (!verified_sources.is_empty()).then(|| format!("<verified_source_inventory>Every listed path was successfully read during this request. This is durable verified evidence of source presence; do not later claim such a source is absent without contrary evidence.\n{verified_sources}</verified_source_inventory>")),
         (!investigated.is_empty())
             .then(|| format!("<investigated_evidence>These are deterministic runtime records, not vague prose. `complete_for_task` means facts are sufficient for this user request even when raw source is absent. `partial` means only a specifically named fact may justify a targeted range read.\n{investigated}</investigated_evidence>")),
     ]
@@ -510,8 +739,8 @@ fn normalize_plan_phases(value: Value) -> Result<Value, String> {
                 .map(|task| match task {
                     Value::String(content) => Ok(json!({"content":content,"status":"pending"})),
                     Value::Object(_) => {
-                        let content = task.get("content").and_then(Value::as_str).ok_or_else(|| "Task Plan item requires content".to_owned())?;
-                        Ok(json!({"content":content,"status":task.get("status").cloned().unwrap_or_else(|| json!("pending"))}))
+                        let content = task.get("content").or_else(|| task.get("label")).and_then(Value::as_str).ok_or_else(|| "Task Plan item requires content or label".to_owned())?;
+                        Ok(json!({"id":task.get("task_id").or_else(|| task.get("id")).cloned().unwrap_or_else(|| json!("")),"content":content,"status":task.get("status").cloned().unwrap_or_else(|| json!("pending"))}))
                     }
                     _ => Err("Task Plan item must be a string or object".to_owned()),
                 })
@@ -521,6 +750,108 @@ fn normalize_plan_phases(value: Value) -> Result<Value, String> {
         })
         .collect::<Result<Vec<_>, String>>()?;
     Ok(json!(normalized))
+}
+
+/// Plan calls are transactional. Parse and validate the complete request on a
+/// clone, then let the caller replace the canonical plan only after success.
+/// This prevents a malformed trailing batch item from leaving an earlier item
+/// applied, and makes refinement an explicit operation instead of an `init`
+/// side effect.
+fn apply_task_plan_update(current: &TaskPlan, arguments: &Value) -> Result<(TaskPlan, String), String> {
+    let action = arguments
+        .get("action")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Task Plan requires an explicit action".to_owned())?;
+    let mut candidate = current.clone();
+    match action {
+        "init" | "refine" => {
+            if action == "init" && !current.phases.is_empty() {
+                return Err("Task Plan already exists; use explicit refine to restructure it. Existing progress was preserved.".into());
+            }
+            if action == "refine" && current.phases.is_empty() {
+                return Err("Task Plan refine requires an existing plan; use init first.".into());
+            }
+            let phases = arguments
+                .get("phases")
+                .cloned()
+                .or_else(|| arguments.get("steps").cloned())
+                .ok_or_else(|| format!("Task Plan {action} requires phases"))?;
+            let mut phases = normalize_plan_phases(phases)?;
+            // IDs belong to runtime. A fresh plan always gets generated IDs;
+            // refine may carry existing IDs to rename/reorder those tasks.
+            if action == "init" {
+                if let Some(phases) = phases.as_array_mut() {
+                    for phase in phases {
+                        if let Some(tasks) = phase.get_mut("tasks").and_then(Value::as_array_mut) {
+                            for task in tasks { task["id"] = json!(""); }
+                        }
+                    }
+                }
+            }
+            let phases = serde_json::from_value(phases)
+                .map_err(|e| format!("invalid Task Plan: {e}"))?;
+            candidate.init(phases)?;
+            if action == "refine" {
+                let retained = candidate
+                    .phases
+                    .iter()
+                    .flat_map(|phase| phase.tasks.iter())
+                    .map(|task| task.id.as_str())
+                    .collect::<std::collections::HashSet<_>>();
+                for old in current.phases.iter().flat_map(|phase| phase.tasks.iter()) {
+                    if matches!(old.status, Status::Completed | Status::Abandoned)
+                        && !retained.contains(old.id.as_str())
+                    {
+                        return Err(format!(
+                            "Task Plan refine would discard completed task '{}'; retain its stable id '{}' so progress remains auditable.",
+                            old.content, old.id
+                        ));
+                    }
+                }
+            }
+        }
+        "start" | "done" | "drop" => {
+            let task = arguments
+                .get("task_id")
+                .or_else(|| arguments.get("task"))
+                .and_then(Value::as_str)
+                .filter(|task| !task.trim().is_empty())
+                .ok_or_else(|| format!("Task Plan {action} requires task"))?;
+            if action == "start" {
+                candidate.start(task)?;
+            } else {
+                candidate.finish(task, action == "drop")?;
+            }
+        }
+        "batch" => {
+            let updates = arguments
+                .get("updates")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "Task Plan batch requires updates".to_owned())?;
+            if updates.is_empty() {
+                return Err("Task Plan batch requires at least one update".into());
+            }
+            for update in updates {
+                let update_action = update
+                    .get("action")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "Task Plan batch update requires action".to_owned())?;
+                let task = update
+                    .get("task_id")
+                    .or_else(|| update.get("task"))
+                    .and_then(Value::as_str)
+                    .filter(|task| !task.trim().is_empty())
+                    .ok_or_else(|| "Task Plan batch update requires task".to_owned())?;
+                match update_action {
+                    "start" => candidate.start(task)?,
+                    "done" | "drop" => candidate.finish(task, update_action == "drop")?,
+                    _ => return Err("Task Plan batch updates must be start, done, or drop".into()),
+                }
+            }
+        }
+        _ => return Err("Task Plan action must be init, refine, start, done, drop, or batch".into()),
+    }
+    Ok((candidate, action.to_owned()))
 }
 #[derive(Default)]
 struct StreamedTurn {
@@ -1001,13 +1332,13 @@ pub fn run(config: Config) {
                 || phase_checkpoint_turn);
         if final_continuation_turn {
             transcript.remind(format!(
-                "FINAL CONTINUATION: the provider exhausted the user-facing answer after {} characters. Continue exactly from that point; do not repeat completed sections, planning, or investigation.",
-                final_content.chars().count()
+                "FINAL CONTINUATION: continue the SAME user-facing answer immediately after the exact emitted text below. Do not restart, summarize, repeat completed sections, plan, or investigate. The partial final is not complete yet.\n<already_emitted_final_tail>\n{}\n</already_emitted_final_tail>",
+                final_continuation_tail(&final_content)
             ));
         } else if phase == "synthesis" {
-            transcript.remind("SYNTHESIS CHECKPOINT: exploration is complete for the work that has complete_for_task evidence. Consolidate new durable findings into Task Notes and honestly close the plan items already covered by that evidence. Do not rediscover the project or draft the final answer in this checkpoint; the final phase will present the audit.".into());
+            transcript.remind("SYNTHESIS CHECKPOINT: consolidate durable findings, create task_checkpoint calls from existing machine evidence IDs for the covered material tasks, then close only those checkpointed tasks. Do not rediscover the project or draft the final answer in this checkpoint; the final phase will present the audit.".into());
         } else if phase == "final" {
-            transcript.remind("FINAL RESPONSE: exploration, Task Plan and Task Notes are complete. Write the user-facing answer directly from the durable evidence. Do not revisit planning, tool selection, or reconstruct the audit outline before answering.".into());
+            transcript.remind("FINAL RESPONSE: investigation is complete. Write the user-facing answer directly from the durable evidence. If the Task Plan has an open Synthesis item, it is completed only after this final response finishes. Do not revisit planning, tool selection, or reconstruct the audit outline before answering.".into());
         }
         if closeout_due_turn {
             transcript.remind(format!(
@@ -1086,10 +1417,15 @@ pub fn run(config: Config) {
                 state.investigated_summary_bounded(6, 160).join("\n")
             ));
         }
+        if state.consecutive_no_progress_turns >= 3 && !state.no_progress_nudged {
+            state.no_progress_nudged = true;
+            transcript.remind("NO PROGRESS DETECTED: recent turns did not add a successful tool result, durable evidence, Task Notes, or Task Plan state. Do not repeat the same rejected or empty strategy. Choose a different permitted action, use the durable evidence already available, or explicitly bound the unresolved fact.".into());
+        }
         // Saturation is evidence-based rather than an action cap. It gives the
-        // model an explicit closeout preference once broad audit dimensions
-        // have durable support, while preserving its freedom to name a real
-        // missing fact and continue.
+        // model an explicit broad-exploration boundary once representative
+        // audit dimensions have durable support. This is deliberately not a
+        // task-completeness decision: open items still decide whether the
+        // agent investigates or synthesizes.
         let coverage_likely_sufficient = needs_plan
             && state.investigated.len() >= 6
             && state.notes.chars().count() >= 500
@@ -1098,16 +1434,15 @@ pub fn run(config: Config) {
             state.saturation_round += 1;
             state.synthesis_nudged = true;
             transcript.remind(format!(
-                "Coverage is likely sufficient for synthesis (saturation round {}). {} investigated sources have durable evidence and Task Notes contain current findings. {} Before another broad inspection, identify one exact unresolved fact. Otherwise update/close the current Task Plan work and write the requested final audit.\n{}",
+                "Broad exploration is now saturated (round {}). {} investigated sources have durable evidence and Task Notes contain current findings. This does not complete open Task Plan items. Do not broaden the audit further; for each remaining item, either name one exact unresolved fact and use focused retrieval, or explicitly record why that fact cannot be verified before dropping the item. Synthesize only after material gaps are resolved or explicitly bounded.\n{}",
                 state.saturation_round,
                 state.investigated.len(),
-                if state.saturation_round >= 2 { "Broad batches are no longer justified: use at most one focused retrieval for that fact, then synthesize." } else { "You may retrieve only a focused fact if it is genuinely missing." },
                 state.plan.open_summary().unwrap_or_default()
             ));
         }
         if state.saturation_round >= 2 {
             transcript.remind(format!(
-                "Second saturation boundary: broad exploration capability is now withheld. If evidence is insufficient, use exactly one `read_file` call with a `reason` naming one missing fact and a narrow line range; then checkpoint that fact and synthesize. Do not list directories, reconstruct full files, run terminal alternatives, or request batches. Focused retrievals used: {}.\n{}",
+                "Second saturation boundary: broad exploration capability is now withheld. Open Task Plan items with incomplete evidence remain in investigation. For one named missing fact, use a focused `read_file` with `reason` and a narrow line range, then checkpoint what it established. Continue with another focused retrieval only for a different unresolved fact; do not list directories, reconstruct whole files, repeat covered ranges, or request broad batches. If a fact cannot be verified after reasonable focused attempts, record that limitation and explicitly drop the affected item before synthesis. Focused retrievals used: {}.\n{}",
                 state.post_saturation_retrievals,
                 state.plan.open_summary().unwrap_or_default()
             ));
@@ -1235,13 +1570,16 @@ pub fn run(config: Config) {
         let saturation_deficit_turn = !final_continuation_turn
             && state.saturation_round >= 2
             && state.open_without_complete_evidence() > 0;
+        let checkpoint_pending_turn = !final_continuation_turn && checkpoint_pending(&state);
         if saturation_deficit_turn {
             transcript.remind(format!(
-                "EVIDENCE GAP: Task Plan items still lack complete_for_task evidence. Continue the audit: name one specific missing fact and retrieve it with a narrow `read_file` start_line/end_line range and `reason`, then checkpoint it with `task_plan` or `task_notes`. Do not bulk-mark unfinished items done, and do not close out the run while the gap remains.\n{}",
+                "EVIDENCE GAP: Task Plan items still lack valid task checkpoints. If relevant machine evidence IDs are already listed in Current Task Memory, create task_checkpoint now; do not retrieve more files merely for bookkeeping. Retrieve only when a concrete factual gap remains. Do not bulk-mark unfinished items done.\n{}",
                 state.plan.open_summary().unwrap_or_default()
             ));
         }
-        let tool_choice = if planning_turn {
+        let tool_choice = if checkpoint_pending_turn {
+            json!("auto")
+        } else if planning_turn {
             // llama.cpp/Qwen honours `required` more reliably for a later
             // closeout handoff than a named function after a long tool suffix.
             // The registry still contains exactly task_plan, so this remains a
@@ -1254,16 +1592,18 @@ pub fn run(config: Config) {
         } else if saturation_deficit_turn {
             json!("auto")
         } else if notes_checkpoint_turn {
-            json!({"type":"function","function":{"name":"task_notes"}})
+            json!("auto")
         } else {
             json!("auto")
         };
         let visible_tools = if final_continuation_turn {
             json!([])
+        } else if checkpoint_pending_turn {
+            if state.saturation_round >= 2 { saturation_tools() } else { tools() }
         } else if planning_turn {
             planning_tools()
         } else if notes_checkpoint_turn {
-            notes_tools()
+            checkpoint_tools()
         } else if phase == "final" {
             json!([])
         } else if state.saturation_round >= 2 {
@@ -1271,6 +1611,14 @@ pub fn run(config: Config) {
         } else {
             tools()
         };
+        let retrieval_needed = !checkpoint_pending_turn
+            && state.open_without_complete_evidence() > 0
+            && state.memory.evidence.is_empty();
+        let visible_tools = ensure_required_tools(
+            visible_tools,
+            checkpoint_pending_turn,
+            retrieval_needed,
+        );
         let request_output_budget = if matches!(phase, "final" | "final_continuation") {
             final_output_budget(config.context_limit, projected_tokens)
         } else {
@@ -1395,9 +1743,13 @@ pub fn run(config: Config) {
                 // Keep invalid calls out of canonical assistant/tool history. This
                 // is a runtime protocol notice, never an invented user turn.
                 transcript.remind(format!("A tool call was rejected by the protocol: {e}. Emit a complete valid call or answer without tools."));
+                state.record_no_progress_turn();
                 continue;
             }
         };
+        let evidence_before_turn = state.evidence_revision;
+        let notes_before_turn = state.notes.clone();
+        let plan_before_turn = state.plan.clone();
         if calls.is_empty() {
             if final_requires_continuation(&finish, false) {
                 // A completion-exhausted prefix is never a successful final.
@@ -1444,33 +1796,49 @@ pub fn run(config: Config) {
             // recorded in canonical history (matching Jan's
             // `record_assistant_turn`), and it is not turned into an invented
             // recovery/user message.
-            // Jan grants one closeout pass when model completion leaves an
-            // explicit Todo open, but only when that open work is genuinely
-            // closeable: open with no remaining evidence gap. A saturated
-            // audit that still lacks `complete_for_task` evidence is not a
-            // completed audit: first give the model a bounded sequence of
-            // closeout passes (fill the gap or explicitly drop it), then
-            // finalize whatever state is left. If the gap is never resolved,
-            // the audit still terminates — this is an escape valve, not a hard
-            // requirement to keep the run open. The pass counter is a run-level
-            // value (`state.gap_closeout_passes`) and is reset whenever new
-            // material evidence is recorded (target saturated read, Notes
-            // checkpoint, or plan mutation).
-            let open_now = state.plan.open_count();
-            let gap_closeout = state.plan.has_open()
+            // A saturated audit with missing task-specific evidence stays in
+            // investigation while focused retrieval capacity remains. The old
+            // path armed a plan-only closeout after every tool-free response;
+            // that made one targeted read look like a cue to mark all open
+            // work done. Only after the bounded focused-retrieval budget is
+            // exhausted may the closeout valve ask the model to record an
+            // explicit limitation and drop the affected item.
+            let focused_retrieval_available = state.saturation_round >= 2
+                && state.post_saturation_retrievals < post_saturation_read_budget(&state);
+            if state.plan.has_open()
+                && !only_synthesis_work_open(&state)
                 && !closeout_due(&state)
-                && state.gap_closeout_passes < MAX_GAP_CLOSEOUT_PASSES.max(open_now.max(1));
+                && focused_retrieval_available
+            {
+                state.record_no_progress_turn();
+                continue;
+            }
+            let gap_closeout = state.plan.has_open()
+                && !only_synthesis_work_open(&state)
+                && !closeout_due(&state)
+                && state.gap_closeout_passes < MAX_GAP_CLOSEOUT_PASSES;
             // Hard escape valve: once `MAX_GAP_CLOSEOUT_PASSES` gap closeout
             // passes have been spent without a fresh evidence record, no
             // further closeout arm is allowed; the run finalizes. A fresh
             // closeout cycle may open again after new evidence (see the
             // reset sites above in the read/Notes/plan paths).
-            let can_arm = closeout_due(&state) || state.gap_closeout_passes < MAX_GAP_CLOSEOUT_PASSES;
+            let can_arm = state.gap_closeout_passes < MAX_GAP_CLOSEOUT_PASSES;
             if state.plan.has_open() && (closeout_due(&state) || gap_closeout) && can_arm
             {
                 state.gap_closeout_passes += 1;
                 plan_closeout_due = true;
+                state.record_no_progress_turn();
                 continue;
+            }
+            if state.plan.has_open() && !only_synthesis_work_open(&state) && !closeout_due(&state) {
+                emit(
+                    &config.run_id,
+                    Event::AgentError {
+                        code: "plan_unresolved".into(),
+                        message: "Task Plan still contains material items without task-specific complete evidence or a bounded dropped limitation; refusing to start a terminal final with unresolved plan state.".into(),
+                    },
+                );
+                return;
             }
             emit(
                 &config.run_id,
@@ -1485,6 +1853,9 @@ pub fn run(config: Config) {
                 final_content.push_str(&content);
                 emit(&config.run_id, Event::FinalDelta { content })
             }
+            if !final_content.trim().is_empty() {
+                finish_synthesis_after_final(&mut state, &config.run_id);
+            }
             emit(
                 &config.run_id,
                 Event::Final {
@@ -1498,6 +1869,7 @@ pub fn run(config: Config) {
             return;
         }
         transcript.assistant_tool_turn(content, &calls);
+        let mut successful_tool_execution = false;
         for tool in calls {
             emit(
                 &config.run_id,
@@ -1509,11 +1881,31 @@ pub fn run(config: Config) {
             // validation too for providers that emit an unadvertised cached
             // tool call. A named reason is the declared missing fact.
             if rejects_saturated_tool(&state, &tool) {
-                let message = format!(
-                    "Coverage is already sufficient for the audited scope, but Task Plan still has work with incomplete evidence. Use a `read_file` with `reason` naming the missing fact and a narrow line range; or use `task_plan`/`task_notes` to checkpoint the gap. Targeted reads left: {}/{}.",
-                    post_saturation_read_budget(&state) - state.post_saturation_retrievals.min(post_saturation_read_budget(&state)),
-                    post_saturation_read_budget(&state)
+                let message = saturated_rejection_message(&state, &tool);
+                emit(
+                    &config.run_id,
+                    Event::ToolError {
+                        id: tool.id.clone(),
+                        name: tool.name.clone(),
+                        message: message.clone(),
+                    },
                 );
+                transcript.tool_result(&tool.id, &tool.name, format!("ERROR: {message}"));
+                continue;
+            }
+            if let Some(message) = plan_completion_error(&state, &tool) {
+                emit(
+                    &config.run_id,
+                    Event::ToolError {
+                        id: tool.id.clone(),
+                        name: tool.name.clone(),
+                        message: message.clone(),
+                    },
+                );
+                transcript.tool_result(&tool.id, &tool.name, format!("ERROR: {message}"));
+                continue;
+            }
+            if let Some(message) = state.repeated_strategy_message(&tool.name, &tool.arguments) {
                 emit(
                     &config.run_id,
                     Event::ToolError {
@@ -1561,6 +1953,7 @@ pub fn run(config: Config) {
                 transcript.tool_result(&tool.id, &tool.name, "ERROR: approval required".into());
                 continue;
             }
+            let strategy_evidence_before = state.evidence_revision;
             let targeted_read = tool.name == "read_file"
                 && (tool.arguments.get("start_line").is_some()
                     || tool.arguments.get("end_line").is_some()
@@ -1599,11 +1992,17 @@ pub fn run(config: Config) {
                             .and_then(Value::as_str)
                             .unwrap_or_default()
                             .to_owned();
-                        state.merge_notes(&incoming_notes);
-                        state.checkpoint_source_evidence(
+                        let notes_changed = state.merge_notes(&incoming_notes);
+                        let evidence_changed = state.checkpoint_source_evidence(
                             tool.arguments.get("evidence").unwrap_or(&Value::Null),
                         );
+                        let hypotheses_changed = state.checkpoint_hypotheses(
+                            tool.arguments.get("hypotheses").unwrap_or(&Value::Null),
+                        );
                         state.checkpoint_notes();
+                        if notes_changed || evidence_changed || hypotheses_changed {
+                            state.record_progress();
+                        }
                         // A Notes checkpoint is new material evidence for the run
                         // and clears the gap-closeout escape valve so the next
                         // closeout cycle can open fresh once the model wants to
@@ -1617,76 +2016,31 @@ pub fn run(config: Config) {
                         );
                         Ok((json!({"updated":true}), None))
                     }
-                    "task_plan" => (|| -> Result<(Value, Option<String>), String> {
-                        let action = tool
-                            .arguments
-                            .get("action")
-                            .and_then(Value::as_str)
-                            .unwrap_or("init");
-                        match action {
-                            "init" => {
-                                let phases = tool
-                                    .arguments
-                                    .get("phases")
-                                    .cloned()
-                                    .or_else(|| tool.arguments.get("steps").cloned())
-                                    .ok_or_else(|| "Task Plan init requires phases".to_owned())?;
-                                let phases = normalize_plan_phases(phases)?;
-                                state.plan.init(
-                                    serde_json::from_value(phases)
-                                        .map_err(|e| format!("invalid Task Plan: {e}"))?,
-                                )?;
-                            }
-                            "start" | "done" | "drop" => {
-                                let task = tool
-                                    .arguments
-                                    .get("task")
-                                    .and_then(Value::as_str)
-                                    .filter(|task| !task.trim().is_empty())
-                                    .ok_or_else(|| format!("Task Plan {action} requires task"))?;
-                                if action == "start" {
-                                    state.plan.start(task)?;
-                                } else {
-                                    state.plan.finish(task, action == "drop")?;
-                                }
-                            }
-                            "batch" => {
-                                let updates = tool
-                                    .arguments
-                                    .get("updates")
-                                    .and_then(Value::as_array)
-                                    .ok_or_else(|| "Task Plan batch requires updates".to_owned())?;
-                                for update in updates {
-                                    let action =
-                                        update.get("action").and_then(Value::as_str).ok_or_else(
-                                            || "Task Plan batch update requires action".to_owned(),
-                                        )?;
-                                    let task = update
-                                        .get("task")
-                                        .and_then(Value::as_str)
-                                        .filter(|task| !task.trim().is_empty())
-                                        .ok_or_else(|| {
-                                            "Task Plan batch update requires task".to_owned()
-                                        })?;
-                                    match action {
-                                        "start" => state.plan.start(task)?,
-                                        "done" | "drop" => {
-                                            state.plan.finish(task, action == "drop")?
-                                        }
-                                        _ => return Err(
-                                            "Task Plan batch updates must be start, done, or drop"
-                                                .into(),
-                                        ),
-                                    }
-                                }
-                            }
-                            _ => {
-                                return Err(
-                                    "Task Plan action must be init, start, done, drop, or batch"
-                                        .into(),
-                                )
-                            }
+                    "task_checkpoint" => (|| -> Result<(Value, Option<String>), String> {
+                        let task_id = tool.arguments.get("task_id").and_then(Value::as_str)
+                            .ok_or_else(|| "task_checkpoint requires task_id".to_owned())?;
+                        let evidence_ids = tool.arguments.get("evidence_ids").and_then(Value::as_array)
+                            .ok_or_else(|| "task_checkpoint requires evidence_ids".to_owned())?
+                            .iter().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>();
+                        let findings = tool.arguments.get("findings").and_then(Value::as_array)
+                            .map(|items| items.iter().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>())
+                            .unwrap_or_default();
+                        let unresolved = tool.arguments.get("unresolved").and_then(Value::as_array)
+                            .map(|items| items.iter().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>())
+                            .unwrap_or_default();
+                        let complete = tool.arguments.get("complete").and_then(Value::as_bool).unwrap_or(false);
+                        state.checkpoint_task(task_id, &evidence_ids, &findings, complete, &unresolved)?;
+                        state.gap_closeout_passes = 0;
+                        if complete {
+                            emit(&config.run_id, Event::PlanUpdate {
+                                plan: serde_json::to_value(&state.plan).map_err(|error| error.to_string())?,
+                            });
                         }
+                        Ok((json!({"checkpointed":true,"task_id":task_id,"complete":complete,"evidence_ids":evidence_ids}), None))
+                    })(),
+                    "task_plan" => (|| -> Result<(Value, Option<String>), String> {
+                        let (candidate, action) = apply_task_plan_update(&state.plan, &tool.arguments)?;
+                        state.plan = candidate;
                         emit(
                             &config.run_id,
                             Event::PlanUpdate {
@@ -1702,8 +2056,12 @@ pub fn run(config: Config) {
                         // starts fresh.
                         plan_closeout_due = false;
                         state.gap_closeout_passes = 0;
+                        state.record_progress();
                         state.mark_plan_checkpoint();
                         let (completed, total) = state.plan.progress();
+                        let task_ids = state.plan.phases.iter().flat_map(|phase| phase.tasks.iter()).map(|task| {
+                            json!({"task_id":task.id,"label":task.content})
+                        }).collect::<Vec<_>>();
                         if state
                             .plan
                             .active_phase()
@@ -1718,7 +2076,7 @@ pub fn run(config: Config) {
                             );
                         }
                         Ok((
-                            json!({"updated":true,"action":action,"completed":completed,"total":total,"open":state.plan.open_summary()}),
+                            json!({"updated":true,"action":action,"completed":completed,"total":total,"open":state.plan.open_summary(),"tasks":task_ids}),
                             None,
                         ))
                     })(),
@@ -1795,9 +2153,18 @@ pub fn run(config: Config) {
                 }
             };
             match result {
-                Ok((value, diff)) => {
+                Ok((mut value, diff)) => {
                     let material_new_evidence = (!reuses_existing_investigation)
                         && record_tool_evidence(&mut state, &tool.name, &tool.arguments, &value);
+                    let machine_evidence_id = (!reuses_existing_investigation)
+                        .then(|| record_machine_evidence(&mut state, &tool.name, &tool.arguments, &value))
+                        .flatten();
+                    if let Some(evidence_id) = machine_evidence_id {
+                        if let Some(object) = value.as_object_mut() {
+                            object.insert("evidence_id".into(), json!(evidence_id));
+                        }
+                    }
+                    state.record_strategy(&tool.name, &tool.arguments, strategy_evidence_before);
                     if matches!(tool.name.as_str(), "write_file" | "create_file" | "apply_patch" | "delete_file" | "edit_file" | "patch") {
                         if let Some(path) = tool.arguments.get("path").and_then(Value::as_str) {
                             state.invalidate_path(path);
@@ -1816,6 +2183,11 @@ pub fn run(config: Config) {
                         // the model may reasonably continue to the next focused
                         // question rather than being forced to synthesize.
                         state.synthesis_nudged = false;
+                    }
+                    if material_new_evidence
+                        || matches!(tool.name.as_str(), "write_file" | "create_file" | "apply_patch" | "delete_file" | "edit_file" | "patch")
+                    {
+                        successful_tool_execution = true;
                     }
                     if state.saturation_round >= 2 && tool.name == "read_file" {
                         let reason = tool
@@ -1883,6 +2255,15 @@ pub fn run(config: Config) {
                     transcript.tool_result(&tool.id, &tool.name, format!("ERROR: {error}"))
                 }
             }
+        }
+        if successful_tool_execution
+            || state.evidence_revision != evidence_before_turn
+            || state.notes != notes_before_turn
+            || state.plan != plan_before_turn
+        {
+            state.record_progress();
+        } else {
+            state.record_no_progress_turn();
         }
     }
     emit(
@@ -1985,6 +2366,59 @@ mod projection_tests {
         assert!(final_continuation_available(0));
         assert!(final_continuation_available(MAX_FINAL_CONTINUATIONS - 1));
         assert!(!final_continuation_available(MAX_FINAL_CONTINUATIONS));
+    }
+
+    #[test]
+    fn final_continuation_includes_exact_emitted_tail() {
+        let content = format!("opening\n{}\nexact ending", "x".repeat(FINAL_CONTINUATION_TAIL_CHARS + 20));
+        let tail = final_continuation_tail(&content);
+        assert!(tail.contains("exact ending"));
+        assert!(tail.contains("earlier final content omitted"));
+        assert!(!tail.contains("opening"));
+    }
+
+    #[test]
+    fn task_plan_updates_are_atomic_and_refinement_preserves_terminal_work() {
+        let mut current = TaskPlan::default();
+        current
+            .init(vec![crate::agent::todo::Phase {
+                name: "Inspect".into(),
+                tasks: vec![
+                    crate::agent::todo::Item { id: String::new(), content: "structure".into(), status: Status::Pending },
+                    crate::agent::todo::Item { id: String::new(), content: "routing".into(), status: Status::Pending },
+                ],
+            }])
+            .unwrap();
+        current.finish("structure", false).unwrap();
+        let before = current.clone();
+        assert!(apply_task_plan_update(
+            &current,
+            &json!({"action":"batch","updates":[
+                {"action":"done","task":"routing"},
+                {"action":"done","task":"missing"}
+            ]})
+        )
+        .is_err());
+        assert_eq!(current, before);
+        assert!(apply_task_plan_update(
+            &current,
+            &json!({"action":"init","phases":[{"name":"Replacement","tasks":["new"]}]})
+        )
+        .is_err());
+        let (refined, _) = apply_task_plan_update(
+            &current,
+            &json!({"action":"refine","phases":[
+                {"name":"Inspect","tasks":["structure","routing"]},
+                {"name":"Synthesis","tasks":["write final"]}
+            ]}),
+        )
+        .unwrap();
+        assert_eq!(refined.progress().0, 1);
+        assert!(apply_task_plan_update(
+            &current,
+            &json!({"action":"refine","phases":[{"name":"Replacement","tasks":["new"]}]})
+        )
+        .is_err());
     }
 
     #[test]
@@ -2092,15 +2526,15 @@ mod projection_tests {
     }
 
     #[test]
-    fn notes_checkpoint_exposes_only_the_real_notes_capability() {
-        let note_tools = notes_tools();
+    fn checkpoint_turn_exposes_notes_and_simple_task_checkpoint() {
+        let note_tools = checkpoint_tools();
         let names = note_tools
             .as_array()
             .unwrap()
             .iter()
             .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
             .collect::<Vec<_>>();
-        assert_eq!(names, vec!["task_notes"]);
+        assert_eq!(names, vec!["task_checkpoint", "task_notes"]);
     }
 
     #[test]
@@ -2220,6 +2654,122 @@ mod projection_tests {
     }
 
     #[test]
+    fn final_projection_contains_structured_verified_memory_after_compaction() {
+        let mut state = AgentState::default();
+        state.plan.init(vec![crate::agent::todo::Phase {
+            name: "Analysis".into(),
+            tasks: vec![crate::agent::todo::Item { id: String::new(), content: "architecture".into(), status: Status::Pending }],
+        }]).unwrap();
+        let task_id = state.plan.active_task().unwrap().id.clone();
+        record_tool_evidence(
+            &mut state,
+            "read_file",
+            &json!({"path":"public/api.php", "start_line":1, "end_line":80}),
+            &json!({"content":"<?php handleOrderForm();"}),
+        );
+        let evidence = record_machine_evidence(
+            &mut state, "read_file", &json!({"path":"public/api.php", "start_line":1, "end_line":80}),
+            &json!({"content":"<?php handleOrderForm();"}),
+        ).unwrap();
+        state.checkpoint_task(&task_id, &[evidence], &["public/api.php exists and contains an order handler".into()], true, &[]).unwrap();
+        for index in 0..32 {
+            record_tool_evidence(
+                &mut state,
+                "read_file",
+                &json!({"path":format!("src/{index}.tsx")}),
+                &json!({"content":"export default null"}),
+            );
+        }
+        let mut transcript = Transcript::default();
+        transcript.push_run_user(json!({"role":"user","content":"write final audit"}));
+        transcript.compact(compacted_working_state(&transcript, 1, &state), 1);
+        let final_projection = project(&transcript, "FINAL RESPONSE", &working_control(&state));
+        let control = final_projection[0]["content"].as_str().unwrap();
+        assert!(control.contains("CURRENT TASK MEMORY"));
+        assert!(control.contains("ev-1"));
+        assert!(control.contains("public/api.php exists and contains an order handler"));
+    }
+
+    #[test]
+    fn completion_gate_requires_checkpoint_before_saturation_and_accepts_machine_evidence() {
+        let mut state = AgentState::default();
+        state.plan.init(vec![crate::agent::todo::Phase {
+            name: "Analysis".into(),
+            tasks: vec![crate::agent::todo::Item { id: String::new(), content: "trace backend".into(), status: Status::Pending }],
+        }]).unwrap();
+        let task_id = state.plan.active_task().unwrap().id.clone();
+        let call = |task: &str| ValidatedCall { id: "plan".into(), name: "task_plan".into(), arguments: json!({"action":"done","task":task}) };
+        assert!(plan_completion_error(&state, &call(&task_id)).unwrap().contains("task_checkpoint"));
+        let evidence = state.record_evidence(crate::agent::state::EvidenceKind::FileRead, "public/api.php".into(), None, "read_file", "handler");
+        state.checkpoint_task(&task_id, &[evidence], &["backend handler exists".into()], true, &[]).unwrap();
+        assert!(plan_completion_error(&state, &call(&task_id)).is_none());
+    }
+
+    #[test]
+    fn checkpoint_pending_repairs_plan_only_registry_before_and_after_compaction() {
+        let mut state = AgentState::default();
+        state.plan.init(vec![crate::agent::todo::Phase {
+            name: "Analysis".into(),
+            tasks: vec![crate::agent::todo::Item { id: String::new(), content: "trace backend".into(), status: Status::Pending }],
+        }]).unwrap();
+        state.record_evidence(crate::agent::state::EvidenceKind::FileRead, "public/api.php".into(), None, "read_file", "handler");
+        assert!(checkpoint_pending(&state));
+        let before = ensure_required_tools(planning_tools(), true, false);
+        let mut transcript = Transcript::default();
+        transcript.push_run_user(json!({"role":"user","content":"audit"}));
+        transcript.compact(compacted_working_state(&transcript, 1, &state), 1);
+        let after = ensure_required_tools(planning_tools(), checkpoint_pending(&state), false);
+        for registry in [before, after] {
+            assert!(registry.as_array().unwrap().iter().any(|tool| tool.pointer("/function/name").and_then(Value::as_str) == Some("task_checkpoint")));
+        }
+    }
+
+    #[test]
+    fn complete_checkpoint_closes_current_task_and_promotes_successor() {
+        let mut state = AgentState::default();
+        state.plan.init(vec![crate::agent::todo::Phase {
+            name: "Analysis".into(),
+            tasks: vec![
+                crate::agent::todo::Item { id: String::new(), content: "first".into(), status: Status::Pending },
+                crate::agent::todo::Item { id: String::new(), content: "second".into(), status: Status::Pending },
+            ],
+        }]).unwrap();
+        let first = state.plan.active_task().unwrap().id.clone();
+        let evidence = state.record_evidence(crate::agent::state::EvidenceKind::FileRead, "src/a.rs".into(), None, "read_file", "fact");
+        state.checkpoint_task(&first, &[evidence], &["first is established".into()], true, &[]).unwrap();
+        assert_eq!(state.plan.progress(), (1, 2));
+        assert_eq!(state.plan.active_task().unwrap().content, "second");
+    }
+
+    #[test]
+    fn fresh_init_generates_ids_and_existing_operations_accept_task_id_only() {
+        let current = TaskPlan::default();
+        let (plan, _) = apply_task_plan_update(&current, &json!({
+            "action":"init", "phases":[{"name":"Inspect","tasks":[{"label":"map project"}]}]
+        })).unwrap();
+        let task_id = plan.active_task().unwrap().id.clone();
+        assert_eq!(task_id, "task-1");
+        let (started, _) = apply_task_plan_update(&plan, &json!({"action":"start","task_id":task_id})).unwrap();
+        assert_eq!(started.active_task().unwrap().id, "task-1");
+        assert!(apply_task_plan_update(&plan, &json!({"action":"start","task_id":"task-999"})).is_err());
+    }
+
+    #[test]
+    fn successful_read_registers_machine_evidence_without_notes_schema() {
+        let mut state = AgentState::default();
+        let first = record_machine_evidence(
+            &mut state, "read_file", &json!({"path":"public/api.php","start_line":1,"end_line":40}),
+            &json!({"content":"handleOrder();"}),
+        ).unwrap();
+        let repeated = record_machine_evidence(
+            &mut state, "read_file", &json!({"path":"public/api.php","start_line":1,"end_line":40}),
+            &json!({"content":"handleOrder();"}),
+        ).unwrap();
+        assert_eq!(first, repeated);
+        assert_eq!(state.memory.evidence.len(), 1);
+    }
+
+    #[test]
     fn second_saturation_exposes_targeted_retrieval_and_write_capability() {
         let saturation = saturation_tools();
         let names = saturation
@@ -2230,7 +2780,7 @@ mod projection_tests {
             .collect::<Vec<_>>();
         assert_eq!(
             names,
-            vec!["read_file", "write_file", "create_file", "apply_patch", "delete_file", "run_terminal", "task_plan", "task_notes"],
+            vec!["read_file", "write_file", "create_file", "apply_patch", "delete_file", "run_terminal", "task_plan", "task_checkpoint", "task_notes"],
             "saturation narrows broad exploration but keeps the sanctioned write toolset"
         );
         let read = saturation
@@ -2253,7 +2803,7 @@ mod projection_tests {
             saturation_round: 2,
             ..AgentState::default()
         };
-        for name in ["task_plan", "task_notes"] {
+        for name in ["task_plan", "task_checkpoint", "task_notes"] {
             assert!(
                 !rejects_saturated_tool(
                     &state,
@@ -2298,6 +2848,7 @@ mod projection_tests {
             .init(vec![crate::agent::todo::Phase {
                 name: "Analysis".into(),
                 tasks: vec![crate::agent::todo::Item {
+                    id: String::new(),
                     content: "write audit".into(),
                     status: crate::agent::todo::Status::Pending,
                 }],
@@ -2312,7 +2863,7 @@ mod projection_tests {
 
         // Once the open item carries complete evidence, the gap is closed and
         // the turn consolidates: the saturated audit leaves investigation.
-        state.checkpoint_source_evidence(&json!([{"path":"core","complete_for_task":true,"facts":["audit content settled"],"unresolved":[]}]));
+        state.checkpoint_source_evidence(&json!([{"path":"core","tasks":["write audit"],"complete_for_task":true,"facts":["audit content settled"],"unresolved":[]}]));
         assert_eq!(state.open_without_complete_evidence(), 0);
         assert_eq!(phase_for(&state, true, 9), "synthesis");
         // The closeout valve may now hand the plan to the model for an honest
@@ -2336,14 +2887,17 @@ mod projection_tests {
                     name: "Analysis".into(),
                     tasks: vec![
                         crate::agent::todo::Item {
+                            id: String::new(),
                             content: "inspect core files".into(),
                             status: crate::agent::todo::Status::Pending,
                         },
                         crate::agent::todo::Item {
+                            id: String::new(),
                             content: "assess architecture".into(),
                             status: crate::agent::todo::Status::Pending,
                         },
                         crate::agent::todo::Item {
+                            id: String::new(),
                             content: "write audit".into(),
                             status: crate::agent::todo::Status::Pending,
                         },
@@ -2376,16 +2930,17 @@ mod projection_tests {
         assert!(rejects_saturated_tool(&state, &wide_read), "wide tool must stay refused in saturation");
 
         // Filling the gaps unlocks consolidation, step by step.
-        state.checkpoint_source_evidence(&json!([{"path":"core","complete_for_task":true,"facts":["core layout mapped"],"unresolved":[]}]));
+        state.checkpoint_source_evidence(&json!([{"path":"core","tasks":["inspect core files"],"complete_for_task":true,"facts":["core layout mapped"],"unresolved":[]}]));
         state.plan.finish("inspect core files", false).unwrap();
-        assert_eq!(state.open_without_complete_evidence(), 1);
-        state.checkpoint_source_evidence(&json!([{"path":"arch","complete_for_task":true,"facts":["architecture reviewed"],"unresolved":[]}]));
+        assert_eq!(state.open_without_complete_evidence(), 2);
+        state.checkpoint_source_evidence(&json!([{"path":"arch","tasks":["assess architecture"],"complete_for_task":true,"facts":["architecture reviewed"],"unresolved":[]}]));
         state.plan.finish("assess architecture", false).unwrap();
-        // Two complete checkpoints cover the one remaining open item's gap.
+        // Evidence for closed tasks cannot cover the remaining audit task.
+        assert_eq!(state.open_without_complete_evidence(), 1);
+        state.checkpoint_source_evidence(&json!([{"path":"audit","tasks":["write audit"],"complete_for_task":true,"facts":["audit settled"],"unresolved":[]}]));
         assert_eq!(state.open_without_complete_evidence(), 0);
         assert_eq!(phase_for(&state, true, 9), "synthesis");
         assert!(closeout_due(&state));
-        state.checkpoint_source_evidence(&json!([{"path":"audit","complete_for_task":true,"facts":["audit settled"],"unresolved":[]}]));
         state.plan.finish("write audit", false).unwrap();
         assert!(!state.plan.has_open());
         assert_eq!(phase_for(&state, true, 10), "final");
@@ -2412,6 +2967,7 @@ mod projection_tests {
             .collect();
         assert!(names.contains(&"read_file"), "targeted reads must stay available: {names:?}");
         assert!(names.contains(&"task_notes"), "evidence checkpointing must stay available: {names:?}");
+        assert!(names.contains(&"task_checkpoint"), "simple task checkpointing must stay available: {names:?}");
         assert!(names.contains(&"task_plan"), "plan handoff must stay available: {names:?}");
         // Implementation runs must not lose their write capability in
         // saturation: the user asked for changes, not only for an audit.
@@ -2582,6 +3138,7 @@ mod projection_tests {
                 name: "Analysis".into(),
                 tasks: (0..6)
                     .map(|i| crate::agent::todo::Item {
+                        id: String::new(),
                         content: format!("item {i}"),
                         status: crate::agent::todo::Status::Pending,
                     })
@@ -2623,14 +3180,15 @@ mod projection_tests {
             "same-range saturated read must be rejected even while budget remains"
         );
 
-        // An overlapping range on the same file is also a repeat:
-        // the model already holds that evidence for the overlapping block.
+        // A partly overlapping range still exposes new lines, so it is a
+        // valid targeted lookup for a different missing fact.
         let overlap = ValidatedCall {
             id: "r3".into(),
             name: "read_file".into(),
             arguments: json!({"path":"src/core.rs","reason":"related fact","start_line":15,"end_line":25}),
         };
-        assert!(rejects_saturated_tool(&state, &overlap), "overlap on the same file is a repeat");
+        assert!(!rejects_saturated_tool(&state, &overlap), "overlap with new lines must stay available");
+        state.record_saturated_range("src/core.rs", 15, 25);
         // A range fully inside the covered block is likewise a repeat.
         let inside = ValidatedCall {
             id: "r3b".into(),
@@ -2665,6 +3223,31 @@ mod projection_tests {
     }
 
     #[test]
+    fn complete_evidence_must_name_the_open_task_it_covers() {
+        let mut state = AgentState::default();
+        state.saturation_round = 2;
+        state.plan.init(vec![crate::agent::todo::Phase {
+            name: "Analysis".into(),
+            tasks: vec![
+                crate::agent::todo::Item { id: String::new(), content: "trace requests".into(), status: crate::agent::todo::Status::Pending },
+                crate::agent::todo::Item { id: String::new(), content: "assess persistence".into(), status: crate::agent::todo::Status::Pending },
+            ],
+        }]).unwrap();
+        state.checkpoint_source_evidence(&json!([
+            {"path":"src/http.rs","tasks":["trace requests"],"facts":["client retries once"],"unresolved":[],"complete_for_task":true},
+            {"path":"src/other.rs","tasks":["obsolete task"],"facts":["unrelated"],"unresolved":[],"complete_for_task":true}
+        ]));
+        assert_eq!(state.open_without_complete_evidence(), 1);
+        assert_eq!(phase_for(&state, true, 8), "investigate");
+
+        state.checkpoint_source_evidence(&json!([
+            {"path":"src/db.rs","tasks":["assess persistence"],"facts":["writes are transactional"],"unresolved":[],"complete_for_task":true}
+        ]));
+        assert_eq!(state.open_without_complete_evidence(), 0);
+        assert_eq!(phase_for(&state, true, 9), "synthesis");
+    }
+
+    #[test]
     fn gap_closeout_valve_is_bounded_and_resets_on_new_evidence() {
         // Termination guarantee: a saturated deep audit cannot cycle through
         // the closeout handoff forever claiming to want more evidence. After
@@ -2677,8 +3260,8 @@ mod projection_tests {
         state.plan.init(vec![crate::agent::todo::Phase {
             name: "Analysis".into(),
             tasks: vec![
-                crate::agent::todo::Item { content: "inspect core".into(), status: crate::agent::todo::Status::Pending },
-                crate::agent::todo::Item { content: "assess".into(), status: crate::agent::todo::Status::Pending },
+                crate::agent::todo::Item { id: String::new(), content: "inspect core".into(), status: crate::agent::todo::Status::Pending },
+                crate::agent::todo::Item { id: String::new(), content: "assess".into(), status: crate::agent::todo::Status::Pending },
             ],
         }]).unwrap();
         assert!(state.plan.has_open());
@@ -2736,7 +3319,7 @@ mod projection_tests {
         state.record_investigation("read_file", "src/core.rs".into(), big.clone(), false);
         state.checkpoint_source_evidence(
             &json!([
-                {"path":"src/core.rs","facts":["fact A","fact B"],"relevance":["audit core"],"unresolved":[],"complete_for_task":true}
+                {"path":"src/core.rs","tasks":["audit core"],"facts":["fact A","fact B"],"relevance":["audit core"],"unresolved":[],"complete_for_task":true}
             ]),
         );
         let item = state

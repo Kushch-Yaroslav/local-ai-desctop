@@ -22,6 +22,8 @@ impl Status {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Item {
+    #[serde(default)]
+    pub id: String,
     pub content: String,
     #[serde(default)]
     pub status: Status,
@@ -64,6 +66,9 @@ impl TaskPlan {
             })
             .map(|phase| phase.name.as_str())
     }
+    pub fn active_task(&self) -> Option<&Item> {
+        self.items().find(|item| item.status == Status::InProgress)
+    }
     pub fn open_summary(&self) -> Option<String> {
         let entries: Vec<_> = self
             .phases
@@ -73,8 +78,8 @@ impl TaskPlan {
                     .tasks
                     .iter()
                     .filter_map(move |task| match task.status {
-                        Status::Pending => Some(format!("• [{}] {}", phase.name, task.content)),
-                        Status::InProgress => Some(format!("→ [{}] {}", phase.name, task.content)),
+                        Status::Pending => Some(format!("• [{}] {} — {}", phase.name, task.id, task.content)),
+                        Status::InProgress => Some(format!("→ [{}] {} — {}", phase.name, task.id, task.content)),
                         _ => None,
                     })
             })
@@ -86,12 +91,18 @@ impl TaskPlan {
         // terminal state of unchanged task labels so refinement never makes
         // evidence look unexplored again. New labels remain model-authored
         // pending work and ordering is still normalized below.
-        let previous = self
+        let previous_by_label = self
             .items()
-            .map(|item| (item.content.clone(), item.status))
+            .map(|item| (item.content.clone(), (item.id.clone(), item.status)))
+            .collect::<std::collections::HashMap<_, _>>();
+        let previous_by_id = self
+            .items()
+            .map(|item| (item.id.clone(), item.status))
             .collect::<std::collections::HashMap<_, _>>();
         let mut phase_names = std::collections::HashSet::new();
         let mut task_names = std::collections::HashSet::new();
+        let mut task_ids = std::collections::HashSet::new();
+        let mut next_id = self.next_task_number();
         for phase in &mut phases {
             if phase.name.trim().is_empty() || !phase_names.insert(phase.name.clone()) {
                 return Err("Task Plan phases must have unique names".into());
@@ -100,9 +111,23 @@ impl TaskPlan {
                 if task.content.trim().is_empty() || !task_names.insert(task.content.clone()) {
                     return Err("Task Plan tasks must be non-empty and unique".into());
                 }
-                task.status = previous
-                    .get(&task.content)
+                if task.id.trim().is_empty() {
+                    task.id = previous_by_label
+                        .get(&task.content)
+                        .map(|(id, _)| id.clone())
+                        .unwrap_or_else(|| {
+                            let id = format!("task-{next_id}");
+                            next_id += 1;
+                            id
+                        });
+                }
+                if !task_ids.insert(task.id.clone()) {
+                    return Err("Task Plan task ids must be unique".into());
+                }
+                task.status = previous_by_id
+                    .get(&task.id)
                     .copied()
+                    .or_else(|| previous_by_label.get(&task.content).map(|(_, status)| *status))
                     .unwrap_or(Status::Pending);
             }
         }
@@ -151,7 +176,21 @@ impl TaskPlan {
             .flat_map(|phase| phase.tasks.iter_mut())
     }
     fn index_of(&self, task: &str) -> Option<usize> {
-        self.items().position(|item| item.content == task)
+        self.items()
+            .position(|item| item.id == task)
+            .or_else(|| self.items().position(|item| item.content == task))
+    }
+    pub fn item_by_ref(&self, task: &str) -> Option<&Item> {
+        self.items()
+            .find(|item| item.id == task)
+            .or_else(|| self.items().find(|item| item.content == task))
+    }
+    fn next_task_number(&self) -> usize {
+        self.items()
+            .filter_map(|item| item.id.strip_prefix("task-").and_then(|value| value.parse::<usize>().ok()))
+            .max()
+            .unwrap_or(0)
+            + 1
     }
     fn item_mut(&mut self, mut index: usize) -> Option<&mut Item> {
         for phase in &mut self.phases {
@@ -181,6 +220,7 @@ mod tests {
             tasks: tasks
                 .iter()
                 .map(|content| Item {
+                    id: String::new(),
                     content: (*content).into(),
                     status: Status::Completed,
                 })
@@ -221,5 +261,20 @@ mod tests {
         let setup = &plan.phases[0].tasks;
         assert_eq!(setup[0].status, Status::Completed);
         assert_eq!(setup[1].status, Status::InProgress);
+    }
+
+    #[test]
+    fn refinement_preserves_stable_id_when_label_changes() {
+        let mut plan = TaskPlan::default();
+        plan.init(vec![phase("Analysis", &["history hypothesis"])]).unwrap();
+        let id = plan.active_task().unwrap().id.clone();
+        plan.finish(&id, false).unwrap();
+        plan.init(vec![Phase {
+            name: "Analysis".into(),
+            tasks: vec![Item { id: id.clone(), content: "project history hypothesis".into(), status: Status::Pending }],
+        }]).unwrap();
+        assert_eq!(plan.active_task(), None);
+        assert_eq!(plan.progress(), (1, 1));
+        assert_eq!(plan.phases[0].tasks[0].id, id);
     }
 }
