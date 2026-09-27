@@ -45,7 +45,8 @@ pub struct Config {
 pub const DEFAULT_COMPACTION_RATIO: f64 = 0.80;
 pub const DEFAULT_KEEP_RECENT: usize = 8;
 pub const SAFETY_RESERVE_TOKENS: usize = 1_024;
-pub const MIN_OUTPUT_HEADROOM_TOKENS: usize = 1_024;
+pub const PREFERRED_OUTPUT_HEADROOM_TOKENS: usize = 1_024;
+pub const MIN_USEFUL_OUTPUT_TOKENS: usize = 32;
 pub const APPLICATION_MAX_OUTPUT_TOKENS: usize = 32_768;
 pub const MAX_COMPACTION_ATTEMPTS: usize = 4;
 pub const MAX_CONTINUATION_TURNS: usize = 32;
@@ -53,8 +54,9 @@ pub const MAX_LOGICAL_FINAL_CHARS: usize = 1_000_000;
 pub const PLAN_NUDGE_ACTION_THRESHOLD: usize = 12;
 pub const PLAN_NUDGE_MAX_PER_RUN: usize = 2;
 pub const SUMMARY_INPUT_CHARS: usize = 48_000;
-pub const SUMMARY_MAX_OUTPUT_TOKENS: usize = 4_096;
-pub const MIN_SUMMARY_OUTPUT_TOKENS: usize = 256;
+pub const SUMMARY_MAX_OUTPUT_TOKENS: usize = 1_024;
+pub const MIN_SUMMARY_OUTPUT_TOKENS: usize = 64;
+const SUMMARY_MAX_CHARS: usize = 3_072;
 
 const AGENT_GUIDANCE: &str = r#"
 # Local AI Desktop Agent
@@ -99,6 +101,41 @@ pub fn dynamic_output_limit(
         .min(app_max_output)
 }
 
+fn request_reasoning(config: &Config) -> Value {
+    match policy::reasoning(&config.reasoning_mode, "agent") {
+        Reasoning::Off => json!({"chat_template_kwargs":{"enable_thinking":false}}),
+        Reasoning::Low => json!({"reasoning_effort":"low"}),
+        Reasoning::Deep => json!({"reasoning_effort":"xhigh"}),
+    }
+}
+
+fn request_payload(
+    config: &Config,
+    messages: &[Value],
+    schemas: &[Value],
+    continuation_only: bool,
+    max_tokens: usize,
+) -> Value {
+    let mut payload = json!({
+        "model": config.model,
+        "messages": messages,
+        "stream": true,
+        "stream_options": {"include_usage": true},
+        "max_tokens": max_tokens,
+    });
+    if !continuation_only {
+        payload["tools"] = json!(turn_tools(schemas, false));
+        payload["tool_choice"] = json!("auto");
+    }
+    payload.as_object_mut().expect("request payload").extend(
+        request_reasoning(config)
+            .as_object()
+            .expect("reasoning payload")
+            .clone(),
+    );
+    payload
+}
+
 fn estimate_tokens(value: &Value) -> usize {
     // Conservative enough for JSON-heavy local tool prompts. Provider-reported
     // usage remains authoritative telemetry.
@@ -108,6 +145,126 @@ fn estimate_tokens(value: &Value) -> usize {
         .count()
         / 3
         + 8
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RequestBudget {
+    projected_input_tokens: usize,
+    stable_prefix_tokens: usize,
+    tool_schemas_tokens: usize,
+    transcript_history_tokens: usize,
+    dynamic_tail_tokens: usize,
+}
+
+fn request_budget(
+    config: &Config,
+    messages: &[Value],
+    schemas: &[Value],
+    continuation_only: bool,
+) -> RequestBudget {
+    let payload = request_payload(config, messages, schemas, continuation_only, 0);
+    let mut transcript = Vec::new();
+    let mut dynamic = Vec::new();
+    for message in messages.iter().skip(1) {
+        let content = message.get("content").and_then(Value::as_str).unwrap_or("");
+        if content.starts_with("[RUNTIME GUIDANCE — NOT USER CONTENT]")
+            || content.starts_with("[RUNTIME SUMMARY — NOT USER CONTENT]")
+            || content.starts_with("[IMPORTED SYSTEM CONTEXT — NOT USER CONTENT]")
+        {
+            dynamic.push(message.clone());
+        } else {
+            transcript.push(message.clone());
+        }
+    }
+    RequestBudget {
+        projected_input_tokens: estimate_tokens(&payload),
+        stable_prefix_tokens: messages
+            .first()
+            .map_or(0, |message| estimate_tokens(&json!([message]))),
+        tool_schemas_tokens: if continuation_only {
+            0
+        } else {
+            estimate_tokens(&Value::Array(schemas.to_vec()))
+        },
+        transcript_history_tokens: estimate_tokens(&Value::Array(transcript)),
+        dynamic_tail_tokens: estimate_tokens(&Value::Array(dynamic)),
+    }
+}
+
+fn summary_size_tokens(transcript: &Transcript) -> usize {
+    transcript
+        .latest_summary()
+        .map_or(0, |(summary, _)| estimate_tokens(&json!(summary)))
+}
+
+fn summary_size_chars(transcript: &Transcript) -> usize {
+    transcript
+        .latest_summary()
+        .map_or(0, |(summary, _)| summary.chars().count())
+}
+
+fn cap_summary(summary: &str) -> String {
+    let summary = summary.trim();
+    if summary.chars().count() <= SUMMARY_MAX_CHARS {
+        return summary.to_owned();
+    }
+    let bounded = summary.chars().take(SUMMARY_MAX_CHARS).collect::<String>();
+    format!("{bounded}\n[summary truncated to preserve context budget]")
+}
+
+fn retained_tail_tokens(messages: &[Value]) -> usize {
+    let retained = messages
+        .iter()
+        .skip(1)
+        .filter(|message| {
+            let content = message.get("content").and_then(Value::as_str).unwrap_or("");
+            !content.starts_with("[RUNTIME GUIDANCE — NOT USER CONTENT]")
+                && !content.starts_with("[RUNTIME SUMMARY — NOT USER CONTENT]")
+                && !content.starts_with("[IMPORTED SYSTEM CONTEXT — NOT USER CONTENT]")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    estimate_tokens(&Value::Array(retained))
+}
+
+fn has_minimum_useful_output(output_tokens: usize) -> bool {
+    output_tokens >= MIN_USEFUL_OUTPUT_TOKENS
+}
+
+fn budget_error(
+    config: &Config,
+    before: RequestBudget,
+    after: RequestBudget,
+    summary_tokens: usize,
+    summary_chars: usize,
+    retained_tokens: usize,
+    attempts: usize,
+    requested_max_output: usize,
+    available_output: usize,
+) -> String {
+    format!(
+        "Context budget cannot fit minimum useful output: context_window={}, projected_input_tokens_before_compaction={}, projected_input_tokens_after_compaction={}, stable_prefix_estimate_before={}, stable_prefix_estimate_after={}, tool_schemas_estimate_before={}, tool_schemas_estimate_after={}, transcript_history_estimate_before={}, transcript_history_estimate_after={}, dynamic_tail_estimate_before={}, dynamic_tail_estimate_after={}, safety_reserve={}, requested_max_output={}, dynamic_max_output={}, preferred_output_headroom={}, minimum_useful_output={}, compaction_summary_tokens={}, compaction_summary_chars={}, retained_tail_tokens={}, compaction_attempts={}",
+        config.context_limit,
+        before.projected_input_tokens,
+        after.projected_input_tokens,
+        before.stable_prefix_tokens,
+        after.stable_prefix_tokens,
+        before.tool_schemas_tokens,
+        after.tool_schemas_tokens,
+        before.transcript_history_tokens,
+        after.transcript_history_tokens,
+        before.dynamic_tail_tokens,
+        after.dynamic_tail_tokens,
+        SAFETY_RESERVE_TOKENS,
+        requested_max_output,
+        available_output,
+        PREFERRED_OUTPUT_HEADROOM_TOKENS,
+        MIN_USEFUL_OUTPUT_TOKENS,
+        summary_tokens,
+        summary_chars,
+        retained_tokens,
+        attempts,
+    )
 }
 
 fn stable_prefix(config: &Config) -> String {
@@ -133,7 +290,7 @@ fn dynamic_tail(state: &AgentState) -> String {
 
 fn tool_schemas(has_project_root: bool) -> Vec<Value> {
     let mut tools = vec![
-        json!({"type":"function","function":{"name":"task_plan","description":"Manage persistent Goal/Milestone Plan and the active milestone Work Plan. Goal init only creates an empty plan once; later use append/refine/done/drop with milestone_id. Work init creates tasks only for the active milestone; later use append/refine/split/start/done/drop with task_id. IDs returned by view are canonical. Completed history is retained.","parameters":{"type":"object","properties":{"scope":{"type":"string","enum":["goal","work"]},"action":{"type":"string","enum":["init","append","refine","split","start","done","drop","view"]},"milestones":{"type":"array","items":{"oneOf":[{"type":"string"},{"type":"object","properties":{"label":{"type":"string"}},"required":["label"]}]}},"tasks":{"type":"array","items":{"oneOf":[{"type":"string"},{"type":"object","properties":{"label":{"type":"string"}},"required":["label"]}]}},"milestone_id":{"type":"string"},"task_id":{"type":"string"},"label":{"type":"string"},"after_id":{"type":"string"}},"required":["action"]}}}),
+        json!({"type":"function","function":{"name":"task_plan","description":"Manage two separate planning layers. For scope=goal, init requires milestones only and creates the active milestone with an empty Work Plan; do not send tasks. For scope=work, init requires milestone_id (the active milestone ID) and tasks; work append also requires milestone_id and label. Work tasks are planned only after orientation. Use view to read the canonical snapshot and stable IDs. Goal and Work Plan IDs returned by view are canonical. Completed history is retained.","parameters":{"type":"object","properties":{"scope":{"type":"string","enum":["goal","work"],"description":"Required: goal manages milestones; work manages tasks for the active milestone."},"action":{"type":"string","enum":["init","append","refine","split","start","done","drop","view"]},"milestones":{"type":"array","description":"Goal init creates milestones only; do not include Work Plan tasks here.","items":{"oneOf":[{"type":"string"},{"type":"object","properties":{"label":{"type":"string"}},"required":["label"]}]}},"tasks":{"type":"array","description":"Work init creates tasks for the active milestone; used separately after Goal init.","items":{"oneOf":[{"type":"string"},{"type":"object","properties":{"label":{"type":"string"}},"required":["label"]}]}},"milestone_id":{"type":"string","description":"Required for Work Plan mutations; must identify the active milestone."},"task_id":{"type":"string"},"label":{"type":"string"},"after_id":{"type":"string"}},"required":["scope","action"]}}}),
     ];
     if has_project_root {
         tools.extend([
@@ -194,20 +351,49 @@ fn required_label(arguments: &Value) -> Result<String, String> {
         .ok_or_else(|| "task_plan requires label".into())
 }
 
+fn require_active_milestone(state: &AgentState, arguments: &Value) -> Result<(), String> {
+    let requested = required_id(arguments, "milestone_id")?;
+    let active = state
+        .plan
+        .active_milestone()
+        .ok_or_else(|| "there is no active milestone".to_owned())?;
+    if requested != active.id {
+        return Err(format!(
+            "Work Plan mutations require the active milestone ID {}; got {requested}",
+            active.id
+        ));
+    }
+    Ok(())
+}
+
 fn apply_plan(state: &mut AgentState, arguments: &Value) -> Result<(Value, bool), String> {
     let action = arguments
         .get("action")
         .and_then(Value::as_str)
         .ok_or_else(|| "task_plan requires action".to_owned())?;
-    if action == "view" {
-        return Ok((json!({"plan": state.plan, "updated": false}), false));
-    }
     let scope = arguments
         .get("scope")
         .and_then(Value::as_str)
-        .unwrap_or("work");
+        .ok_or_else(|| "task_plan requires scope (goal or work)".to_owned())?;
+    if !matches!(scope, "goal" | "work") {
+        return Err("task_plan scope must be goal or work".into());
+    }
+    if action == "view" {
+        return Ok((json!({"plan": state.plan, "updated": false}), false));
+    }
+    if scope == "work" && action != "view" {
+        require_active_milestone(state, arguments)?;
+    }
     match (scope, action) {
-        ("goal", "init") => state.plan.init(plan_labels(arguments, "milestones")?)?,
+        ("goal", "init") => {
+            if arguments.get("tasks").is_some() {
+                return Err(
+                    "Goal Plan init accepts milestones only; initialize Work Plan tasks separately"
+                        .into(),
+                );
+            }
+            state.plan.init(plan_labels(arguments, "milestones")?)?;
+        }
         ("goal", "append") => state.plan.append_milestone(
             required_label(arguments)?,
             arguments.get("after_id").and_then(Value::as_str),
@@ -294,22 +480,15 @@ fn append_final_text(accumulator: &mut String, delta: &str) {
 
 fn needs_compaction(
     budget: CompactionBudget,
-    context_limit: usize,
     projected_input_tokens: usize,
-    provider_max_output: Option<usize>,
+    available_output: usize,
 ) -> bool {
     projected_input_tokens > budget.trigger_tokens()
-        || dynamic_output_limit(
-            context_limit,
-            projected_input_tokens,
-            SAFETY_RESERVE_TOKENS,
-            provider_max_output,
-            APPLICATION_MAX_OUTPUT_TOKENS,
-        ) < MIN_OUTPUT_HEADROOM_TOKENS
+        || available_output < PREFERRED_OUTPUT_HEADROOM_TOKENS
 }
 
 fn retry_keep_recent(attempt: usize) -> usize {
-    (DEFAULT_KEEP_RECENT >> attempt).max(2)
+    (DEFAULT_KEEP_RECENT >> attempt).max(1)
 }
 
 fn turn_tools(schemas: &[Value], continuation_only: bool) -> Vec<Value> {
@@ -688,7 +867,7 @@ fn summarize_span(config: &Config, transcript: &Transcript, covers: usize) -> St
         "max_tokens": max_tokens,
     });
     match stream_call(&config.endpoint, &payload, &config.run_id, &config.cancelled, false) {
-        Ok(turn) if !turn.content.trim().is_empty() => turn.content.trim().to_owned(),
+        Ok(turn) if !turn.content.trim().is_empty() => cap_summary(&turn.content),
         _ => "Earlier conversation was compacted. Retained recent transcript and current planning state remain available.".into(),
     }
 }
@@ -696,6 +875,8 @@ fn summarize_span(config: &Config, transcript: &Transcript, covers: usize) -> St
 fn compact_once(
     config: &Config,
     transcript: &mut Transcript,
+    schemas: &[Value],
+    continuation_only: bool,
     before: usize,
     keep_recent: usize,
     reason: &str,
@@ -706,11 +887,9 @@ fn compact_once(
     };
     let summary = summarize_span(config, transcript, covers);
     transcript.compact(summary, covers);
-    let after = estimate_tokens(&Value::Array(project(
-        transcript,
-        &stable_prefix(config),
-        dynamic_tail,
-    )));
+    let messages = project(transcript, &stable_prefix(config), dynamic_tail);
+    let after =
+        request_budget(config, &messages, schemas, continuation_only).projected_input_tokens;
     emit(
         &config.run_id,
         Event::ContextOptimized {
@@ -869,7 +1048,7 @@ pub fn run(config: Config) {
     let budget = CompactionBudget {
         context_window: config.context_limit,
         ratio: DEFAULT_COMPACTION_RATIO,
-        reserve_tokens: SAFETY_RESERVE_TOKENS + MIN_OUTPUT_HEADROOM_TOKENS,
+        reserve_tokens: SAFETY_RESERVE_TOKENS + PREFERRED_OUTPUT_HEADROOM_TOKENS,
     };
     let stable = stable_prefix(&config);
     let schemas = tool_schemas(config.root.is_some());
@@ -907,70 +1086,96 @@ pub fn run(config: Config) {
         let mut messages = project(&transcript, &stable, &dynamic);
         // The just-projected reminder expires before the following turn.
         transcript.clear_reminders();
-        let mut projected = estimate_tokens(&Value::Array(messages.clone()));
-        if needs_compaction(
-            budget,
+        let before_budget = request_budget(&config, &messages, &schemas, continuation_only);
+        let requested_max_output = config
+            .provider_max_output
+            .unwrap_or(APPLICATION_MAX_OUTPUT_TOKENS)
+            .min(APPLICATION_MAX_OUTPUT_TOKENS);
+        let mut current_budget = before_budget;
+        let mut output_limit = dynamic_output_limit(
             config.context_limit,
-            projected,
-            config.provider_max_output,
-        ) {
-            let before = projected;
-            if compact_once(
-                &config,
-                &mut transcript,
-                before,
-                DEFAULT_KEEP_RECENT,
-                "proactive_threshold",
-                &dynamic,
-            ) {
-                let dynamic = if continuation_only {
-                    String::new()
-                } else {
-                    dynamic_tail(&state)
-                };
-                messages = project(&transcript, &stable, &dynamic);
-                projected = estimate_tokens(&Value::Array(messages.clone()));
-            }
-        }
-        let output_limit = dynamic_output_limit(
-            config.context_limit,
-            projected,
+            current_budget.projected_input_tokens,
             SAFETY_RESERVE_TOKENS,
             config.provider_max_output,
             APPLICATION_MAX_OUTPUT_TOKENS,
         );
-        if output_limit < MIN_OUTPUT_HEADROOM_TOKENS {
+        let should_compact =
+            needs_compaction(budget, current_budget.projected_input_tokens, output_limit);
+        let mut compaction_attempts = 0;
+        if should_compact {
+            for attempt in 0..MAX_COMPACTION_ATTEMPTS {
+                let keep_recent = if attempt == 0 {
+                    DEFAULT_KEEP_RECENT
+                } else {
+                    retry_keep_recent(attempt)
+                };
+                let current_dynamic = if continuation_only {
+                    String::new()
+                } else {
+                    dynamic_tail(&state)
+                };
+                if !compact_once(
+                    &config,
+                    &mut transcript,
+                    &schemas,
+                    continuation_only,
+                    current_budget.projected_input_tokens,
+                    keep_recent,
+                    if attempt == 0 {
+                        "proactive_threshold"
+                    } else {
+                        "output_headroom_retry"
+                    },
+                    &current_dynamic,
+                ) {
+                    break;
+                }
+                compaction_attempts += 1;
+                messages = project(&transcript, &stable, &current_dynamic);
+                current_budget = request_budget(&config, &messages, &schemas, continuation_only);
+                output_limit = dynamic_output_limit(
+                    config.context_limit,
+                    current_budget.projected_input_tokens,
+                    SAFETY_RESERVE_TOKENS,
+                    config.provider_max_output,
+                    APPLICATION_MAX_OUTPUT_TOKENS,
+                );
+                if output_limit >= PREFERRED_OUTPUT_HEADROOM_TOKENS {
+                    break;
+                }
+            }
+        }
+        if !has_minimum_useful_output(output_limit) {
+            let message = budget_error(
+                &config,
+                before_budget,
+                current_budget,
+                summary_size_tokens(&transcript),
+                summary_size_chars(&transcript),
+                retained_tail_tokens(&messages),
+                compaction_attempts,
+                requested_max_output,
+                output_limit,
+            );
             emit(
                 &config.run_id,
                 Event::AgentError {
                     code: "context_budget".into(),
-                    message: "context compaction could not leave enough output headroom".into(),
+                    message,
                 },
             );
             return;
         }
-        let reasoning = match policy::reasoning(&config.reasoning_mode, "agent") {
-            Reasoning::Off => json!({"chat_template_kwargs":{"enable_thinking":false}}),
-            Reasoning::Low => json!({"reasoning_effort":"low"}),
-            Reasoning::Deep => json!({"reasoning_effort":"xhigh"}),
-        };
+        let projected = current_budget.projected_input_tokens;
         // A prose continuation is deliberately tool-free. It receives the
         // exact visible tail as a one-turn reminder and can only append text.
-        let mut payload = json!({
-            "model": config.model,
-            "messages": messages,
-            "stream": true,
-            "stream_options": {"include_usage": true},
-            "max_tokens": output_limit,
-        });
-        if !continuation_only {
-            payload["tools"] = json!(turn_tools(&schemas, false));
-            payload["tool_choice"] = json!("auto");
-        }
-        payload
-            .as_object_mut()
-            .expect("request payload")
-            .extend(reasoning.as_object().expect("reasoning payload").clone());
+        let payload = request_payload(
+            &config,
+            &messages,
+            &schemas,
+            continuation_only,
+            output_limit,
+        );
         let payload_messages = payload
             .get("messages")
             .and_then(Value::as_array)
@@ -1077,6 +1282,8 @@ pub fn run(config: Config) {
                 if compact_once(
                     &config,
                     &mut transcript,
+                    &schemas,
+                    continuation_only,
                     before,
                     keep,
                     "context_overflow_retry",
@@ -1418,6 +1625,100 @@ mod tests {
     }
 
     #[test]
+    fn goal_and_work_plan_initialization_are_separate_and_return_stable_ids() {
+        let mut state = AgentState::default();
+        let (goal_snapshot, changed) = apply_plan(
+            &mut state,
+            &json!({
+                "scope":"goal",
+                "action":"init",
+                "milestones":["Inspect","Implement"]
+            }),
+        )
+        .unwrap();
+        assert!(changed);
+        assert_eq!(
+            state.plan.active_milestone_id.as_deref(),
+            Some("milestone-1")
+        );
+        assert!(state
+            .plan
+            .active_milestone()
+            .unwrap()
+            .work_plan
+            .tasks
+            .is_empty());
+        assert_eq!(
+            goal_snapshot["plan"]["milestones"][0]["work_plan"]["tasks"],
+            json!([])
+        );
+        assert!(apply_plan(
+            &mut AgentState::default(),
+            &json!({"scope":"goal","action":"init","milestones":["Inspect"],"tasks":["Lost task"]}),
+        )
+        .is_err());
+
+        let first_work = apply_plan(
+            &mut state,
+            &json!({
+                "scope":"work",
+                "action":"init",
+                "milestone_id":"milestone-1",
+                "tasks":["Read entry point","Trace request"]
+            }),
+        )
+        .unwrap()
+        .0;
+        let first_id = first_work["plan"]["milestones"][0]["work_plan"]["tasks"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(first_id, "task-1");
+
+        apply_plan(
+            &mut state,
+            &json!({
+                "scope":"work",
+                "action":"append",
+                "milestone_id":"milestone-1",
+                "label":"Verify behavior"
+            }),
+        )
+        .unwrap();
+        let (view, changed) =
+            apply_plan(&mut state, &json!({"scope":"goal","action":"view"})).unwrap();
+        assert!(!changed);
+        let tasks = view["plan"]["milestones"][0]["work_plan"]["tasks"]
+            .as_array()
+            .unwrap();
+        assert_eq!(tasks.len(), 3);
+        assert_eq!(tasks[0]["id"], first_id);
+        assert_eq!(tasks[0]["label"], "Read entry point");
+        assert_eq!(tasks[2]["id"], "task-3");
+        assert_eq!(tasks[2]["label"], "Verify behavior");
+    }
+
+    #[test]
+    fn task_plan_schema_explains_separate_goal_and_work_scopes() {
+        let schema = tool_schemas(false)
+            .into_iter()
+            .find(|tool| tool_name(tool) == "task_plan")
+            .unwrap();
+        let description = schema
+            .pointer("/function/description")
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert!(description.contains("milestones only"));
+        assert!(description.contains("milestone_id"));
+        assert!(description.contains("do not send tasks"));
+        assert_eq!(
+            schema.pointer("/function/parameters/required"),
+            Some(&json!(["scope", "action"]))
+        );
+    }
+
+    #[test]
     fn stable_prefix_is_byte_stable_and_plan_stays_in_the_dynamic_tail() {
         let config = test_config(Some("/project"));
         assert_eq!(stable_prefix(&config), stable_prefix(&config));
@@ -1440,21 +1741,306 @@ mod tests {
     }
 
     #[test]
+    fn useful_smaller_output_is_accepted_below_preferred_headroom() {
+        let output =
+            dynamic_output_limit(32_768, 30_944, SAFETY_RESERVE_TOKENS, Some(8_000), 8_000);
+        assert_eq!(output, 800);
+        assert!(output < PREFERRED_OUTPUT_HEADROOM_TOKENS);
+        assert!(has_minimum_useful_output(output));
+        assert!(!has_minimum_useful_output(MIN_USEFUL_OUTPUT_TOKENS - 1));
+    }
+
+    #[test]
+    fn impossible_budget_error_reports_component_estimates() {
+        let before = RequestBudget {
+            projected_input_tokens: 40_000,
+            stable_prefix_tokens: 500,
+            tool_schemas_tokens: 1_200,
+            transcript_history_tokens: 38_000,
+            dynamic_tail_tokens: 300,
+        };
+        let after = RequestBudget {
+            projected_input_tokens: 32_000,
+            stable_prefix_tokens: 500,
+            tool_schemas_tokens: 1_200,
+            transcript_history_tokens: 30_000,
+            dynamic_tail_tokens: 300,
+        };
+        let error = budget_error(
+            &test_config(None),
+            before,
+            after,
+            128,
+            384,
+            29_000,
+            4,
+            8_000,
+            0,
+        );
+        for expected in [
+            "context_window=16384",
+            "projected_input_tokens_before_compaction=40000",
+            "projected_input_tokens_after_compaction=32000",
+            "stable_prefix_estimate_after=500",
+            "tool_schemas_estimate_after=1200",
+            "transcript_history_estimate_after=30000",
+            "dynamic_tail_estimate_after=300",
+            "safety_reserve=1024",
+            "requested_max_output=8000",
+            "dynamic_max_output=0",
+            "minimum_useful_output=32",
+            "compaction_summary_tokens=128",
+            "compaction_summary_chars=384",
+            "retained_tail_tokens=29000",
+            "compaction_attempts=4",
+        ] {
+            assert!(error.contains(expected), "missing {expected} from {error}");
+        }
+    }
+
+    #[test]
+    fn summary_output_is_bounded_before_it_returns_to_the_transcript() {
+        let bounded = cap_summary(&"s".repeat(SUMMARY_MAX_CHARS + 5_000));
+        assert!(bounded.chars().count() <= SUMMARY_MAX_CHARS + 64);
+        assert!(bounded.ends_with("[summary truncated to preserve context budget]"));
+        assert_eq!(cap_summary(" concise summary "), "concise summary");
+    }
+
+    #[test]
     fn low_remaining_context_compacts_before_a_tiny_output_budget() {
         let budget = CompactionBudget {
             context_window: 16_384,
             ratio: DEFAULT_COMPACTION_RATIO,
-            reserve_tokens: SAFETY_RESERVE_TOKENS + MIN_OUTPUT_HEADROOM_TOKENS,
+            reserve_tokens: SAFETY_RESERVE_TOKENS + PREFERRED_OUTPUT_HEADROOM_TOKENS,
         };
-        assert!(needs_compaction(budget, 16_384, 14_500, Some(32_768)));
-        assert!(!needs_compaction(budget, 16_384, 4_000, Some(32_768)));
+        assert!(needs_compaction(budget, 14_500, 500));
+        assert!(!needs_compaction(budget, 4_000, 2_000));
     }
 
     #[test]
     fn overflow_recovery_shrinks_tail_and_stays_bounded() {
         assert_eq!(retry_keep_recent(1), 4);
         assert_eq!(retry_keep_recent(2), 2);
-        assert_eq!(retry_keep_recent(MAX_COMPACTION_ATTEMPTS), 2);
+        assert_eq!(retry_keep_recent(3), 1);
+        assert_eq!(retry_keep_recent(MAX_COMPACTION_ATTEMPTS), 1);
+    }
+
+    #[test]
+    fn retained_tail_decreases_across_bounded_compaction_attempts() {
+        let mut transcript = Transcript::default();
+        for turn in 0..10 {
+            transcript.push_message(json!({"role":"user","content":format!("request {turn}")}));
+            transcript
+                .push_message(json!({"role":"assistant","content":format!("response {turn}")}));
+        }
+        transcript.push_run_user(json!({"role":"user","content":"current request"}));
+
+        let mut retained = Vec::new();
+        for keep_recent in [
+            DEFAULT_KEEP_RECENT,
+            retry_keep_recent(1),
+            retry_keep_recent(2),
+            retry_keep_recent(3),
+        ] {
+            let boundary = transcript.compaction_plan(keep_recent).unwrap();
+            retained.push(
+                transcript.entries()[boundary..]
+                    .iter()
+                    .filter(|entry| {
+                        matches!(
+                            entry,
+                            crate::agent::transcript::Entry::Message(_)
+                                | crate::agent::transcript::Entry::RunUser(_)
+                        )
+                    })
+                    .count(),
+            );
+        }
+        assert_eq!(retained, vec![8, 4, 2, 1]);
+    }
+
+    #[test]
+    fn long_32k_transcript_recompacts_then_sends_the_next_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            loop {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_mock_request(&mut stream);
+                let is_summary =
+                    request["messages"][0]["content"]
+                        .as_str()
+                        .is_some_and(|content| {
+                            content.contains("Summarize the earlier agent transcript")
+                        });
+                requests.push(request);
+                let response = if is_summary {
+                    json!({"choices":[{"delta":{"content":"Compact handoff."},"finish_reason":"stop"}]})
+                } else {
+                    json!({"choices":[{"delta":{"content":"Request continued after compaction."},"finish_reason":"stop"}]})
+                };
+                stream
+                    .write_all(sse_response(&[response]).as_bytes())
+                    .unwrap();
+                if !is_summary {
+                    return requests;
+                }
+            }
+        });
+
+        let mut config = test_config(None);
+        config.endpoint = endpoint;
+        config.context_limit = 32_768;
+        config.provider_max_output = Some(1_600);
+        config.user = "current request".into();
+        let long_turn = "transcript detail ".repeat(1_100);
+        for turn in 0..10 {
+            config
+                .history
+                .push(json!({"role":"user","content":format!("request {turn}: {long_turn}")}));
+            config.history.push(
+                json!({"role":"assistant","content":format!("response {turn}: {long_turn}")}),
+            );
+        }
+
+        run(config);
+        let requests = server.join().unwrap();
+        let summary_requests = requests
+            .iter()
+            .filter(|request| {
+                request["messages"][0]["content"]
+                    .as_str()
+                    .is_some_and(|content| {
+                        content.contains("Summarize the earlier agent transcript")
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            summary_requests.len() >= 2,
+            "expected normal and aggressive compaction"
+        );
+        let agent_request = requests.last().unwrap();
+        assert_eq!(agent_request["max_tokens"], 1_600);
+        let messages = agent_request["messages"].as_array().unwrap();
+        let systems = messages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, message)| (message["role"] == "system").then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(systems, vec![0]);
+        assert_eq!(
+            messages
+                .iter()
+                .filter(
+                    |message| message["role"] == "user" && message["content"] == "current request"
+                )
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn smaller_provider_output_budget_is_sent_instead_of_failing() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_mock_request(&mut stream);
+            let final_turn =
+                json!({"choices":[{"delta":{"content":"short answer"},"finish_reason":"stop"}]});
+            stream
+                .write_all(sse_response(&[final_turn]).as_bytes())
+                .unwrap();
+            request
+        });
+        let mut config = test_config(None);
+        config.endpoint = endpoint;
+        config.provider_max_output = Some(700);
+
+        run(config);
+        let request = server.join().unwrap();
+        assert_eq!(request["max_tokens"], 700);
+    }
+
+    #[test]
+    fn smaller_dynamic_output_budget_is_sent_when_current_turn_cannot_be_compacted() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_mock_request(&mut stream);
+            let final_turn =
+                json!({"choices":[{"delta":{"content":"brief answer"},"finish_reason":"stop"}]});
+            stream
+                .write_all(sse_response(&[final_turn]).as_bytes())
+                .unwrap();
+            request
+        });
+
+        let mut config = test_config(None);
+        config.endpoint = endpoint;
+        config.user = "current turn ".repeat(9_000);
+        let messages = project(
+            &{
+                let mut transcript = Transcript::default();
+                transcript.push_run_user(json!({"role":"user","content":config.user}));
+                transcript
+            },
+            &stable_prefix(&config),
+            "",
+        );
+        let projected =
+            request_budget(&config, &messages, &tool_schemas(false), false).projected_input_tokens;
+        config.context_limit = projected + SAFETY_RESERVE_TOKENS + 600;
+
+        run(config);
+        let request = server.join().unwrap();
+        let max_tokens = request["max_tokens"].as_u64().unwrap() as usize;
+        assert!(max_tokens >= MIN_USEFUL_OUTPUT_TOKENS);
+        assert!(max_tokens < PREFERRED_OUTPUT_HEADROOM_TOKENS);
+    }
+
+    #[test]
+    fn aggressive_compaction_leaves_tool_call_result_pairs_valid() {
+        let mut transcript = Transcript::default();
+        transcript.push_run_user(json!({"role":"user","content":"inspect"}));
+        for index in 0..6 {
+            let id = format!("tool-{index}");
+            transcript.push_message(json!({
+                "role":"assistant",
+                "content":"",
+                "tool_calls":[{"id":id,"type":"function","function":{"name":"read_file","arguments":"{}"}}]
+            }));
+            transcript.tool_result(&id, "read_file", "result".into());
+        }
+        let boundary = transcript.compaction_plan(1).unwrap();
+        assert!(matches!(
+            &transcript.entries()[boundary],
+            crate::agent::transcript::Entry::Message(message)
+                if message["role"] == "assistant" && message["tool_calls"][0]["id"] == "tool-5"
+        ));
+        let projected = project(&transcript, "stable", "");
+        let call = projected
+            .iter()
+            .position(|message| {
+                message["role"] == "assistant" && message["tool_calls"][0]["id"] == "tool-5"
+            })
+            .unwrap();
+        let result = projected
+            .iter()
+            .position(|message| message["role"] == "tool" && message["tool_call_id"] == "tool-5")
+            .unwrap();
+        assert!(call < result);
     }
 
     #[test]
@@ -1553,6 +2139,48 @@ mod tests {
     }
 
     #[test]
+    fn provider_request_contains_each_actual_user_turn_once_in_order() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_mock_request(&mut stream);
+            let final_turn = json!({
+                "choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]
+            });
+            stream
+                .write_all(sse_response(&[final_turn]).as_bytes())
+                .unwrap();
+            request
+        });
+        let mut config = test_config(None);
+        config.endpoint = endpoint;
+        config.user = "current request".into();
+        config.history = vec![
+            json!({"role":"user","content":"first request"}),
+            json!({"role":"assistant","content":"first answer"}),
+            json!({"role":"user","content":"second request"}),
+            json!({"role":"assistant","content":"second answer"}),
+        ];
+
+        run(config);
+        let request = server.join().unwrap();
+        let messages = request["messages"].as_array().unwrap();
+        let user_turns = messages
+            .iter()
+            .filter(|message| message["role"] == "user")
+            .filter_map(|message| message["content"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            user_turns,
+            vec!["first request", "second request", "current request"]
+        );
+    }
+
+    #[test]
     fn length_continuation_keeps_one_logical_response_and_hides_tools() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!(
@@ -1587,15 +2215,22 @@ mod tests {
         assert!(requests[1].get("tools").is_none());
         assert!(requests[1].get("tool_choice").is_none());
         let second_messages = requests[1]["messages"].as_array().unwrap();
+        let systems = second_messages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, message)| (message["role"] == "system").then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(systems, vec![0]);
         assert!(second_messages
             .iter()
             .any(|message| message["role"] == "assistant"
                 && message["content"] == "First visible prefix. "));
         assert!(second_messages.iter().any(|message| {
             message["role"] == "user"
-                && message["content"]
-                    .as_str()
-                    .is_some_and(|content| content.contains("<previous_tail>"))
+                && message["content"].as_str().is_some_and(|content| {
+                    content.contains("[RUNTIME GUIDANCE — NOT USER CONTENT]")
+                        && content.contains("<previous_tail>")
+                })
         }));
     }
 

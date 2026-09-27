@@ -115,8 +115,13 @@ impl Transcript {
 
     pub fn render_span(&self, covers: usize, max_chars: usize) -> String {
         let mut out = String::new();
-        for entry in self.entries.iter().take(covers) {
+        let current_run_user = self
+            .entries
+            .iter()
+            .rposition(|entry| matches!(entry, Entry::RunUser(_)));
+        for (index, entry) in self.entries.iter().take(covers).enumerate() {
             match entry {
+                Entry::RunUser(_) if Some(index) == current_run_user => {}
                 Entry::Message(message) | Entry::RunUser(message) => {
                     render_message(&mut out, message)
                 }
@@ -262,5 +267,22 @@ mod tests {
         transcript.push_message(json!({"role":"assistant","content":"recent"}));
         let boundary = transcript.compaction_plan(2).unwrap();
         assert!(!is_tool(&transcript.entries()[boundary]));
+    }
+
+    #[test]
+    fn compaction_never_summarizes_the_current_run_user() {
+        let mut transcript = Transcript::default();
+        transcript.push_message(json!({"role":"user","content":"older request"}));
+        transcript.push_message(json!({"role":"assistant","content":"older answer"}));
+        transcript.push_run_user(json!({"role":"user","content":"current request"}));
+        transcript.assistant_message("first response".into());
+        transcript.push_message(json!({"role":"user","content":"later historic user"}));
+        transcript.assistant_message("later historic answer".into());
+
+        let boundary = transcript.compaction_plan(2).unwrap();
+        assert!(boundary > 2);
+        assert!(!transcript
+            .render_span(boundary, 10_000)
+            .contains("current request"));
     }
 }
