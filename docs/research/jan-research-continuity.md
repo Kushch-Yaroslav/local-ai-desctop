@@ -52,16 +52,15 @@ post-compaction model-retained.
 
 Local's `rust-agent/src/agent/transcript.rs` is append-only and
 `context/projection.rs` sends the latest summary and retained tail after a
-compaction. It trims large retained tool results (`compact_tool_payload`), so a
-model can lose exact earlier read findings even though the runtime preserves the
-canonical record.
+compaction. Since the 2026-09-28 correction it follows Jan's structural tail
+selection and projects retained tool results verbatim; the former
+`compact_tool_payload` rewrite was deleted because it lost exact source detail.
 
-The observed task-13 loop is therefore consistent with repeated broad reads
-creating more transcript/tool-result pressure, compaction replacing their raw
-details with a bounded conversation summary, and a defensive model treating
-missing details as a reason to restart orientation. The plan itself remained
-open. Jan's mutation-only nudge is intentionally not a read-only research
-completion mechanism.
+The observed task-13 loop is therefore consistent with repeated broad reads,
+the former Local summary-input duplication and repeated proactive compactions,
+and the former retained-tool truncation. Jan's mutation-only nudge is
+intentionally not a read-only research completion mechanism. Detailed measured
+parameters and the corrected port are in `jan-compaction-port.md`.
 
 ## Port outcome
 

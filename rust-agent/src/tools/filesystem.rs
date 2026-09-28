@@ -41,6 +41,17 @@ fn is_runtime_temporary(root: &Path, target: &Path) -> bool {
         || (root.file_name().and_then(|name| name.to_str()) == Some("runtime")
             && components.first() == Some(&".tmp"))
 }
+
+/// `.ai-framework` is accessed only through the dedicated knowledge tools.
+/// Treating it as application source would make broad repository traversal
+/// recursively audit the cache itself.
+fn is_knowledge_cache(root: &Path, target: &Path) -> bool {
+    target
+        .strip_prefix(root)
+        .ok()
+        .and_then(|relative| relative.components().next())
+        .is_some_and(|component| component.as_os_str() == ".ai-framework")
+}
 pub fn execute(root: &Path, name: &str, args: &Value) -> Result<(Value, Option<String>), String> {
     let object = args
         .as_object()
@@ -49,15 +60,18 @@ pub fn execute(root: &Path, name: &str, args: &Value) -> Result<(Value, Option<S
     match name {
         "list_directory" => {
             let target = scoped(root, path)?;
-            if is_runtime_temporary(root, &target) {
+            if is_runtime_temporary(root, &target) || is_knowledge_cache(root, &target) {
                 return Err(
-                    "runtime acceptance artifacts are excluded from project discovery".to_owned(),
+                    "internal runtime/cache files are excluded from project discovery".to_owned(),
                 );
             }
             let mut items = fs::read_dir(target)
                 .map_err(|e| e.to_string())?
                 .filter_map(Result::ok)
-                .filter(|entry| !is_runtime_temporary(root, &entry.path()))
+                .filter(|entry| {
+                    !is_runtime_temporary(root, &entry.path())
+                        && !is_knowledge_cache(root, &entry.path())
+                })
                 .map(|x| x.file_name().to_string_lossy().to_string())
                 .collect::<Vec<_>>();
             items.sort();
@@ -65,9 +79,9 @@ pub fn execute(root: &Path, name: &str, args: &Value) -> Result<(Value, Option<S
         }
         "read_file" => {
             let target = scoped(root, path)?;
-            if is_runtime_temporary(root, &target) {
+            if is_runtime_temporary(root, &target) || is_knowledge_cache(root, &target) {
                 return Err(
-                    "runtime acceptance artifacts are excluded from project discovery".to_owned(),
+                    "internal runtime/cache files are excluded from project discovery".to_owned(),
                 );
             }
             let content = fs::read_to_string(target).map_err(|e| e.to_string())?;

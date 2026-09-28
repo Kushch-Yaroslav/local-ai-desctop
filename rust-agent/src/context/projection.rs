@@ -49,7 +49,10 @@ pub fn project(transcript: &Transcript, stable_prefix: &str, dynamic_tail: &str)
             Entry::Message(message)
                 if message.get("role").and_then(Value::as_str) != Some("system") =>
             {
-                messages.push(compact_tool_payload(message))
+                // Jan projects the retained structural tail verbatim. A
+                // separate per-tool truncation here made the model lose the
+                // exact detail it deliberately kept and encouraged rereads.
+                messages.push(message.clone())
             }
             Entry::RunUser(message) => {
                 messages.push(message.clone());
@@ -86,32 +89,6 @@ pub fn project(transcript: &Transcript, stable_prefix: &str, dynamic_tail: &str)
         messages.push(json!({"role":"user", "content":format!("[RUNTIME GUIDANCE — NOT USER CONTENT]\n{tail}")}));
     }
     messages
-}
-
-#[must_use]
-pub fn compact_tool_payload(message: &Value) -> Value {
-    if message.get("role").and_then(Value::as_str) != Some("tool") {
-        return message.clone();
-    }
-    let Some(content) = message.get("content").and_then(Value::as_str) else {
-        return message.clone();
-    };
-    const KEEP: usize = 6_000;
-    if content.chars().count() <= KEEP {
-        return message.clone();
-    }
-    let head = content.chars().take(3_800).collect::<String>();
-    let tail = content
-        .chars()
-        .rev()
-        .take(1_800)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<String>();
-    let mut projected = message.clone();
-    projected["content"] = json!(format!("{head}\n… [large raw tool result omitted from projection; canonical transcript retained] …\n{tail}"));
-    projected
 }
 
 #[cfg(test)]
@@ -170,6 +147,24 @@ mod tests {
             .unwrap();
         assert!(assistant < tool);
         assert_eq!(projected[tool]["tool_call_id"], "read-1");
+    }
+
+    #[test]
+    fn retained_large_tool_result_is_replayed_verbatim() {
+        let mut transcript = Transcript::default();
+        transcript.push_run_user(json!({"role":"user","content":"inspect"}));
+        transcript.push_message(json!({
+            "role":"assistant",
+            "tool_calls":[{"id":"read-1","type":"function","function":{"name":"read_file","arguments":"{}"}}]
+        }));
+        let output = "concrete source detail ".repeat(900);
+        transcript.tool_result("read-1", "read_file", output.clone());
+        let projected = project(&transcript, "stable", "");
+        let tool = projected
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .unwrap();
+        assert_eq!(tool["content"], output);
     }
 
     #[test]
@@ -280,11 +275,11 @@ mod tests {
                 .push_message(json!({"role":"assistant","content":format!("response {index}")}));
             transcript.push_message(json!({"role":"user","content":format!("follow-up {index}")}));
         }
-        let boundary = transcript.compaction_plan(2).unwrap();
-        assert!(boundary > 0);
-        let summary = transcript.render_span(boundary, 10_000);
+        let plan = transcript.compaction_plan(2).unwrap();
+        assert!(plan.covers > 0);
+        let summary = plan.render(10_000);
         assert!(!summary.contains("current request exactly once"));
-        transcript.compact(summary, boundary);
+        transcript.compact(summary, plan.covers);
 
         let projected = project(&transcript, "stable", "");
         let current_occurrences = projected

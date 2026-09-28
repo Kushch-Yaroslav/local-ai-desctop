@@ -95,6 +95,12 @@ export interface AgentTelemetry {
   cachedTokens?: number;
   /** Provider-reported prompt/KV cache writes. */
   cacheWriteTokens?: number;
+  /** `.ai-framework` diagnostics; content remains on disk and is not exposed here. */
+  knowledgeCacheFiles?: number;
+  knowledgeCacheBytes?: number;
+  knowledgeCacheHits?: number;
+  knowledgeCacheStale?: number;
+  knowledgeCacheInjectedBytes?: number;
   startedAt: string;
   finishedAt?: string;
 }

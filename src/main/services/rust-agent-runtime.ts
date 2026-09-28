@@ -18,6 +18,8 @@ type RuntimeEvent = {
   reserved_output_tokens?: number; complete?: boolean; continuation_count?: number; chars?: number;
   continuation?: number; prior_chars?: number; next_max_tokens?: number; arguments?: Record<string, unknown>;
   command?: string; cwd?: string; pid?: number; pgid?: number; session_id?: number; started_at?: number;
+  exists?: boolean; manifest_version?: number; total_files?: number; approximate_bytes?: number;
+  knowledge_reads?: number; knowledge_writes?: number; cache_hits?: number; stale_source_entries?: number; bytes_injected?: number;
 };
 type RuntimeRequest = {
   type: 'run'; run_id: string; endpoint: string; model: string; system: string; user: string;
@@ -70,6 +72,15 @@ export function taskPlan(value: unknown): AgentPlan {
     return { milestones: [{ id: 'legacy-milestone-1', label: 'Previous plan', status: active ? 'in_progress' : steps.every((step) => step.status === 'completed' || step.status === 'abandoned') ? 'completed' : 'pending', workPlan: { tasks: steps } }], activeMilestoneId: active ? 'legacy-milestone-1' : undefined };
   }
   return { milestones: [] };
+}
+
+/** A successful Rust planning mutation cannot produce an empty Goal Plan.
+ * Ignore malformed or stale empty snapshots so diagnostic traffic can never
+ * replace an already-rendered canonical plan with a 0/0 placeholder. */
+export function taskPlanUpdate(event: { type: string; plan?: unknown }): AgentPlan | undefined {
+  if (event.type !== 'plan_update') return undefined;
+  const plan = taskPlan(event.plan);
+  return plan.milestones?.length ? plan : undefined;
 }
 
 function latestPlan(history: ChatMessage[]): AgentPlan | undefined {
@@ -131,12 +142,15 @@ export class RustAgentRuntime {
           const terminal = event.name === 'run_terminal' ? terminalResult(event.content ?? event.message) : undefined;
           yield { type: 'tool', activity: { id: event.id ?? crypto.randomUUID(), label: activityLabel(event.name), detail: terminal?.command ?? event.name, kind: activityKind(event.name), state: event.is_error || event.type === 'tool_error' ? 'error' : 'completed', output: event.content ?? event.message, rawOutput: event.content ?? event.message, ...(terminal ? { terminal } : {}), ...(event.diff ? { metadata: { diff: event.diff } } : {}) } };
         } else if (event.type === 'plan_update') {
-          yield { type: 'task-plan', plan: taskPlan(event.plan) };
+          const plan = taskPlanUpdate(event);
+          if (plan) yield { type: 'task-plan', plan };
         } else if (event.type === 'context_optimized') {
           compactions += 1;
           yield { type: 'tool', activity: { id: `context-${runId}-${compactions}`, label: 'Context optimized', detail: `${event.before ?? 0} → ${event.after ?? 0} tokens`, kind: 'context', state: 'completed' } };
           yield { type: 'context-usage', used: event.after ?? 0, maximum: contextLimit };
           yield { type: 'agent-telemetry', telemetry: { compactions } };
+        } else if (event.type === 'knowledge_cache') {
+          yield { type: 'agent-telemetry', telemetry: { knowledgeCacheFiles: event.total_files, knowledgeCacheBytes: event.approximate_bytes, knowledgeCacheHits: event.cache_hits, knowledgeCacheStale: event.stale_source_entries, knowledgeCacheInjectedBytes: event.bytes_injected } };
         } else if (event.type === 'context_stats') {
           yield { type: 'context-usage', used: event.used ?? 0, maximum: event.limit ?? contextLimit };
           yield { type: 'agent-telemetry', telemetry: { contextUsed: event.used, contextLimit: event.limit ?? contextLimit } };
@@ -170,10 +184,10 @@ export class RustAgentRuntime {
 }
 
 function activityLabel(name?: string): string {
-  return ({ list_directory: 'Просмотр структуры проекта', read_file: 'Чтение файла', write_file: 'Изменение файла', create_file: 'Создание файла', apply_patch: 'Изменение проекта', delete_file: 'Удаление файла', run_terminal: 'Запуск terminal', task_plan: 'Планирование' } as Record<string, string>)[name ?? ''] ?? 'Действие агента';
+  return ({ list_directory: 'Просмотр структуры проекта', read_file: 'Чтение файла', write_file: 'Изменение файла', create_file: 'Создание файла', apply_patch: 'Изменение проекта', delete_file: 'Удаление файла', run_terminal: 'Запуск terminal', task_plan: 'Планирование', project_knowledge_index: 'Индекс знаний проекта', project_knowledge_read: 'Чтение знаний проекта', project_knowledge_update: 'Обновление знаний проекта' } as Record<string, string>)[name ?? ''] ?? 'Действие агента';
 }
 function activityKind(name?: string): NonNullable<import('../../shared/types').ToolActivity['kind']> {
-  return name === 'run_terminal' ? 'terminal' : name === 'task_plan' ? 'planning' : name === 'read_file' ? 'file_read' : name === 'list_directory' ? 'directory' : 'mutation';
+  return name === 'run_terminal' ? 'terminal' : name === 'task_plan' ? 'planning' : name === 'read_file' || name === 'project_knowledge_read' || name === 'project_knowledge_index' ? 'file_read' : name === 'list_directory' ? 'directory' : 'mutation';
 }
 function timestamp(value: number | undefined): string | undefined { return typeof value === 'number' && Number.isFinite(value) ? new Date(value).toISOString() : undefined; }
 function terminalResult(raw: string | undefined): TerminalExecution | undefined {

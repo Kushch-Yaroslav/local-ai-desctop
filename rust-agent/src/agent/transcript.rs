@@ -16,6 +16,29 @@ pub enum Entry {
     Reminder(String),
 }
 
+/// A Jan-style compaction decision: the concrete projected messages to
+/// summarize and the record index where the verbatim tail begins.
+#[derive(Debug, Clone)]
+pub struct CompactionPlan {
+    pub covers: usize,
+    summarize: Vec<Value>,
+    retained_message_count: usize,
+}
+
+impl CompactionPlan {
+    pub fn render(&self, max_chars: usize) -> String {
+        render_messages(&self.summarize, max_chars)
+    }
+
+    pub fn message_count(&self) -> usize {
+        self.summarize.len()
+    }
+
+    pub fn retained_message_count(&self) -> usize {
+        self.retained_message_count
+    }
+}
+
 impl Transcript {
     pub fn push_message(&mut self, message: Value) {
         self.entries.push(Entry::Message(message));
@@ -83,79 +106,110 @@ impl Transcript {
         })
     }
 
-    /// Select a boundary retaining `keep_recent` non-system messages. The
-    /// boundary is moved back if needed so retained history never starts with a
-    /// tool result whose assistant tool-call was discarded.
-    pub fn compaction_plan(&self, keep_recent: usize) -> Option<usize> {
-        let message_indices = self
-            .entries
-            .iter()
-            .enumerate()
-            .filter_map(|(index, entry)| match entry {
+    /// Project the current summary plus only raw entries after its boundary.
+    /// This is deliberately separate from the append-only record: a later
+    /// compaction must summarize the latest summary and its tail, never count
+    /// covered raw history again.
+    fn conversation(&self) -> (Vec<Value>, Vec<usize>) {
+        let boundary = self.compaction_boundary().unwrap_or(0);
+        let mut messages = Vec::new();
+        let mut sources = Vec::new();
+        if let Some((summary, _)) = self.latest_summary() {
+            messages.push(
+                json!({"role":"assistant", "content":format!("[earlier summary]\n{summary}")}),
+            );
+            sources.push(boundary);
+        }
+        for (index, entry) in self.entries.iter().enumerate().skip(boundary) {
+            match entry {
                 Entry::Message(message)
                     if message.get("role").and_then(Value::as_str) != Some("system") =>
                 {
-                    Some(index)
+                    messages.push(message.clone());
+                    sources.push(index);
                 }
-                Entry::RunUser(_) => Some(index),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        if message_indices.len() <= keep_recent.saturating_add(1) {
-            return None;
+                Entry::RunUser(message) => {
+                    messages.push(message.clone());
+                    sources.push(index);
+                }
+                Entry::Steering(content) => {
+                    messages.push(
+                        json!({"role":"user", "content":content, "metadata":{"steering":true}}),
+                    );
+                    sources.push(index);
+                }
+                Entry::Compaction { .. } | Entry::Reminder(_) | Entry::Message(_) => {}
+            }
         }
-        let mut boundary = message_indices[message_indices.len() - keep_recent];
-        while boundary > 0 && is_tool(&self.entries[boundary]) {
-            boundary -= 1;
-        }
-        // A summary adds one message; a boundary that covers no meaningful
-        // history is not an optimization.
-        (boundary >= 1).then_some(boundary)
+        (messages, sources)
     }
 
-    pub fn render_span(&self, covers: usize, max_chars: usize) -> String {
-        let mut out = String::new();
+    /// Select Jan's structural tail boundary. Prefer moving forward over a
+    /// tool-result batch so the dropped span is as large as possible; when a
+    /// batch reaches the end, move back to its owning assistant call instead.
+    /// Either choice keeps every projected assistant/tool relationship valid.
+    pub fn compaction_plan(&self, keep_recent: usize) -> Option<CompactionPlan> {
+        let (messages, sources) = self.conversation();
+        if messages.len() <= keep_recent {
+            return None;
+        }
+        let target = messages.len() - keep_recent;
+        let mut cut = target;
+        while cut < messages.len() && is_tool_message(&messages[cut]) {
+            cut += 1;
+        }
+        if cut >= messages.len() {
+            cut = target;
+            while cut > 0 && is_tool_message(&messages[cut]) {
+                cut -= 1;
+            }
+        }
+        // Jan does not add a summary when it would replace fewer than two
+        // message entries, because the summary message itself would not shrink
+        // the request enough to be useful.
+        if cut < 2 {
+            return None;
+        }
         let current_run_user = self
             .entries
             .iter()
             .rposition(|entry| matches!(entry, Entry::RunUser(_)));
-        for (index, entry) in self.entries.iter().take(covers).enumerate() {
-            match entry {
-                Entry::RunUser(_) if Some(index) == current_run_user => {}
-                Entry::Message(message) | Entry::RunUser(message) => {
-                    render_message(&mut out, message)
-                }
-                Entry::Steering(content) => {
-                    out.push_str("[steering]\n");
-                    out.push_str(content);
-                    out.push('\n');
-                }
-                Entry::Compaction { summary, .. } => {
-                    out.push_str("[earlier summary]\n");
-                    out.push_str(summary);
-                    out.push('\n');
-                }
-                Entry::Reminder(_) => {}
-            }
-            if out.chars().count() >= max_chars {
-                let chars = out.chars().collect::<Vec<_>>();
-                let head = max_chars / 2;
-                let tail = max_chars.saturating_sub(head + 48);
-                return format!(
-                    "{}\n[… middle of transcript omitted …]\n{}",
-                    chars[..head].iter().collect::<String>(),
-                    chars[chars.len().saturating_sub(tail)..]
-                        .iter()
-                        .collect::<String>()
-                );
-            }
-        }
-        out
+        let summarize = messages[..cut]
+            .iter()
+            .zip(&sources[..cut])
+            .filter(|(_, source)| Some(**source) != current_run_user)
+            .map(|(message, _)| message.clone())
+            .collect::<Vec<_>>();
+        Some(CompactionPlan {
+            covers: sources[cut],
+            summarize,
+            retained_message_count: messages.len().saturating_sub(cut),
+        })
     }
 }
 
-fn is_tool(entry: &Entry) -> bool {
-    matches!(entry, Entry::Message(message) if message.get("role").and_then(Value::as_str) == Some("tool"))
+fn is_tool_message(message: &Value) -> bool {
+    message.get("role").and_then(Value::as_str) == Some("tool")
+}
+
+fn render_messages(messages: &[Value], max_chars: usize) -> String {
+    let mut out = String::new();
+    for message in messages {
+        render_message(&mut out, message);
+        if out.chars().count() >= max_chars {
+            let chars = out.chars().collect::<Vec<_>>();
+            let head = max_chars / 2;
+            let tail = max_chars.saturating_sub(head + 48);
+            return format!(
+                "{}\n[… middle of transcript omitted …]\n{}",
+                chars[..head].iter().collect::<String>(),
+                chars[chars.len().saturating_sub(tail)..]
+                    .iter()
+                    .collect::<String>()
+            );
+        }
+    }
+    out
 }
 
 fn render_message(out: &mut String, message: &Value) {
@@ -265,8 +319,11 @@ mod tests {
         transcript.push_message(json!({"role":"assistant","tool_calls":[{"id":"a","function":{"name":"read_file","arguments":"{}"}}]}));
         transcript.tool_result("a", "read_file", "result".into());
         transcript.push_message(json!({"role":"assistant","content":"recent"}));
-        let boundary = transcript.compaction_plan(2).unwrap();
-        assert!(!is_tool(&transcript.entries()[boundary]));
+        let plan = transcript.compaction_plan(2).unwrap();
+        assert!(!matches!(
+            &transcript.entries()[plan.covers],
+            Entry::Message(message) if is_tool_message(message)
+        ));
     }
 
     #[test]
@@ -279,10 +336,31 @@ mod tests {
         transcript.push_message(json!({"role":"user","content":"later historic user"}));
         transcript.assistant_message("later historic answer".into());
 
-        let boundary = transcript.compaction_plan(2).unwrap();
-        assert!(boundary > 2);
-        assert!(!transcript
-            .render_span(boundary, 10_000)
-            .contains("current request"));
+        let plan = transcript.compaction_plan(2).unwrap();
+        assert!(plan.covers > 2);
+        assert!(!plan.render(10_000).contains("current request"));
+    }
+
+    #[test]
+    fn later_compaction_summarizes_the_prior_handoff_instead_of_covered_raw_history() {
+        let mut transcript = Transcript::default();
+        for index in 0..12 {
+            transcript.push_message(
+                json!({"role":if index % 2 == 0 {"user"} else {"assistant"},"content":format!("old finding {index}")}),
+            );
+        }
+        let first = transcript.compaction_plan(8).unwrap();
+        let first_boundary = first.covers;
+        transcript.compact("verified first handoff: old findings".into(), first.covers);
+        for index in 0..10 {
+            transcript.push_message(
+                json!({"role":if index % 2 == 0 {"assistant"} else {"tool"},"content":format!("new finding {index}")}),
+            );
+        }
+
+        let second = transcript.compaction_plan(8).unwrap();
+        assert!(second.covers > first_boundary);
+        assert!(second.render(10_000).contains("verified first handoff"));
+        assert!(!second.render(10_000).contains("old finding 0"));
     }
 }

@@ -5,6 +5,7 @@
 //! transcript and the durable plan are the agent's working state.
 
 use super::todo::GoalPlan;
+use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Default)]
 pub struct AgentState {
@@ -16,6 +17,11 @@ pub struct AgentState {
     pub plan_nudges: usize,
     pub closeout_nudged: bool,
     pub verification_nudged: bool,
+    /// Observability for optional `.ai-framework` virtual context access.
+    pub knowledge_reads: usize,
+    pub knowledge_writes: usize,
+    pub knowledge_cache_hits: usize,
+    pub knowledge_missing_paths: BTreeMap<String, u64>,
 }
 
 impl AgentState {
@@ -34,6 +40,15 @@ impl AgentState {
 
     pub fn record_validation(&mut self) {
         self.workspace_mutated_since_validation = false;
+    }
+
+    pub fn record_knowledge_read(&mut self) {
+        self.knowledge_reads = self.knowledge_reads.saturating_add(1);
+        self.knowledge_cache_hits = self.knowledge_cache_hits.saturating_add(1);
+    }
+
+    pub fn record_knowledge_write(&mut self) {
+        self.knowledge_writes = self.knowledge_writes.saturating_add(1);
     }
 }
 

@@ -5,11 +5,11 @@
 //! semantic completion decisions for the model.
 
 use crate::agent::{
-    events::Event,
+    events::{Event, TailCandidateAttempt},
     policy::{self, Reasoning, RunPolicy},
     state::AgentState,
     todo::GoalPlan,
-    transcript::{validate_calls, Transcript, ValidatedCall},
+    transcript::{validate_calls, CompactionPlan, Transcript, ValidatedCall},
 };
 use crate::context::projection::project;
 use crate::protocol::emit;
@@ -56,10 +56,12 @@ pub const PLAN_NUDGE_MAX_PER_RUN: usize = 2;
 pub const SUMMARY_INPUT_CHARS: usize = 48_000;
 pub const SUMMARY_MAX_OUTPUT_TOKENS: usize = 2_048;
 pub const MIN_SUMMARY_OUTPUT_TOKENS: usize = 64;
-const ROLLING_SUMMARY_MAX_CHARS: usize = 3_600;
 const MIN_CONTINUATION_OVERLAP_CHARS: usize = 32;
 const MIN_FULL_RESTART_PREFIX_CHARS: usize = 96;
 const MAX_CONTINUATION_OVERLAP_CHARS: usize = 24_000;
+const SUMMARY_FIT_RESERVE_CHARS: usize = SUMMARY_MAX_OUTPUT_TOKENS * 3;
+const TOOL_RESULT_TRUNCATION_MARKER: &str =
+    "\n[… tool result projection truncated to fit the provider context …]\n";
 
 const AGENT_GUIDANCE: &str = r#"
 # Local AI Desktop Agent
@@ -67,7 +69,7 @@ const AGENT_GUIDANCE: &str = r#"
 - Use the plan when a task has several substantial stages. Keep it concise and update it honestly, but do not create a detailed Work Plan before you understand the active milestone.
 - Goal Plan milestones are stable user-request stages. Work Plan tasks belong only to the active milestone. Existing IDs are canonical: refine, append, split, complete, or drop them instead of replacing completed history.
 - After modifying project files, run the most relevant available validation before finishing when practical. Prefer targeted existing project commands. Inspect the diff when practical. If validation is unavailable, say why; never invent commands just to satisfy this guideline.
-- Tool output is evidence in the transcript. Do not reread unchanged files merely because old raw output was compacted.
+- Local AI Desktop maintains reusable project knowledge in `.ai-framework`; `manifest.json` is its index. Check relevant cached knowledge before broad reorientation, but treat current source as authoritative and refresh stale entries when exact detail matters.
 - Do not call a tool only because tools are available. Decide yourself when the task has enough information.
 "#;
 
@@ -79,21 +81,33 @@ Priority order:
 4. Current milestone/work-task intent and stable IDs.
 5. Decisions, what is verified versus unverified, unresolved questions/gaps, and hypotheses explicitly labeled as hypotheses.
 6. Investigations already completed that should not be repeated.
-Preserve concrete evidence from tool output and assistant reasoning. Never replace findings with an activity log such as "read App.tsx". Distinguish verified facts from hypotheses; do not invent or imply access to omitted raw output. Drop pleasantries, repeated requests, and redundant raw output before dropping findings. Write only the handoff summary."#;
+Preserve concrete evidence from tool output and assistant reasoning. Never replace findings with an activity log such as "read App.tsx". Distinguish verified facts from hypotheses; do not invent or imply access to omitted raw output. Drop pleasantries, repeated requests, and redundant raw output before dropping findings. Write only the handoff summary.
+
+Return exactly two sections, even if updates are empty:
+<rolling_summary>
+concise handoff only
+</rolling_summary>
+<project_knowledge_updates>
+[{"kind":"project","slot":"overview","content":"durable factual overview"},{"kind":"module","key":"routing","content":"durable relationships"},{"kind":"source","source_path":"src/App.tsx","content":"semantic findings only"}]
+</project_knowledge_updates>
+Use `[]` when no durable facts exist. On first meaningful project orientation, create a concise project overview if stack, purpose, entry points, or directories are established. Persist durable stack, architecture, product flows, source findings, investigated areas, and concrete open project questions. Never persist compaction/runtime state, output budgets, plan rendering, generic self-talk, secrets, or raw source copies."#;
 
 #[derive(Clone, Copy, Debug)]
 pub struct CompactionBudget {
     pub context_window: usize,
     pub ratio: f64,
-    pub reserve_tokens: usize,
+    /// Mirrors Jan: an explicit reserve overrides the ratio. Local normally
+    /// uses the 80% ratio and separately computes a dynamic output ceiling.
+    pub reserve_tokens: Option<usize>,
 }
 
 impl CompactionBudget {
     pub fn trigger_tokens(self) -> usize {
         let ratio = self.ratio.clamp(0.10, 0.99);
         let by_ratio = (self.context_window as f64 * ratio) as usize;
-        let by_reserve = self.context_window.saturating_sub(self.reserve_tokens);
-        by_ratio.min(by_reserve)
+        self.reserve_tokens.map_or(by_ratio, |reserve| {
+            self.context_window.saturating_sub(reserve)
+        })
     }
 }
 
@@ -202,18 +216,6 @@ fn summary_size_chars(transcript: &Transcript) -> usize {
         .map_or(0, |(summary, _)| summary.chars().count())
 }
 
-fn cap_rolling_summary(summary: &str) -> String {
-    let summary = summary.trim();
-    if summary.chars().count() <= ROLLING_SUMMARY_MAX_CHARS {
-        return summary.to_owned();
-    }
-    let bounded = summary
-        .chars()
-        .take(ROLLING_SUMMARY_MAX_CHARS)
-        .collect::<String>();
-    format!("{bounded}\n[rolling summary truncated to preserve context budget]")
-}
-
 fn retained_tail_tokens(messages: &[Value]) -> usize {
     let retained = messages
         .iter()
@@ -279,7 +281,7 @@ fn stable_prefix(config: &Config) -> String {
     prefix
 }
 
-fn dynamic_tail(state: &AgentState) -> String {
+fn dynamic_tail(state: &AgentState, root: Option<&str>) -> String {
     let mut tail = Vec::new();
     if !state.plan.milestones.is_empty() {
         tail.push(format!(
@@ -287,7 +289,52 @@ fn dynamic_tail(state: &AgentState) -> String {
             serde_json::to_string(&state.plan).unwrap_or_default()
         ));
     }
+    let knowledge = crate::tools::knowledge::prompt_index(root);
+    if !knowledge.is_empty() {
+        tail.push(knowledge);
+    }
+    let labels = state.plan.open_summary().unwrap_or_default();
+    let materialized = crate::tools::knowledge::relevant_context(root, &labels);
+    if !materialized.is_empty() {
+        tail.push(materialized);
+    }
     tail.join("\n")
+}
+
+fn emit_knowledge_diagnostics(config: &Config, state: &AgentState) {
+    let Some(root) = config.root.as_deref() else {
+        return;
+    };
+    let index = crate::tools::knowledge::index(&PathBuf::from(root)).ok();
+    let stats = index.as_ref().and_then(|value| value.get("stats"));
+    let injected = crate::tools::knowledge::prompt_index(Some(root));
+    emit(
+        &config.run_id,
+        Event::KnowledgeCache {
+            exists: index.is_some(),
+            manifest_version: index
+                .as_ref()
+                .and_then(|value| value.get("version"))
+                .and_then(Value::as_u64)
+                .map(|value| value as u32),
+            total_files: stats
+                .and_then(|value| value.get("totalFiles"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize,
+            approximate_bytes: stats
+                .and_then(|value| value.get("approximateBytes"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            knowledge_reads: state.knowledge_reads,
+            knowledge_writes: state.knowledge_writes,
+            cache_hits: state.knowledge_cache_hits,
+            stale_source_entries: stats
+                .and_then(|value| value.get("staleSourceEntries"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize,
+            bytes_injected: injected.len(),
+        },
+    );
 }
 
 fn tool_schemas(has_project_root: bool) -> Vec<Value> {
@@ -301,6 +348,9 @@ fn tool_schemas(has_project_root: bool) -> Vec<Value> {
             json!({"type":"function","function":{"name":"delete_file","description":"Delete a project file when allowed.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}),
             json!({"type":"function","function":{"name":"list_directory","description":"List a project directory.","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}),
             json!({"type":"function","function":{"name":"read_file","description":"Read a project file. Use a line range only when it helps answer a specific question.","parameters":{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1}},"required":["path"]}}}),
+            json!({"type":"function","function":{"name":"project_knowledge_index","description":"Read the small .ai-framework manifest index and source freshness map. Use it before repeating broad project orientation.","parameters":{"type":"object","properties":{}}}}),
+            json!({"type":"function","function":{"name":"project_knowledge_read","description":"Read bounded semantic project knowledge from .ai-framework. Cached knowledge is supplementary; source files remain authoritative.","parameters":{"type":"object","properties":{"paths":{"type":"array","items":{"type":"string"}}},"required":["paths"]}}}),
+            json!({"type":"function","function":{"name":"project_knowledge_update","description":"Optionally persist durable, reusable semantic project knowledge in .ai-framework. This is never required for normal work. Only use project/, modules/, sources/, or tasks/ markdown paths.","parameters":{"type":"object","properties":{"updates":{"type":"array","items":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["replace","merge"]}},"required":["path","content"]}},"source_paths":{"type":"array","items":{"type":"string"}}},"required":["updates"]}}}),
             json!({"type":"function","function":{"name":"run_terminal","description":"Run an existing relevant project command. After code changes, prefer a focused test, typecheck, lint, build, or check when available.","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1}},"required":["command"]}}}),
             json!({"type":"function","function":{"name":"write_file","description":"Write a project file.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}),
         ]);
@@ -621,17 +671,14 @@ fn append_continuation_text(accumulator: &mut String, continuation: &str) -> Str
     accepted
 }
 
-fn needs_compaction(
-    budget: CompactionBudget,
-    projected_input_tokens: usize,
-    available_output: usize,
-) -> bool {
+fn needs_compaction(budget: CompactionBudget, projected_input_tokens: usize) -> bool {
     projected_input_tokens > budget.trigger_tokens()
-        || available_output < PREFERRED_OUTPUT_HEADROOM_TOKENS
 }
 
 fn retry_keep_recent(attempt: usize) -> usize {
-    (DEFAULT_KEEP_RECENT >> attempt).max(1)
+    // Jan's reactive retry sequence is 8 -> 4 -> 2. Do not silently reduce
+    // the retained structural tail to one message during ordinary recovery.
+    (DEFAULT_KEEP_RECENT >> attempt).max(2)
 }
 
 #[derive(Default)]
@@ -968,12 +1015,13 @@ fn consume_sse(
     Ok(())
 }
 
-fn summarize_span(
-    config: &Config,
-    plan: &GoalPlan,
-    transcript: &Transcript,
-    covers: usize,
-) -> String {
+struct SummaryResult {
+    text: String,
+    input_tokens: usize,
+    output_tokens: usize,
+}
+
+fn summarize_span(config: &Config, plan: &CompactionPlan) -> SummaryResult {
     // Summary generation is also a provider turn. Keep its input small enough
     // to leave meaningful output headroom on the selected local context size.
     let summary_input_chars = SUMMARY_INPUT_CHARS.min(
@@ -982,14 +1030,36 @@ fn summarize_span(
             .saturating_sub(SAFETY_RESERVE_TOKENS + MIN_SUMMARY_OUTPUT_TOKENS)
             .saturating_mul(2),
     );
-    let summary_source = summary_source(config, plan, transcript, covers, summary_input_chars);
+    // Jan summarizes exactly the dropped transcript span. Local projects the
+    // current user request and canonical planning state independently after
+    // compaction, so spending this input budget on copies of them starves old
+    // concrete tool findings and worsens continuity.
+    let knowledge_index = config.root.as_deref().map_or_else(String::new, |root| {
+        crate::tools::knowledge::prompt_index(Some(root))
+    });
+    let knowledge_reserve = knowledge_index
+        .chars()
+        .count()
+        .min(8_000)
+        .saturating_add(64);
+    let mut summary_source =
+        summary_source(plan, summary_input_chars.saturating_sub(knowledge_reserve));
+    if !knowledge_index.is_empty() {
+        summary_source.push_str("\n\n[AVAILABLE PROJECT KNOWLEDGE INDEX]\n");
+        summary_source.push_str(&knowledge_index.chars().take(8_000).collect::<String>());
+    }
     if summary_source.trim().is_empty() {
-        return "Earlier conversation was omitted to fit the selected context window.".into();
+        return SummaryResult {
+            text: "Earlier conversation was omitted to fit the selected context window.".into(),
+            input_tokens: 0,
+            output_tokens: 0,
+        };
     }
     let messages = vec![
         json!({"role":"system", "content": SUMMARY_GUIDANCE}),
         json!({"role":"user", "content": summary_source}),
     ];
+    let input_tokens = estimate_tokens(&Value::Array(messages.clone()));
     let max_tokens = dynamic_output_limit(
         config.context_limit,
         estimate_tokens(&Value::Array(messages.clone())),
@@ -998,7 +1068,11 @@ fn summarize_span(
         SUMMARY_MAX_OUTPUT_TOKENS,
     );
     if max_tokens < MIN_SUMMARY_OUTPUT_TOKENS {
-        return "Earlier conversation was compacted; the current prompt contains the usable summary and retained recent transcript.".into();
+        return SummaryResult {
+            text: "Earlier conversation was compacted; the current prompt contains the usable summary and retained recent transcript.".into(),
+            input_tokens,
+            output_tokens: 0,
+        };
     }
     let payload = json!({
         "model": config.model,
@@ -1007,54 +1081,169 @@ fn summarize_span(
         "max_tokens": max_tokens,
     });
     match stream_call(&config.endpoint, &payload, &config.run_id, &config.cancelled, false) {
-        Ok(turn) if !turn.content.trim().is_empty() => cap_rolling_summary(&turn.content),
-        _ => "Earlier conversation was compacted; the current prompt contains the usable summary and retained recent transcript.".into(),
+        Ok(turn) if !turn.content.trim().is_empty() => {
+            let text = turn.content.trim().to_owned();
+            SummaryResult {
+                output_tokens: turn
+                    .completion_tokens
+                    .map_or_else(|| estimate_tokens(&json!(text)), |tokens| tokens as usize),
+                text,
+                input_tokens,
+            }
+        }
+        _ => SummaryResult {
+            text: "Earlier conversation was compacted; the current prompt contains the usable summary and retained recent transcript.".into(),
+            input_tokens,
+            output_tokens: 0,
+        },
     }
 }
 
-fn summary_source(
+fn summary_source(plan: &CompactionPlan, max_chars: usize) -> String {
+    plan.render(max_chars)
+}
+
+struct CompactionReport {
+    before: RequestBudget,
+    after: RequestBudget,
+    messages: Vec<Value>,
+    boundary_event_index: usize,
+    events_summarized: usize,
+    events_retained: usize,
+    messages_summarized: usize,
+    messages_retained: usize,
+    estimated_retained_tokens: usize,
+    summary_input_tokens: usize,
+    summary_output_tokens: usize,
+    summary_output_chars: usize,
+    preferred_tail_messages: usize,
+    selected_tail_messages: usize,
+    tail_candidate_attempts: Vec<TailCandidateAttempt>,
+    emergency_tool_result_truncation: Option<EmergencyToolResultTruncation>,
+}
+
+#[derive(Debug)]
+struct EmergencyToolResultTruncation {
+    original_tokens: usize,
+    original_chars: usize,
+    projected_tokens: usize,
+    projected_chars: usize,
+    source: Option<String>,
+}
+
+fn emit_compaction_diagnostics(
     config: &Config,
-    plan: &GoalPlan,
-    transcript: &Transcript,
-    covers: usize,
-    max_chars: usize,
-) -> String {
-    let current_user_budget = max_chars.min(12_000);
-    let current_user = config
-        .user
-        .chars()
-        .take(current_user_budget)
-        .collect::<String>();
-    let plan_snapshot = serde_json::to_string(plan).unwrap_or_default();
-    let plan_budget = max_chars
-        .saturating_sub(current_user.chars().count())
-        .min(6_000);
-    let plan_snapshot = plan_snapshot.chars().take(plan_budget).collect::<String>();
-    let labels = format!(
-        "[CURRENT USER GOAL AND CONSTRAINTS]\n{current_user}\n\n[CURRENT CANONICAL GOAL / MILESTONE / WORK PLAN]\n{plan_snapshot}\n\n[EARLIER TRANSCRIPT TO SUMMARIZE]\n"
+    state: &AgentState,
+    compaction_index: usize,
+    trigger_reason: &str,
+    report: &CompactionReport,
+) {
+    let available_before = dynamic_output_limit(
+        config.context_limit,
+        report.before.projected_input_tokens,
+        SAFETY_RESERVE_TOKENS,
+        config.provider_max_output,
+        APPLICATION_MAX_OUTPUT_TOKENS,
     );
-    let transcript_budget = max_chars.saturating_sub(labels.chars().count());
-    let earlier = transcript.render_span(covers, transcript_budget);
-    format!("{labels}{earlier}")
+    let available_after = dynamic_output_limit(
+        config.context_limit,
+        report.after.projected_input_tokens,
+        SAFETY_RESERVE_TOKENS,
+        config.provider_max_output,
+        APPLICATION_MAX_OUTPUT_TOKENS,
+    );
+    emit(
+        &config.run_id,
+        Event::CompactionDiagnostics {
+            compaction_index,
+            trigger_reason: trigger_reason.to_owned(),
+            context_window: config.context_limit,
+            projected_input_before: report.before.projected_input_tokens,
+            projected_input_after: report.after.projected_input_tokens,
+            stable_prefix_tokens: report.after.stable_prefix_tokens,
+            tool_schema_tokens: report.after.tool_schemas_tokens,
+            transcript_tokens_before: report.before.transcript_history_tokens,
+            runtime_tail_tokens: report.after.dynamic_tail_tokens,
+            planning_tokens: estimate_tokens(&json!(dynamic_tail(state, config.root.as_deref()))),
+            preferred_output_tokens: PREFERRED_OUTPUT_HEADROOM_TOKENS,
+            available_output_before: available_before,
+            available_output_after: available_after,
+            selected_max_output_tokens: available_after,
+            boundary_event_index: report.boundary_event_index,
+            events_summarized: report.events_summarized,
+            events_retained: report.events_retained,
+            messages_summarized: report.messages_summarized,
+            messages_retained: report.messages_retained,
+            estimated_retained_tokens: report.estimated_retained_tokens,
+            summary_input_tokens: report.summary_input_tokens,
+            summary_output_tokens: report.summary_output_tokens,
+            summary_output_chars: report.summary_output_chars,
+            preferred_tail_messages: report.preferred_tail_messages,
+            selected_tail_messages: report.selected_tail_messages,
+            tail_candidate_attempts: report.tail_candidate_attempts.clone(),
+            emergency_tool_result_truncation: report.emergency_tool_result_truncation.is_some(),
+            emergency_tool_result_original_tokens: report
+                .emergency_tool_result_truncation
+                .as_ref()
+                .map(|entry| entry.original_tokens),
+            emergency_tool_result_original_chars: report
+                .emergency_tool_result_truncation
+                .as_ref()
+                .map(|entry| entry.original_chars),
+            emergency_tool_result_projected_tokens: report
+                .emergency_tool_result_truncation
+                .as_ref()
+                .map(|entry| entry.projected_tokens),
+            emergency_tool_result_projected_chars: report
+                .emergency_tool_result_truncation
+                .as_ref()
+                .map(|entry| entry.projected_chars),
+            emergency_tool_result_source: report
+                .emergency_tool_result_truncation
+                .as_ref()
+                .and_then(|entry| entry.source.clone()),
+            active_milestone_id: state.plan.active_milestone().map(|item| item.id.clone()),
+            active_work_task_id: state.plan.active_work_task().map(|item| item.id.clone()),
+        },
+    );
 }
 
 fn compact_once(
     config: &Config,
     transcript: &mut Transcript,
-    plan: &GoalPlan,
     schemas: &[Value],
     before: usize,
     keep_recent: usize,
     reason: &str,
     dynamic_tail: &str,
-) -> bool {
-    let Some(covers) = transcript.compaction_plan(keep_recent) else {
-        return false;
-    };
-    let summary = summarize_span(config, plan, transcript, covers);
-    transcript.compact(summary, covers);
-    let messages = project(transcript, &stable_prefix(config), dynamic_tail);
-    let after = request_budget(config, &messages, schemas).projected_input_tokens;
+) -> Option<CompactionReport> {
+    let (plan, tail_candidate_attempts) =
+        select_fit_aware_compaction_plan(config, transcript, schemas, keep_recent, dynamic_tail)?;
+    let covers = plan.covers;
+    let before_budget = request_budget(
+        config,
+        &project(transcript, &stable_prefix(config), dynamic_tail),
+        schemas,
+    );
+    let entries_before = transcript.entries().len();
+    let messages_summarized = plan.message_count();
+    let messages_retained = plan.retained_message_count();
+    let mut summary = summarize_span(config, &plan);
+    if let Some(root) = config.root.as_deref() {
+        summary.text = crate::tools::knowledge::promote_compaction(
+            &PathBuf::from(root),
+            &config.run_id,
+            &summary.text,
+        );
+    }
+    let summary_output_chars = summary.text.chars().count();
+    transcript.compact(summary.text, covers);
+    let mut messages = project(transcript, &stable_prefix(config), dynamic_tail);
+    let emergency_tool_result_truncation =
+        truncate_retained_tool_result_to_fit(config, schemas, &mut messages);
+    let after_budget = request_budget(config, &messages, schemas);
+    let after = after_budget.projected_input_tokens;
+    let estimated_retained_tokens = retained_tail_tokens(&messages);
     emit(
         &config.run_id,
         Event::ContextOptimized {
@@ -1065,7 +1254,176 @@ fn compact_once(
             retained_suffix_tokens: after,
         },
     );
-    true
+    Some(CompactionReport {
+        before: before_budget,
+        after: after_budget,
+        messages,
+        boundary_event_index: covers,
+        events_summarized: covers,
+        events_retained: entries_before.saturating_sub(covers),
+        messages_summarized,
+        messages_retained,
+        estimated_retained_tokens,
+        summary_input_tokens: summary.input_tokens,
+        summary_output_tokens: summary.output_tokens,
+        summary_output_chars,
+        preferred_tail_messages: keep_recent,
+        selected_tail_messages: plan.retained_message_count(),
+        tail_candidate_attempts,
+        emergency_tool_result_truncation,
+    })
+}
+
+/// Select a Jan-style structural boundary before the single semantic summary
+/// call. Jan's preferred recent tail is tried first; local 32K providers also
+/// require that the complete projected request can physically leave a useful
+/// output. This is boundary selection, not a second compaction operation.
+fn select_fit_aware_compaction_plan(
+    config: &Config,
+    transcript: &Transcript,
+    schemas: &[Value],
+    preferred_keep_recent: usize,
+    dynamic_tail: &str,
+) -> Option<(CompactionPlan, Vec<TailCandidateAttempt>)> {
+    let mut candidates = vec![preferred_keep_recent];
+    candidates.extend(
+        [4, 2, 1]
+            .into_iter()
+            .filter(|candidate| *candidate < preferred_keep_recent),
+    );
+    candidates.dedup();
+    let mut attempts = Vec::new();
+    let mut smallest_plan = None;
+
+    for keep_recent in candidates {
+        let Some(plan) = transcript.compaction_plan(keep_recent) else {
+            continue;
+        };
+        let mut projected_transcript = transcript.clone();
+        projected_transcript.compact(summary_fit_reserve(), plan.covers);
+        let messages = project(&projected_transcript, &stable_prefix(config), dynamic_tail);
+        let budget = request_budget(config, &messages, schemas);
+        let fits = has_minimum_useful_output(dynamic_output_limit(
+            config.context_limit,
+            budget.projected_input_tokens,
+            SAFETY_RESERVE_TOKENS,
+            config.provider_max_output,
+            APPLICATION_MAX_OUTPUT_TOKENS,
+        ));
+        attempts.push(TailCandidateAttempt {
+            message_count: plan.retained_message_count(),
+            estimated_tokens: retained_tail_tokens(&messages),
+            projected_request_tokens: budget.projected_input_tokens,
+            fits,
+        });
+        if fits {
+            return Some((plan, attempts));
+        }
+        smallest_plan = Some(plan);
+    }
+    // A giant single tool result can make even the smallest valid structural
+    // tail fail. Keep the canonical pair intact, summarize once, then reduce
+    // only its provider projection as a last-resort compatibility measure.
+    smallest_plan.map(|plan| (plan, attempts))
+}
+
+fn summary_fit_reserve() -> String {
+    // The actual summary is normally much smaller, but selection must leave
+    // room for the configured summary ceiling without issuing trial summaries.
+    "s".repeat(SUMMARY_FIT_RESERVE_CHARS)
+}
+
+fn truncate_retained_tool_result_to_fit(
+    config: &Config,
+    schemas: &[Value],
+    messages: &mut [Value],
+) -> Option<EmergencyToolResultTruncation> {
+    let usable_input = config
+        .context_limit
+        .saturating_sub(SAFETY_RESERVE_TOKENS + MIN_USEFUL_OUTPUT_TOKENS);
+    let initial = request_budget(config, messages, schemas);
+    if initial.projected_input_tokens <= usable_input {
+        return None;
+    }
+
+    let (index, original) = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| message.get("role").and_then(Value::as_str) == Some("tool"))
+        .filter_map(|(index, message)| {
+            message
+                .get("content")
+                .and_then(Value::as_str)
+                .map(|content| (index, content.to_owned()))
+        })
+        .max_by_key(|(_, content)| content.chars().count())?;
+    let original_chars = original.chars().count();
+    let original_tokens = estimate_tokens(&json!(original));
+    // Choose the largest head+tail projection that fits the full request,
+    // rather than applying a blanket cap or guessing from character counts.
+    let mut low = 0_usize;
+    let mut high = original_chars;
+    let mut best = None;
+    while low <= high {
+        let middle = low + (high - low) / 2;
+        let candidate = truncate_tool_result_content(&original, middle);
+        messages[index]["content"] = Value::String(candidate.clone());
+        if request_budget(config, messages, schemas).projected_input_tokens <= usable_input {
+            best = Some(candidate);
+            low = middle.saturating_add(1);
+        } else if middle == 0 {
+            break;
+        } else {
+            high = middle - 1;
+        }
+    }
+    let projected = best.unwrap_or_else(|| truncate_tool_result_content(&original, 0));
+    messages[index]["content"] = Value::String(projected.clone());
+
+    let projected_chars = projected.chars().count();
+    let projected_tokens = estimate_tokens(&json!(projected));
+    let source = tool_result_source(&original);
+    Some(EmergencyToolResultTruncation {
+        original_tokens,
+        original_chars,
+        projected_tokens,
+        projected_chars,
+        source,
+    })
+}
+
+fn truncate_tool_result_content(content: &str, target_chars: usize) -> String {
+    if content.chars().count() <= target_chars {
+        return content.to_owned();
+    }
+    let marker_chars = TOOL_RESULT_TRUNCATION_MARKER.chars().count();
+    if target_chars <= marker_chars {
+        return TOOL_RESULT_TRUNCATION_MARKER.to_owned();
+    }
+    let preserved = target_chars.saturating_sub(marker_chars);
+    let head = preserved / 2;
+    let tail = preserved.saturating_sub(head);
+    let chars = content.chars().collect::<Vec<_>>();
+    format!(
+        "{}{}{}",
+        chars[..head].iter().collect::<String>(),
+        TOOL_RESULT_TRUNCATION_MARKER,
+        chars[chars.len().saturating_sub(tail)..]
+            .iter()
+            .collect::<String>()
+    )
+}
+
+fn tool_result_source(content: &str) -> Option<String> {
+    serde_json::from_str::<Value>(content)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("path")
+                .or_else(|| value.pointer("/data/path"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
 }
 
 fn request_shape(messages: &[Value]) -> Vec<String> {
@@ -1089,6 +1447,62 @@ fn run_tool(
     tool: &ValidatedCall,
 ) -> Result<(Value, Option<String>), String> {
     match tool.name.as_str() {
+        "project_knowledge_index" => {
+            let root = config
+                .root
+                .as_ref()
+                .ok_or_else(|| "no project scope".to_owned())?;
+            let value = crate::tools::knowledge::index(&PathBuf::from(root))?;
+            state.record_knowledge_read();
+            emit_knowledge_diagnostics(config, state);
+            Ok((value, None))
+        }
+        "project_knowledge_read" => {
+            let root = config
+                .root
+                .as_ref()
+                .ok_or_else(|| "no project scope".to_owned())?;
+            let revision = crate::tools::knowledge::revision(&PathBuf::from(root));
+            if let Some(path) = tool
+                .arguments
+                .get("paths")
+                .and_then(Value::as_array)
+                .and_then(|paths| paths.first())
+                .and_then(Value::as_str)
+            {
+                if state.knowledge_missing_paths.get(path) == Some(&revision) {
+                    return Ok((
+                        json!({"entries":[{"status":"missing","stillMissing":true,"path":path,"cacheRevision":revision,"message":"This knowledge document is still missing. Do not retry alternate path spellings; continue source research or wait for cache revision change."}]}),
+                        None,
+                    ));
+                }
+            }
+            let value = crate::tools::knowledge::read(&PathBuf::from(root), &tool.arguments)?;
+            if let Some(entries) = value.get("entries").and_then(Value::as_array) {
+                for entry in entries {
+                    if entry.get("status").and_then(Value::as_str) == Some("missing") {
+                        if let Some(path) = entry.get("path").and_then(Value::as_str) {
+                            state
+                                .knowledge_missing_paths
+                                .insert(path.to_owned(), revision);
+                        }
+                    }
+                }
+            }
+            state.record_knowledge_read();
+            emit_knowledge_diagnostics(config, state);
+            Ok((value, None))
+        }
+        "project_knowledge_update" => {
+            let root = config
+                .root
+                .as_ref()
+                .ok_or_else(|| "no project scope".to_owned())?;
+            let value = crate::tools::knowledge::update(&PathBuf::from(root), &tool.arguments)?;
+            state.record_knowledge_write();
+            emit_knowledge_diagnostics(config, state);
+            Ok((value, None))
+        }
         "task_plan" => {
             let (value, changed) = apply_plan(state, &tool.arguments)?;
             if changed {
@@ -1210,10 +1624,13 @@ pub fn run(config: Config) {
         .and_then(|plan| serde_json::from_value::<GoalPlan>(plan.clone()).ok())
         .unwrap_or_default();
     state.plan.normalize_active();
+    if let Some(root) = config.root.as_deref() {
+        let _ = crate::tools::knowledge::bootstrap(&PathBuf::from(root));
+    }
     let budget = CompactionBudget {
         context_window: config.context_limit,
         ratio: DEFAULT_COMPACTION_RATIO,
-        reserve_tokens: SAFETY_RESERVE_TOKENS + PREFERRED_OUTPUT_HEADROOM_TOKENS,
+        reserve_tokens: None,
     };
     let stable = stable_prefix(&config);
     let schemas = tool_schemas(config.root.is_some());
@@ -1221,6 +1638,12 @@ pub fn run(config: Config) {
     let mut continuation_count = 0_usize;
     let mut continuation_pending = false;
     let mut overflow_attempts = 0_usize;
+    let mut compaction_index = 0_usize;
+    let mut last_compaction: Option<(usize, usize)> = None;
+    let mut tool_result_tokens_since_compaction = 0_usize;
+    // An emergency tool-result reduction belongs only to the next provider
+    // projection. The append-only transcript remains verbatim.
+    let mut pending_fitted_projection: Option<Vec<Value>> = None;
 
     emit(
         &config.run_id,
@@ -1228,6 +1651,7 @@ pub fn run(config: Config) {
             run_id: config.run_id.clone(),
         },
     );
+    emit_knowledge_diagnostics(&config, &state);
     for turn in 0..128_usize {
         if config.cancelled.load(Ordering::Relaxed) {
             emit(
@@ -1243,8 +1667,10 @@ pub fn run(config: Config) {
                 transcript.push_steering(content);
             }
         }
-        let dynamic = dynamic_tail(&state);
-        let mut messages = project(&transcript, &stable, &dynamic);
+        let dynamic = dynamic_tail(&state, config.root.as_deref());
+        let mut messages = pending_fitted_projection
+            .take()
+            .unwrap_or_else(|| project(&transcript, &stable, &dynamic));
         // The just-projected reminder expires before the following turn.
         transcript.clear_reminders();
         let before_budget = request_budget(&config, &messages, &schemas);
@@ -1260,36 +1686,50 @@ pub fn run(config: Config) {
             config.provider_max_output,
             APPLICATION_MAX_OUTPUT_TOKENS,
         );
-        let should_compact =
-            needs_compaction(budget, current_budget.projected_input_tokens, output_limit);
+        let should_compact = needs_compaction(budget, current_budget.projected_input_tokens);
         let mut compaction_attempts = 0;
         if should_compact {
-            for attempt in 0..MAX_COMPACTION_ATTEMPTS {
-                let keep_recent = if attempt == 0 {
-                    DEFAULT_KEEP_RECENT
-                } else {
-                    retry_keep_recent(attempt)
-                };
-                let current_dynamic = dynamic_tail(&state);
-                if !compact_once(
-                    &config,
-                    &mut transcript,
-                    &state.plan,
-                    &schemas,
-                    current_budget.projected_input_tokens,
-                    keep_recent,
-                    if attempt == 0 {
-                        "proactive_threshold"
-                    } else {
-                        "output_headroom_retry"
-                    },
-                    &current_dynamic,
-                ) {
-                    break;
+            // Jan preflights once, then sends the request. Local's dynamic
+            // output budget handles a smaller useful answer without using it
+            // as a reason to discard additional transcript.
+            let current_dynamic = dynamic_tail(&state, config.root.as_deref());
+            if let Some(report) = compact_once(
+                &config,
+                &mut transcript,
+                &schemas,
+                current_budget.projected_input_tokens,
+                DEFAULT_KEEP_RECENT,
+                "proactive_threshold",
+                &current_dynamic,
+            ) {
+                let fitted_messages = report.messages.clone();
+                if let Some((previous_after, previous_turn)) = last_compaction {
+                    let new_turns = turn.saturating_sub(previous_turn);
+                    if new_turns <= 3 {
+                        emit(
+                            &config.run_id,
+                            Event::RapidRecompaction {
+                                previous_after_tokens: previous_after,
+                                current_before_tokens: report.before.projected_input_tokens,
+                                new_turns,
+                                new_tool_result_tokens: tool_result_tokens_since_compaction,
+                            },
+                        );
+                    }
                 }
+                compaction_index += 1;
+                emit_compaction_diagnostics(
+                    &config,
+                    &state,
+                    compaction_index,
+                    "proactive_threshold",
+                    &report,
+                );
+                last_compaction = Some((report.after.projected_input_tokens, turn));
+                tool_result_tokens_since_compaction = 0;
                 compaction_attempts += 1;
-                messages = project(&transcript, &stable, &dynamic_tail(&state));
-                current_budget = request_budget(&config, &messages, &schemas);
+                messages = fitted_messages;
+                current_budget = report.after;
                 output_limit = dynamic_output_limit(
                     config.context_limit,
                     current_budget.projected_input_tokens,
@@ -1297,9 +1737,6 @@ pub fn run(config: Config) {
                     config.provider_max_output,
                     APPLICATION_MAX_OUTPUT_TOKENS,
                 );
-                if output_limit >= PREFERRED_OUTPUT_HEADROOM_TOKENS {
-                    break;
-                }
             }
         }
         if !has_minimum_useful_output(output_limit) {
@@ -1423,30 +1860,56 @@ pub fn run(config: Config) {
             {
                 overflow_attempts += 1;
                 let before = projected;
-                let keep = retry_keep_recent(overflow_attempts);
-                if compact_once(
+                let keep = retry_keep_recent(overflow_attempts.saturating_sub(1));
+                let Some(report) = compact_once(
                     &config,
                     &mut transcript,
-                    &state.plan,
                     &schemas,
                     before,
                     keep,
                     "context_overflow_retry",
                     &dynamic,
-                ) {
+                ) else {
+                    emit(
+                        &config.run_id,
+                        Event::AgentError {
+                            code: "context_overflow".into(),
+                            message: error,
+                        },
+                    );
+                    return;
+                };
+                if let Some((previous_after, previous_turn)) = last_compaction {
+                    let new_turns = turn.saturating_sub(previous_turn);
+                    if new_turns <= 3 {
+                        emit(
+                            &config.run_id,
+                            Event::RapidRecompaction {
+                                previous_after_tokens: previous_after,
+                                current_before_tokens: report.before.projected_input_tokens,
+                                new_turns,
+                                new_tool_result_tokens: tool_result_tokens_since_compaction,
+                            },
+                        );
+                    }
+                }
+                compaction_index += 1;
+                emit_compaction_diagnostics(
+                    &config,
+                    &state,
+                    compaction_index,
+                    "context_overflow_retry",
+                    &report,
+                );
+                last_compaction = Some((report.after.projected_input_tokens, turn));
+                tool_result_tokens_since_compaction = 0;
+                pending_fitted_projection = Some(report.messages);
+                {
                     if continuation_pending {
                         transcript.remind(continuation_reminder(&final_content));
                     }
                     continue;
                 }
-                emit(
-                    &config.run_id,
-                    Event::AgentError {
-                        code: "context_overflow".into(),
-                        message: error,
-                    },
-                );
-                return;
             }
             Err(error) => {
                 emit(
@@ -1630,6 +2093,8 @@ pub fn run(config: Config) {
             match run_tool(&config, &mut state, &tool) {
                 Ok((value, diff)) => {
                     let content = value.to_string();
+                    tool_result_tokens_since_compaction = tool_result_tokens_since_compaction
+                        .saturating_add(estimate_tokens(&json!(content)));
                     emit(
                         &config.run_id,
                         Event::ToolResult {
@@ -1849,6 +2314,112 @@ mod tests {
     }
 
     #[test]
+    fn plan_update_snapshot_tracks_goal_and_work_mutations_without_compaction_state() {
+        let mut state = AgentState::default();
+        let mutate = |state: &mut AgentState, arguments: Value| {
+            let (_, changed) = apply_plan(state, &arguments).unwrap();
+            assert!(changed);
+            let canonical = serde_json::to_value(&state.plan).unwrap();
+            let emitted = serde_json::to_value(Event::PlanUpdate {
+                plan: canonical.clone(),
+            })
+            .unwrap();
+            assert_eq!(emitted["type"], "plan_update");
+            assert_eq!(emitted["plan"], canonical);
+            emitted["plan"].clone()
+        };
+
+        let goal = mutate(
+            &mut state,
+            json!({"scope":"goal","action":"init","milestones":["M1","M2","M3","M4","M5","M6"]}),
+        );
+        assert_eq!(goal["milestones"].as_array().unwrap().len(), 6);
+        assert_eq!(goal["active_milestone_id"], "milestone-1");
+
+        let work = mutate(
+            &mut state,
+            json!({"scope":"work","action":"init","milestone_id":"milestone-1","tasks":["T1","T2","T3"]}),
+        );
+        assert_eq!(
+            work["milestones"][0]["work_plan"]["tasks"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+
+        let first_done = mutate(
+            &mut state,
+            json!({"scope":"work","action":"done","milestone_id":"milestone-1","task_id":"task-1"}),
+        );
+        assert_eq!(
+            first_done["milestones"][0]["work_plan"]["tasks"][0]["status"],
+            "completed"
+        );
+        let second_done = mutate(
+            &mut state,
+            json!({"scope":"work","action":"done","milestone_id":"milestone-1","task_id":"task-2"}),
+        );
+        assert_eq!(
+            second_done["milestones"][0]["work_plan"]["tasks"][1]["status"],
+            "completed"
+        );
+        let active = mutate(
+            &mut state,
+            json!({"scope":"work","action":"start","milestone_id":"milestone-1","task_id":"task-3"}),
+        );
+        assert_eq!(
+            active["milestones"][0]["work_plan"]["tasks"][2]["status"],
+            "in_progress"
+        );
+
+        // Compaction diagnostics do not own or mutate AgentState::plan.
+        let before = serde_json::to_value(&state.plan).unwrap();
+        let _diagnostic = Event::CompactionDiagnostics {
+            compaction_index: 1,
+            trigger_reason: "test".into(),
+            context_window: 32_768,
+            projected_input_before: 26_300,
+            projected_input_after: 12_000,
+            stable_prefix_tokens: 100,
+            tool_schema_tokens: 200,
+            transcript_tokens_before: 25_000,
+            runtime_tail_tokens: 50,
+            planning_tokens: 50,
+            preferred_output_tokens: 1_024,
+            available_output_before: 100,
+            available_output_after: 1_024,
+            selected_max_output_tokens: 1_024,
+            boundary_event_index: 12,
+            events_summarized: 12,
+            events_retained: 8,
+            messages_summarized: 12,
+            messages_retained: 8,
+            estimated_retained_tokens: 10_000,
+            summary_input_tokens: 4_000,
+            summary_output_tokens: 800,
+            summary_output_chars: 3_200,
+            preferred_tail_messages: 8,
+            selected_tail_messages: 8,
+            tail_candidate_attempts: vec![TailCandidateAttempt {
+                message_count: 8,
+                estimated_tokens: 10_000,
+                projected_request_tokens: 12_000,
+                fits: true,
+            }],
+            emergency_tool_result_truncation: false,
+            emergency_tool_result_original_tokens: None,
+            emergency_tool_result_original_chars: None,
+            emergency_tool_result_projected_tokens: None,
+            emergency_tool_result_projected_chars: None,
+            emergency_tool_result_source: None,
+            active_milestone_id: Some("milestone-1".into()),
+            active_work_task_id: Some("task-3".into()),
+        };
+        assert_eq!(serde_json::to_value(&state.plan).unwrap(), before);
+    }
+
+    #[test]
     fn task_plan_schema_explains_separate_goal_and_work_scopes() {
         let schema = tool_schemas(false)
             .into_iter()
@@ -1875,7 +2446,7 @@ mod tests {
         let mut state = AgentState::default();
         state.plan.init(vec!["Inspect".into()]).unwrap();
         assert!(!stable_prefix(&config).contains("planning_state"));
-        assert!(dynamic_tail(&state).contains("planning_state"));
+        assert!(dynamic_tail(&state, None).contains("planning_state"));
     }
 
     #[test]
@@ -1949,11 +2520,9 @@ mod tests {
     }
 
     #[test]
-    fn rolling_summary_output_is_bounded_before_it_returns_to_the_transcript() {
-        let bounded = cap_rolling_summary(&"s".repeat(ROLLING_SUMMARY_MAX_CHARS + 5_000));
-        assert!(bounded.chars().count() <= ROLLING_SUMMARY_MAX_CHARS + 72);
-        assert!(bounded.ends_with("[rolling summary truncated to preserve context budget]"));
-        assert_eq!(cap_rolling_summary(" concise summary "), "concise summary");
+    fn summary_is_bounded_by_provider_max_tokens_without_a_second_char_truncation() {
+        assert_eq!(SUMMARY_MAX_OUTPUT_TOKENS, 2_048);
+        assert!(MIN_SUMMARY_OUTPUT_TOKENS <= SUMMARY_MAX_OUTPUT_TOKENS);
     }
 
     #[test]
@@ -1980,12 +2549,7 @@ mod tests {
     }
 
     #[test]
-    fn summary_contract_and_source_preserve_concrete_research_findings() {
-        let config = test_config(None);
-        let mut plan = GoalPlan::default();
-        plan.init(vec!["Audit routes".into()]).unwrap();
-        plan.init_work(vec!["Trace route composition".into()])
-            .unwrap();
+    fn jan_style_summary_source_is_the_dropped_transcript_only() {
         let mut transcript = Transcript::default();
         transcript.push_message(json!({
             "role":"user",
@@ -1995,11 +2559,10 @@ mod tests {
             "role":"assistant",
             "content":"App.tsx uses BrowserRouter and renders PurchaseToast, AppRoutes, and ScrollToTopButton. Routes.tsx uses LangGate plus ProductShell and routes product/:id, products-page, confirm, and legal pages."
         }));
-        let source = summary_source(&config, &plan, &transcript, 2, SUMMARY_INPUT_CHARS);
+        let plan = transcript.compaction_plan(1).unwrap();
+        let source = summary_source(&plan, SUMMARY_INPUT_CHARS);
         assert!(SUMMARY_GUIDANCE.contains("what was learned from each"));
         assert!(SUMMARY_GUIDANCE.contains("not merely that a file was read"));
-        assert!(source.contains("Audit routes"));
-        assert!(source.contains("Trace route composition"));
         assert!(source.contains("App.tsx uses BrowserRouter"));
         assert!(source.contains("Routes.tsx uses LangGate"));
     }
@@ -2038,17 +2601,19 @@ mod tests {
         transcript.push_message(
             json!({"role":"assistant","content":"Need inspect api.php, .htaccess, robots.txt."}),
         );
-        let covers = transcript.entries().len();
-
-        let summary = summarize_span(&config, &plan, &transcript, covers);
-        transcript.compact(summary, covers);
+        let compaction_plan = transcript.compaction_plan(1).unwrap();
+        let summary = summarize_span(&config, &compaction_plan);
+        transcript.compact(summary.text, compaction_plan.covers);
         let projected = project(
             &transcript,
             &stable_prefix(&config),
-            &dynamic_tail(&AgentState {
-                plan,
-                ..AgentState::default()
-            }),
+            &dynamic_tail(
+                &AgentState {
+                    plan,
+                    ..AgentState::default()
+                },
+                None,
+            ),
         );
         let summary_message = projected
             .iter()
@@ -2146,18 +2711,218 @@ mod tests {
         let budget = CompactionBudget {
             context_window: 16_384,
             ratio: DEFAULT_COMPACTION_RATIO,
-            reserve_tokens: SAFETY_RESERVE_TOKENS + PREFERRED_OUTPUT_HEADROOM_TOKENS,
+            reserve_tokens: None,
         };
-        assert!(needs_compaction(budget, 14_500, 500));
-        assert!(!needs_compaction(budget, 4_000, 2_000));
+        assert!(needs_compaction(budget, 14_500));
+        assert!(!needs_compaction(budget, 4_000));
     }
 
     #[test]
-    fn overflow_recovery_shrinks_tail_and_stays_bounded() {
+    fn jan_retry_tail_policy_is_eight_then_four_then_two() {
+        assert_eq!(retry_keep_recent(0), 8);
         assert_eq!(retry_keep_recent(1), 4);
         assert_eq!(retry_keep_recent(2), 2);
-        assert_eq!(retry_keep_recent(3), 1);
-        assert_eq!(retry_keep_recent(MAX_COMPACTION_ATTEMPTS), 1);
+        assert_eq!(retry_keep_recent(3), 2);
+        assert_eq!(retry_keep_recent(MAX_COMPACTION_ATTEMPTS), 2);
+    }
+
+    fn fit_selection_fixture(
+        large_tail_messages: usize,
+        large_chars: usize,
+    ) -> (Config, Transcript, Vec<Value>, String) {
+        let mut config = test_config(None);
+        config.context_limit = 32_768;
+        // These approximate the real failure's stable prefix, schemas, and
+        // dynamic tail without depending on a provider or real files.
+        config.system = "s".repeat(900);
+        let schemas = vec![json!({"type":"function","description":"t".repeat(1_000)})];
+        let dynamic = "d".repeat(2_000);
+        let mut transcript = Transcript::default();
+        for index in 0..8 {
+            transcript
+                .push_message(json!({"role":"assistant","content":format!("old finding {index}")}));
+        }
+        for index in 0..large_tail_messages {
+            transcript.push_message(json!({
+                "role":"assistant",
+                "content": format!("large finding {index}: {}", "x".repeat(large_chars)),
+            }));
+        }
+        transcript.push_run_user(json!({"role":"user","content":"continue the audit"}));
+        (config, transcript, schemas, dynamic)
+    }
+
+    #[test]
+    fn preflight_tail_selection_retries_eight_four_two_before_summary() {
+        let (config, transcript, schemas, dynamic) = fit_selection_fixture(8, 20_000);
+        let (plan, attempts) = select_fit_aware_compaction_plan(
+            &config,
+            &transcript,
+            &schemas,
+            DEFAULT_KEEP_RECENT,
+            &dynamic,
+        )
+        .unwrap();
+
+        assert!(attempts[0].estimated_tokens >= 46_000);
+        assert_eq!(attempts[0].message_count, 8);
+        assert!(!attempts[0].fits);
+        assert!(attempts
+            .iter()
+            .any(|attempt| attempt.message_count == 4 && attempt.fits));
+        assert_eq!(plan.retained_message_count(), 4);
+        let mut compacted = transcript.clone();
+        compacted.compact("verified handoff".into(), plan.covers);
+        let post_compaction = request_budget(
+            &config,
+            &project(&compacted, &stable_prefix(&config), &dynamic),
+            &schemas,
+        );
+        assert!(has_minimum_useful_output(dynamic_output_limit(
+            config.context_limit,
+            post_compaction.projected_input_tokens,
+            SAFETY_RESERVE_TOKENS,
+            config.provider_max_output,
+            APPLICATION_MAX_OUTPUT_TOKENS,
+        )));
+    }
+
+    #[test]
+    fn fit_selection_keeps_eight_when_it_fits() {
+        let (config, transcript, schemas, dynamic) = fit_selection_fixture(1, 20_000);
+        let (plan, attempts) = select_fit_aware_compaction_plan(
+            &config,
+            &transcript,
+            &schemas,
+            DEFAULT_KEEP_RECENT,
+            &dynamic,
+        )
+        .unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert!(attempts[0].fits);
+        assert_eq!(plan.retained_message_count(), 8);
+    }
+
+    #[test]
+    fn fit_selection_uses_two_when_eight_and_four_do_not_fit() {
+        let (config, transcript, schemas, dynamic) = fit_selection_fixture(8, 35_000);
+        let (plan, attempts) = select_fit_aware_compaction_plan(
+            &config,
+            &transcript,
+            &schemas,
+            DEFAULT_KEEP_RECENT,
+            &dynamic,
+        )
+        .unwrap();
+        assert_eq!(attempts[0].message_count, 8);
+        assert!(!attempts[0].fits);
+        assert!(attempts
+            .iter()
+            .any(|attempt| attempt.message_count == 4 && !attempt.fits));
+        assert!(attempts
+            .iter()
+            .any(|attempt| attempt.message_count == 2 && attempt.fits));
+        assert_eq!(plan.retained_message_count(), 2);
+    }
+
+    #[test]
+    fn real_failure_sized_preflight_selects_smaller_tail_and_dispatches() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_mock_request(&mut stream);
+                let is_summary =
+                    request["messages"][0]["content"]
+                        .as_str()
+                        .is_some_and(|content| {
+                            content.contains("Create a concise but information-dense")
+                        });
+                let response = if is_summary {
+                    json!({"choices":[{"delta":{"content":"Verified earlier findings."},"finish_reason":"stop"}]})
+                } else {
+                    json!({"choices":[{"delta":{"content":"Continue with the fitted request."},"finish_reason":"stop"}]})
+                };
+                requests.push(request);
+                stream
+                    .write_all(sse_response(&[response]).as_bytes())
+                    .unwrap();
+            }
+            requests
+        });
+        let (mut config, transcript, _schemas, _dynamic) = fit_selection_fixture(8, 20_000);
+        config.endpoint = endpoint;
+        config.user = "continue the audit".into();
+        config.history = transcript
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                crate::agent::transcript::Entry::Message(message) => Some(message.clone()),
+                _ => None,
+            })
+            .collect();
+
+        run(config);
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        let agent = requests
+            .iter()
+            .find(|request| {
+                request["messages"][0]["content"]
+                    .as_str()
+                    .is_some_and(|content| content.starts_with("s"))
+            })
+            .expect("a model request is dispatched after the one summary request");
+        assert!(agent["max_tokens"].as_u64().unwrap() >= MIN_USEFUL_OUTPUT_TOKENS as u64);
+        assert_eq!(
+            agent["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|message| message["role"] == "user"
+                    && message["content"] == "continue the audit")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn giant_retained_tool_result_is_truncated_only_in_projection() {
+        let mut config = test_config(None);
+        config.context_limit = 32_768;
+        let schemas = tool_schemas(true);
+        let giant = json!({"path":"src/giant.rs","content":"z".repeat(140_000)}).to_string();
+        let mut messages = vec![
+            json!({"role":"system","content":stable_prefix(&config)}),
+            json!({"role":"assistant","content":"I will inspect the file.","tool_calls":[{"id":"read-1","type":"function","function":{"name":"read_file","arguments":"{\\\"path\\\":\\\"src/giant.rs\\\"}"}}]}),
+            json!({"role":"tool","tool_call_id":"read-1","name":"read_file","content":giant}),
+            json!({"role":"user","content":"continue"}),
+        ];
+        let canonical = messages.clone();
+        let diagnostic = truncate_retained_tool_result_to_fit(&config, &schemas, &mut messages)
+            .expect("the giant retained result needs an emergency projection");
+        assert_eq!(messages[1], canonical[1]);
+        assert_eq!(messages[2]["tool_call_id"], "read-1");
+        assert_ne!(messages[2]["content"], canonical[2]["content"]);
+        assert!(messages[2]["content"]
+            .as_str()
+            .unwrap()
+            .contains("tool result projection truncated"));
+        assert_eq!(diagnostic.source.as_deref(), Some("src/giant.rs"));
+        assert!(
+            request_budget(&config, &messages, &schemas).projected_input_tokens
+                <= config.context_limit - SAFETY_RESERVE_TOKENS - MIN_USEFUL_OUTPUT_TOKENS
+        );
+        // The caller owns the canonical transcript; its value was never edited.
+        assert!(canonical[2]["content"]
+            .as_str()
+            .unwrap()
+            .contains("src/giant.rs"));
     }
 
     #[test]
@@ -2177,7 +2942,7 @@ mod tests {
             retry_keep_recent(2),
             retry_keep_recent(3),
         ] {
-            let boundary = transcript.compaction_plan(keep_recent).unwrap();
+            let boundary = transcript.compaction_plan(keep_recent).unwrap().covers;
             retained.push(
                 transcript.entries()[boundary..]
                     .iter()
@@ -2191,11 +2956,59 @@ mod tests {
                     .count(),
             );
         }
-        assert_eq!(retained, vec![8, 4, 2, 1]);
+        assert_eq!(retained, vec![8, 4, 2, 2]);
     }
 
     #[test]
-    fn long_32k_transcript_recompacts_then_sends_the_next_request() {
+    fn structural_eight_message_compaction_leaves_32k_room_for_multiple_turns() {
+        let mut config = test_config(Some("/project"));
+        config.context_limit = 32_768;
+        let schemas = tool_schemas(true);
+        let stable = stable_prefix(&config);
+        let mut transcript = Transcript::default();
+        let large_turn = "source detail ".repeat(480);
+        for turn in 0..10 {
+            transcript.push_message(
+                json!({"role":"user","content":format!("request {turn}: {large_turn}")}),
+            );
+            transcript.push_message(
+                json!({"role":"assistant","content":format!("finding {turn}: {large_turn}")}),
+            );
+        }
+        transcript.push_run_user(json!({"role":"user","content":"current audit request"}));
+        let budget = CompactionBudget {
+            context_window: config.context_limit,
+            ratio: DEFAULT_COMPACTION_RATIO,
+            reserve_tokens: None,
+        };
+        let before = request_budget(&config, &project(&transcript, &stable, ""), &schemas);
+        assert!(needs_compaction(budget, before.projected_input_tokens));
+
+        let plan = transcript.compaction_plan(DEFAULT_KEEP_RECENT).unwrap();
+        transcript.compact("dense verified handoff ".repeat(300), plan.covers);
+        let after = request_budget(&config, &project(&transcript, &stable, ""), &schemas);
+        assert!(
+            after.projected_input_tokens < budget.trigger_tokens(),
+            "after={} trigger={}",
+            after.projected_input_tokens,
+            budget.trigger_tokens()
+        );
+
+        for turn in 0..4 {
+            transcript.push_message(json!({"role":"assistant","content":format!("new analysis {turn}: {}", "detail ".repeat(100))}));
+            transcript.push_message(json!({"role":"tool","tool_call_id":format!("t-{turn}"),"name":"read_file","content":"new file result ".repeat(100)}));
+        }
+        let later = request_budget(&config, &project(&transcript, &stable, ""), &schemas);
+        assert!(
+            !needs_compaction(budget, later.projected_input_tokens),
+            "several ordinary post-compaction turns should fit: later={} trigger={}",
+            later.projected_input_tokens,
+            budget.trigger_tokens()
+        );
+    }
+
+    #[test]
+    fn long_32k_transcript_compacts_once_then_leaves_room_for_the_next_request() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!(
             "http://{}/v1/chat/completions",
@@ -2232,7 +3045,7 @@ mod tests {
         config.context_limit = 32_768;
         config.provider_max_output = Some(1_600);
         config.user = "current request".into();
-        let long_turn = "transcript detail ".repeat(1_100);
+        let long_turn = "transcript detail ".repeat(400);
         for turn in 0..10 {
             config
                 .history
@@ -2254,9 +3067,13 @@ mod tests {
                     })
             })
             .collect::<Vec<_>>();
+        assert_eq!(
+            summary_requests.len(),
+            1,
+            "Jan preflights once before dispatch"
+        );
         assert!(
-            summary_requests.len() >= 2,
-            "expected normal and aggressive compaction"
+            summary_requests[0]["max_tokens"].as_u64().unwrap() <= SUMMARY_MAX_OUTPUT_TOKENS as u64
         );
         let agent_request = requests.last().unwrap();
         assert_eq!(agent_request["max_tokens"], 1_600);
@@ -2488,7 +3305,7 @@ mod tests {
             }));
             transcript.tool_result(&id, "read_file", "result".into());
         }
-        let boundary = transcript.compaction_plan(1).unwrap();
+        let boundary = transcript.compaction_plan(1).unwrap().covers;
         assert!(matches!(
             &transcript.entries()[boundary],
             crate::agent::transcript::Entry::Message(message)

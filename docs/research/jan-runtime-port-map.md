@@ -82,3 +82,27 @@ new Local stall subsystem. The retained Local extensions are dynamic output
 budgeting, provider-compatible length continuation with overlap dedup, strict
 one-leading-system projection, hierarchical plan adapter, project tools, IPC
 streaming, and cancellation.
+
+## Compaction: Jan vs Local
+
+The detailed forensic trace is in
+[`jan-compaction-port.md`](jan-compaction-port.md). The relevant Jan functions
+are `compaction.rs::{trigger_tokens, tail_start, summarize_span, summarize}`,
+`transcript.rs::{conversation, compaction_plan, project}`, and
+`loop.rs::{run_turn_cycle, compact, build_completion_request}`. Jan's default
+is an 80% whole-request trigger, a structural eight-message tail, a 48,000
+character dropped-span summary input, and reactive 8/4/2 tail retries after a
+provider overflow.
+
+Local now mirrors those boundary and retry semantics in
+`rust-agent/src/agent/transcript.rs::compaction_plan` and
+`rust-agent/src/agent/loop_runtime.rs::{needs_compaction, compact_once,
+summarize_span}`. It no longer rewrites retained tool outputs in
+`context/projection.rs`, no longer duplicates current user/plan data in the
+summary input, and no longer runs repeated proactive compactions just to
+recover preferred output headroom. The Local-only output ceiling remains
+separate and accepts any useful smaller response.
+
+For the next benchmark `Event::CompactionDiagnostics` and
+`Event::RapidRecompaction` report the complete non-content accounting needed to
+verify trigger, boundary, tail, summary, and output behavior.

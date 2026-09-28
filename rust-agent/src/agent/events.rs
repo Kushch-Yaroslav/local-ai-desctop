@@ -1,6 +1,17 @@
 use serde::Serialize;
 use serde_json::Value;
 
+/// One structural retained-tail candidate considered during a single
+/// compaction. It is accounting only; transcript content never crosses this
+/// protocol boundary.
+#[derive(Clone, Debug, Serialize)]
+pub struct TailCandidateAttempt {
+    pub message_count: usize,
+    pub estimated_tokens: usize,
+    pub projected_request_tokens: usize,
+    pub fits: bool,
+}
+
 /// Stable NDJSON protocol consumed by Electron main. Unknown event types are
 /// intentionally ignorable, so the protocol can grow without breaking UI.
 #[derive(Debug, Serialize)]
@@ -120,6 +131,64 @@ pub enum Event {
         trigger_reason: String,
         removed_transcript_tokens: usize,
         retained_suffix_tokens: usize,
+    },
+    /// Safe compaction accounting for benchmark forensics. It contains sizes,
+    /// structure, and stable planning IDs only; never transcript text.
+    CompactionDiagnostics {
+        compaction_index: usize,
+        trigger_reason: String,
+        context_window: usize,
+        projected_input_before: usize,
+        projected_input_after: usize,
+        stable_prefix_tokens: usize,
+        tool_schema_tokens: usize,
+        transcript_tokens_before: usize,
+        runtime_tail_tokens: usize,
+        planning_tokens: usize,
+        preferred_output_tokens: usize,
+        available_output_before: usize,
+        available_output_after: usize,
+        selected_max_output_tokens: usize,
+        boundary_event_index: usize,
+        events_summarized: usize,
+        events_retained: usize,
+        messages_summarized: usize,
+        messages_retained: usize,
+        estimated_retained_tokens: usize,
+        summary_input_tokens: usize,
+        summary_output_tokens: usize,
+        summary_output_chars: usize,
+        preferred_tail_messages: usize,
+        selected_tail_messages: usize,
+        tail_candidate_attempts: Vec<TailCandidateAttempt>,
+        emergency_tool_result_truncation: bool,
+        emergency_tool_result_original_tokens: Option<usize>,
+        emergency_tool_result_original_chars: Option<usize>,
+        emergency_tool_result_projected_tokens: Option<usize>,
+        emergency_tool_result_projected_chars: Option<usize>,
+        emergency_tool_result_source: Option<String>,
+        active_milestone_id: Option<String>,
+        active_work_task_id: Option<String>,
+    },
+    /// Observability only: compaction occurred soon after a prior compaction.
+    RapidRecompaction {
+        previous_after_tokens: usize,
+        current_before_tokens: usize,
+        new_turns: usize,
+        new_tool_result_tokens: usize,
+    },
+    /// Project-local virtual-context cache diagnostics. Content is deliberately
+    /// excluded; this is for the context/debug surface only.
+    KnowledgeCache {
+        exists: bool,
+        manifest_version: Option<u32>,
+        total_files: usize,
+        approximate_bytes: u64,
+        knowledge_reads: usize,
+        knowledge_writes: usize,
+        cache_hits: usize,
+        stale_source_entries: usize,
+        bytes_injected: usize,
     },
     ApprovalRequired {
         id: String,

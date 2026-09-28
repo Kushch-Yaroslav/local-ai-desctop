@@ -5,7 +5,7 @@ import { promisify } from 'node:util';
 import type { RiskCategory } from '../../shared/types';
 
 const execFileAsync = promisify(execFile);
-const ignoredDirectories = new Set(['.git', 'node_modules', 'dist', 'build', '.next', '.cache', 'coverage']);
+const ignoredDirectories = new Set(['.git', '.ai-framework', 'node_modules', 'dist', 'build', '.next', '.cache', 'coverage']);
 const maxLineReadBytes = 8_000_000;
 const defaultPageSize = 100;
 const maxPageSize = 250;
