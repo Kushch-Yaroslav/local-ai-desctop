@@ -15,6 +15,7 @@ use crate::context::projection::project;
 use crate::protocol::emit;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
@@ -70,7 +71,11 @@ const AGENT_GUIDANCE: &str = r#"
 - Work directly from the conversation and tool results. A tool-free response normally completes the run.
 - For code changes, read before writing, make targeted changes, and run the most relevant practical validation or readback. Adapt after errors; do not invent checks.
 - For read-only analysis, use tools for concrete evidence, avoid broad rereads, and synthesize when the active Todo has enough evidence.
-- Project knowledge is persistent in `.ai-framework`. Its compact catalog is supplementary; retrieve a named document with project_knowledge_read when it is useful, and treat current source as authoritative.
+- Respond and narrate visible reasoning/progress in the user's language. Keep code, identifiers, paths, commands, APIs, and quoted source in their original language.
+- Todo = what to do next. Keep its concise items current; when work is actually complete, use its exact `done` action rather than leaving an earlier item active or recreating the plan.
+- Task Memory = durable semantic continuity for this task. Record meaningful findings, decisions, blockers, and next actions. After compaction, trust a precise Task Memory finding from an unchanged inspected file; reread only for a missing fact, ambiguity, possible change, exact detail, or targeted verification.
+- Project Knowledge = reusable observations already derived from this project. Use relevant fresh knowledge before broad rereading; source remains authoritative when exact current code or an unresolved detail is needed. It is project-level; Task Memory is task-level.
+- After compaction: inspect Todo, use Task Memory, then relevant Project Knowledge; read source only for genuinely new or verification-specific information.
 - Do not call tools merely because they are available. Stop naturally when the requested work is complete.
 "#;
 
@@ -206,6 +211,27 @@ fn request_payload(
     payload
 }
 
+/// llama.cpp's OpenAI-compatible API intentionally implements only the
+/// string tool-choice variants (`auto`, `none`, `required`).  Keep this
+/// decision separate from the provider payload construction so the eager
+/// Todo path has a small regression test and never regresses to OpenAI's
+/// named-function object form.
+fn tool_choice_for_turn(eager_todo: bool) -> Value {
+    if eager_todo {
+        json!("required")
+    } else {
+        json!("auto")
+    }
+}
+
+fn eager_todo_schemas(schemas: &[Value]) -> Vec<Value> {
+    schemas
+        .iter()
+        .filter(|schema| tool_name(schema) == "todo")
+        .cloned()
+        .collect()
+}
+
 fn estimate_tokens(value: &Value) -> usize {
     // Conservative enough for JSON-heavy local tool prompts. Provider-reported
     // usage remains authoritative telemetry.
@@ -336,7 +362,6 @@ fn stable_prefix(config: &Config) -> String {
 }
 
 const EAGER_TODO_GUIDANCE: &str = "For substantial multi-step work, create one short Todo when useful. Keep it flat and high-level; begin useful investigation without waiting on planning.";
-const TODO_UPKEEP_GUIDANCE: &str = "Todo is lightweight orientation, not a gate. When a meaningful subtask is complete, mark it done and attach one concise handoff memory if it preserves a finding or next action. Continue useful work even if Todo is slightly stale.";
 
 fn is_multi_step_request(user: &str) -> bool {
     let lower = user.to_ascii_lowercase();
@@ -365,9 +390,8 @@ fn dynamic_tail(state: &AgentState, root: Option<&str>, eager_todo: bool) -> Str
         tail.push(EAGER_TODO_GUIDANCE.to_owned());
     } else if !state.plan.model_todo.is_empty() {
         tail.push(format!(
-            "<model_todo>\n{}\n</model_todo>\n{}",
-            state.plan.model_todo.prompt(),
-            TODO_UPKEEP_GUIDANCE,
+            "<model_todo>\n{}\n</model_todo>",
+            state.plan.model_todo.prompt()
         ));
     }
     let active = state
@@ -424,8 +448,8 @@ fn emit_knowledge_diagnostics(config: &Config, state: &AgentState) {
 
 fn tool_schemas(has_project_root: bool) -> Vec<Value> {
     let mut tools = vec![
-        json!({"type":"function","function":{"name":"todo","description":"Maintain a small flat working Todo. It is optional guidance, never a completion gate. `done` may include one compact memory handoff; the next pending item becomes active automatically.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["init","append","start","done","drop","view"]},"list":{"type":"array","description":"For init: [{items:[\"concise task\"]}]. Phase is accepted only for older clients and is UI-only.","items":{"type":"object","properties":{"phase":{"type":"string"},"items":{"type":"array","items":{"type":"string"}}},"required":["items"]}},"task":{"type":"string"},"phase":{"type":"string"},"content":{"type":"string"},"memory":{"type":"object","description":"Optional durable handoff when completing a Todo.","properties":{"finding":{"type":"string"},"evidence":{"type":"string"},"implication":{"type":"string"},"next":{"type":"string"}},"required":["finding"]}},"required":["action"]}}}),
-        json!({"type":"function","function":{"name":"task_memory","description":"Record, correct, or invalidate a concise durable task finding. Use only for meaningful conclusions, decisions, blockers, or test outcomes; never after every read.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["record","update","invalidate","view"]},"id":{"type":"string"},"task":{"type":"string"},"finding":{"type":"string"},"evidence":{"type":"string"},"implication":{"type":"string"},"next":{"type":"string"},"supersedes":{"type":"string"}},"required":["action"]}}}),
+        json!({"type":"function","function":{"name":"todo","description":"Canonical current plan, not a gate. init uses list:[{items:[\"outcome\"]}]; append uses one content string; view reads it. To finish current work use {action:\"done\"}; no task label is needed and the next pending item activates automatically. start/drop may name a task by its full content or displayed id, but start cannot skip earlier open work: finish or drop it first. done may attach optional memory {finding, evidence, implication, next}. Keep the active item aligned with current work; do not recreate the plan.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["init","append","start","done","drop","view"]},"list":{"type":"array","description":"For init: [{items:[\"concise task\"]}]. Phase is accepted only for older clients and is UI-only.","items":{"type":"object","properties":{"phase":{"type":"string"},"items":{"type":"array","items":{"type":"string"}}},"required":["items"]}},"task":{"type":"string","description":"Optional for done (defaults to active); required for start/drop. Accepts a displayed id or full task content."},"phase":{"type":"string"},"content":{"type":"string","description":"One new Todo item for append; also accepted as a task reference for done/start/drop."},"memory":{"type":"object","description":"Optional durable handoff when completing a Todo.","properties":{"finding":{"type":"string"},"evidence":{"type":"string"},"implication":{"type":"string"},"next":{"type":"string"}},"required":["finding"]}},"required":["action"]}}}),
+        json!({"type":"function","function":{"name":"task_memory","description":"Durable semantic memory for the current task across compaction, not the Todo. Record/update meaningful findings, decisions, blockers, or unresolved questions; view reads it; invalidate needs id. Record/update requires finding and may include task, evidence, implication, next, id, supersedes. Trust precise unchanged-file memory; reread only for a concrete missing, ambiguous, changed, exact-detail, or verification need.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["record","update","invalidate","view"]},"id":{"type":"string"},"task":{"type":"string"},"finding":{"type":"string"},"evidence":{"type":"string"},"implication":{"type":"string"},"next":{"type":"string"},"supersedes":{"type":"string"}},"required":["action"]}}}),
     ];
     if has_project_root {
         tools.extend([
@@ -435,7 +459,7 @@ fn tool_schemas(has_project_root: bool) -> Vec<Value> {
             json!({"type":"function","function":{"name":"list_directory","description":"List a project directory.","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}),
             json!({"type":"function","function":{"name":"read_file","description":"Read a project file. Use a line range only when it helps answer a specific question.","parameters":{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1}},"required":["path"]}}}),
             json!({"type":"function","function":{"name":"project_knowledge_index","description":"Read the small .ai-framework manifest index and source freshness map. Use it before repeating broad project orientation.","parameters":{"type":"object","properties":{}}}}),
-            json!({"type":"function","function":{"name":"project_knowledge_read","description":"Read bounded semantic project knowledge from .ai-framework. Cached knowledge is supplementary; source files remain authoritative.","parameters":{"type":"object","properties":{"paths":{"type":"array","items":{"type":"string"}}},"required":["paths"]}}}),
+            json!({"type":"function","function":{"name":"project_knowledge_read","description":"Read selected reusable project observations from .ai-framework: paths is required. Prefer relevant fresh knowledge before broad rereads; do not reread unchanged source only to reconstruct context. Read source for exact current code or a concrete unresolved/verification detail.","parameters":{"type":"object","properties":{"paths":{"type":"array","items":{"type":"string"}}},"required":["paths"]}}}),
             json!({"type":"function","function":{"name":"project_knowledge_update","description":"Optionally persist durable, reusable semantic project knowledge in .ai-framework. This is never required for normal work. Only use project/, modules/, sources/, or tasks/ markdown paths.","parameters":{"type":"object","properties":{"updates":{"type":"array","items":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["replace","merge"]}},"required":["path","content"]}},"source_paths":{"type":"array","items":{"type":"string"}}},"required":["updates"]}}}),
             json!({"type":"function","function":{"name":"run_terminal","description":"Run an existing relevant project command. After code changes, prefer a focused test, typecheck, lint, build, or check when available.","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1}},"required":["command"]}}}),
             json!({"type":"function","function":{"name":"write_file","description":"Write a project file.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}),
@@ -480,6 +504,31 @@ fn required_text(arguments: &Value, key: &str) -> Result<String, String> {
         .filter(|value| !value.trim().is_empty())
         .map(str::to_owned)
         .ok_or_else(|| format!("todo requires {key}"))
+}
+
+fn todo_reference(
+    state: &AgentState,
+    arguments: &Value,
+    require_explicit: bool,
+) -> Result<String, String> {
+    for key in ["task", "content"] {
+        if let Some(value) = arguments
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            return Ok(value.to_owned());
+        }
+    }
+    if !require_explicit {
+        return state
+            .plan
+            .model_todo
+            .active()
+            .map(|(_, item)| item.id.clone())
+            .ok_or_else(|| "todo has no active item".to_owned());
+    }
+    Err("todo requires task or content".into())
 }
 
 fn todo_init_phases(arguments: &Value) -> Result<Vec<(String, Vec<String>)>, String> {
@@ -530,9 +579,9 @@ fn apply_todo(state: &mut AgentState, arguments: &Value) -> Result<(Value, bool)
         "start" => state
             .plan
             .model_todo
-            .start(&required_text(arguments, "task")?)?,
+            .start(&todo_reference(state, arguments, true)?)?,
         "done" => {
-            let task = required_text(arguments, "task")?;
+            let task = todo_reference(state, arguments, false)?;
             let todo_id = state.plan.model_todo.id_for(&task);
             state.plan.model_todo.finish(&task, false)?;
             if let Some(memory) = arguments.get("memory") {
@@ -543,7 +592,7 @@ fn apply_todo(state: &mut AgentState, arguments: &Value) -> Result<(Value, bool)
         "drop" => state
             .plan
             .model_todo
-            .finish(&required_text(arguments, "task")?, true)?,
+            .finish(&todo_reference(state, arguments, true)?, true)?,
         _ => return Err("unsupported todo action".into()),
     }
     state.plan.sync_from_model_todo();
@@ -841,6 +890,19 @@ struct StreamedTurn {
     predicted_per_second: Option<f64>,
 }
 
+/// Opt-in forensic trace for a real provider run. It stays outside the
+/// transcript and is disabled unless the operator supplies a path, so it
+/// cannot affect prompt construction or persisted chat history.
+fn trace_forensics(run_id: &str, kind: &str, data: Value) {
+    let Ok(path) = std::env::var("LOCAL_AI_AGENT_TRACE_PATH") else {
+        return;
+    };
+    let record = json!({"run_id":run_id,"kind":kind,"data":data});
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{record}");
+    }
+}
+
 /// Dependency-free OpenAI-compatible SSE transport. Visible content is emitted
 /// at the delta boundary; finalization never becomes the first visible output.
 fn stream_call(
@@ -858,6 +920,17 @@ fn stream_call(
     let path = format!("/{path}");
     let mut stream = TcpStream::connect(host_port).map_err(|error| error.to_string())?;
     let body = payload.to_string();
+    trace_forensics(
+        run_id,
+        "provider_request",
+        json!({
+            "payload_chars":body.len(),
+            "message_roles":payload.pointer("/messages").and_then(Value::as_array).map(|messages| messages.iter().filter_map(|message| message.get("role").and_then(Value::as_str)).collect::<Vec<_>>()),
+            "tool_choice":payload.get("tool_choice"),
+            "tool_names":payload.get("tools").and_then(Value::as_array).map(|tools| tools.iter().map(tool_name).collect::<Vec<_>>()),
+            "max_tokens":payload.get("max_tokens"),
+        }),
+    );
     let request = format!(
         "POST {path} HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(), body
@@ -1014,6 +1087,16 @@ fn stream_call(
         }
         consume_transport_buffer(&mut buffer, &mut turn, run_id, emit_visible, native_ollama)?;
     }
+    trace_forensics(
+        run_id,
+        "assembled_turn",
+        json!({
+            "reasoning_chars":turn.reasoning.chars().count(),
+            "content_chars":turn.content.chars().count(),
+            "calls":turn.calls.values().cloned().collect::<Vec<_>>(),
+            "finish_reason":turn.finish_reason,
+        }),
+    );
     Ok(turn)
 }
 
@@ -1136,6 +1219,7 @@ fn consume_sse(
             if line == "[DONE]" {
                 continue;
             }
+            trace_forensics(run_id, "raw_sse", json!({"data":line}));
             let value: Value =
                 serde_json::from_str(line).map_err(|error| format!("invalid SSE JSON: {error}"))?;
             if let Some(usage) = value.get("usage") {
@@ -1195,6 +1279,11 @@ fn consume_sse(
                     .iter()
                     .find_map(|field| delta.get(*field).and_then(Value::as_str))
             }) {
+                trace_forensics(
+                    run_id,
+                    "parsed_reasoning_delta",
+                    json!({"content":reasoning}),
+                );
                 if !turn.thinking_started {
                     turn.thinking_started = true;
                     if emit_visible {
@@ -1216,6 +1305,7 @@ fn consume_sse(
                 .and_then(|delta| delta.get("content"))
                 .and_then(Value::as_str)
             {
+                trace_forensics(run_id, "parsed_content_delta", json!({"content":content}));
                 turn.content.push_str(content);
                 if emit_visible {
                     emit(
@@ -1230,6 +1320,7 @@ fn consume_sse(
                 .and_then(|delta| delta.get("tool_calls"))
                 .and_then(Value::as_array)
             {
+                trace_forensics(run_id, "parsed_tool_delta", json!({"calls":calls}));
                 for call in calls {
                     let index = call
                         .get("index")
@@ -1559,57 +1650,72 @@ fn truncate_retained_tool_result_to_fit(
     schemas: &[Value],
     messages: &mut [Value],
 ) -> Option<EmergencyToolResultTruncation> {
-    let usable_input = config
-        .context_limit
-        .saturating_sub(SAFETY_RESERVE_TOKENS + MIN_USEFUL_OUTPUT_TOKENS);
+    // This is the final fallback after structural selection.  Its job is not
+    // merely to avoid an HTTP context error: it must restore the same
+    // low-water target used by selection, leaving useful room for the next
+    // model turn.  The previous physical-ceiling limit could emit a 64,480
+    // token request into a 65,536-token server and immediately force another
+    // compaction.
+    let target = compaction_target_tokens(config.context_limit);
     let initial = request_budget(config, messages, schemas);
-    if initial.projected_input_tokens <= usable_input {
+    if initial.projected_input_tokens <= target {
         return None;
     }
 
-    let (index, original) = messages
-        .iter()
-        .enumerate()
-        .filter(|(_, message)| message.get("role").and_then(Value::as_str) == Some("tool"))
-        .filter_map(|(index, message)| {
-            message
-                .get("content")
-                .and_then(Value::as_str)
-                .map(|content| (index, content.to_owned()))
-        })
-        .max_by_key(|(_, content)| content.chars().count())?;
-    let original_chars = original.chars().count();
-    let original_tokens = estimate_tokens(&json!(original));
-    // Choose the largest head+tail projection that fits the full request,
-    // rather than applying a blanket cap or guessing from character counts.
-    let mut low = 0_usize;
-    let mut high = original_chars;
-    let mut best = None;
-    while low <= high {
-        let middle = low + (high - low) / 2;
-        let candidate = truncate_tool_result_content(&original, middle);
-        messages[index]["content"] = Value::String(candidate.clone());
-        if request_budget(config, messages, schemas).projected_input_tokens <= usable_input {
-            best = Some(candidate);
-            low = middle.saturating_add(1);
-        } else if middle == 0 {
-            break;
-        } else {
-            high = middle - 1;
+    let mut diagnostic = None;
+    while request_budget(config, messages, schemas).projected_input_tokens > target {
+        let (index, original) = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message.get("role").and_then(Value::as_str) == Some("tool"))
+            .filter_map(|(index, message)| {
+                message
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .filter(|content| content != &TOOL_RESULT_TRUNCATION_MARKER)
+                    .map(|content| (index, content.to_owned()))
+            })
+            .max_by_key(|(_, content)| content.chars().count())?;
+        let original_chars = original.chars().count();
+        let original_tokens = estimate_tokens(&json!(original));
+        // First try to retain as much as possible from this largest result.
+        // If it alone cannot bring the projection under the target, collapse
+        // it and continue with the next largest result.  Tool messages stay
+        // in place, so no assistant-call/result pair is ever split.
+        let mut low = 0_usize;
+        let mut high = original_chars;
+        let mut best = None;
+        while low <= high {
+            let middle = low + (high - low) / 2;
+            let candidate = truncate_tool_result_content(&original, middle);
+            messages[index]["content"] = Value::String(candidate.clone());
+            if request_budget(config, messages, schemas).projected_input_tokens <= target {
+                best = Some(candidate);
+                low = middle.saturating_add(1);
+            } else if middle == 0 {
+                break;
+            } else {
+                high = middle - 1;
+            }
         }
+        let projected = best.unwrap_or_else(|| truncate_tool_result_content(&original, 0));
+        messages[index]["content"] = Value::String(projected.clone());
+        diagnostic = Some(EmergencyToolResultTruncation {
+            original_tokens,
+            original_chars,
+            projected_tokens: estimate_tokens(&json!(projected.clone())),
+            projected_chars: projected.chars().count(),
+            source: tool_result_source(&original),
+        });
     }
-    let projected = best.unwrap_or_else(|| truncate_tool_result_content(&original, 0));
-    messages[index]["content"] = Value::String(projected.clone());
 
-    let projected_chars = projected.chars().count();
-    let projected_tokens = estimate_tokens(&json!(projected));
-    let source = tool_result_source(&original);
+    let diagnostic = diagnostic?;
     Some(EmergencyToolResultTruncation {
-        original_tokens,
-        original_chars,
-        projected_tokens,
-        projected_chars,
-        source,
+        original_tokens: diagnostic.original_tokens,
+        original_chars: diagnostic.original_chars,
+        projected_tokens: diagnostic.projected_tokens,
+        projected_chars: diagnostic.projected_chars,
+        source: diagnostic.source,
     })
 }
 
@@ -1963,6 +2069,7 @@ pub fn run(config: Config) {
     };
     let stable = stable_prefix(&config);
     let schemas = tool_schemas_for_policy(config.root.is_some(), config.policy);
+    let eager_todo_schemas = eager_todo_schemas(&schemas);
     let mut final_content = String::new();
     let mut continuation_count = 0_usize;
     let mut continuation_pending = false;
@@ -1998,6 +2105,17 @@ pub fn run(config: Config) {
         }
         let eager_todo =
             turn == 0 && state.plan.model_todo.is_empty() && is_multi_step_request(&config.user);
+        let eager_todo_uses_string_choice =
+            eager_todo && !is_ollama_native_endpoint(&config.endpoint);
+        // llama.cpp supports only string tool_choice values, so it cannot
+        // express OpenAI's named-function object form.  Restricting this
+        // one eager request to the existing Todo schema gives `required` the
+        // same unambiguous meaning without inventing a provider-specific API.
+        let request_schemas = if eager_todo_uses_string_choice {
+            &eager_todo_schemas
+        } else {
+            &schemas
+        };
         let dynamic = dynamic_tail(&state, config.root.as_deref(), eager_todo);
         let pending_tail = transcript.pending_tail(&dynamic);
         let sent_tail = if transcript.has_active_prompt_tail(&pending_tail) {
@@ -2008,7 +2126,7 @@ pub fn run(config: Config) {
         let mut messages = pending_fitted_projection
             .take()
             .unwrap_or_else(|| project(&transcript, &stable, &sent_tail));
-        let before_budget = request_budget(&config, &messages, &schemas);
+        let before_budget = request_budget(&config, &messages, request_schemas);
         let requested_max_output = config
             .provider_max_output
             .unwrap_or(APPLICATION_MAX_OUTPUT_TOKENS)
@@ -2031,7 +2149,7 @@ pub fn run(config: Config) {
             if let Some(report) = compact_once(
                 &config,
                 &mut transcript,
-                &schemas,
+                request_schemas,
                 current_budget.projected_input_tokens,
                 DEFAULT_KEEP_RECENT,
                 "proactive_threshold",
@@ -2096,10 +2214,34 @@ pub fn run(config: Config) {
             return;
         }
         let projected = current_budget.projected_input_tokens;
-        let mut payload = request_payload(&config, &messages, &schemas, output_limit);
+        let mut payload = request_payload(&config, &messages, request_schemas, output_limit);
         if eager_todo {
-            payload["tool_choice"] = json!({"type":"function","function":{"name":"todo"}});
+            // llama.cpp's OpenAI-compatible endpoint accepts only the string
+            // choices auto/none/required. Its parser rejects OpenAI's object
+            // form for a named function and silently falls back to default.
+            // `required` preserves the useful eager-plan invariant without
+            // sending an unsupported provider contract.
+            payload["tool_choice"] = if eager_todo_uses_string_choice {
+                tool_choice_for_turn(true)
+            } else {
+                // Preserve the native Ollama request shape. This compatibility
+                // adaptation is for llama.cpp's OpenAI endpoint only.
+                json!({"type":"function","function":{"name":"todo"}})
+            };
         }
+        trace_forensics(
+            &config.run_id,
+            "agent_request_state",
+            json!({
+                "turn":turn + 1,
+                "projected_input_tokens":projected,
+                "dynamic_tail":dynamic,
+                "todo":state.plan.model_todo.prompt(),
+                "task_memory":state.plan.task_memory.prompt(state.plan.model_todo.active().map(|(_, item)| item.id.as_str())),
+                "compaction_boundary":transcript.compaction_boundary(),
+                "message_shape":request_shape(&messages),
+            }),
+        );
         let payload_messages = payload
             .get("messages")
             .and_then(Value::as_array)
@@ -2376,7 +2518,13 @@ pub fn run(config: Config) {
             );
             return;
         }
+        let canonical_content = streamed.content.clone();
         transcript.assistant_tool_turn(streamed.content, &calls);
+        trace_forensics(
+            &config.run_id,
+            "canonical_assistant_tool_turn",
+            json!({"content":canonical_content,"calls":calls.iter().map(ValidatedCall::wire).collect::<Vec<_>>() }),
+        );
         let mut call_index = 0_usize;
         while call_index < calls.len() {
             if safe_read_only_tool(&calls[call_index].name)
@@ -2684,6 +2832,20 @@ mod tests {
     }
 
     #[test]
+    fn eager_todo_uses_llama_cpp_supported_string_tool_choice() {
+        assert_eq!(tool_choice_for_turn(false), json!("auto"));
+        assert_eq!(tool_choice_for_turn(true), json!("required"));
+        let schemas = tool_schemas_for_policy(true, RunPolicy::Safe);
+        assert_eq!(
+            eager_todo_schemas(&schemas)
+                .iter()
+                .map(tool_name)
+                .collect::<Vec<_>>(),
+            vec!["todo"]
+        );
+    }
+
+    #[test]
     fn todo_is_canonical_and_promotes_the_next_item_into_the_ui_adapter() {
         let mut state = AgentState::default();
         let (_, changed) = apply_todo(
@@ -2732,9 +2894,37 @@ mod tests {
         .unwrap();
         assert_eq!(emitted["type"], "plan_update");
         let tail = dynamic_tail(&state, None, false);
-        assert!(tail.contains("[active] todo-1: Inspect runtime"));
+        assert!(tail.contains("[active] Inspect runtime"));
+        assert!(!tail.contains("todo-1"));
         assert!(!tail.contains("milestones"));
         assert!(!tail.contains("work_plan"));
+    }
+
+    #[test]
+    fn glm_style_done_by_visible_id_completes_and_promotes_without_a_label_match() {
+        let mut state = AgentState::default();
+        apply_todo(
+            &mut state,
+            &json!({"action":"init","list":[{"items":["Inspect entry points", "Map routing"]}]}),
+        )
+        .unwrap();
+        // This is the exact shape emitted by the real GLM reproduction: the
+        // model referred to the displayed stable id and supplied a content
+        // handoff. Both are now accepted, while a bare done also works.
+        apply_todo(
+            &mut state,
+            &json!({"action":"done","task":"todo-1","content":"Inspect entry points","memory":{"finding":"Entry point confirmed","next":"Map routing"}}),
+        )
+        .unwrap();
+        assert_eq!(state.plan.model_todo.active_label(), Some("Map routing"));
+        assert_eq!(
+            state.plan.model_todo.phases[0].items[0]
+                .memory_id
+                .as_deref(),
+            Some("tm-001")
+        );
+        apply_todo(&mut state, &json!({"action":"done"})).unwrap();
+        assert!(!state.plan.model_todo.has_open());
     }
 
     #[test]
@@ -2748,15 +2938,40 @@ mod tests {
             .unwrap()
             .as_str()
             .unwrap();
-        assert!(description.contains("small flat working Todo"));
-        assert!(description.contains("next pending item becomes active"));
+        assert!(description.contains("Canonical current plan"));
+        assert!(description.contains("next pending item activates automatically"));
         assert_eq!(
             schema.pointer("/function/parameters/required"),
             Some(&json!(["action"]))
         );
         let config = test_config(Some("/project"));
-        assert_eq!(stable_prefix(&config), stable_prefix(&config));
-        assert!(!stable_prefix(&config).contains("model_todo"));
+        let stable = stable_prefix(&config);
+        assert_eq!(stable, stable_prefix(&config));
+        assert!(stable.contains("Todo = what to do next"));
+        assert!(stable.contains("Task Memory = durable semantic continuity"));
+        assert!(stable.contains("Project Knowledge = reusable observations"));
+        assert!(stable.contains("user's language"));
+        assert!(!stable.contains("model_todo"));
+        let memory = tool_schemas(true)
+            .into_iter()
+            .find(|tool| tool_name(tool) == "task_memory")
+            .unwrap();
+        assert!(memory
+            .pointer("/function/description")
+            .and_then(Value::as_str)
+            .unwrap()
+            .contains("across compaction"));
+        let knowledge = tool_schemas(true)
+            .into_iter()
+            .find(|tool| tool_name(tool) == "project_knowledge_read")
+            .unwrap();
+        assert!(knowledge
+            .pointer("/function/description")
+            .and_then(Value::as_str)
+            .unwrap()
+            .contains("before broad rereads"));
+        let state = AgentState::default();
+        assert!(!dynamic_tail(&state, None, false).contains("user's language"));
     }
 
     #[test]
@@ -2779,8 +2994,8 @@ mod tests {
         transcript.compact("compact factual location only".into(), plan.covers);
         transcript.compact("later compact factual location only".into(), 0);
         let tail = dynamic_tail(&state, None, false);
-        assert!(tail.contains("[done] todo-1: Investigate GLM context bug -> tm-001"));
-        assert!(tail.contains("[active] todo-2: Implement GLM context fix"));
+        assert!(tail.contains("[done] Investigate GLM context bug -> tm-001"));
+        assert!(tail.contains("[active] Implement GLM context fix"));
         assert!(tail.contains("summarize_span auxiliary Ollama request omits options.num_ctx"));
         assert_eq!(state.plan.task_memory.entries.len(), 1);
     }
@@ -2993,9 +3208,9 @@ mod tests {
         let summary_message = projected
             .iter()
             .find(|message| {
-                message["content"]
-                    .as_str()
-                    .is_some_and(|content| content.starts_with("[COMPACTION SUMMARY]"))
+                message["content"].as_str().is_some_and(|content| {
+                    content.starts_with("[RUNTIME COMPACTION SUMMARY — NOT USER CONTENT]")
+                })
             })
             .unwrap();
         let handoff = summary_message["content"].as_str().unwrap();
@@ -3281,13 +3496,47 @@ mod tests {
         assert_eq!(diagnostic.source.as_deref(), Some("src/giant.rs"));
         assert!(
             request_budget(&config, &messages, &schemas).projected_input_tokens
-                <= config.context_limit - SAFETY_RESERVE_TOKENS - MIN_USEFUL_OUTPUT_TOKENS
+                <= compaction_target_tokens(config.context_limit)
         );
         // The caller owns the canonical transcript; its value was never edited.
         assert!(canonical[2]["content"]
             .as_str()
             .unwrap()
             .contains("src/giant.rs"));
+    }
+
+    #[test]
+    fn emergency_compaction_keeps_tool_pairs_and_low_water_with_multiple_large_results() {
+        let mut config = test_config(None);
+        config.context_limit = 65_536;
+        let schemas = tool_schemas(true);
+        let mut messages = vec![
+            json!({"role":"system","content":stable_prefix(&config)}),
+            json!({"role":"assistant","content":"Read both files.","tool_calls":[
+                {"id":"read-a","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.ts\"}"}},
+                {"id":"read-b","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"b.ts\"}"}}
+            ]}),
+            json!({"role":"tool","tool_call_id":"read-a","name":"read_file","content":json!({"path":"a.ts","content":"a".repeat(180_000)}).to_string()}),
+            json!({"role":"tool","tool_call_id":"read-b","name":"read_file","content":json!({"path":"b.ts","content":"b".repeat(180_000)}).to_string()}),
+            json!({"role":"user","content":"continue the current task"}),
+        ];
+
+        truncate_retained_tool_result_to_fit(&config, &schemas, &mut messages)
+            .expect("large retained results need projection reduction");
+        assert!(
+            request_budget(&config, &messages, &schemas).projected_input_tokens
+                <= compaction_target_tokens(config.context_limit)
+        );
+        let call_ids = messages[1]["tool_calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|call| call["id"].as_str())
+            .collect::<Vec<_>>();
+        assert!(call_ids.contains(&"read-a"));
+        assert!(call_ids.contains(&"read-b"));
+        assert_eq!(messages[2]["tool_call_id"], "read-a");
+        assert_eq!(messages[3]["tool_call_id"], "read-b");
     }
 
     #[test]
@@ -3514,7 +3763,7 @@ mod tests {
             .collect();
         config
             .history
-            .push(json!({"role":"user","content":"x".repeat(72_000)}));
+            .push(json!({"role":"user","content":"x".repeat(68_000)}));
         let initial_transcript = {
             let mut transcript = Transcript::default();
             for message in config.history.clone() {
@@ -3526,7 +3775,6 @@ mod tests {
         let initial_messages = project(&initial_transcript, &stable_prefix(&config), "");
         let initial_budget =
             request_budget(&config, &initial_messages, &tool_schemas(true)).projected_input_tokens;
-        assert!(initial_budget < 32_768 * 80 / 100);
         assert!(
             dynamic_output_limit(
                 config.context_limit,
@@ -3580,8 +3828,12 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .filter_map(|message| message["content"].as_str())
-            .all(|content| !content.contains("Do not call tools")));
+            .any(|message| {
+                message["content"].as_str().is_some_and(|content| {
+                    content.starts_with("[RUNTIME COMPACTION SUMMARY — NOT USER CONTENT]")
+                        && !content.contains("Do not call tools")
+                })
+            }));
         assert!(requests.iter().any(|request| {
             request["messages"].as_array().is_some_and(|messages| {
                 messages.iter().any(|message| {

@@ -96,10 +96,7 @@ impl TaskMemory {
             if entries.len() == 4 {
                 break;
             }
-            if entry.invalidated
-                || (entry.next.is_empty() && entry.supersedes.is_none())
-                || entries.iter().any(|selected| selected.id == entry.id)
-            {
+            if entry.invalidated || entries.iter().any(|selected| selected.id == entry.id) {
                 continue;
             }
             entries.push(entry);
@@ -166,6 +163,26 @@ mod tests {
             6,
             "older entries remain persisted and retrievable"
         );
+    }
+
+    #[test]
+    fn completed_todo_finding_without_next_remains_available_as_a_handoff() {
+        let mut memory = TaskMemory::default();
+        memory
+            .upsert(
+                Some("tm-001"),
+                "confirmed project structure".into(),
+                "src/main.tsx".into(),
+                "architecture stage can begin".into(),
+                String::new(),
+                Some("todo-1".into()),
+                None,
+            )
+            .unwrap();
+
+        let prompt = memory.prompt(Some("todo-2"));
+        assert!(prompt.contains("tm-001: confirmed project structure"));
+        assert!(prompt.contains("evidence: src/main.tsx"));
     }
 }
 fn clean(value: &str, required: bool) -> Result<String, String> {

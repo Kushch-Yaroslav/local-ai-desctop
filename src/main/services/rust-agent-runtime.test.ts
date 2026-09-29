@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import type { ChatMessage } from '../../shared/types';
 import { splitAgentRunHistory, taskPlan, taskPlanUpdate } from './rust-agent-runtime';
+import { displayToolResult, toolResultSummary } from '../../renderer/components/AgentTimeline';
 
 const message = (role: ChatMessage['role'], content: string): ChatMessage => ({
   id: `${role}-${content}`, conversationId: 'test', role, content, createdAt: '2026-01-01T00:00:00.000Z',
@@ -35,6 +36,10 @@ export function runRustAgentRuntimeRegression(): void {
   });
   assert.equal(todoPlan.modelTodo?.revision, 3);
   assert.equal(todoPlan.modelTodo?.phases[0]?.items[0]?.content, 'Read runtime');
+  assert.deepEqual(todoPlan.modelTodo?.phases.flatMap((phase) => phase.items).map((item) => item.content), ['Read runtime'], 'Task Planning receives canonical Todo items instead of needing projected work-plan tasks');
+  const knowledgeActivity = { id: 'knowledge', label: 'Project knowledge', detail: 'project_knowledge_read', kind: 'file_read' as const, state: 'completed' as const, output: JSON.stringify({ entries: [{ status: 'ok', path: 'sources/App.tsx', content: 'large cached body' }, { status: 'missing', path: 'tasks/audit.md', message: 'not materialized' }] }) };
+  assert.equal(displayToolResult(knowledgeActivity), 'sources/App.tsx\ntasks/audit.md · missing · not materialized', 'structured knowledge entries must not render as object coercions or cached bodies');
+  assert.match(toolResultSummary(knowledgeActivity) ?? '', /^2 knowledge entries/);
   const legacy = taskPlan({ steps: [{ id: 'legacy-task', label: 'Old item', status: 'completed' }] });
   assert.equal(legacy.milestones?.[0]?.workPlan.tasks[0]?.id, 'legacy-task');
 

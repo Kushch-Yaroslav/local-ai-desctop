@@ -30,7 +30,8 @@ impl Status {
 /// The agent's canonical working plan. This intentionally mirrors Jan's
 /// small phased Todo contract: one active item, pending work in order, and
 /// automatic promotion after a terminal update. IDs are retained for durable
-/// product projections, but never shown in the model-facing prompt.
+/// product projections and tolerated at the tool boundary, but a model never
+/// needs to manipulate them to complete the current item.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TodoItem {
     pub id: String,
@@ -99,7 +100,7 @@ impl ModelTodo {
                     .as_deref()
                     .map(|id| format!(" -> {id}"))
                     .unwrap_or_default();
-                lines.push(format!("[{status}] {}: {}{result}", item.id, item.content));
+                lines.push(format!("[{status}] {}{result}", item.content));
             }
         }
         lines.join("\n")
@@ -137,11 +138,11 @@ impl ModelTodo {
         }
     }
 
-    fn item_mut(&mut self, content: &str) -> Option<&mut TodoItem> {
+    fn item_mut(&mut self, reference: &str) -> Option<&mut TodoItem> {
         self.phases
             .iter_mut()
             .flat_map(|phase| phase.items.iter_mut())
-            .find(|item| item.content == content)
+            .find(|item| item.content == reference || item.id == reference)
     }
 
     fn has_content(&self, content: &str) -> bool {
@@ -224,14 +225,25 @@ impl ModelTodo {
         Ok(())
     }
 
-    pub fn start(&mut self, content: &str) -> Result<(), String> {
+    pub fn start(&mut self, reference: &str) -> Result<(), String> {
         let position = self
             .phases
             .iter()
             .flat_map(|phase| phase.items.iter())
-            .position(|item| item.content == content)
-            .ok_or_else(|| format!("unknown todo item: {content}"))?;
-        let _ = position;
+            .position(|item| item.content == reference || item.id == reference)
+            .ok_or_else(|| format!("unknown todo item: {reference}"))?;
+        let earlier_open = self
+            .phases
+            .iter()
+            .flat_map(|phase| phase.items.iter())
+            .take(position)
+            .find(|item| item.status.is_open());
+        if let Some(item) = earlier_open {
+            return Err(format!(
+                "cannot start this Todo item while earlier work is open: {}; finish or drop it first",
+                item.content
+            ));
+        }
         for item in self
             .phases
             .iter_mut()
@@ -242,8 +254,8 @@ impl ModelTodo {
             }
         }
         let item = self
-            .item_mut(content)
-            .ok_or_else(|| format!("unknown todo item: {content}"))?;
+            .item_mut(reference)
+            .ok_or_else(|| format!("unknown todo item: {reference}"))?;
         if item.status.is_terminal() {
             return Err("cannot start completed or dropped Todo item".into());
         }
@@ -252,10 +264,10 @@ impl ModelTodo {
         Ok(())
     }
 
-    pub fn finish(&mut self, content: &str, dropped: bool) -> Result<(), String> {
+    pub fn finish(&mut self, reference: &str, dropped: bool) -> Result<(), String> {
         let item = self
-            .item_mut(content)
-            .ok_or_else(|| format!("unknown todo item: {content}"))?;
+            .item_mut(reference)
+            .ok_or_else(|| format!("unknown todo item: {reference}"))?;
         if item.status.is_terminal() {
             return Ok(());
         }
@@ -269,17 +281,17 @@ impl ModelTodo {
         Ok(())
     }
 
-    pub fn id_for(&self, content: &str) -> Option<String> {
+    pub fn id_for(&self, reference: &str) -> Option<String> {
         self.phases
             .iter()
             .flat_map(|phase| &phase.items)
-            .find(|item| item.content == content)
+            .find(|item| item.content == reference || item.id == reference)
             .map(|item| item.id.clone())
     }
 
-    pub fn attach_memory(&mut self, content: &str, memory_id: String) -> Result<(), String> {
-        self.item_mut(content)
-            .ok_or_else(|| format!("unknown todo item: {content}"))?
+    pub fn attach_memory(&mut self, reference: &str, memory_id: String) -> Result<(), String> {
+        self.item_mut(reference)
+            .ok_or_else(|| format!("unknown todo item: {reference}"))?
             .memory_id = Some(memory_id);
         self.revision = self.revision.saturating_add(1);
         Ok(())
@@ -1069,6 +1081,27 @@ mod tests {
             plan.active_milestone().unwrap().work_plan.tasks[0].status,
             Status::Completed
         );
+    }
+
+    #[test]
+    fn start_cannot_skip_open_predecessors_in_a_sequential_todo() {
+        let mut todo = ModelTodo::default();
+        todo.init(vec![(
+            "Work".into(),
+            vec!["Investigate".into(), "Implement".into(), "Verify".into()],
+        )])
+        .unwrap();
+
+        let error = todo.start("todo-3").unwrap_err();
+        assert!(error.contains("earlier work is open: Investigate"));
+        assert_eq!(todo.active_label(), Some("Investigate"));
+
+        todo.finish("todo-1", false).unwrap();
+        todo.finish("todo-2", false).unwrap();
+        todo.start("todo-3").unwrap();
+        assert_eq!(todo.active_label(), Some("Verify"));
+        assert_eq!(todo.phases[0].items[0].status, Status::Completed);
+        assert_eq!(todo.phases[0].items[1].status, Status::Completed);
     }
 
     #[test]

@@ -315,7 +315,7 @@ pub fn prompt_catalog(root: Option<&str>) -> String {
     }
     if !manifest.tasks.is_empty() {
         available.push(format!(
-            "- task notes: {}",
+            "- task records: {}",
             manifest
                 .tasks
                 .values()

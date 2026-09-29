@@ -2,7 +2,7 @@ import { ChevronDown, File, Folder, Paperclip, Send, Square, X } from 'lucide-re
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import { useAppStore } from '../store/app-store';
 import { ContextUsage } from './ContextUsage';
-import type { AgentPlan, ProjectReference, ProjectSuggestion } from '../../shared/types';
+import type { AgentPlan, ModelTodoItem, ProjectReference, ProjectSuggestion } from '../../shared/types';
 import { removeProjectReferenceQuery } from '../../shared/project-references';
 
 const isImageFile = (file: File): boolean => file.type.startsWith('image/') || /\.(png|jpe?g|webp)$/i.test(file.name);
@@ -75,31 +75,28 @@ export function Composer() {
   </div>{attachmentError && <p className="attachment-error" role="status">{attachmentError}</p>}<p>Enter — отправить · Shift+Enter — новая строка · вставьте или перетащите файлы</p></div>;
 }
 
+export function taskPlanningItems(plan: AgentPlan): ModelTodoItem[] {
+  const legacy = plan.steps ?? [];
+  const milestones = plan.milestones ?? (legacy.length ? [{ id: 'legacy-plan', label: 'Previous plan', status: legacy.some((step) => step.status === 'in_progress') ? 'in_progress' as const : 'pending' as const, workPlan: { tasks: legacy } }] : []);
+  return plan.modelTodo?.phases.flatMap((phase) => phase.items) ?? milestones.flatMap((milestone) => milestone.workPlan.tasks.map((task) => ({ id: task.id, content: task.label, status: task.status })));
+}
+
 export function TaskPlanPanel({ plan, active = false }: { plan: AgentPlan; active?: boolean }) {
   const [collapsed, setCollapsed] = useState(false);
   const contentId = useId();
-  const legacy = plan.steps ?? [];
-  const milestones = plan.milestones ?? (legacy.length ? [{ id: 'legacy-plan', label: 'Previous plan', status: legacy.some((step) => step.status === 'in_progress') ? 'in_progress' as const : 'pending' as const, workPlan: { tasks: legacy } }] : []);
-  const activeMilestone = milestones.find((milestone) => milestone.id === plan.activeMilestoneId) ?? milestones.find((milestone) => milestone.status === 'in_progress') ?? milestones[0];
-  const terminal = (status: string) => status === 'completed' || status === 'abandoned';
   const marker = (status: string) => status === 'completed' ? '✓' : status === 'abandoned' ? '–' : status === 'in_progress' ? '●' : '○';
-  const completed = milestones.filter((milestone) => terminal(milestone.status)).length;
-  const todoItems = plan.modelTodo?.phases.flatMap((phase) => phase.items) ?? [];
-  if (!milestones.length && !todoItems.length) return null;
+  const todoItems = taskPlanningItems(plan);
+  if (!todoItems.length) return null;
+  const completed = todoItems.filter((task) => task.status === 'completed' || task.status === 'abandoned').length;
   return <section className={`task-plan-panel milestone-plan${active ? ' active' : ''}${collapsed ? ' collapsed' : ''}`} aria-label="Task Planning">
     <header>
       <button type="button" className="task-plan-toggle" aria-expanded={!collapsed} aria-controls={contentId} onClick={() => setCollapsed((value) => !value)}>
-        <strong>Task Planning</strong><span>{completed}/{milestones.length} milestones</span><ChevronDown size={15} aria-hidden="true" />
+        <strong>Task Planning</strong><span>{completed}/{todoItems.length}</span><ChevronDown size={15} aria-hidden="true" />
       </button>
     </header>
     <div id={contentId} className="task-plan-collapse" inert={collapsed}>
       <div className="task-plan-content">
-        {todoItems.length > 0 && <section className="work-plan-column"><h4>Todo</h4><ol>{todoItems.map((task) => <li className={task.status} key={task.id}><i>{marker(task.status)}</i><span>{task.content}{task.memoryId ? ` → ${task.memoryId}` : ''}</span></li>)}</ol></section>}
-        <div className="milestone-plan-grid">
-          <section className="milestone-column"><h4>Goal / Milestones</h4><ol>{milestones.map((milestone) => <li key={milestone.id} className={`${milestone.status}${milestone.id === activeMilestone?.id ? ' active' : ''}`}><i>{marker(milestone.status)}</i><span>{milestone.label}</span>{milestone.id === activeMilestone?.id && <b>active</b>}</li>)}</ol></section>
-          <section className="work-plan-column"><h4>Adaptive Work Plan</h4>{activeMilestone ? <><p className="work-plan-milestone">{activeMilestone.label}</p>{activeMilestone.workPlan.tasks.length ? <ol>{activeMilestone.workPlan.tasks.map((task) => <li className={task.status} key={task.id}><i>{marker(task.status)}</i><span>{task.label}</span></li>)}</ol> : <p className="work-plan-empty">The model will add tasks after it has enough orientation.</p>}</> : <p className="work-plan-empty">No active milestone.</p>}</section>
-        </div>
-        {milestones.some((milestone) => milestone.id !== activeMilestone?.id && milestone.workPlan.tasks.length) && <details className="work-plan-history"><summary>Previous work plans</summary>{milestones.filter((milestone) => milestone.id !== activeMilestone?.id && milestone.workPlan.tasks.length).map((milestone) => <section key={milestone.id}><strong>{milestone.label}</strong><ol>{milestone.workPlan.tasks.map((task) => <li className={task.status} key={task.id}><i>{marker(task.status)}</i><span>{task.label}</span></li>)}</ol></section>)}</details>}
+        <ol className="task-plan-todo">{todoItems.map((task) => <li className={task.status} key={task.id}><i>{marker(task.status)}</i><span>{task.content}{'memoryId' in task && task.memoryId ? ` → ${task.memoryId}` : ''}</span></li>)}</ol>
       </div>
     </div>
   </section>;

@@ -10,13 +10,42 @@ const elapsed = (start?: string, end?: string, now = Date.now()) => {
 };
 const actionTitle = (activity: ToolActivity) => ({ file_read: 'Read', directory: 'Viewed project structure', mutation: activity.label.includes('Изменение') ? 'Edited' : activity.label, terminal: '$ Terminal', web: 'Browser', context: 'Context optimized' } as Record<string, string>)[activity.kind ?? ''] ?? activity.label;
 
-function displayOutput(activity: ToolActivity): string | undefined {
+type StructuredEntry = { path?: unknown; name?: unknown; id?: unknown; status?: unknown; truncated?: unknown; message?: unknown };
+const text = (value: unknown): string | undefined => typeof value === 'string' && value.trim() ? value : undefined;
+function entryLine(entry: unknown): string {
+  if (typeof entry === 'string') return entry;
+  if (Array.isArray(entry)) return JSON.stringify(entry);
+  if (!entry || typeof entry !== 'object') return entry === null ? 'entry' : String(entry);
+  const value = entry as StructuredEntry;
+  const label = text(value.path) ?? text(value.name) ?? text(value.id) ?? 'entry';
+  const status = text(value.status);
+  const message = text(value.message);
+  return [label, status && status !== 'ok' ? status : undefined, value.truncated === true ? 'truncated' : undefined, message].filter(Boolean).join(' · ');
+}
+function structuredEntries(result: unknown): unknown[] | undefined {
+  return result && typeof result === 'object' && !Array.isArray(result) && Array.isArray((result as { entries?: unknown }).entries) ? (result as { entries: unknown[] }).entries : undefined;
+}
+export function toolResultSummary(activity: ToolActivity): string | undefined {
+  if (activity.detail === 'project_knowledge_read') {
+    try {
+      const entries = structuredEntries(JSON.parse(activity.output ?? ''));
+      if (entries) return `${entries.length} knowledge ${entries.length === 1 ? 'entry' : 'entries'}${entries.length ? ` · ${entries.slice(0, 2).map(entryLine).join(', ')}` : ''}`;
+    } catch { /* Fall through to the event detail. */ }
+  }
+  if (activity.kind === 'directory') {
+    try { const entries = structuredEntries(JSON.parse(activity.output ?? '')); return entries ? `${entries.length} items` : activity.detail; } catch { return activity.detail; }
+  }
+  return activity.detail;
+}
+export function displayToolResult(activity: ToolActivity): string | undefined {
   if (!activity.output) return undefined;
   try {
-    const result = JSON.parse(activity.output) as { command?: string; stdout?: string; stderr?: string; exit_code?: number; timed_out?: boolean; cancelled?: boolean; content?: string; entries?: string[] };
+    const result = JSON.parse(activity.output) as { command?: string; stdout?: string; stderr?: string; exit_code?: number; timed_out?: boolean; cancelled?: boolean; content?: string };
     if (activity.kind === 'terminal') return `${result.command ? `$ ${result.command}\n` : ''}${result.exit_code === 0 ? '✓ exit 0' : result.exit_code !== undefined ? `✗ exit ${result.exit_code}` : ''}${result.timed_out ? ' · timed out' : ''}${result.cancelled ? ' · cancelled' : ''}${result.stdout ? `\n${result.stdout}` : ''}${result.stderr ? `\n${result.stderr}` : ''}`.trim();
     if (typeof result.content === 'string') return result.content;
-    if (Array.isArray(result.entries)) return result.entries.join('\n');
+    const entries = structuredEntries(result);
+    if (entries) return entries.map(entryLine).join('\n');
+    return JSON.stringify(result, null, 2);
   } catch { /* Streaming tool output is already presentation text. */ }
   return activity.output;
 }
@@ -39,8 +68,8 @@ const Action = memo(function Action({ activity }: { activity: ToolActivity }) {
   const [expanded, setExpanded] = useState(activity.state === 'error');
   const state = activity.state === 'error' ? '✗' : activity.state === 'completed' ? '✓' : '↳';
   const diff = activity.metadata?.diff;
-  const output = displayOutput(activity);
-  const summary = activity.kind === 'directory' ? (() => { try { const result = JSON.parse(activity.output ?? '{}') as { entries?: unknown[] }; return result.entries ? `${result.entries.length} items` : activity.detail; } catch { return activity.detail; } })() : activity.detail;
+  const output = displayToolResult(activity);
+  const summary = toolResultSummary(activity);
   const hasBody = Boolean(output || diff || activity.terminal);
   return <section className={`agent-timeline-action ${activity.kind ?? 'other'} ${activity.state ?? 'running'} ${expanded ? 'expanded' : ''}`}><button type="button" className="agent-timeline-action-head" onClick={() => hasBody && setExpanded((value) => !value)} aria-expanded={hasBody ? expanded : undefined}><b>{state} {actionTitle(activity)}</b>{summary && <span>{summary}</span>}{activity.state === 'running' && <em>running…</em>}</button>{expanded && <div className="agent-timeline-action-body">{activity.kind === 'terminal' ? <TerminalDetails terminal={activity.terminal} fallback={output} /> : output && <pre>{output}</pre>}{typeof diff === 'string' && <details><summary>Diff</summary><pre>{diff}</pre></details>}</div>}</section>;
 });
