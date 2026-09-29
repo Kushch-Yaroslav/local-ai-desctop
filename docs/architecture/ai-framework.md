@@ -71,7 +71,7 @@ Compaction does not write or curate `.ai-framework`. Runtime-owned source and
 directory observations continue to update the cache deterministically, while
 the model may make an explicit `project_knowledge_update` for durable facts.
 The compaction request has one job: create a dense factual continuation brief
-for the active Todo. It never asks the model to emit cache-update JSON or
+for the current task. It never asks the model to emit cache-update JSON or
 requires cache persistence as a condition of a successful handoff.
 
 This keeps a rolling transcript summary separate from persistent project

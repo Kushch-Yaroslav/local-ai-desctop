@@ -119,7 +119,7 @@ mod tests {
     fn only_the_stable_prefix_uses_the_system_role() {
         let mut transcript = Transcript::default();
         transcript.push_run_user(json!({"role":"user","content":"audit"}));
-        transcript.record_prompt_tail("<model_todo>\n[active] Inspect\n</model_todo>");
+        transcript.record_prompt_tail("<task_memory>\nInspect findings\n</task_memory>");
         transcript.push_message(json!({"role":"assistant","content":"reading"}));
         transcript.compact("important finding".into(), 0);
         let projected = project(&transcript, "stable", "");
@@ -240,7 +240,7 @@ mod tests {
         let projected = project(
             &transcript,
             "stable prefix",
-            &transcript.pending_tail("<model_todo />"),
+            &transcript.pending_tail("<task_memory />"),
         );
         let system_positions = projected
             .iter()

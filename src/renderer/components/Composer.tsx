@@ -10,7 +10,7 @@ const isImageFile = (file: File): boolean => file.type.startsWith('image/') || /
 export function Composer() {
   const [value, setValue] = useState(''); const [files, setFiles] = useState<File[]>([]); const [projectReferences, setProjectReferences] = useState<ProjectReference[]>([]); const [suggestions, setSuggestions] = useState<ProjectSuggestion[]>([]); const [referenceQuery, setReferenceQuery] = useState<{ start: number; text: string } | null>(null); const [activeSuggestion, setActiveSuggestion] = useState(0); const [attachmentError, setAttachmentError] = useState<string | null>(null); const ref = useRef<HTMLTextAreaElement>(null); const inputRef = useRef<HTMLInputElement>(null);
   const manualHeight = useRef<number | null>(null); const resizeHandle = useRef(false);
-  const { sendMessage, stop, isGenerating, conversations, activeId, activeTaskPlan } = useAppStore();
+  const { sendMessage, stop, isGenerating, conversations, activeId } = useAppStore();
   const chat = conversations.find((item) => item.id === activeId);
   const projectEnabled = Boolean(chat?.workingDirectory);
   const resetHeight = () => { const textarea = ref.current; if (!textarea) return; manualHeight.current = null; textarea.style.height = ''; textarea.style.overflowY = 'hidden'; };
@@ -65,7 +65,7 @@ export function Composer() {
     resizeHandle.current = false;
     window.requestAnimationFrame(() => { if (ref.current) { manualHeight.current = ref.current.offsetHeight; ref.current.style.overflowY = 'auto'; } });
   };
-  return <div className="composer-wrap">{activeTaskPlan && <TaskPlanPanel key={activeId ?? 'active'} plan={activeTaskPlan} active />}<div className="composer" onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); addFiles([...event.dataTransfer.files]); }}>
+  return <div className="composer-wrap"><div className="composer" onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); addFiles([...event.dataTransfer.files]); }}>
     {(files.length > 0 || projectReferences.length > 0) && <div className="attachment-draft">{projectReferences.map((reference) => <ProjectReferenceChip key={reference.id} reference={reference} onRemove={() => setProjectReferences((items) => items.filter((item) => item.id !== reference.id))} />)}{files.map((file, index) => <DraftAttachment key={`${file.name}-${index}`} file={file} index={isImageFile(file) ? files.slice(0, index + 1).filter(isImageFile).length - 1 : index} onRemove={() => { setFiles((items) => items.filter((_, itemIndex) => itemIndex !== index)); setAttachmentError(null); }} />)}</div>}
     <input ref={inputRef} className="attachment-input" type="file" multiple accept=".png,.jpg,.jpeg,.webp,.txt,.md,.json,.csv,.log,.js,.ts,.jsx,.tsx,.html,.css,.yaml,.yml,.xml,.docx,.xlsx,.xls,.pdf" onChange={(event) => { addFiles([...(event.target.files ?? [])]); event.currentTarget.value = ''; }} />
     <button className="attach-button" type="button" disabled={isGenerating} title="Прикрепить файлы" onClick={() => inputRef.current?.click()}><Paperclip size={18} /></button>

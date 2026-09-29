@@ -101,8 +101,8 @@ pub enum Event {
         name: String,
         message: String,
     },
-    PlanUpdate {
-        plan: Value,
+    TaskMemoryUpdate {
+        memory: Value,
     },
     ContextStats {
         used: usize,
@@ -145,7 +145,6 @@ pub enum Event {
         transcript_tokens_before: usize,
         summary_prompt_tokens: usize,
         runtime_tail_tokens: usize,
-        model_todo_tokens: usize,
         memory_catalog_tokens: usize,
         compaction_target_tokens: usize,
         preferred_output_tokens: usize,
@@ -170,7 +169,6 @@ pub enum Event {
         emergency_tool_result_projected_tokens: Option<usize>,
         emergency_tool_result_projected_chars: Option<usize>,
         emergency_tool_result_source: Option<String>,
-        active_todo: Option<String>,
     },
     /// Observability only: compaction occurred soon after a prior compaction.
     RapidRecompaction {

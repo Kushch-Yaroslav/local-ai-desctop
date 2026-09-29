@@ -364,7 +364,7 @@ mod tests {
     fn accepted_prompt_tail_stays_before_the_following_tool_turn_and_reappears_after_compaction() {
         let mut transcript = Transcript::default();
         transcript.push_run_user(json!({"role":"user","content":"audit"}));
-        transcript.record_prompt_tail("<model_todo>\n[active] Inspect project\n</model_todo>");
+        transcript.record_prompt_tail("<task_memory>\nInspect findings\n</task_memory>");
         transcript.assistant_message("I will inspect the project.".into());
         let projected = crate::context::projection::project(&transcript, "stable", "");
         let tail = projected
@@ -372,7 +372,7 @@ mod tests {
             .position(|message| {
                 message["content"]
                     .as_str()
-                    .is_some_and(|content| content.contains("model_todo"))
+                    .is_some_and(|content| content.contains("task_memory"))
             })
             .unwrap();
         let assistant = projected
@@ -382,8 +382,9 @@ mod tests {
         assert!(tail < assistant);
 
         transcript.compact("factual handoff".into(), 2);
-        assert!(!transcript
-            .has_active_prompt_tail("<model_todo>\n[active] Inspect project\n</model_todo>"));
+        assert!(
+            !transcript.has_active_prompt_tail("<task_memory>\nInspect findings\n</task_memory>")
+        );
     }
 
     #[test]

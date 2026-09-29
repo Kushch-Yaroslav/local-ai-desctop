@@ -1,7 +1,7 @@
 //! Project-local `.ai-framework` knowledge cache.
 //!
 //! This is an external, model-neutral semantic cache. It is deliberately not
-//! part of the canonical transcript or the GoalPlan: source remains the
+//! part of the canonical transcript or task memory: source remains the
 //! authority and cache writes are always optional.
 
 use serde::{Deserialize, Serialize};

@@ -5,7 +5,7 @@ import { Database } from '../services/database';
 import { getHardwareStats } from '../services/hardware';
 import { OllamaBackend } from '../backends/ollama-backend';
 import { LlamaCppBackend } from '../backends/llama-cpp-backend';
-import { RustAgentRuntime, type AgentProject } from '../services/rust-agent-runtime';
+import { RustAgentRuntime, taskPlan, type AgentProject } from '../services/rust-agent-runtime';
 import { paths } from '../services/paths';
 import { log } from '../services/logger';
 import { contextPresetsFor, getModelProfile, modelRegistry } from '../models/model-registry';
@@ -235,11 +235,11 @@ export function registerIpc(): void {
     if (!current()) return;
     await backend.ensureModelAvailable(request.model);
     if (!current()) return;
-    let output = ''; let thinking = ''; let taskPlan: import('../../shared/types').AgentPlan | undefined; let messageDiagnostics: import('../../shared/types').GenerationDiagnostics | undefined; let completed = false; let failed = false; let finishReason: 'stop' | 'length' = 'stop';
+    let output = ''; let thinking = ''; let messageDiagnostics: import('../../shared/types').GenerationDiagnostics | undefined; let completed = false; let failed = false; let finishReason: 'stop' | 'length' = 'stop';
     const thinkingTimeline: ThinkingTimelineEvent[] = []; const activityTimelinePositions = new Map<string, number>(); let timelinePosition = 0; let lastTimelineKind: ThinkingTimelineEvent['kind'] | null = null;
     const agentProjects: AgentProject[] = mode === 'agent' ? [...selectedProjects] : [];
     const agentRoot = agentProjects[0]?.root ?? null;
-    const enabledTools = mode === 'agent' ? ['apply_patch', 'create_file', 'delete_file', 'list_directory', 'project_knowledge_index', 'project_knowledge_read', 'project_knowledge_update', 'read_file', 'run_terminal', 'todo', 'write_file'] : conversation.webMode === 'auto' ? ['web'] : [];
+    const enabledTools = mode === 'agent' ? ['apply_patch', 'create_file', 'delete_file', 'list_directory', 'project_knowledge_index', 'project_knowledge_read', 'project_knowledge_update', 'read_file', 'run_terminal', 'task_memory', 'write_file'] : conversation.webMode === 'auto' ? ['web'] : [];
     log('generation.snapshot', { generationId: generation.id, chatId: request.conversationId, mode, storedMode: conversation.mode, requestedMode: request.mode, workingDirectory: conversation.workingDirectory, resolvedWorkingDirectory: agentRoot, projects: agentProjects.map((project) => ({ id: project.id, slot: project.slot })), webMode: conversation.webMode, modelId: request.model, contextSize: conversation.contextWindow, reasoningMode: conversation.reasoningMode, enabledTools });
     run = mode === 'agent' ? database.createAnalysisRun(request.conversationId, conversation.reasoningMode) : null;
     if (run && current()) event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run });
@@ -263,9 +263,9 @@ export function registerIpc(): void {
       // image payload is attached only to its owning user turn below.
       let history = attachmentPipeline.buildContext(request.messages, !hasImages);
       if (nativeVision) history = await attachmentPipeline.prepareNativeImages(history, abort.signal);
-      const persistedPlan = mode === 'agent' ? database.getAgentPlan(request.conversationId) : null;
+      const persistedTaskMemory = mode === 'agent' ? taskPlan(database.getAgentPlan(request.conversationId) ?? {}).taskMemory : undefined;
       const stream = mode === 'agent'
-        ? rustAgent.stream(request.model, history, agentProjects, abort.signal, context.active, conversation.reasoningMode, conversation.webMode, generation.id, persistedPlan)
+        ? rustAgent.stream(request.model, history, agentProjects, abort.signal, context.active, conversation.reasoningMode, conversation.webMode, generation.id, persistedTaskMemory)
         : conversation.webMode === 'auto'
           ? webChat.stream(request.model, history, abort.signal, context.active, conversation.reasoningMode)
           : backend.streamChat(request.model, chatMessagesWithSystemPrefix(history, [chatSystemContext({ webAvailable: false }, conversation.reasoningMode === 'deep' ? 'deep' : 'fast')], request.conversationId, `capability-${request.conversationId}`), abort.signal, context.active, conversation.reasoningMode);
@@ -280,10 +280,8 @@ export function registerIpc(): void {
             chunk = { ...chunk, timelinePosition };
           }
         }
-        if (chunk.type === 'task-plan') {
-          taskPlan = structuredClone(chunk.plan);
-          database.saveAgentPlan(request.conversationId, taskPlan);
-          event.sender.send('chat:stream', { ...chunk, conversationId: request.conversationId, generationId: generation.id });
+        if (chunk.type === 'task-memory') {
+          database.saveAgentPlan(request.conversationId, { milestones: [], taskMemory: structuredClone(chunk.memory) });
           continue;
         }
         if (chunk.type === 'context-usage') {
@@ -326,7 +324,7 @@ export function registerIpc(): void {
         ...(messageDiagnostics.timeToFirstTokenMs !== undefined ? { timeToFirstTokenMs: messageDiagnostics.timeToFirstTokenMs } : {}),
         ...(inputTokens !== undefined ? { inputTokens } : {}),
       };
-      const assistant = output ? database.addMessage(request.conversationId, 'assistant', output, undefined, [], { ...(thinking.trim() ? { thinking } : {}), ...(thinkingTimeline.length ? { thinkingTimeline } : {}), ...(taskPlan ? { taskPlan } : {}), ...(generationStats ? { generationStats } : {}) }) : null;
+      const assistant = output ? database.addMessage(request.conversationId, 'assistant', output, undefined, [], { ...(thinking.trim() ? { thinking } : {}), ...(thinkingTimeline.length ? { thinkingTimeline } : {}), ...(generationStats ? { generationStats } : {}) }) : null;
       if (run) event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run: database.finishAnalysisRun(run.id, 'completed', assistant?.id ?? null) });
       event.sender.send('chat:stream', { type: 'done', conversationId: request.conversationId, generationId: generation.id, assistant, finishReason });
     } catch (error) {

@@ -2,16 +2,15 @@
 //!
 //! This deliberately contains no evidence ontology, completion proof, source
 //! inventory, saturation counter, or semantic no-progress state. The model's
-//! transcript and the durable plan are the agent's working state.
+//! transcript and durable task memory are the agent's working state.
 
-use super::todo::GoalPlan;
+use super::task_memory::TaskMemory;
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Default)]
 pub struct AgentState {
-    /// Persisted canonical Todo plus its renderer/UI projection.
-    /// Provider construction reads only the compact Todo representation.
-    pub plan: GoalPlan,
+    /// Durable semantic findings for the current task. This is not a plan.
+    pub task_memory: TaskMemory,
     pub workspace_mutated_since_validation: bool,
     pub closeout_nudged: bool,
     pub verification_nudged: bool,

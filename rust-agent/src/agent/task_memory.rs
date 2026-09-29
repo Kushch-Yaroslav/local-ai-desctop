@@ -12,8 +12,6 @@ pub struct TaskMemoryEntry {
     #[serde(default)]
     pub next: String,
     #[serde(default)]
-    pub todo_id: Option<String>,
-    #[serde(default)]
     pub supersedes: Option<String>,
     #[serde(default)]
     pub invalidated: bool,
@@ -33,7 +31,6 @@ impl TaskMemory {
         evidence: String,
         implication: String,
         next: String,
-        todo_id: Option<String>,
         supersedes: Option<String>,
     ) -> Result<String, String> {
         let finding = clean(&finding, true)?;
@@ -46,7 +43,6 @@ impl TaskMemory {
             entry.evidence = clean(&evidence, false)?;
             entry.implication = clean(&implication, false)?;
             entry.next = clean(&next, false)?;
-            entry.todo_id = todo_id;
             entry.supersedes = supersedes;
             entry.invalidated = false;
         } else {
@@ -62,7 +58,6 @@ impl TaskMemory {
                 evidence: clean(&evidence, false)?,
                 implication: clean(&implication, false)?,
                 next: clean(&next, false)?,
-                todo_id,
                 supersedes,
                 invalidated: false,
             });
@@ -80,18 +75,10 @@ impl TaskMemory {
         self.revision = self.revision.saturating_add(1);
         Ok(())
     }
-    pub fn prompt(&self, active: Option<&str>) -> String {
-        // Active-Todo links are authoritative. Fill only the remaining small
-        // window with recent handoffs, so an older dependency cannot disappear
-        // merely because unrelated work happened later.
-        let mut entries = self
-            .entries
-            .iter()
-            .filter(|entry| {
-                !entry.invalidated && active.is_some_and(|id| entry.todo_id.as_deref() == Some(id))
-            })
-            .take(4)
-            .collect::<Vec<_>>();
+    pub fn prompt(&self) -> String {
+        // Keep a small recency-bounded handoff window. The model decides its
+        // own work sequence; memory stores findings rather than plan state.
+        let mut entries: Vec<&TaskMemoryEntry> = Vec::new();
         for entry in self.entries.iter().rev() {
             if entries.len() == 4 {
                 break;
@@ -126,15 +113,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn active_task_memory_beats_recency_with_a_bounded_prompt() {
+    fn recent_task_memory_is_bounded_in_the_prompt() {
         let mut memory = TaskMemory::default();
-        for (id, finding, todo_id) in [
-            ("tm-001", "product finding", None),
-            ("tm-002", "architecture finding", None),
-            ("tm-003", "GLM root cause", Some("todo-implement")),
-            ("tm-004", "unrelated completed finding", None),
-            ("tm-005", "implementation decision", Some("todo-implement")),
-            ("tm-006", "verification result", None),
+        for (id, finding) in [
+            ("tm-001", "product finding"),
+            ("tm-002", "architecture finding"),
+            ("tm-003", "GLM root cause"),
+            ("tm-004", "unrelated completed finding"),
+            ("tm-005", "implementation decision"),
+            ("tm-006", "verification result"),
         ] {
             memory
                 .upsert(
@@ -143,13 +130,12 @@ mod tests {
                     String::new(),
                     String::new(),
                     "handoff".into(),
-                    todo_id.map(str::to_owned),
                     None,
                 )
                 .unwrap();
         }
-        let prompt = memory.prompt(Some("todo-implement"));
-        assert!(prompt.contains("tm-003: GLM root cause"));
+        let prompt = memory.prompt();
+        assert!(prompt.contains("tm-006: verification result"));
         assert!(prompt.contains("tm-005: implementation decision"));
         assert!(
             prompt
@@ -166,7 +152,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_todo_finding_without_next_remains_available_as_a_handoff() {
+    fn finding_without_next_remains_available_as_a_handoff() {
         let mut memory = TaskMemory::default();
         memory
             .upsert(
@@ -175,12 +161,11 @@ mod tests {
                 "src/main.tsx".into(),
                 "architecture stage can begin".into(),
                 String::new(),
-                Some("todo-1".into()),
                 None,
             )
             .unwrap();
 
-        let prompt = memory.prompt(Some("todo-2"));
+        let prompt = memory.prompt();
         assert!(prompt.contains("tm-001: confirmed project structure"));
         assert!(prompt.contains("evidence: src/main.tsx"));
     }

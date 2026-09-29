@@ -18,10 +18,10 @@ pub enum Request {
         policy: String,
         #[serde(default)]
         history: Vec<Value>,
-        /// Latest persistent GoalPlan snapshot from the conversation. Older
-        /// conversations omit it and simply start with an empty plan.
+        /// Durable semantic findings from an earlier turn of this user task.
+        /// This carries Task Memory only; it is never interpreted as a plan.
         #[serde(default)]
-        plan: Option<Value>,
+        task_memory: Option<Value>,
         /// Optional backend/model output ceiling. The runtime intersects this
         /// with selected context capacity and its application ceiling.
         #[serde(default)]

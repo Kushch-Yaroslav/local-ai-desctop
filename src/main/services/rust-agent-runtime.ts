@@ -10,7 +10,7 @@ export type AgentProject = { id: string; slot: 1 | 2; root: string; label: strin
 
 type RuntimeEvent = {
   type: string; content?: string; id?: string; name?: string; message?: string; detail?: string; status?: string;
-  diff?: string | null; is_error?: boolean; plan?: unknown; used?: number; limit?: number;
+  diff?: string | null; is_error?: boolean; plan?: unknown; memory?: unknown; used?: number; limit?: number;
   before?: number; after?: number; stream?: string; state?: string; index?: number;
   prompt_tokens?: number; completion_tokens?: number; total_tokens?: number; cached_tokens?: number; cache_write_tokens?: number;
   prompt_ms?: number; predicted_ms?: number; predicted_per_second?: number; finish_reason?: string;
@@ -24,7 +24,7 @@ type RuntimeEvent = {
 type RuntimeRequest = {
   type: 'run'; run_id: string; endpoint: string; model: string; system: string; user: string;
   project_root?: string; secondary_project_root?: string; context_limit: number; reasoning_mode: ReasoningMode;
-  web_mode: WebMode; policy: 'auto' | 'safe'; history: unknown[]; plan?: AgentPlan; provider_max_output?: number;
+  web_mode: WebMode; policy: 'auto' | 'safe'; history: unknown[]; task_memory?: AgentPlan['taskMemory']; provider_max_output?: number;
 };
 
 /** The latest actual user node owns an Agent run. */
@@ -95,28 +95,12 @@ export function taskPlan(value: unknown): AgentPlan {
   return { milestones: [], ...(todo ? { modelTodo: todo } : {}), ...(raw.task_memory && typeof raw.task_memory === 'object' ? { taskMemory: raw.task_memory as AgentPlan['taskMemory'] } : {}) };
 }
 
-/** A successful Rust planning mutation cannot produce an empty Goal Plan.
- * Ignore malformed or stale empty snapshots so diagnostic traffic can never
- * replace an already-rendered canonical plan with a 0/0 placeholder. */
-export function taskPlanUpdate(event: { type: string; plan?: unknown }): AgentPlan | undefined {
-  if (event.type !== 'plan_update') return undefined;
-  const plan = taskPlan(event.plan);
-  return plan.milestones?.length || plan.modelTodo?.phases.some((phase) => phase.items.length) ? plan : undefined;
-}
-
-function latestPlan(history: ChatMessage[]): AgentPlan | undefined {
-  for (const message of [...history].reverse()) {
-    if (message.taskPlan) return taskPlan(message.taskPlan);
-  }
-  return undefined;
-}
-
 /** Electron bridge for the Rust runtime. It passes each content delta through
  * immediately; `final` is metadata, not a delayed text transport. */
 export class RustAgentRuntime {
   constructor(private readonly endpoint: string, private readonly binary = process.env.LOCAL_AI_AGENT_RUNTIME ?? resolve(process.cwd(), 'rust-agent', 'target', 'debug', 'local-ai-agent-runtime')) {}
 
-  async *stream(model: string, history: ChatMessage[], projects: AgentProject[], signal: AbortSignal, contextLimit: number, reasoningMode: ReasoningMode, webMode: WebMode, runId: string, persistedPlan?: AgentPlan | null): AsyncIterable<StreamEvent> {
+  async *stream(model: string, history: ChatMessage[], projects: AgentProject[], signal: AbortSignal, contextLimit: number, reasoningMode: ReasoningMode, webMode: WebMode, runId: string, persistedTaskMemory?: AgentPlan['taskMemory']): AsyncIterable<StreamEvent> {
     if (!existsSync(this.binary)) throw new Error(`Rust Agent Runtime V2 не собран: ${this.binary}. Выполните cargo build в rust-agent.`);
     const child = spawn(this.binary, [], { stdio: 'pipe' });
     let stopped = false;
@@ -134,7 +118,7 @@ export class RustAgentRuntime {
       user: current.user, project_root: projects[0]?.root, secondary_project_root: projects[1]?.root,
       context_limit: contextLimit, reasoning_mode: reasoningMode, web_mode: webMode, policy: 'auto',
       history: current.prior.filter((message) => !message.agentError && !message.agentCancelled).map((message) => ({ role: message.role, content: message.content })),
-      plan: persistedPlan ? taskPlan(persistedPlan) : latestPlan(current.prior),
+      ...(persistedTaskMemory ? { task_memory: persistedTaskMemory } : {}),
       provider_max_output: maxOutputTokens,
     };
     child.stdin.write(`${JSON.stringify(request)}\n`);
@@ -162,9 +146,8 @@ export class RustAgentRuntime {
         } else if (event.type === 'tool_result' || event.type === 'tool_error') {
           const terminal = event.name === 'run_terminal' ? terminalResult(event.content ?? event.message) : undefined;
           yield { type: 'tool', activity: { id: event.id ?? crypto.randomUUID(), label: activityLabel(event.name), detail: terminal?.command ?? event.name, kind: activityKind(event.name), state: event.is_error || event.type === 'tool_error' ? 'error' : 'completed', output: event.content ?? event.message, rawOutput: event.content ?? event.message, ...(terminal ? { terminal } : {}), ...(event.diff ? { metadata: { diff: event.diff } } : {}) } };
-        } else if (event.type === 'plan_update') {
-          const plan = taskPlanUpdate(event);
-          if (plan) yield { type: 'task-plan', plan };
+        } else if (event.type === 'task_memory_update' && event.memory && typeof event.memory === 'object') {
+          yield { type: 'task-memory', memory: event.memory as NonNullable<AgentPlan['taskMemory']> };
         } else if (event.type === 'context_optimized') {
           compactions += 1;
           yield { type: 'tool', activity: { id: `context-${runId}-${compactions}`, label: 'Context optimized', detail: `${event.before ?? 0} → ${event.after ?? 0} tokens`, kind: 'context', state: 'completed' } };
@@ -205,10 +188,10 @@ export class RustAgentRuntime {
 }
 
 function activityLabel(name?: string): string {
-  return ({ list_directory: 'Просмотр структуры проекта', read_file: 'Чтение файла', write_file: 'Изменение файла', create_file: 'Создание файла', apply_patch: 'Изменение проекта', delete_file: 'Удаление файла', run_terminal: 'Запуск terminal', todo: 'Todo', task_memory: 'Task Memory', project_knowledge_index: 'Индекс знаний проекта', project_knowledge_read: 'Чтение знаний проекта', project_knowledge_update: 'Обновление знаний проекта' } as Record<string, string>)[name ?? ''] ?? 'Действие агента';
+  return ({ list_directory: 'Просмотр структуры проекта', read_file: 'Чтение файла', write_file: 'Изменение файла', create_file: 'Создание файла', apply_patch: 'Изменение проекта', delete_file: 'Удаление файла', run_terminal: 'Запуск terminal', task_memory: 'Task Memory', project_knowledge_index: 'Индекс знаний проекта', project_knowledge_read: 'Чтение знаний проекта', project_knowledge_update: 'Обновление знаний проекта' } as Record<string, string>)[name ?? ''] ?? 'Действие агента';
 }
 function activityKind(name?: string): NonNullable<import('../../shared/types').ToolActivity['kind']> {
-  return name === 'run_terminal' ? 'terminal' : name === 'todo' || name === 'task_memory' ? 'planning' : name === 'read_file' || name === 'project_knowledge_read' || name === 'project_knowledge_index' ? 'file_read' : name === 'list_directory' ? 'directory' : 'mutation';
+  return name === 'run_terminal' ? 'terminal' : name === 'task_memory' || name === 'project_knowledge_read' || name === 'project_knowledge_index' ? 'file_read' : name === 'read_file' ? 'file_read' : name === 'list_directory' ? 'directory' : 'mutation';
 }
 function timestamp(value: number | undefined): string | undefined { return typeof value === 'number' && Number.isFinite(value) ? new Date(value).toISOString() : undefined; }
 function terminalResult(raw: string | undefined): TerminalExecution | undefined {

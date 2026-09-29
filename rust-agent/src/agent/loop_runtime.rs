@@ -8,7 +8,6 @@ use crate::agent::{
     events::{Event, TailCandidateAttempt},
     policy::{self, Reasoning, RunPolicy},
     state::AgentState,
-    todo::GoalPlan,
     transcript::{validate_calls, CompactionPlan, Transcript, ValidatedCall},
 };
 use crate::context::projection::project;
@@ -35,7 +34,7 @@ pub struct Config {
     pub reasoning_mode: String,
     pub policy: RunPolicy,
     pub history: Vec<Value>,
-    pub plan: Option<Value>,
+    pub task_memory: Option<Value>,
     pub provider_max_output: Option<usize>,
     pub cancelled: Arc<AtomicBool>,
     pub steering: Arc<Mutex<Vec<String>>>,
@@ -70,16 +69,15 @@ const AGENT_GUIDANCE: &str = r#"
 # Local AI Desktop Agent
 - Work directly from the conversation and tool results. A tool-free response normally completes the run.
 - For code changes, read before writing, make targeted changes, and run the most relevant practical validation or readback. Adapt after errors; do not invent checks.
-- For read-only analysis, use tools for concrete evidence, avoid broad rereads, and synthesize when the active Todo has enough evidence.
+- For substantial tasks, reason about an approach before acting, adapt as you learn, use tools for concrete evidence, avoid broad rereads, and continue until the user's task is complete.
 - Respond and narrate visible reasoning/progress in the user's language. Keep code, identifiers, paths, commands, APIs, and quoted source in their original language.
-- Todo = what to do next. Keep its concise items current; when work is actually complete, use its exact `done` action rather than leaving an earlier item active or recreating the plan.
 - Task Memory = durable semantic continuity for this task. Record meaningful findings, decisions, blockers, and next actions. After compaction, trust a precise Task Memory finding from an unchanged inspected file; reread only for a missing fact, ambiguity, possible change, exact detail, or targeted verification.
 - Project Knowledge = reusable observations already derived from this project. Use relevant fresh knowledge before broad rereading; source remains authoritative when exact current code or an unresolved detail is needed. It is project-level; Task Memory is task-level.
-- After compaction: inspect Todo, use Task Memory, then relevant Project Knowledge; read source only for genuinely new or verification-specific information.
+- After compaction: use the continuation brief, Task Memory, then relevant Project Knowledge; read source only for genuinely new or verification-specific information.
 - Do not call tools merely because they are available. Stop naturally when the requested work is complete.
 "#;
 
-const SUMMARY_GUIDANCE: &str = r#"Write one dense factual continuation brief for the same task. Preserve the user's goal and constraints; decisions; concrete findings with important files and their roles; meaningful commands and tool outcomes; completed work; the current active Todo direction; unresolved questions; and the next useful action. Distinguish verified facts from hypotheses. Do not repeat raw tool output, runtime mechanics, token counts, cache protocols, generic encouragement, or an activity log. Write only the continuation brief."#;
+const SUMMARY_GUIDANCE: &str = r#"Write one dense factual continuation brief for the same task. Preserve the user's goal and constraints; decisions; concrete findings with important files and their roles; meaningful commands and tool outcomes; completed work; the current focus or line of investigation; meaningful unresolved work or questions; blockers or approval-required operations; relevant Task Memory references; relevant Project Knowledge availability; and the next useful action. Distinguish verified facts from hypotheses. Do not repeat raw tool output, runtime mechanics, token counts, cache protocols, generic encouragement, or an activity log. Write only the continuation brief."#;
 
 #[derive(Clone, Copy, Debug)]
 pub struct CompactionBudget {
@@ -211,27 +209,6 @@ fn request_payload(
     payload
 }
 
-/// llama.cpp's OpenAI-compatible API intentionally implements only the
-/// string tool-choice variants (`auto`, `none`, `required`).  Keep this
-/// decision separate from the provider payload construction so the eager
-/// Todo path has a small regression test and never regresses to OpenAI's
-/// named-function object form.
-fn tool_choice_for_turn(eager_todo: bool) -> Value {
-    if eager_todo {
-        json!("required")
-    } else {
-        json!("auto")
-    }
-}
-
-fn eager_todo_schemas(schemas: &[Value]) -> Vec<Value> {
-    schemas
-        .iter()
-        .filter(|schema| tool_name(schema) == "todo")
-        .cloned()
-        .collect()
-}
-
 fn estimate_tokens(value: &Value) -> usize {
     // Conservative enough for JSON-heavy local tool prompts. Provider-reported
     // usage remains authoritative telemetry.
@@ -361,45 +338,9 @@ fn stable_prefix(config: &Config) -> String {
     prefix
 }
 
-const EAGER_TODO_GUIDANCE: &str = "For substantial multi-step work, create one short Todo when useful. Keep it flat and high-level; begin useful investigation without waiting on planning.";
-
-fn is_multi_step_request(user: &str) -> bool {
-    let lower = user.to_ascii_lowercase();
-    user.chars().count() > 220
-        || [
-            "audit",
-            "analy",
-            "implement",
-            "migrate",
-            "review",
-            "investigat",
-            "architecture",
-            "report",
-            "multiple",
-            "several",
-            "then ",
-            "phase",
-        ]
-        .iter()
-        .any(|needle| lower.contains(needle))
-}
-
-fn dynamic_tail(state: &AgentState, root: Option<&str>, eager_todo: bool) -> String {
+fn dynamic_tail(state: &AgentState, root: Option<&str>) -> String {
     let mut tail = Vec::new();
-    if eager_todo && state.plan.model_todo.is_empty() {
-        tail.push(EAGER_TODO_GUIDANCE.to_owned());
-    } else if !state.plan.model_todo.is_empty() {
-        tail.push(format!(
-            "<model_todo>\n{}\n</model_todo>",
-            state.plan.model_todo.prompt()
-        ));
-    }
-    let active = state
-        .plan
-        .model_todo
-        .active()
-        .map(|(_, item)| item.id.as_str());
-    let memory = state.plan.task_memory.prompt(active);
+    let memory = state.task_memory.prompt();
     if !memory.is_empty() {
         tail.push(format!("<task_memory>\n{memory}\n</task_memory>"));
     }
@@ -448,8 +389,7 @@ fn emit_knowledge_diagnostics(config: &Config, state: &AgentState) {
 
 fn tool_schemas(has_project_root: bool) -> Vec<Value> {
     let mut tools = vec![
-        json!({"type":"function","function":{"name":"todo","description":"Canonical current plan, not a gate. init uses list:[{items:[\"outcome\"]}]; append uses one content string; view reads it. To finish current work use {action:\"done\"}; no task label is needed and the next pending item activates automatically. start/drop may name a task by its full content or displayed id, but start cannot skip earlier open work: finish or drop it first. done may attach optional memory {finding, evidence, implication, next}. Keep the active item aligned with current work; do not recreate the plan.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["init","append","start","done","drop","view"]},"list":{"type":"array","description":"For init: [{items:[\"concise task\"]}]. Phase is accepted only for older clients and is UI-only.","items":{"type":"object","properties":{"phase":{"type":"string"},"items":{"type":"array","items":{"type":"string"}}},"required":["items"]}},"task":{"type":"string","description":"Optional for done (defaults to active); required for start/drop. Accepts a displayed id or full task content."},"phase":{"type":"string"},"content":{"type":"string","description":"One new Todo item for append; also accepted as a task reference for done/start/drop."},"memory":{"type":"object","description":"Optional durable handoff when completing a Todo.","properties":{"finding":{"type":"string"},"evidence":{"type":"string"},"implication":{"type":"string"},"next":{"type":"string"}},"required":["finding"]}},"required":["action"]}}}),
-        json!({"type":"function","function":{"name":"task_memory","description":"Durable semantic memory for the current task across compaction, not the Todo. Record/update meaningful findings, decisions, blockers, or unresolved questions; view reads it; invalidate needs id. Record/update requires finding and may include task, evidence, implication, next, id, supersedes. Trust precise unchanged-file memory; reread only for a concrete missing, ambiguous, changed, exact-detail, or verification need.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["record","update","invalidate","view"]},"id":{"type":"string"},"task":{"type":"string"},"finding":{"type":"string"},"evidence":{"type":"string"},"implication":{"type":"string"},"next":{"type":"string"},"supersedes":{"type":"string"}},"required":["action"]}}}),
+        json!({"type":"function","function":{"name":"task_memory","description":"Durable semantic memory for the current task across compaction. Record/update meaningful findings, decisions, blockers, or unresolved questions; view reads it; invalidate needs id. Record/update requires finding and may include evidence, implication, next, id, supersedes. Trust precise unchanged-file memory; reread only for a concrete missing, ambiguous, changed, exact-detail, or verification need.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["record","update","invalidate","view"]},"id":{"type":"string"},"finding":{"type":"string"},"evidence":{"type":"string"},"implication":{"type":"string"},"next":{"type":"string"},"supersedes":{"type":"string"}},"required":["action"]}}}),
     ];
     if has_project_root {
         tools.extend([
@@ -468,9 +408,8 @@ fn tool_schemas(has_project_root: bool) -> Vec<Value> {
     tools.sort_by(|left, right| tool_name(left).cmp(tool_name(right)));
     tools
 }
-
 /// A constrained/read-only run does not advertise mutations and therefore
-/// cannot strand the model behind an approval-only capability. `todo` and
+/// cannot strand the model behind an approval-only capability. Task Memory and
 /// explicit knowledge reads remain available so analysis has a complete
 /// working contract.
 fn tool_schemas_for_policy(has_project_root: bool, policy: RunPolicy) -> Vec<Value> {
@@ -479,8 +418,7 @@ fn tool_schemas_for_policy(has_project_root: bool, policy: RunPolicy) -> Vec<Val
         tools.retain(|tool| {
             matches!(
                 tool_name(tool),
-                "todo"
-                    | "task_memory"
+                "task_memory"
                     | "read_file"
                     | "list_directory"
                     | "project_knowledge_index"
@@ -503,109 +441,12 @@ fn required_text(arguments: &Value, key: &str) -> Result<String, String> {
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .map(str::to_owned)
-        .ok_or_else(|| format!("todo requires {key}"))
-}
-
-fn todo_reference(
-    state: &AgentState,
-    arguments: &Value,
-    require_explicit: bool,
-) -> Result<String, String> {
-    for key in ["task", "content"] {
-        if let Some(value) = arguments
-            .get(key)
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-        {
-            return Ok(value.to_owned());
-        }
-    }
-    if !require_explicit {
-        return state
-            .plan
-            .model_todo
-            .active()
-            .map(|(_, item)| item.id.clone())
-            .ok_or_else(|| "todo has no active item".to_owned());
-    }
-    Err("todo requires task or content".into())
-}
-
-fn todo_init_phases(arguments: &Value) -> Result<Vec<(String, Vec<String>)>, String> {
-    let list = arguments
-        .get("list")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "todo init requires list".to_owned())?;
-    list.iter()
-        .map(|phase| {
-            let name = phase
-                .get("phase")
-                .and_then(Value::as_str)
-                .unwrap_or("Work")
-                .to_owned();
-            let items = phase
-                .get("items")
-                .and_then(Value::as_array)
-                .ok_or_else(|| "each Todo phase requires items".to_owned())?
-                .iter()
-                .map(|item| {
-                    item.as_str()
-                        .map(str::to_owned)
-                        .ok_or_else(|| "Todo items must be strings".to_owned())
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok((name, items))
-        })
-        .collect()
-}
-
-fn apply_todo(state: &mut AgentState, arguments: &Value) -> Result<(Value, bool), String> {
-    let action = arguments
-        .get("action")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "todo requires action".to_owned())?;
-    if action == "view" {
-        return Ok((
-            json!({"todo": state.plan.model_todo, "updated": false}),
-            false,
-        ));
-    }
-    match action {
-        "init" => state.plan.model_todo.init(todo_init_phases(arguments)?)?,
-        "append" => state.plan.model_todo.append(
-            arguments.get("phase").and_then(Value::as_str),
-            required_text(arguments, "content")?,
-        )?,
-        "start" => state
-            .plan
-            .model_todo
-            .start(&todo_reference(state, arguments, true)?)?,
-        "done" => {
-            let task = todo_reference(state, arguments, false)?;
-            let todo_id = state.plan.model_todo.id_for(&task);
-            state.plan.model_todo.finish(&task, false)?;
-            if let Some(memory) = arguments.get("memory") {
-                let memory_id = write_task_memory(&mut state.plan, memory, todo_id)?;
-                state.plan.model_todo.attach_memory(&task, memory_id)?;
-            }
-        }
-        "drop" => state
-            .plan
-            .model_todo
-            .finish(&todo_reference(state, arguments, true)?, true)?,
-        _ => return Err("unsupported todo action".into()),
-    }
-    state.plan.sync_from_model_todo();
-    Ok((
-        json!({"todo": state.plan.model_todo, "updated": true}),
-        true,
-    ))
+        .ok_or_else(|| format!("missing required field: {key}"))
 }
 
 fn write_task_memory(
-    plan: &mut GoalPlan,
+    memory: &mut crate::agent::task_memory::TaskMemory,
     value: &Value,
-    todo_id: Option<String>,
 ) -> Result<String, String> {
     let finding = value
         .get("finding")
@@ -627,13 +468,12 @@ fn write_task_memory(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
-    plan.task_memory.upsert(
+    memory.upsert(
         value.get("id").and_then(Value::as_str),
         finding,
         evidence,
         implication,
         next,
-        todo_id,
         value
             .get("supersedes")
             .and_then(Value::as_str)
@@ -648,26 +488,21 @@ fn apply_task_memory(state: &mut AgentState, arguments: &Value) -> Result<(Value
         .unwrap_or("record");
     if action == "view" {
         return Ok((
-            json!({"task_memory": state.plan.task_memory, "updated": false}),
+            json!({"task_memory": state.task_memory, "updated": false}),
             false,
         ));
     }
     if action == "invalidate" {
         state
-            .plan
             .task_memory
             .invalidate(required_text(arguments, "id")?.as_str())?;
     } else if action == "record" || action == "update" {
-        let todo_id = arguments
-            .get("task")
-            .and_then(Value::as_str)
-            .and_then(|task| state.plan.model_todo.id_for(task));
-        write_task_memory(&mut state.plan, arguments, todo_id)?;
+        write_task_memory(&mut state.task_memory, arguments)?;
     } else {
         return Err("unsupported task_memory action".into());
     }
     Ok((
-        json!({"task_memory": state.plan.task_memory, "updated": true}),
+        json!({"task_memory": state.task_memory, "updated": true}),
         true,
     ))
 }
@@ -1371,9 +1206,9 @@ fn summarize_span(config: &Config, plan: &CompactionPlan) -> SummaryResult {
             .saturating_sub(SAFETY_RESERVE_TOKENS + MIN_SUMMARY_OUTPUT_TOKENS)
             .saturating_mul(2),
     );
-    // Compaction has one responsibility: construct a factual handoff. Todo
-    // and Task Memory are independent runtime state and are never repeatedly
-    // rewritten by a summary model.
+    // Compaction has one responsibility: construct a factual handoff. Task
+    // Memory remains independent runtime state and is never rewritten by a
+    // summary model.
     let summary_source = summary_source(plan, summary_input_chars);
     if summary_source.trim().is_empty() {
         return SummaryResult {
@@ -1460,7 +1295,7 @@ struct EmergencyToolResultTruncation {
 
 fn emit_compaction_diagnostics(
     config: &Config,
-    state: &AgentState,
+    _state: &AgentState,
     compaction_index: usize,
     trigger_reason: &str,
     report: &CompactionReport,
@@ -1492,7 +1327,6 @@ fn emit_compaction_diagnostics(
             transcript_tokens_before: report.before.transcript_history_tokens,
             summary_prompt_tokens: report.after.summary_tokens,
             runtime_tail_tokens: report.after.dynamic_tail_tokens,
-            model_todo_tokens: estimate_tokens(&json!(state.plan.model_todo.prompt())),
             memory_catalog_tokens: estimate_tokens(&json!(
                 crate::tools::knowledge::prompt_catalog(config.root.as_deref())
             )),
@@ -1534,7 +1368,6 @@ fn emit_compaction_diagnostics(
                 .emergency_tool_result_truncation
                 .as_ref()
                 .and_then(|entry| entry.source.clone()),
-            active_todo: state.plan.model_todo.active_label().map(str::to_owned),
         },
     );
 }
@@ -1830,26 +1663,13 @@ fn run_tool(
             emit_knowledge_diagnostics(config, state);
             Ok((value, None))
         }
-        "todo" => {
-            let (value, changed) = apply_todo(state, &tool.arguments)?;
-            if changed {
-                emit(
-                    &config.run_id,
-                    Event::PlanUpdate {
-                        plan: serde_json::to_value(&state.plan)
-                            .map_err(|error| error.to_string())?,
-                    },
-                );
-            }
-            Ok((value, None))
-        }
         "task_memory" => {
             let (value, changed) = apply_task_memory(state, &tool.arguments)?;
             if changed {
                 emit(
                     &config.run_id,
-                    Event::PlanUpdate {
-                        plan: serde_json::to_value(&state.plan)
+                    Event::TaskMemoryUpdate {
+                        memory: serde_json::to_value(&state.task_memory)
                             .map_err(|error| error.to_string())?,
                     },
                 );
@@ -1924,13 +1744,12 @@ fn run_tool(
             let result =
                 crate::tools::filesystem::execute(&PathBuf::from(root), name, &tool.arguments)?;
             if matches!(name, "read_file" | "list_directory") {
-                let active = state.plan.model_todo.active_label();
                 let _ = crate::tools::knowledge::observe_tool(
                     &PathBuf::from(root),
                     &config.run_id,
                     &config.user,
                     None,
-                    active,
+                    None,
                     name,
                     &tool.arguments,
                     &result.0,
@@ -2009,13 +1828,12 @@ fn record_safe_read_effect(
         }
         "read_file" | "list_directory" => {
             if let Some(root) = config.root.as_deref() {
-                let active = state.plan.model_todo.active_label();
                 let _ = crate::tools::knowledge::observe_tool(
                     &PathBuf::from(root),
                     &config.run_id,
                     &config.user,
                     None,
-                    active,
+                    None,
                     &tool.name,
                     &tool.arguments,
                     value,
@@ -2052,13 +1870,11 @@ pub fn run(config: Config) {
     }
     transcript.push_run_user(json!({"role":"user", "content":config.user}));
     let mut state = AgentState::default();
-    state.plan = config
-        .plan
+    state.task_memory = config
+        .task_memory
         .as_ref()
-        .and_then(|plan| serde_json::from_value::<GoalPlan>(plan.clone()).ok())
+        .and_then(|memory| serde_json::from_value(memory.clone()).ok())
         .unwrap_or_default();
-    state.plan.normalize_active();
-    state.plan.ensure_model_todo();
     if let Some(root) = config.root.as_deref() {
         let _ = crate::tools::knowledge::bootstrap(&PathBuf::from(root));
     }
@@ -2069,7 +1885,6 @@ pub fn run(config: Config) {
     };
     let stable = stable_prefix(&config);
     let schemas = tool_schemas_for_policy(config.root.is_some(), config.policy);
-    let eager_todo_schemas = eager_todo_schemas(&schemas);
     let mut final_content = String::new();
     let mut continuation_count = 0_usize;
     let mut continuation_pending = false;
@@ -2103,20 +1918,8 @@ pub fn run(config: Config) {
                 transcript.push_steering(content);
             }
         }
-        let eager_todo =
-            turn == 0 && state.plan.model_todo.is_empty() && is_multi_step_request(&config.user);
-        let eager_todo_uses_string_choice =
-            eager_todo && !is_ollama_native_endpoint(&config.endpoint);
-        // llama.cpp supports only string tool_choice values, so it cannot
-        // express OpenAI's named-function object form.  Restricting this
-        // one eager request to the existing Todo schema gives `required` the
-        // same unambiguous meaning without inventing a provider-specific API.
-        let request_schemas = if eager_todo_uses_string_choice {
-            &eager_todo_schemas
-        } else {
-            &schemas
-        };
-        let dynamic = dynamic_tail(&state, config.root.as_deref(), eager_todo);
+        let request_schemas = &schemas;
+        let dynamic = dynamic_tail(&state, config.root.as_deref());
         let pending_tail = transcript.pending_tail(&dynamic);
         let sent_tail = if transcript.has_active_prompt_tail(&pending_tail) {
             String::new()
@@ -2214,21 +2017,7 @@ pub fn run(config: Config) {
             return;
         }
         let projected = current_budget.projected_input_tokens;
-        let mut payload = request_payload(&config, &messages, request_schemas, output_limit);
-        if eager_todo {
-            // llama.cpp's OpenAI-compatible endpoint accepts only the string
-            // choices auto/none/required. Its parser rejects OpenAI's object
-            // form for a named function and silently falls back to default.
-            // `required` preserves the useful eager-plan invariant without
-            // sending an unsupported provider contract.
-            payload["tool_choice"] = if eager_todo_uses_string_choice {
-                tool_choice_for_turn(true)
-            } else {
-                // Preserve the native Ollama request shape. This compatibility
-                // adaptation is for llama.cpp's OpenAI endpoint only.
-                json!({"type":"function","function":{"name":"todo"}})
-            };
-        }
+        let payload = request_payload(&config, &messages, request_schemas, output_limit);
         trace_forensics(
             &config.run_id,
             "agent_request_state",
@@ -2236,8 +2025,7 @@ pub fn run(config: Config) {
                 "turn":turn + 1,
                 "projected_input_tokens":projected,
                 "dynamic_tail":dynamic,
-                "todo":state.plan.model_todo.prompt(),
-                "task_memory":state.plan.task_memory.prompt(state.plan.model_todo.active().map(|(_, item)| item.id.as_str())),
+                "task_memory":state.task_memory.prompt(),
                 "compaction_boundary":transcript.compaction_boundary(),
                 "message_shape":request_shape(&messages),
             }),
@@ -2728,1479 +2516,53 @@ fn is_context_overflow(error: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::todo::GoalPlan;
-    use std::{
-        fs,
-        net::{TcpListener, TcpStream},
-        sync::mpsc,
-        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-    };
-
-    fn sse_response(events: &[Value]) -> String {
-        let body = events
-            .iter()
-            .map(|event| format!("data: {event}\n\n"))
-            .chain(std::iter::once("data: [DONE]\n\n".to_owned()))
-            .collect::<String>();
-        format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
-        )
-    }
-
-    fn read_mock_request(stream: &mut TcpStream) -> Value {
-        let mut reader = BufReader::new(stream);
-        let mut line = String::new();
-        reader.read_line(&mut line).unwrap();
-        let mut content_length = 0_usize;
-        loop {
-            line.clear();
-            reader.read_line(&mut line).unwrap();
-            if line == "\r\n" || line == "\n" {
-                break;
-            }
-            if let Some((name, value)) = line.split_once(':') {
-                if name.eq_ignore_ascii_case("content-length") {
-                    content_length = value.trim().parse().unwrap();
-                }
-            }
-        }
-        let mut body = vec![0_u8; content_length];
-        reader.read_exact(&mut body).unwrap();
-        serde_json::from_slice(&body).unwrap()
-    }
-
-    fn unique_temp_root(name: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("local-ai-agent-{name}-{nonce}"))
-    }
-
-    fn test_config(root: Option<&str>) -> Config {
-        Config {
-            run_id: "test".into(),
-            endpoint: "http://127.0.0.1:1".into(),
-            model: "test-model".into(),
-            system: "base system".into(),
-            user: "task".into(),
-            root: root.map(str::to_owned),
-            context_limit: 16_384,
-            reasoning_mode: "fast".into(),
-            policy: RunPolicy::Auto,
-            history: Vec::new(),
-            plan: None,
-            provider_max_output: Some(APPLICATION_MAX_OUTPUT_TOKENS),
-            cancelled: Arc::new(AtomicBool::new(false)),
-            steering: Arc::new(Mutex::new(Vec::new())),
-        }
-    }
 
     #[test]
-    fn deterministic_tool_ordering() {
-        let first = tool_schemas(true);
-        let second = tool_schemas(true);
-        assert_eq!(first, second);
-        let names = first.iter().map(tool_name).collect::<Vec<_>>();
-        let mut sorted = names.clone();
-        sorted.sort();
-        assert_eq!(names, sorted);
-        assert_eq!(
-            tool_schemas(false)
-                .iter()
-                .map(tool_name)
-                .collect::<Vec<_>>(),
-            vec!["task_memory", "todo"]
-        );
-    }
-
-    #[test]
-    fn safe_policy_advertises_a_complete_read_only_tool_contract() {
-        let schemas = tool_schemas_for_policy(true, RunPolicy::Safe);
+    fn experimental_toolset_excludes_todo_and_keeps_production_capabilities() {
+        let schemas = tool_schemas(true);
         let names = schemas.iter().map(tool_name).collect::<Vec<_>>();
-        assert_eq!(
-            names,
-            vec![
-                "list_directory",
-                "project_knowledge_index",
-                "project_knowledge_read",
-                "read_file",
-                "task_memory",
-                "todo",
-            ]
-        );
-    }
-
-    #[test]
-    fn eager_todo_uses_llama_cpp_supported_string_tool_choice() {
-        assert_eq!(tool_choice_for_turn(false), json!("auto"));
-        assert_eq!(tool_choice_for_turn(true), json!("required"));
-        let schemas = tool_schemas_for_policy(true, RunPolicy::Safe);
-        assert_eq!(
-            eager_todo_schemas(&schemas)
-                .iter()
-                .map(tool_name)
-                .collect::<Vec<_>>(),
-            vec!["todo"]
-        );
-    }
-
-    #[test]
-    fn todo_is_canonical_and_promotes_the_next_item_into_the_ui_adapter() {
-        let mut state = AgentState::default();
-        let (_, changed) = apply_todo(
-            &mut state,
-            &json!({
-                "action":"init",
-                "list":[
-                    {"phase":"Research","items":["Understand project orientation", "Analyze product flow"]},
-                    {"phase":"Synthesis","items":["Produce final report"]}
-                ]
-            }),
-        )
-        .unwrap();
-        assert!(changed);
-        assert_eq!(
-            state.plan.model_todo.active_label(),
-            Some("Understand project orientation")
-        );
-        assert_eq!(state.plan.milestones.len(), 1);
-        apply_todo(
-            &mut state,
-            &json!({"action":"done","task":"Understand project orientation"}),
-        )
-        .unwrap();
-        assert_eq!(
-            state.plan.model_todo.active_label(),
-            Some("Analyze product flow")
-        );
-        assert_eq!(
-            state.plan.milestones[0].work_plan.tasks[0].status,
-            crate::agent::todo::Status::Completed
-        );
-        assert_eq!(
-            state.plan.milestones[0].work_plan.tasks[1].status,
-            crate::agent::todo::Status::InProgress
-        );
-    }
-
-    #[test]
-    fn todo_snapshot_drives_plan_update_without_exposing_ui_schema_to_the_model() {
-        let mut state = AgentState::default();
-        apply_todo(&mut state, &json!({"action":"init","list":[{"phase":"Audit","items":["Inspect runtime", "Write report"]}]})).unwrap();
-        let emitted = serde_json::to_value(Event::PlanUpdate {
-            plan: serde_json::to_value(&state.plan).unwrap(),
-        })
-        .unwrap();
-        assert_eq!(emitted["type"], "plan_update");
-        let tail = dynamic_tail(&state, None, false);
-        assert!(tail.contains("[active] Inspect runtime"));
-        assert!(!tail.contains("todo-1"));
-        assert!(!tail.contains("milestones"));
-        assert!(!tail.contains("work_plan"));
-    }
-
-    #[test]
-    fn glm_style_done_by_visible_id_completes_and_promotes_without_a_label_match() {
-        let mut state = AgentState::default();
-        apply_todo(
-            &mut state,
-            &json!({"action":"init","list":[{"items":["Inspect entry points", "Map routing"]}]}),
-        )
-        .unwrap();
-        // This is the exact shape emitted by the real GLM reproduction: the
-        // model referred to the displayed stable id and supplied a content
-        // handoff. Both are now accepted, while a bare done also works.
-        apply_todo(
-            &mut state,
-            &json!({"action":"done","task":"todo-1","content":"Inspect entry points","memory":{"finding":"Entry point confirmed","next":"Map routing"}}),
-        )
-        .unwrap();
-        assert_eq!(state.plan.model_todo.active_label(), Some("Map routing"));
-        assert_eq!(
-            state.plan.model_todo.phases[0].items[0]
-                .memory_id
-                .as_deref(),
-            Some("tm-001")
-        );
-        apply_todo(&mut state, &json!({"action":"done"})).unwrap();
-        assert!(!state.plan.model_todo.has_open());
-    }
-
-    #[test]
-    fn todo_schema_and_stable_prefix_are_compact_and_explicit() {
-        let schema = tool_schemas(false)
-            .into_iter()
-            .find(|tool| tool_name(tool) == "todo")
-            .unwrap();
-        let description = schema
-            .pointer("/function/description")
-            .unwrap()
-            .as_str()
-            .unwrap();
-        assert!(description.contains("Canonical current plan"));
-        assert!(description.contains("next pending item activates automatically"));
-        assert_eq!(
-            schema.pointer("/function/parameters/required"),
-            Some(&json!(["action"]))
-        );
-        let config = test_config(Some("/project"));
-        let stable = stable_prefix(&config);
-        assert_eq!(stable, stable_prefix(&config));
-        assert!(stable.contains("Todo = what to do next"));
-        assert!(stable.contains("Task Memory = durable semantic continuity"));
-        assert!(stable.contains("Project Knowledge = reusable observations"));
-        assert!(stable.contains("user's language"));
-        assert!(!stable.contains("model_todo"));
-        let memory = tool_schemas(true)
-            .into_iter()
-            .find(|tool| tool_name(tool) == "task_memory")
-            .unwrap();
-        assert!(memory
-            .pointer("/function/description")
-            .and_then(Value::as_str)
-            .unwrap()
-            .contains("across compaction"));
-        let knowledge = tool_schemas(true)
-            .into_iter()
-            .find(|tool| tool_name(tool) == "project_knowledge_read")
-            .unwrap();
-        assert!(knowledge
-            .pointer("/function/description")
-            .and_then(Value::as_str)
-            .unwrap()
-            .contains("before broad rereads"));
-        let state = AgentState::default();
-        assert!(!dynamic_tail(&state, None, false).contains("user's language"));
-    }
-
-    #[test]
-    fn completed_todo_handoff_survives_multiple_compactions_without_reinvestigation() {
-        let mut state = AgentState::default();
-        apply_todo(&mut state, &json!({"action":"init","list":[{"items":["Investigate GLM context bug", "Implement GLM context fix"]}]})).unwrap();
-        apply_todo(&mut state, &json!({"action":"done","task":"Investigate GLM context bug","memory":{"finding":"summarize_span auxiliary Ollama request omits options.num_ctx","evidence":"rust-agent/src/agent/loop_runtime.rs summarize_span","implication":"auxiliary generation can reload model-native context","next":"patch request path and add regression test"}})).unwrap();
-        assert_eq!(
-            state.plan.model_todo.active_label(),
-            Some("Implement GLM context fix")
-        );
-        let mut transcript = Transcript::default();
-        transcript.push_message(json!({"role":"user","content":"Investigate the GLM bug"}));
-        transcript.push_message(
-            json!({"role":"assistant","content":"raw exploration that may be discarded"}),
-        );
-        transcript
-            .push_message(json!({"role":"assistant","content":"recent implementation handoff"}));
-        let plan = transcript.compaction_plan(1).unwrap();
-        transcript.compact("compact factual location only".into(), plan.covers);
-        transcript.compact("later compact factual location only".into(), 0);
-        let tail = dynamic_tail(&state, None, false);
-        assert!(tail.contains("[done] Investigate GLM context bug -> tm-001"));
-        assert!(tail.contains("[active] Implement GLM context fix"));
-        assert!(tail.contains("summarize_span auxiliary Ollama request omits options.num_ctx"));
-        assert_eq!(state.plan.task_memory.entries.len(), 1);
-    }
-
-    #[test]
-    fn task_memory_can_supersede_a_wrong_finding() {
-        let mut state = AgentState::default();
-        apply_task_memory(
-            &mut state,
-            &json!({"action":"record","finding":"old conclusion"}),
-        )
-        .unwrap();
-        apply_task_memory(
-            &mut state,
-            &json!({"action":"record","finding":"correct conclusion","supersedes":"tm-001"}),
-        )
-        .unwrap();
-        let prompt = state.plan.task_memory.prompt(None);
-        assert!(!prompt.contains("old conclusion"));
-        assert!(prompt.contains("correct conclusion"));
-    }
-
-    #[test]
-    fn automatic_project_knowledge_is_a_catalog_not_materialized_document_bodies() {
-        let root = unique_temp_root("knowledge-catalog");
-        fs::create_dir_all(&root).unwrap();
-        crate::tools::knowledge::bootstrap(&root).unwrap();
-        crate::tools::knowledge::update(
-            &root,
-            &json!({"updates":[{"path":"project/overview.md","content":"SENTINEL_RAW_OVERVIEW_BODY","mode":"replace"}]}),
-        )
-        .unwrap();
-        let state = AgentState::default();
-        let tail = dynamic_tail(&state, root.to_str(), false);
-        assert!(tail.contains("project_knowledge_catalog"));
-        assert!(tail.contains("project overview"));
-        assert!(!tail.contains("SENTINEL_RAW_OVERVIEW_BODY"));
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn safe_read_classification_excludes_mutations_and_terminal_work() {
+        assert!(!names.contains(&"todo"));
         for name in [
+            "task_memory",
             "read_file",
             "list_directory",
+            "run_terminal",
             "project_knowledge_index",
             "project_knowledge_read",
+            "project_knowledge_update",
         ] {
-            assert!(safe_read_only_tool(name), "{name}");
+            assert!(names.contains(&name), "{name}");
         }
-        for name in [
-            "write_file",
-            "apply_patch",
-            "delete_file",
-            "run_terminal",
-            "todo",
-        ] {
-            assert!(!safe_read_only_tool(name), "{name}");
-        }
-    }
-
-    #[test]
-    fn dynamic_output_uses_real_remaining_context() {
-        assert_eq!(
-            dynamic_output_limit(32_768, 4_000, 1_024, Some(20_000), 32_768),
-            20_000
-        );
-        assert_eq!(
-            dynamic_output_limit(16_384, 15_000, 1_024, None, 32_768),
-            360
-        );
-    }
-
-    #[test]
-    fn useful_smaller_output_is_accepted_below_preferred_headroom() {
-        let output =
-            dynamic_output_limit(32_768, 30_944, SAFETY_RESERVE_TOKENS, Some(8_000), 8_000);
-        assert_eq!(output, 800);
-        assert!(output < PREFERRED_OUTPUT_HEADROOM_TOKENS);
-        assert!(has_minimum_useful_output(output));
-        assert!(!has_minimum_useful_output(MIN_USEFUL_OUTPUT_TOKENS - 1));
-    }
-
-    #[test]
-    fn impossible_budget_error_reports_component_estimates() {
-        let before = RequestBudget {
-            projected_input_tokens: 40_000,
-            stable_prefix_tokens: 500,
-            tool_schemas_tokens: 1_200,
-            transcript_history_tokens: 38_000,
-            summary_tokens: 0,
-            dynamic_tail_tokens: 300,
-        };
-        let after = RequestBudget {
-            projected_input_tokens: 32_000,
-            stable_prefix_tokens: 500,
-            tool_schemas_tokens: 1_200,
-            transcript_history_tokens: 30_000,
-            summary_tokens: 128,
-            dynamic_tail_tokens: 300,
-        };
-        let error = budget_error(
-            &test_config(None),
-            before,
-            after,
-            128,
-            384,
-            29_000,
-            4,
-            8_000,
-            0,
-        );
-        for expected in [
-            "context_window=16384",
-            "projected_input_tokens_before_compaction=40000",
-            "projected_input_tokens_after_compaction=32000",
-            "stable_prefix_estimate_after=500",
-            "tool_schemas_estimate_after=1200",
-            "transcript_history_estimate_after=30000",
-            "summary_prompt_estimate_after=128",
-            "dynamic_tail_estimate_after=300",
-            "safety_reserve=1024",
-            "requested_max_output=8000",
-            "dynamic_max_output=0",
-            "minimum_useful_output=32",
-            "compaction_summary_tokens=128",
-            "compaction_summary_chars=384",
-            "retained_tail_tokens=29000",
-            "compaction_attempts=4",
-        ] {
-            assert!(error.contains(expected), "missing {expected} from {error}");
-        }
-    }
-
-    #[test]
-    fn summary_is_bounded_by_provider_max_tokens_without_a_second_char_truncation() {
-        assert_eq!(SUMMARY_MAX_OUTPUT_TOKENS, 1_024);
-        assert!(MIN_SUMMARY_OUTPUT_TOKENS <= SUMMARY_MAX_OUTPUT_TOKENS);
-    }
-
-    #[test]
-    fn jan_style_summary_source_is_the_dropped_transcript_only() {
-        let mut transcript = Transcript::default();
-        transcript.push_message(json!({
-            "role":"user",
-            "content":"Audit routing and report concrete findings."
-        }));
-        transcript.push_message(json!({
-            "role":"assistant",
-            "content":"App.tsx uses BrowserRouter and renders PurchaseToast, AppRoutes, and ScrollToTopButton. Routes.tsx uses LangGate plus ProductShell and routes product/:id, products-page, confirm, and legal pages."
-        }));
-        transcript.push_message(json!({"role":"assistant","content":"Keep the next investigation focused on the API boundary."}));
-        let plan = transcript.compaction_plan(1).unwrap();
-        let source = summary_source(&plan, SUMMARY_INPUT_CHARS);
-        assert!(SUMMARY_GUIDANCE.contains("factual continuation brief"));
-        assert!(!SUMMARY_GUIDANCE.contains("project_knowledge_updates"));
-        assert!(source.contains("App.tsx uses BrowserRouter"));
-        assert!(source.contains("Routes.tsx uses LangGate"));
-    }
-
-    #[test]
-    fn mocked_compaction_returns_a_semantic_handoff_not_an_activity_log() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint = format!(
-            "http://{}/v1/chat/completions",
-            listener.local_addr().unwrap()
-        );
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let request = read_mock_request(&mut stream);
-            let source = request["messages"][1]["content"].as_str().unwrap();
-            assert!(source.contains("App.tsx uses BrowserRouter"));
-            assert!(source.contains("Routes.tsx uses LangGate"));
-            let response = json!({"choices":[{"delta":{"content":"App.tsx uses BrowserRouter and renders PurchaseToast, AppRoutes, and ScrollToTopButton. Routes.tsx composes LangGate with ProductShell and defines product/:id, products-page, confirm, and legal routes. These are verified source findings; finish checking api.php and robots.txt."},"finish_reason":"stop"}]});
-            stream
-                .write_all(sse_response(&[response]).as_bytes())
-                .unwrap();
-        });
-        let mut config = test_config(None);
-        config.endpoint = endpoint;
-        let mut plan = GoalPlan::default();
-        plan.init(vec!["Audit routing".into(), "Inspect API and SEO".into()])
+        let memory = schemas
+            .iter()
+            .find(|tool| tool_name(tool) == "task_memory")
             .unwrap();
-        plan.init_work(vec!["Trace route composition".into()])
-            .unwrap();
-        let mut transcript = Transcript::default();
-        transcript.push_message(
-            json!({"role":"user","content":"Audit route architecture and endpoints."}),
-        );
-        transcript.push_message(json!({"role":"assistant","content":"App.tsx uses BrowserRouter and renders PurchaseToast, AppRoutes, and ScrollToTopButton."}));
-        transcript.push_message(json!({"role":"assistant","content":"Routes.tsx uses LangGate plus ProductShell and defines product/:id and legal routes."}));
-        transcript.push_message(
-            json!({"role":"assistant","content":"Need inspect api.php, .htaccess, robots.txt."}),
-        );
-        let compaction_plan = transcript.compaction_plan(1).unwrap();
-        let summary = summarize_span(&config, &compaction_plan);
-        transcript.compact(summary.text, compaction_plan.covers);
-        let projected = project(
-            &transcript,
-            &stable_prefix(&config),
-            &dynamic_tail(
-                &AgentState {
-                    plan,
-                    ..AgentState::default()
-                },
-                None,
-                false,
-            ),
-        );
-        let summary_message = projected
-            .iter()
-            .find(|message| {
-                message["content"].as_str().is_some_and(|content| {
-                    content.starts_with("[RUNTIME COMPACTION SUMMARY — NOT USER CONTENT]")
-                })
-            })
-            .unwrap();
-        let handoff = summary_message["content"].as_str().unwrap();
-        assert!(handoff.contains("App.tsx uses BrowserRouter"));
-        assert!(handoff.contains("product/:id"));
-        assert!(handoff.contains("verified source findings"));
-        server.join().unwrap();
+        assert!(!memory.to_string().to_ascii_lowercase().contains("todo"));
+        assert!(memory
+            .pointer("/function/parameters/properties/task")
+            .is_none());
     }
 
     #[test]
-    fn continuation_appends_exact_next_text_without_modification() {
-        let mut final_text = String::from("Earlier findings end here.");
-        let accepted = append_continuation_text(&mut final_text, " Next finding starts here.");
-        assert_eq!(accepted, " Next finding starts here.");
-        assert_eq!(
-            final_text,
-            "Earlier findings end here. Next finding starts here."
-        );
+    fn dynamic_tail_contains_memory_and_knowledge_without_plan_state() {
+        let state = AgentState::default();
+        let tail = dynamic_tail(&state, None);
+        assert!(!tail.to_ascii_lowercase().contains("todo"));
+        assert!(!tail.contains("model_todo"));
     }
 
     #[test]
-    fn continuation_strips_substantial_suffix_overlap_once() {
-        let repeated = "Verified finding from the route audit. ".repeat(5);
-        let mut final_text = format!("Earlier text. {repeated}");
-        let continuation = format!("{repeated}New finding.");
-        let accepted = append_continuation_text(&mut final_text, &continuation);
-        assert_eq!(accepted, " New finding.");
-        assert!(final_text.ends_with("New finding."));
-        assert_eq!(final_text.matches("Verified finding").count(), 5);
-    }
-
-    #[test]
-    fn continuation_strips_a_restart_from_the_answer_beginning() {
-        let beginning = "## 1. Scope\n".to_owned() + &"Concrete route finding.\n".repeat(12);
-        let already_emitted = format!("{beginning}## 7. Summary\nPartial ending.");
-        let restarted = format!("{beginning}## 2. API findings\nAdditional details.");
-        assert_eq!(
-            continuation_text_to_append(&already_emitted, &restarted),
-            "## 2. API findings\nAdditional details."
-        );
-    }
-
-    #[test]
-    fn continuation_strips_a_repeated_markdown_heading_only() {
-        let existing = "Prior section details.\n## 7. Architecture\n";
-        assert_eq!(
-            continuation_text_to_append(existing, "## 7. Architecture\nNew details."),
-            "New details."
-        );
-    }
-
-    #[test]
-    fn continuation_without_overlap_is_preserved() {
-        let existing = "Earlier answer about routing.";
-        let new = "A distinct database finding.";
-        assert_eq!(continuation_text_to_append(existing, new), new);
-    }
-
-    #[test]
-    fn multiple_continuations_form_one_deduplicated_final_string() {
-        let first = "Opening. ".to_owned() + &"Repeated audit phrase. ".repeat(5);
-        let second_novel = "Second continuation adds verified details.";
-        let third_novel = "Third continuation closes the report.";
-        let repeated_second = format!(
-            "{}{}",
-            first
-                .chars()
-                .rev()
-                .take(80)
-                .collect::<String>()
-                .chars()
-                .rev()
-                .collect::<String>(),
-            second_novel
-        );
-        let mut final_text = first;
-        let accepted_second = append_continuation_text(&mut final_text, &repeated_second);
-        let repeated_third = format!("{second_novel}{third_novel}");
-        let accepted_third = append_continuation_text(&mut final_text, &repeated_third);
-        assert!(accepted_second.contains(second_novel));
-        assert_eq!(accepted_third, third_novel);
-        assert_eq!(final_text.matches(second_novel).count(), 1);
-        assert_eq!(final_text.matches(third_novel).count(), 1);
-    }
-
-    #[test]
-    fn low_remaining_context_compacts_before_a_tiny_output_budget() {
-        let budget = CompactionBudget {
-            context_window: 16_384,
-            ratio: DEFAULT_COMPACTION_RATIO,
-            reserve_tokens: None,
-        };
-        assert!(needs_compaction(budget, 14_500));
-        assert!(!needs_compaction(budget, 4_000));
-    }
-
-    #[test]
-    fn jan_retry_tail_policy_is_eight_then_four_then_two() {
-        assert_eq!(retry_keep_recent(0), 8);
-        assert_eq!(retry_keep_recent(1), 4);
-        assert_eq!(retry_keep_recent(2), 2);
-        assert_eq!(retry_keep_recent(3), 2);
-        assert_eq!(retry_keep_recent(MAX_COMPACTION_ATTEMPTS), 2);
-    }
-
-    fn fit_selection_fixture(
-        large_tail_messages: usize,
-        large_chars: usize,
-    ) -> (Config, Transcript, Vec<Value>, String) {
-        let mut config = test_config(None);
-        config.context_limit = 32_768;
-        // These approximate the real failure's stable prefix, schemas, and
-        // dynamic tail without depending on a provider or real files.
-        config.system = "s".repeat(900);
-        let schemas = vec![json!({"type":"function","description":"t".repeat(1_000)})];
-        let dynamic = "d".repeat(2_000);
-        let mut transcript = Transcript::default();
-        for index in 0..8 {
-            transcript
-                .push_message(json!({"role":"assistant","content":format!("old finding {index}")}));
-        }
-        for index in 0..large_tail_messages {
-            transcript.push_message(json!({
-                "role":"assistant",
-                "content": format!("large finding {index}: {}", "x".repeat(large_chars)),
-            }));
-        }
-        transcript.push_run_user(json!({"role":"user","content":"continue the audit"}));
-        (config, transcript, schemas, dynamic)
-    }
-
-    #[test]
-    fn preflight_tail_selection_retries_eight_four_two_before_summary() {
-        let (config, transcript, schemas, dynamic) = fit_selection_fixture(8, 20_000);
-        let (plan, attempts) = select_fit_aware_compaction_plan(
-            &config,
-            &transcript,
-            &schemas,
-            DEFAULT_KEEP_RECENT,
-            &dynamic,
-        )
-        .unwrap();
-
-        assert!(attempts[0].estimated_tokens >= 46_000);
-        assert_eq!(attempts[0].message_count, 8);
-        assert!(!attempts[0].fits);
-        assert!(attempts.len() > 1);
-        assert!(plan.retained_message_count() <= 4);
-        let mut compacted = transcript.clone();
-        compacted.compact("verified handoff".into(), plan.covers);
-        let post_compaction = request_budget(
-            &config,
-            &project(&compacted, &stable_prefix(&config), &dynamic),
-            &schemas,
-        );
-        assert!(
-            post_compaction.projected_input_tokens
-                <= compaction_target_tokens(config.context_limit)
-        );
-    }
-
-    #[test]
-    fn fit_selection_keeps_eight_when_it_fits() {
-        let (config, transcript, schemas, dynamic) = fit_selection_fixture(1, 20_000);
-        let (plan, attempts) = select_fit_aware_compaction_plan(
-            &config,
-            &transcript,
-            &schemas,
-            DEFAULT_KEEP_RECENT,
-            &dynamic,
-        )
-        .unwrap();
-        assert_eq!(attempts.len(), 1);
-        assert!(attempts[0].fits);
-        assert_eq!(plan.retained_message_count(), 8);
-    }
-
-    #[test]
-    fn fit_selection_uses_two_when_eight_and_four_do_not_fit() {
-        let (config, transcript, schemas, dynamic) = fit_selection_fixture(8, 35_000);
-        let (plan, attempts) = select_fit_aware_compaction_plan(
-            &config,
-            &transcript,
-            &schemas,
-            DEFAULT_KEEP_RECENT,
-            &dynamic,
-        )
-        .unwrap();
-        assert_eq!(attempts[0].message_count, 8);
-        assert!(!attempts[0].fits);
-        assert!(attempts.len() > 1);
-        assert!(plan.retained_message_count() <= 2);
-    }
-
-    #[test]
-    fn real_failure_sized_preflight_selects_smaller_tail_and_dispatches() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint = format!(
-            "http://{}/v1/chat/completions",
-            listener.local_addr().unwrap()
-        );
-        let server = std::thread::spawn(move || {
-            let mut requests = Vec::new();
-            for _ in 0..2 {
-                let (mut stream, _) = listener.accept().unwrap();
-                let request = read_mock_request(&mut stream);
-                let is_summary =
-                    request["messages"][0]["content"]
-                        .as_str()
-                        .is_some_and(|content| {
-                            content.contains("Write one dense factual continuation brief")
-                        });
-                let response = if is_summary {
-                    json!({"choices":[{"delta":{"content":"Verified earlier findings."},"finish_reason":"stop"}]})
-                } else {
-                    json!({"choices":[{"delta":{"content":"Continue with the fitted request."},"finish_reason":"stop"}]})
-                };
-                requests.push(request);
-                stream
-                    .write_all(sse_response(&[response]).as_bytes())
-                    .unwrap();
-            }
-            requests
-        });
-        let (mut config, transcript, _schemas, _dynamic) = fit_selection_fixture(8, 20_000);
-        config.endpoint = endpoint;
-        config.user = "continue the audit".into();
-        config.history = transcript
-            .entries()
-            .iter()
-            .filter_map(|entry| match entry {
-                crate::agent::transcript::Entry::Message(message) => Some(message.clone()),
-                _ => None,
-            })
-            .collect();
-
-        run(config);
-        let requests = server.join().unwrap();
-        assert_eq!(requests.len(), 2);
-        let agent = requests
-            .iter()
-            .find(|request| {
-                request["messages"][0]["content"]
-                    .as_str()
-                    .is_some_and(|content| content.starts_with("s"))
-            })
-            .expect("a model request is dispatched after the one summary request");
-        assert!(agent["max_tokens"].as_u64().unwrap() >= MIN_USEFUL_OUTPUT_TOKENS as u64);
-        assert_eq!(
-            agent["messages"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|message| message["role"] == "user"
-                    && message["content"] == "continue the audit")
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn giant_retained_tool_result_is_truncated_only_in_projection() {
-        let mut config = test_config(None);
-        config.context_limit = 32_768;
-        let schemas = tool_schemas(true);
-        let giant = json!({"path":"src/giant.rs","content":"z".repeat(140_000)}).to_string();
-        let mut messages = vec![
-            json!({"role":"system","content":stable_prefix(&config)}),
-            json!({"role":"assistant","content":"I will inspect the file.","tool_calls":[{"id":"read-1","type":"function","function":{"name":"read_file","arguments":"{\\\"path\\\":\\\"src/giant.rs\\\"}"}}]}),
-            json!({"role":"tool","tool_call_id":"read-1","name":"read_file","content":giant}),
-            json!({"role":"user","content":"continue"}),
-        ];
-        let canonical = messages.clone();
-        let diagnostic = truncate_retained_tool_result_to_fit(&config, &schemas, &mut messages)
-            .expect("the giant retained result needs an emergency projection");
-        assert_eq!(messages[1], canonical[1]);
-        assert_eq!(messages[2]["tool_call_id"], "read-1");
-        assert_ne!(messages[2]["content"], canonical[2]["content"]);
-        assert!(messages[2]["content"]
-            .as_str()
-            .unwrap()
-            .contains("tool result projection truncated"));
-        assert_eq!(diagnostic.source.as_deref(), Some("src/giant.rs"));
-        assert!(
-            request_budget(&config, &messages, &schemas).projected_input_tokens
-                <= compaction_target_tokens(config.context_limit)
-        );
-        // The caller owns the canonical transcript; its value was never edited.
-        assert!(canonical[2]["content"]
-            .as_str()
-            .unwrap()
-            .contains("src/giant.rs"));
-    }
-
-    #[test]
-    fn emergency_compaction_keeps_tool_pairs_and_low_water_with_multiple_large_results() {
-        let mut config = test_config(None);
-        config.context_limit = 65_536;
-        let schemas = tool_schemas(true);
-        let mut messages = vec![
-            json!({"role":"system","content":stable_prefix(&config)}),
-            json!({"role":"assistant","content":"Read both files.","tool_calls":[
-                {"id":"read-a","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.ts\"}"}},
-                {"id":"read-b","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"b.ts\"}"}}
-            ]}),
-            json!({"role":"tool","tool_call_id":"read-a","name":"read_file","content":json!({"path":"a.ts","content":"a".repeat(180_000)}).to_string()}),
-            json!({"role":"tool","tool_call_id":"read-b","name":"read_file","content":json!({"path":"b.ts","content":"b".repeat(180_000)}).to_string()}),
-            json!({"role":"user","content":"continue the current task"}),
-        ];
-
-        truncate_retained_tool_result_to_fit(&config, &schemas, &mut messages)
-            .expect("large retained results need projection reduction");
-        assert!(
-            request_budget(&config, &messages, &schemas).projected_input_tokens
-                <= compaction_target_tokens(config.context_limit)
-        );
-        let call_ids = messages[1]["tool_calls"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|call| call["id"].as_str())
-            .collect::<Vec<_>>();
-        assert!(call_ids.contains(&"read-a"));
-        assert!(call_ids.contains(&"read-b"));
-        assert_eq!(messages[2]["tool_call_id"], "read-a");
-        assert_eq!(messages[3]["tool_call_id"], "read-b");
-    }
-
-    #[test]
-    fn retained_tail_decreases_across_bounded_compaction_attempts() {
-        let mut transcript = Transcript::default();
-        for turn in 0..10 {
-            transcript.push_message(json!({"role":"user","content":format!("request {turn}")}));
-            transcript
-                .push_message(json!({"role":"assistant","content":format!("response {turn}")}));
-        }
-        transcript.push_run_user(json!({"role":"user","content":"current request"}));
-
-        let mut retained = Vec::new();
-        for keep_recent in [
-            DEFAULT_KEEP_RECENT,
-            retry_keep_recent(1),
-            retry_keep_recent(2),
-            retry_keep_recent(3),
-        ] {
-            let boundary = transcript.compaction_plan(keep_recent).unwrap().covers;
-            retained.push(
-                transcript.entries()[boundary..]
-                    .iter()
-                    .filter(|entry| {
-                        matches!(
-                            entry,
-                            crate::agent::transcript::Entry::Message(_)
-                                | crate::agent::transcript::Entry::RunUser(_)
-                        )
-                    })
-                    .count(),
-            );
-        }
-        assert_eq!(retained, vec![8, 4, 2, 2]);
-    }
-
-    #[test]
-    fn structural_eight_message_compaction_leaves_32k_room_for_multiple_turns() {
-        let mut config = test_config(Some("/project"));
-        config.context_limit = 32_768;
-        let schemas = tool_schemas(true);
-        let stable = stable_prefix(&config);
-        let mut transcript = Transcript::default();
-        let large_turn = "source detail ".repeat(480);
-        for turn in 0..10 {
-            transcript.push_message(
-                json!({"role":"user","content":format!("request {turn}: {large_turn}")}),
-            );
-            transcript.push_message(
-                json!({"role":"assistant","content":format!("finding {turn}: {large_turn}")}),
-            );
-        }
-        transcript.push_run_user(json!({"role":"user","content":"current audit request"}));
-        let budget = CompactionBudget {
-            context_window: config.context_limit,
-            ratio: DEFAULT_COMPACTION_RATIO,
-            reserve_tokens: None,
-        };
-        let before = request_budget(&config, &project(&transcript, &stable, ""), &schemas);
-        assert!(needs_compaction(budget, before.projected_input_tokens));
-
-        let plan = transcript.compaction_plan(DEFAULT_KEEP_RECENT).unwrap();
-        transcript.compact("dense verified handoff ".repeat(300), plan.covers);
-        let after = request_budget(&config, &project(&transcript, &stable, ""), &schemas);
-        assert!(
-            after.projected_input_tokens < budget.trigger_tokens(),
-            "after={} trigger={}",
-            after.projected_input_tokens,
-            budget.trigger_tokens()
-        );
-
-        for turn in 0..4 {
-            transcript.push_message(json!({"role":"assistant","content":format!("new analysis {turn}: {}", "detail ".repeat(100))}));
-            transcript.push_message(json!({"role":"tool","tool_call_id":format!("t-{turn}"),"name":"read_file","content":"new file result ".repeat(100)}));
-        }
-        let later = request_budget(&config, &project(&transcript, &stable, ""), &schemas);
-        assert!(
-            !needs_compaction(budget, later.projected_input_tokens),
-            "several ordinary post-compaction turns should fit: later={} trigger={}",
-            later.projected_input_tokens,
-            budget.trigger_tokens()
-        );
-    }
-
-    #[test]
-    fn long_32k_transcript_compacts_once_then_leaves_room_for_the_next_request() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint = format!(
-            "http://{}/v1/chat/completions",
-            listener.local_addr().unwrap()
-        );
-        let server = std::thread::spawn(move || {
-            let mut requests = Vec::new();
-            loop {
-                let (mut stream, _) = listener.accept().unwrap();
-                let request = read_mock_request(&mut stream);
-                let is_summary =
-                    request["messages"][0]["content"]
-                        .as_str()
-                        .is_some_and(|content| {
-                            content.contains("Write one dense factual continuation brief")
-                        });
-                requests.push(request);
-                let response = if is_summary {
-                    json!({"choices":[{"delta":{"content":"Compact handoff."},"finish_reason":"stop"}]})
-                } else {
-                    json!({"choices":[{"delta":{"content":"Request continued after compaction."},"finish_reason":"stop"}]})
-                };
-                stream
-                    .write_all(sse_response(&[response]).as_bytes())
-                    .unwrap();
-                if !is_summary {
-                    return requests;
-                }
-            }
-        });
-
-        let mut config = test_config(None);
-        config.endpoint = endpoint;
-        config.context_limit = 32_768;
-        config.provider_max_output = Some(1_600);
-        config.user = "current request".into();
-        let long_turn = "transcript detail ".repeat(400);
-        for turn in 0..10 {
-            config
-                .history
-                .push(json!({"role":"user","content":format!("request {turn}: {long_turn}")}));
-            config.history.push(
-                json!({"role":"assistant","content":format!("response {turn}: {long_turn}")}),
-            );
-        }
-
-        run(config);
-        let requests = server.join().unwrap();
-        let summary_requests = requests
-            .iter()
-            .filter(|request| {
-                request["messages"][0]["content"]
-                    .as_str()
-                    .is_some_and(|content| {
-                        content.contains("Write one dense factual continuation brief")
-                    })
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            summary_requests.len(),
-            1,
-            "Jan preflights once before dispatch"
-        );
-        assert!(
-            summary_requests[0]["max_tokens"].as_u64().unwrap() <= SUMMARY_MAX_OUTPUT_TOKENS as u64
-        );
-        let agent_request = requests.last().unwrap();
-        assert_eq!(agent_request["max_tokens"], 1_600);
-        let messages = agent_request["messages"].as_array().unwrap();
-        let systems = messages
-            .iter()
-            .enumerate()
-            .filter_map(|(index, message)| (message["role"] == "system").then_some(index))
-            .collect::<Vec<_>>();
-        assert_eq!(systems, vec![0]);
-        assert_eq!(
-            messages
-                .iter()
-                .filter(
-                    |message| message["role"] == "user" && message["content"] == "current request"
-                )
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn compaction_preserves_agent_tool_capabilities_on_the_next_request() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint = format!(
-            "http://{}/v1/chat/completions",
-            listener.local_addr().unwrap()
-        );
-        let server = std::thread::spawn(move || {
-            let mut requests = Vec::new();
-            loop {
-                let (mut stream, _) = listener.accept().unwrap();
-                let request = read_mock_request(&mut stream);
-                let is_summary =
-                    request["messages"][0]["content"]
-                        .as_str()
-                        .is_some_and(|content| {
-                            content.contains("Write one dense factual continuation brief")
-                        });
-                let response = if requests.is_empty() {
-                    json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"large-read","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"large.txt\"}"}}]},"finish_reason":"tool_calls"}]})
-                } else if is_summary {
-                    json!({"choices":[{"delta":{"content":"Preserve prior findings and active task."},"finish_reason":"stop"}]})
-                } else {
-                    json!({"choices":[{"delta":{"content":"Continuing with tools available."},"finish_reason":"stop"}]})
-                };
-                requests.push(request);
-                stream
-                    .write_all(sse_response(&[response]).as_bytes())
-                    .unwrap();
-                if !requests.is_empty() && !is_summary && requests.len() > 1 {
-                    return requests;
-                }
-            }
-        });
-        let root = unique_temp_root("post-compaction-tools");
-        fs::create_dir_all(&root).unwrap();
-        fs::write(
-            root.join("large.txt"),
-            "verified source result ".repeat(1_600),
-        )
-        .unwrap();
-        let mut config = test_config(Some(root.to_str().unwrap()));
-        config.endpoint = endpoint;
-        config.context_limit = 32_768;
-        config.history = (0..12)
-            .map(|index| {
-                json!({
-                    "role": if index % 2 == 0 {"user"} else {"assistant"},
-                    "content": format!("prior turn {index}")
-                })
-            })
-            .collect();
-        config
-            .history
-            .push(json!({"role":"user","content":"x".repeat(68_000)}));
-        let initial_transcript = {
-            let mut transcript = Transcript::default();
-            for message in config.history.clone() {
-                transcript.push_message(message);
-            }
-            transcript.push_run_user(json!({"role":"user","content":config.user}));
-            transcript
-        };
-        let initial_messages = project(&initial_transcript, &stable_prefix(&config), "");
-        let initial_budget =
-            request_budget(&config, &initial_messages, &tool_schemas(true)).projected_input_tokens;
+    fn compaction_keeps_meaningful_output_headroom_in_a_physical_64k_context() {
+        let target = compaction_target_tokens(65_536);
+        assert!(target < 65_536 - PREFERRED_OUTPUT_HEADROOM_TOKENS);
         assert!(
             dynamic_output_limit(
-                config.context_limit,
-                initial_budget,
+                65_536,
+                target,
                 SAFETY_RESERVE_TOKENS,
-                config.provider_max_output,
+                None,
                 APPLICATION_MAX_OUTPUT_TOKENS
             ) >= PREFERRED_OUTPUT_HEADROOM_TOKENS
         );
-
-        run(config);
-        let requests = server.join().unwrap();
-        let agent_requests = requests
-            .iter()
-            .filter(|request| {
-                request["messages"][0]["content"]
-                    .as_str()
-                    .is_some_and(|content| content.starts_with("base system"))
-            })
-            .collect::<Vec<_>>();
-        assert!(agent_requests.len() >= 2);
-        assert!(requests.iter().any(|request| {
-            request["messages"][0]["content"]
-                .as_str()
-                .is_some_and(|content| {
-                    content.contains("Write one dense factual continuation brief")
-                })
-        }));
-        let first_agent = agent_requests[0];
-        let after_compaction = agent_requests.last().unwrap();
-        assert_eq!(first_agent["tools"], after_compaction["tools"]);
-        assert_eq!(agent_requests[0]["tool_choice"], "auto");
-        assert_eq!(after_compaction["tool_choice"], "auto");
-        let names = after_compaction["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(tool_name)
-            .collect::<Vec<_>>();
-        assert!(names.contains(&"read_file"));
-        assert!(names.contains(&"run_terminal"));
-        assert!(names.contains(&"todo"));
-        assert!(after_compaction["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|message| message["role"].as_str())
-            .enumerate()
-            .all(|(index, role)| role != "system" || index <= 1));
-        assert!(after_compaction["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|message| {
-                message["content"].as_str().is_some_and(|content| {
-                    content.starts_with("[RUNTIME COMPACTION SUMMARY — NOT USER CONTENT]")
-                        && !content.contains("Do not call tools")
-                })
-            }));
-        assert!(requests.iter().any(|request| {
-            request["messages"].as_array().is_some_and(|messages| {
-                messages.iter().any(|message| {
-                    message["role"] == "tool" && message["tool_call_id"] == "large-read"
-                })
-            })
-        }));
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn smaller_provider_output_budget_is_sent_instead_of_failing() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint = format!(
-            "http://{}/v1/chat/completions",
-            listener.local_addr().unwrap()
-        );
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let request = read_mock_request(&mut stream);
-            let final_turn =
-                json!({"choices":[{"delta":{"content":"short answer"},"finish_reason":"stop"}]});
-            stream
-                .write_all(sse_response(&[final_turn]).as_bytes())
-                .unwrap();
-            request
-        });
-        let mut config = test_config(None);
-        config.endpoint = endpoint;
-        config.provider_max_output = Some(700);
-
-        run(config);
-        let request = server.join().unwrap();
-        assert_eq!(request["max_tokens"], 700);
-    }
-
-    #[test]
-    fn smaller_dynamic_output_budget_is_sent_when_current_turn_cannot_be_compacted() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint = format!(
-            "http://{}/v1/chat/completions",
-            listener.local_addr().unwrap()
-        );
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let request = read_mock_request(&mut stream);
-            let final_turn =
-                json!({"choices":[{"delta":{"content":"brief answer"},"finish_reason":"stop"}]});
-            stream
-                .write_all(sse_response(&[final_turn]).as_bytes())
-                .unwrap();
-            request
-        });
-
-        let mut config = test_config(None);
-        config.endpoint = endpoint;
-        config.user = "current turn ".repeat(9_000);
-        let messages = project(
-            &{
-                let mut transcript = Transcript::default();
-                transcript.push_run_user(json!({"role":"user","content":config.user}));
-                transcript
-            },
-            &stable_prefix(&config),
-            "",
-        );
-        let projected =
-            request_budget(&config, &messages, &tool_schemas(false)).projected_input_tokens;
-        config.context_limit = projected + SAFETY_RESERVE_TOKENS + 600;
-
-        run(config);
-        let request = server.join().unwrap();
-        let max_tokens = request["max_tokens"].as_u64().unwrap() as usize;
-        assert!(max_tokens >= MIN_USEFUL_OUTPUT_TOKENS);
-        assert!(max_tokens < PREFERRED_OUTPUT_HEADROOM_TOKENS);
-    }
-
-    #[test]
-    fn aggressive_compaction_leaves_tool_call_result_pairs_valid() {
-        let mut transcript = Transcript::default();
-        transcript.push_run_user(json!({"role":"user","content":"inspect"}));
-        for index in 0..6 {
-            let id = format!("tool-{index}");
-            transcript.push_message(json!({
-                "role":"assistant",
-                "content":"",
-                "tool_calls":[{"id":id,"type":"function","function":{"name":"read_file","arguments":"{}"}}]
-            }));
-            transcript.tool_result(&id, "read_file", "result".into());
-        }
-        let boundary = transcript.compaction_plan(1).unwrap().covers;
-        assert!(matches!(
-            &transcript.entries()[boundary],
-            crate::agent::transcript::Entry::Message(message)
-                if message["role"] == "assistant" && message["tool_calls"][0]["id"] == "tool-5"
-        ));
-        let projected = project(&transcript, "stable", "");
-        let call = projected
-            .iter()
-            .position(|message| {
-                message["role"] == "assistant" && message["tool_calls"][0]["id"] == "tool-5"
-            })
-            .unwrap();
-        let result = projected
-            .iter()
-            .position(|message| message["role"] == "tool" && message["tool_call_id"] == "tool-5")
-            .unwrap();
-        assert!(call < result);
-    }
-
-    #[test]
-    fn one_combined_soft_reminder_is_bounded() {
-        let mut state = AgentState::default();
-        state.plan = GoalPlan::default();
-        state.plan.init(vec!["Implement".into()]).unwrap();
-        state.workspace_mutated_since_validation = true;
-        let mut transcript = Transcript::default();
-        assert!(add_soft_closeout_if_needed(&mut state, &mut transcript));
-        assert!(!add_soft_closeout_if_needed(&mut state, &mut transcript));
-    }
-
-    #[test]
-    fn a_tool_free_response_normally_needs_no_gate() {
-        let mut state = AgentState::default();
-        let mut transcript = Transcript::default();
-        assert!(!add_soft_closeout_if_needed(&mut state, &mut transcript));
-    }
-
-    #[test]
-    fn completed_todo_allows_final_and_follow_up_without_bookkeeping() {
-        let mut state = AgentState::default();
-        apply_todo(
-            &mut state,
-            &json!({"action":"init","list":[{"items":["Investigate", "Implement", "Verify"]}]}),
-        )
-        .unwrap();
-        apply_todo(&mut state, &json!({"action":"done","task":"Investigate","memory":{"finding":"confirmed root cause"}})).unwrap();
-        apply_todo(&mut state, &json!({"action":"done","task":"Implement"})).unwrap();
-        apply_todo(&mut state, &json!({"action":"done","task":"Verify"})).unwrap();
-        assert!(!state.plan.model_todo.has_open());
-        let mut transcript = Transcript::default();
-        // This is the branch taken for a normal tool-free final answer. A
-        // completed Todo and existing handoff must not turn it into another
-        // planning turn; a simple follow-up uses the same no-gate path.
-        assert!(!add_soft_closeout_if_needed(&mut state, &mut transcript));
-        assert!(!add_soft_closeout_if_needed(&mut state, &mut transcript));
-        assert_eq!(
-            state.plan.task_memory.entries[0].finding,
-            "confirmed root cause"
-        );
-    }
-
-    #[test]
-    fn validation_clears_verification_requirement() {
-        let mut state = AgentState::default();
-        state.record_mutation();
-        state.record_validation();
-        let mut transcript = Transcript::default();
-        assert!(!add_soft_closeout_if_needed(&mut state, &mut transcript));
-    }
-
-    #[test]
-    fn continuation_is_deduplicated_and_has_a_bounded_tail() {
-        let mut final_text = String::from("first part ");
-        append_final_text(&mut final_text, "second part");
-        assert_eq!(final_text, "first part second part");
-        let long = "x".repeat(13_000);
-        assert_eq!(continuation_tail(&long).chars().count(), 12_000);
-        assert_eq!(
-            request_payload(
-                &test_config(Some("/project")),
-                &[],
-                &tool_schemas(true),
-                1_000
-            )["tools"]
-                .as_array()
-                .unwrap()
-                .len(),
-            tool_schemas(true).len()
-        );
-    }
-
-    #[test]
-    fn tool_call_result_is_replayed_on_the_next_model_turn() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint = format!(
-            "http://{}/v1/chat/completions",
-            listener.local_addr().unwrap()
-        );
-        let server = std::thread::spawn(move || {
-            let mut requests = Vec::new();
-            {
-                let (mut first, _) = listener.accept().unwrap();
-                requests.push(read_mock_request(&mut first));
-                let tool_turn = json!({
-                    "choices":[{"delta":{"tool_calls":[{
-                        "index":0,
-                        "id":"directory-1",
-                        "type":"function",
-                        "function":{"name":"list_directory","arguments":"{\"path\":\".\"}"}
-                    }]},"finish_reason":"tool_calls"}]
-                });
-                first
-                    .write_all(sse_response(&[tool_turn]).as_bytes())
-                    .unwrap();
-            }
-
-            let (mut second, _) = listener.accept().unwrap();
-            requests.push(read_mock_request(&mut second));
-            let final_turn = json!({
-                "choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]
-            });
-            second
-                .write_all(sse_response(&[final_turn]).as_bytes())
-                .unwrap();
-            requests
-        });
-        let root = unique_temp_root("tool-loop");
-        fs::create_dir_all(&root).unwrap();
-        let mut config = test_config(Some(root.to_str().unwrap()));
-        config.endpoint = endpoint;
-        run(config);
-        let requests = server.join().unwrap();
-        let second_messages = requests[1]["messages"].as_array().unwrap();
-        assert!(second_messages.iter().any(|message| {
-            message["role"] == "assistant"
-                && message["tool_calls"]
-                    .as_array()
-                    .is_some_and(|calls| calls[0]["id"] == "directory-1")
-        }));
-        assert!(second_messages.iter().any(|message| {
-            message["role"] == "tool"
-                && message["tool_call_id"] == "directory-1"
-                && message["content"]
-                    .as_str()
-                    .is_some_and(|content| content.contains("entries"))
-        }));
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn provider_request_contains_each_actual_user_turn_once_in_order() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint = format!(
-            "http://{}/v1/chat/completions",
-            listener.local_addr().unwrap()
-        );
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let request = read_mock_request(&mut stream);
-            let final_turn = json!({
-                "choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]
-            });
-            stream
-                .write_all(sse_response(&[final_turn]).as_bytes())
-                .unwrap();
-            request
-        });
-        let mut config = test_config(None);
-        config.endpoint = endpoint;
-        config.user = "current request".into();
-        config.history = vec![
-            json!({"role":"user","content":"first request"}),
-            json!({"role":"assistant","content":"first answer"}),
-            json!({"role":"user","content":"second request"}),
-            json!({"role":"assistant","content":"second answer"}),
-        ];
-
-        run(config);
-        let request = server.join().unwrap();
-        let messages = request["messages"].as_array().unwrap();
-        let user_turns = messages
-            .iter()
-            .filter(|message| message["role"] == "user")
-            .filter_map(|message| message["content"].as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            user_turns,
-            vec!["first request", "second request", "current request"]
-        );
-    }
-
-    #[test]
-    fn length_continuation_keeps_one_logical_response_and_preserves_tools() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint = format!(
-            "http://{}/v1/chat/completions",
-            listener.local_addr().unwrap()
-        );
-        let server = std::thread::spawn(move || {
-            let mut requests = Vec::new();
-            {
-                let (mut first, _) = listener.accept().unwrap();
-                requests.push(read_mock_request(&mut first));
-                let prefix = json!({
-                    "choices":[{"delta":{"content":"First visible prefix. "},"finish_reason":"length"}]
-                });
-                first.write_all(sse_response(&[prefix]).as_bytes()).unwrap();
-            }
-            let (mut second, _) = listener.accept().unwrap();
-            requests.push(read_mock_request(&mut second));
-            let suffix = json!({
-                "choices":[{"delta":{"content":"Second visible suffix."},"finish_reason":"stop"}]
-            });
-            second
-                .write_all(sse_response(&[suffix]).as_bytes())
-                .unwrap();
-            requests
-        });
-        let mut config = test_config(None);
-        config.endpoint = endpoint;
-        run(config);
-        let requests = server.join().unwrap();
-        assert!(requests[0].get("tools").is_some());
-        assert_eq!(requests[1]["tools"], requests[0]["tools"]);
-        assert_eq!(requests[1]["tool_choice"], "auto");
-        let second_messages = requests[1]["messages"].as_array().unwrap();
-        let systems = second_messages
-            .iter()
-            .enumerate()
-            .filter_map(|(index, message)| (message["role"] == "system").then_some(index))
-            .collect::<Vec<_>>();
-        assert_eq!(systems, vec![0]);
-        assert!(second_messages
-            .iter()
-            .any(|message| message["role"] == "assistant"
-                && message["content"] == "First visible prefix. "));
-        assert!(second_messages.iter().any(|message| {
-            message["role"] == "user"
-                && message["content"].as_str().is_some_and(|content| {
-                    content.contains("[RUNTIME GUIDANCE — NOT USER CONTENT]")
-                        && content.contains("<previous_tail>")
-                })
-        }));
-    }
-
-    #[test]
-    fn cancellation_interrupts_an_active_stream_read() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint = format!(
-            "http://{}/v1/chat/completions",
-            listener.local_addr().unwrap()
-        );
-        let (request_started, request_received) = mpsc::channel();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let _ = read_mock_request(&mut stream);
-            request_started.send(()).unwrap();
-            std::thread::sleep(Duration::from_millis(700));
-        });
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let mut config = test_config(None);
-        config.endpoint = endpoint;
-        config.cancelled = Arc::clone(&cancelled);
-        let (finished, done) = mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            run(config);
-            finished.send(()).unwrap();
-        });
-        request_received
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap();
-        let cancelled_at = Instant::now();
-        cancelled.store(true, Ordering::Relaxed);
-        done.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(cancelled_at.elapsed() < Duration::from_millis(500));
-        worker.join().unwrap();
-        server.join().unwrap();
     }
 }

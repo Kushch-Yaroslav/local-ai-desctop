@@ -304,7 +304,7 @@ export interface AnalysisProgress {
 export type StreamEvent =
   | { type: 'token'; content: string }
   | { type: 'thinking'; content: string; timelinePosition?: number }
-  | { type: 'task-plan'; plan: AgentPlan }
+  | { type: 'task-memory'; memory: NonNullable<AgentPlan['taskMemory']> }
   | { type: 'tool'; activity: ToolActivity; runId?: string }
   | { type: 'attachment'; activity: ToolActivity }
   | { type: 'approval-request'; actionId: string; approval: ActionApproval }

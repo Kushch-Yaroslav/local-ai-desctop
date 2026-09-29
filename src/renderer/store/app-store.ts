@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { ActionApproval, AgentPlan, AgentTelemetry, AnalysisProgress, AnalysisRun, AppSettings, Attachment, AttachmentStatus, ApprovalDecision, ApprovalStatus, ChatMessage, Conversation, FinishReason, GenerationDiagnostics, HardwareStats, ModelInfo, ProjectReference, ThinkingTimelineEvent, ToolActivity } from '../../shared/types';
+import type { ActionApproval, AgentTelemetry, AnalysisProgress, AnalysisRun, AppSettings, Attachment, AttachmentStatus, ApprovalDecision, ApprovalStatus, ChatMessage, Conversation, FinishReason, GenerationDiagnostics, HardwareStats, ModelInfo, ProjectReference, ThinkingTimelineEvent, ToolActivity } from '../../shared/types';
 import { isCurrentGenerationEvent } from '../../shared/generation-guard';
 
 type State = {
@@ -22,7 +22,6 @@ type State = {
   performance: GenerationDiagnostics | null;
   pendingApproval: { actionId: string; approval: ActionApproval } | null;
   approvalSubmitting: boolean;
-  activeTaskPlan: AgentPlan | null;
   agentTelemetry: AgentTelemetry | null;
   initialize: () => Promise<void>;
   selectConversation: (id: string) => Promise<void>;
@@ -35,7 +34,7 @@ type State = {
   editMessage: (message: ChatMessage, content: string) => Promise<boolean>;
   regenerateMessage: (message: ChatMessage) => Promise<boolean>;
   stop: () => Promise<void>;
-  handleStream: (event: { type: string; content?: string; message?: string; details?: string; activity?: ToolActivity; plan?: AgentPlan; run?: AnalysisRun; progress?: AnalysisProgress; requested?: number; active?: number; supported?: number; used?: number; maximum?: number; timelinePosition?: number; telemetry?: Partial<AgentTelemetry>; conversationId: string; generationId: string; modelId?: string; assistant?: ChatMessage | null; finishReason?: FinishReason; diagnostics?: Omit<GenerationDiagnostics, 'generationId' | 'conversationId' | 'createdAt'>; actionId?: string; approval?: ActionApproval; approvalId?: string; status?: Exclude<ApprovalStatus, 'pending'> | AttachmentStatus }) => void;
+  handleStream: (event: { type: string; content?: string; message?: string; details?: string; activity?: ToolActivity; run?: AnalysisRun; progress?: AnalysisProgress; requested?: number; active?: number; supported?: number; used?: number; maximum?: number; timelinePosition?: number; telemetry?: Partial<AgentTelemetry>; conversationId: string; generationId: string; modelId?: string; assistant?: ChatMessage | null; finishReason?: FinishReason; diagnostics?: Omit<GenerationDiagnostics, 'generationId' | 'conversationId' | 'createdAt'>; actionId?: string; approval?: ActionApproval; approvalId?: string; status?: Exclude<ApprovalStatus, 'pending'> | AttachmentStatus }) => void;
 };
 
 const assistantId = (generationId: string) => `stream-${generationId}`;
@@ -100,7 +99,7 @@ export const useAppStore = create<State>((set, get) => {
     return true;
   };
   return {
-  conversations: [], activeId: null, messages: [], models: [], hardware: null, settings: null, isGenerating: false, generationId: null, generationState: 'idle', error: null, toolActivities: [], toolActivityCount: 0, activeContextWindow: null, analysisProgress: [], analysisRuns: [], lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false, activeTaskPlan: null, agentTelemetry: null,
+  conversations: [], activeId: null, messages: [], models: [], hardware: null, settings: null, isGenerating: false, generationId: null, generationState: 'idle', error: null, toolActivities: [], toolActivityCount: 0, activeContextWindow: null, analysisProgress: [], analysisRuns: [], lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false, agentTelemetry: null,
   initialize: async () => {
     const [conversations, models, settings] = await Promise.all([window.localAi.conversations.list(), window.localAi.models.list(), window.localAi.settings.get()]);
     set({ conversations, models, settings });
@@ -110,10 +109,9 @@ export const useAppStore = create<State>((set, get) => {
   },
   selectConversation: async (id) => {
     if (get().activeId !== id && get().generationId) await get().stop();
-    const [messages, analysisRuns, persistedPlan] = await Promise.all([window.localAi.messages.list(id), window.localAi.analysis.list(id), window.localAi.agentPlans.get(id)]);
+    const [messages, analysisRuns] = await Promise.all([window.localAi.messages.list(id), window.localAi.analysis.list(id)]);
     const conversation = get().conversations.find((item) => item.id === id);
-    const messagePlan = [...messages].reverse().find((message) => message.taskPlan)?.taskPlan ?? null;
-    set({ activeId: id, messages, analysisRuns, isGenerating: false, generationId: null, generationState: 'idle', error: null, toolActivities: [], toolActivityCount: 0, activeContextWindow: conversation?.contextWindow ?? null, analysisProgress: [], lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false, activeTaskPlan: persistedPlan ?? messagePlan });
+    set({ activeId: id, messages, analysisRuns, isGenerating: false, generationId: null, generationState: 'idle', error: null, toolActivities: [], toolActivityCount: 0, activeContextWindow: conversation?.contextWindow ?? null, analysisProgress: [], lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false });
   },
   createConversation: async () => {
     const activeChat = get().conversations.find((chat) => chat.id === get().activeId);
@@ -192,7 +190,6 @@ export const useAppStore = create<State>((set, get) => {
       pendingTokens.set(event.generationId, (pendingTokens.get(event.generationId) ?? '') + (event.content ?? ''));
       if (animationFrame === null) animationFrame = window.requestAnimationFrame(() => drainStream());
     }
-    if (event.type === 'task-plan' && event.plan) set({ activeTaskPlan: event.plan });
     if (event.type === 'agent-telemetry' && event.telemetry) {
       const telemetry = event.telemetry;
       set((state) => state.agentTelemetry ? {
