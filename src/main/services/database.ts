@@ -259,7 +259,7 @@ export class Database {
     if (!raw) return null;
     try {
       const parsed = JSON.parse(raw) as unknown;
-      return parsed && typeof parsed === 'object' && (Array.isArray((parsed as { milestones?: unknown }).milestones) || Array.isArray((parsed as { steps?: unknown }).steps)) ? parsed as AgentPlan : null;
+      return parsed && typeof parsed === 'object' && (Array.isArray((parsed as { milestones?: unknown }).milestones) || Array.isArray((parsed as { steps?: unknown }).steps) || Array.isArray((parsed as { modelTodo?: { phases?: unknown } }).modelTodo?.phases) || Array.isArray((parsed as { model_todo?: { phases?: unknown } }).model_todo?.phases)) ? parsed as AgentPlan : null;
     } catch { return null; }
   }
 

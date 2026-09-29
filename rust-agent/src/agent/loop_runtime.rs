@@ -8,7 +8,7 @@ use crate::agent::{
     events::{Event, TailCandidateAttempt},
     policy::{self, Reasoning, RunPolicy},
     state::AgentState,
-    todo::{GoalPlan, ModelTodo},
+    todo::GoalPlan,
     transcript::{validate_calls, CompactionPlan, Transcript, ValidatedCall},
 };
 use crate::context::projection::project;
@@ -335,8 +335,8 @@ fn stable_prefix(config: &Config) -> String {
     prefix
 }
 
-const EAGER_TODO_GUIDANCE: &str = "Before substantial multi-step work, call `todo` with one `init` operation. Keep the list high-level and phased; do not research repeatedly before creating it.";
-const TODO_UPKEEP_GUIDANCE: &str = "Keep the Todo current: immediately mark finished work done, drop intentionally skipped work, keep one active item, and continue the active item.";
+const EAGER_TODO_GUIDANCE: &str = "For substantial multi-step work, create one short Todo when useful. Keep it flat and high-level; begin useful investigation without waiting on planning.";
+const TODO_UPKEEP_GUIDANCE: &str = "Todo is lightweight orientation, not a gate. When a meaningful subtask is complete, mark it done and attach one concise handoff memory if it preserves a finding or next action. Continue useful work even if Todo is slightly stale.";
 
 fn is_multi_step_request(user: &str) -> bool {
     let lower = user.to_ascii_lowercase();
@@ -369,6 +369,15 @@ fn dynamic_tail(state: &AgentState, root: Option<&str>, eager_todo: bool) -> Str
             state.plan.model_todo.prompt(),
             TODO_UPKEEP_GUIDANCE,
         ));
+    }
+    let active = state
+        .plan
+        .model_todo
+        .active()
+        .map(|(_, item)| item.id.as_str());
+    let memory = state.plan.task_memory.prompt(active);
+    if !memory.is_empty() {
+        tail.push(format!("<task_memory>\n{memory}\n</task_memory>"));
     }
     let knowledge = crate::tools::knowledge::prompt_catalog(root);
     if !knowledge.is_empty() {
@@ -415,7 +424,8 @@ fn emit_knowledge_diagnostics(config: &Config, state: &AgentState) {
 
 fn tool_schemas(has_project_root: bool) -> Vec<Value> {
     let mut tools = vec![
-        json!({"type":"function","function":{"name":"todo","description":"Maintain the compact working Todo. Init a high-level phased list for substantial work. Mark completed work done or intentionally skipped work drop immediately; the runtime promotes the next pending item automatically.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["init","append","start","done","drop","view"]},"list":{"type":"array","description":"For init only: [{phase, items:[\"concise task\"]}].","items":{"type":"object","properties":{"phase":{"type":"string"},"items":{"type":"array","items":{"type":"string"}}},"required":["items"]}},"task":{"type":"string","description":"Exact concise Todo task label for start, done, or drop."},"phase":{"type":"string","description":"Existing phase for append."},"content":{"type":"string","description":"New concise Todo item for append."}},"required":["action"]}}}),
+        json!({"type":"function","function":{"name":"todo","description":"Maintain a small flat working Todo. It is optional guidance, never a completion gate. `done` may include one compact memory handoff; the next pending item becomes active automatically.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["init","append","start","done","drop","view"]},"list":{"type":"array","description":"For init: [{items:[\"concise task\"]}]. Phase is accepted only for older clients and is UI-only.","items":{"type":"object","properties":{"phase":{"type":"string"},"items":{"type":"array","items":{"type":"string"}}},"required":["items"]}},"task":{"type":"string"},"phase":{"type":"string"},"content":{"type":"string"},"memory":{"type":"object","description":"Optional durable handoff when completing a Todo.","properties":{"finding":{"type":"string"},"evidence":{"type":"string"},"implication":{"type":"string"},"next":{"type":"string"}},"required":["finding"]}},"required":["action"]}}}),
+        json!({"type":"function","function":{"name":"task_memory","description":"Record, correct, or invalidate a concise durable task finding. Use only for meaningful conclusions, decisions, blockers, or test outcomes; never after every read.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["record","update","invalidate","view"]},"id":{"type":"string"},"task":{"type":"string"},"finding":{"type":"string"},"evidence":{"type":"string"},"implication":{"type":"string"},"next":{"type":"string"},"supersedes":{"type":"string"}},"required":["action"]}}}),
     ];
     if has_project_root {
         tools.extend([
@@ -436,7 +446,7 @@ fn tool_schemas(has_project_root: bool) -> Vec<Value> {
 }
 
 /// A constrained/read-only run does not advertise mutations and therefore
-/// cannot strand the model behind an approval-only capability. `todo` and the
+/// cannot strand the model behind an approval-only capability. `todo` and
 /// explicit knowledge reads remain available so analysis has a complete
 /// working contract.
 fn tool_schemas_for_policy(has_project_root: bool, policy: RunPolicy) -> Vec<Value> {
@@ -446,6 +456,7 @@ fn tool_schemas_for_policy(has_project_root: bool, policy: RunPolicy) -> Vec<Val
             matches!(
                 tool_name(tool),
                 "todo"
+                    | "task_memory"
                     | "read_file"
                     | "list_directory"
                     | "project_knowledge_index"
@@ -520,10 +531,15 @@ fn apply_todo(state: &mut AgentState, arguments: &Value) -> Result<(Value, bool)
             .plan
             .model_todo
             .start(&required_text(arguments, "task")?)?,
-        "done" => state
-            .plan
-            .model_todo
-            .finish(&required_text(arguments, "task")?, false)?,
+        "done" => {
+            let task = required_text(arguments, "task")?;
+            let todo_id = state.plan.model_todo.id_for(&task);
+            state.plan.model_todo.finish(&task, false)?;
+            if let Some(memory) = arguments.get("memory") {
+                let memory_id = write_task_memory(&mut state.plan, memory, todo_id)?;
+                state.plan.model_todo.attach_memory(&task, memory_id)?;
+            }
+        }
         "drop" => state
             .plan
             .model_todo
@@ -533,6 +549,76 @@ fn apply_todo(state: &mut AgentState, arguments: &Value) -> Result<(Value, bool)
     state.plan.sync_from_model_todo();
     Ok((
         json!({"todo": state.plan.model_todo, "updated": true}),
+        true,
+    ))
+}
+
+fn write_task_memory(
+    plan: &mut GoalPlan,
+    value: &Value,
+    todo_id: Option<String>,
+) -> Result<String, String> {
+    let finding = value
+        .get("finding")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let evidence = value
+        .get("evidence")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let implication = value
+        .get("implication")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let next = value
+        .get("next")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    plan.task_memory.upsert(
+        value.get("id").and_then(Value::as_str),
+        finding,
+        evidence,
+        implication,
+        next,
+        todo_id,
+        value
+            .get("supersedes")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    )
+}
+
+fn apply_task_memory(state: &mut AgentState, arguments: &Value) -> Result<(Value, bool), String> {
+    let action = arguments
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("record");
+    if action == "view" {
+        return Ok((
+            json!({"task_memory": state.plan.task_memory, "updated": false}),
+            false,
+        ));
+    }
+    if action == "invalidate" {
+        state
+            .plan
+            .task_memory
+            .invalidate(required_text(arguments, "id")?.as_str())?;
+    } else if action == "record" || action == "update" {
+        let todo_id = arguments
+            .get("task")
+            .and_then(Value::as_str)
+            .and_then(|task| state.plan.model_todo.id_for(task));
+        write_task_memory(&mut state.plan, arguments, todo_id)?;
+    } else {
+        return Err("unsupported task_memory action".into());
+    }
+    Ok((
+        json!({"task_memory": state.plan.task_memory, "updated": true}),
         true,
     ))
 }
@@ -1185,7 +1271,7 @@ struct SummaryResult {
     output_tokens: usize,
 }
 
-fn summarize_span(config: &Config, plan: &CompactionPlan, todo: &ModelTodo) -> SummaryResult {
+fn summarize_span(config: &Config, plan: &CompactionPlan) -> SummaryResult {
     // Summary generation is also a provider turn. Keep its input small enough
     // to leave meaningful output headroom on the selected local context size.
     let summary_input_chars = SUMMARY_INPUT_CHARS.min(
@@ -1194,14 +1280,10 @@ fn summarize_span(config: &Config, plan: &CompactionPlan, todo: &ModelTodo) -> S
             .saturating_sub(SAFETY_RESERVE_TOKENS + MIN_SUMMARY_OUTPUT_TOKENS)
             .saturating_mul(2),
     );
-    // Compaction has one responsibility: construct a factual handoff. Durable
-    // source observations are stored by runtime tool ingestion, never emitted
-    // by this summary model call.
-    let mut summary_source = summary_source(plan, summary_input_chars);
-    if !todo.is_empty() {
-        summary_source.push_str("\n\n[CURRENT MODEL TODO]\n");
-        summary_source.push_str(&todo.prompt());
-    }
+    // Compaction has one responsibility: construct a factual handoff. Todo
+    // and Task Memory are independent runtime state and are never repeatedly
+    // rewritten by a summary model.
+    let summary_source = summary_source(plan, summary_input_chars);
     if summary_source.trim().is_empty() {
         return SummaryResult {
             text: "Earlier conversation was omitted to fit the selected context window.".into(),
@@ -1370,7 +1452,6 @@ fn compact_once(
     config: &Config,
     transcript: &mut Transcript,
     schemas: &[Value],
-    todo: &ModelTodo,
     before: usize,
     keep_recent: usize,
     reason: &str,
@@ -1387,7 +1468,7 @@ fn compact_once(
     let entries_before = transcript.entries().len();
     let messages_summarized = plan.message_count();
     let messages_retained = plan.retained_message_count();
-    let summary = summarize_span(config, &plan, todo);
+    let summary = summarize_span(config, &plan);
     let summary_output_chars = summary.text.chars().count();
     transcript.compact(summary.text, covers);
     let mut messages = project(transcript, &stable_prefix(config), dynamic_tail);
@@ -1656,6 +1737,19 @@ fn run_tool(
             }
             Ok((value, None))
         }
+        "task_memory" => {
+            let (value, changed) = apply_task_memory(state, &tool.arguments)?;
+            if changed {
+                emit(
+                    &config.run_id,
+                    Event::PlanUpdate {
+                        plan: serde_json::to_value(&state.plan)
+                            .map_err(|error| error.to_string())?,
+                    },
+                );
+            }
+            Ok((value, None))
+        }
         "run_terminal" => {
             let root = config
                 .root
@@ -1834,22 +1928,14 @@ fn concise_tool_error(message: &str) -> String {
 }
 
 fn add_soft_closeout_if_needed(state: &mut AgentState, transcript: &mut Transcript) -> bool {
-    let todo_open = state.plan.model_todo.has_open();
     let needs_validation = state.workspace_mutated_since_validation && !state.verification_nudged;
-    let needs_todo = todo_open && !state.closeout_nudged;
-    if !needs_validation && !needs_todo {
+    if !needs_validation {
         return false;
-    }
-    let mut reminder = Vec::new();
-    if needs_todo {
-        state.closeout_nudged = true;
-        reminder.push(format!("Before you stop, mark completed Todo items done, drop intentionally skipped items, or continue the active work. {}", state.plan.model_todo.open_summary().unwrap_or_default()));
     }
     if needs_validation {
         state.verification_nudged = true;
-        reminder.push("You changed project files but no meaningful validation has been observed since the latest mutation. Run the most relevant available check, or state why validation is unavailable. Inspect the diff when practical.".into());
+        transcript.remind("You changed project files but no meaningful validation has been observed since the latest mutation. Run the most relevant available check, or state why validation is unavailable. Inspect the diff when practical.".into());
     }
-    transcript.remind(reminder.join("\n\n"));
     true
 }
 
@@ -1946,7 +2032,6 @@ pub fn run(config: Config) {
                 &config,
                 &mut transcript,
                 &schemas,
-                &state.plan.model_todo,
                 current_budget.projected_input_tokens,
                 DEFAULT_KEEP_RECENT,
                 "proactive_threshold",
@@ -2122,7 +2207,6 @@ pub fn run(config: Config) {
                     &config,
                     &mut transcript,
                     &schemas,
-                    &state.plan.model_todo,
                     before,
                     keep,
                     "context_overflow_retry",
@@ -2578,7 +2662,7 @@ mod tests {
                 .iter()
                 .map(tool_name)
                 .collect::<Vec<_>>(),
-            vec!["todo"]
+            vec!["task_memory", "todo"]
         );
     }
 
@@ -2593,6 +2677,7 @@ mod tests {
                 "project_knowledge_index",
                 "project_knowledge_read",
                 "read_file",
+                "task_memory",
                 "todo",
             ]
         );
@@ -2617,7 +2702,7 @@ mod tests {
             state.plan.model_todo.active_label(),
             Some("Understand project orientation")
         );
-        assert_eq!(state.plan.milestones.len(), 2);
+        assert_eq!(state.plan.milestones.len(), 1);
         apply_todo(
             &mut state,
             &json!({"action":"done","task":"Understand project orientation"}),
@@ -2647,7 +2732,7 @@ mod tests {
         .unwrap();
         assert_eq!(emitted["type"], "plan_update");
         let tail = dynamic_tail(&state, None, false);
-        assert!(tail.contains("[active] Audit: Inspect runtime"));
+        assert!(tail.contains("[active] todo-1: Inspect runtime"));
         assert!(!tail.contains("milestones"));
         assert!(!tail.contains("work_plan"));
     }
@@ -2663,8 +2748,8 @@ mod tests {
             .unwrap()
             .as_str()
             .unwrap();
-        assert!(description.contains("compact working Todo"));
-        assert!(description.contains("promotes the next"));
+        assert!(description.contains("small flat working Todo"));
+        assert!(description.contains("next pending item becomes active"));
         assert_eq!(
             schema.pointer("/function/parameters/required"),
             Some(&json!(["action"]))
@@ -2672,6 +2757,50 @@ mod tests {
         let config = test_config(Some("/project"));
         assert_eq!(stable_prefix(&config), stable_prefix(&config));
         assert!(!stable_prefix(&config).contains("model_todo"));
+    }
+
+    #[test]
+    fn completed_todo_handoff_survives_multiple_compactions_without_reinvestigation() {
+        let mut state = AgentState::default();
+        apply_todo(&mut state, &json!({"action":"init","list":[{"items":["Investigate GLM context bug", "Implement GLM context fix"]}]})).unwrap();
+        apply_todo(&mut state, &json!({"action":"done","task":"Investigate GLM context bug","memory":{"finding":"summarize_span auxiliary Ollama request omits options.num_ctx","evidence":"rust-agent/src/agent/loop_runtime.rs summarize_span","implication":"auxiliary generation can reload model-native context","next":"patch request path and add regression test"}})).unwrap();
+        assert_eq!(
+            state.plan.model_todo.active_label(),
+            Some("Implement GLM context fix")
+        );
+        let mut transcript = Transcript::default();
+        transcript.push_message(json!({"role":"user","content":"Investigate the GLM bug"}));
+        transcript.push_message(
+            json!({"role":"assistant","content":"raw exploration that may be discarded"}),
+        );
+        transcript
+            .push_message(json!({"role":"assistant","content":"recent implementation handoff"}));
+        let plan = transcript.compaction_plan(1).unwrap();
+        transcript.compact("compact factual location only".into(), plan.covers);
+        transcript.compact("later compact factual location only".into(), 0);
+        let tail = dynamic_tail(&state, None, false);
+        assert!(tail.contains("[done] todo-1: Investigate GLM context bug -> tm-001"));
+        assert!(tail.contains("[active] todo-2: Implement GLM context fix"));
+        assert!(tail.contains("summarize_span auxiliary Ollama request omits options.num_ctx"));
+        assert_eq!(state.plan.task_memory.entries.len(), 1);
+    }
+
+    #[test]
+    fn task_memory_can_supersede_a_wrong_finding() {
+        let mut state = AgentState::default();
+        apply_task_memory(
+            &mut state,
+            &json!({"action":"record","finding":"old conclusion"}),
+        )
+        .unwrap();
+        apply_task_memory(
+            &mut state,
+            &json!({"action":"record","finding":"correct conclusion","supersedes":"tm-001"}),
+        )
+        .unwrap();
+        let prompt = state.plan.task_memory.prompt(None);
+        assert!(!prompt.contains("old conclusion"));
+        assert!(prompt.contains("correct conclusion"));
     }
 
     #[test]
@@ -2847,7 +2976,7 @@ mod tests {
             json!({"role":"assistant","content":"Need inspect api.php, .htaccess, robots.txt."}),
         );
         let compaction_plan = transcript.compaction_plan(1).unwrap();
-        let summary = summarize_span(&config, &compaction_plan, &plan.model_todo);
+        let summary = summarize_span(&config, &compaction_plan);
         transcript.compact(summary.text, compaction_plan.covers);
         let projected = project(
             &transcript,
@@ -3579,6 +3708,30 @@ mod tests {
         let mut state = AgentState::default();
         let mut transcript = Transcript::default();
         assert!(!add_soft_closeout_if_needed(&mut state, &mut transcript));
+    }
+
+    #[test]
+    fn completed_todo_allows_final_and_follow_up_without_bookkeeping() {
+        let mut state = AgentState::default();
+        apply_todo(
+            &mut state,
+            &json!({"action":"init","list":[{"items":["Investigate", "Implement", "Verify"]}]}),
+        )
+        .unwrap();
+        apply_todo(&mut state, &json!({"action":"done","task":"Investigate","memory":{"finding":"confirmed root cause"}})).unwrap();
+        apply_todo(&mut state, &json!({"action":"done","task":"Implement"})).unwrap();
+        apply_todo(&mut state, &json!({"action":"done","task":"Verify"})).unwrap();
+        assert!(!state.plan.model_todo.has_open());
+        let mut transcript = Transcript::default();
+        // This is the branch taken for a normal tool-free final answer. A
+        // completed Todo and existing handoff must not turn it into another
+        // planning turn; a simple follow-up uses the same no-gate path.
+        assert!(!add_soft_closeout_if_needed(&mut state, &mut transcript));
+        assert!(!add_soft_closeout_if_needed(&mut state, &mut transcript));
+        assert_eq!(
+            state.plan.task_memory.entries[0].finding,
+            "confirmed root cause"
+        );
     }
 
     #[test]

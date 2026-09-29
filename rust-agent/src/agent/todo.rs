@@ -37,6 +37,8 @@ pub struct TodoItem {
     pub content: String,
     #[serde(default)]
     pub status: Status,
+    #[serde(default)]
+    pub memory_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,12 +94,12 @@ impl ModelTodo {
                     Status::Completed => "done",
                     Status::Abandoned => "dropped",
                 };
-                let label = if phase.name.trim().is_empty() {
-                    item.content.clone()
-                } else {
-                    format!("{}: {}", phase.name, item.content)
-                };
-                lines.push(format!("[{status}] {label}"));
+                let result = item
+                    .memory_id
+                    .as_deref()
+                    .map(|id| format!(" -> {id}"))
+                    .unwrap_or_default();
+                lines.push(format!("[{status}] {}: {}{result}", item.id, item.content));
             }
         }
         lines.join("\n")
@@ -170,6 +172,7 @@ impl ModelTodo {
                     id: format!("todo-{next}"),
                     content,
                     status: Status::Pending,
+                    memory_id: None,
                 });
                 next += 1;
             }
@@ -183,7 +186,12 @@ impl ModelTodo {
         if built.is_empty() {
             return Err("Todo init requires at least one item".into());
         }
-        self.phases = built;
+        // Phase labels are accepted for backward compatibility, but Todo is
+        // model-facing flat state. The UI may group this canonical list.
+        self.phases = vec![TodoPhase {
+            name: "Work".into(),
+            items: built.into_iter().flat_map(|phase| phase.items).collect(),
+        }];
         self.revision = self.revision.saturating_add(1);
         self.promote_next();
         Ok(())
@@ -194,7 +202,7 @@ impl ModelTodo {
         if self.has_content(&content) {
             return Err("Todo item labels must be unique".into());
         }
-        let requested = phase_name.unwrap_or("Work").trim();
+        let _ = phase_name;
         let next = self
             .phases
             .iter()
@@ -203,13 +211,13 @@ impl ModelTodo {
             .saturating_add(1);
         let phase = self
             .phases
-            .iter_mut()
-            .find(|phase| phase.name == requested)
-            .ok_or_else(|| format!("unknown todo phase: {requested}"))?;
+            .last_mut()
+            .ok_or_else(|| "Todo has no list; use init before append".to_owned())?;
         phase.items.push(TodoItem {
             id: format!("todo-{next}"),
             content,
             status: Status::Pending,
+            memory_id: None,
         });
         self.revision = self.revision.saturating_add(1);
         self.promote_next();
@@ -223,15 +231,7 @@ impl ModelTodo {
             .flat_map(|phase| phase.items.iter())
             .position(|item| item.content == content)
             .ok_or_else(|| format!("unknown todo item: {content}"))?;
-        let earlier_open = self
-            .phases
-            .iter()
-            .flat_map(|phase| phase.items.iter())
-            .take(position)
-            .any(|item| item.status.is_open());
-        if earlier_open {
-            return Err("cannot start a Todo item before earlier open work".into());
-        }
+        let _ = position;
         for item in self
             .phases
             .iter_mut()
@@ -266,6 +266,22 @@ impl ModelTodo {
         };
         self.revision = self.revision.saturating_add(1);
         self.promote_next();
+        Ok(())
+    }
+
+    pub fn id_for(&self, content: &str) -> Option<String> {
+        self.phases
+            .iter()
+            .flat_map(|phase| &phase.items)
+            .find(|item| item.content == content)
+            .map(|item| item.id.clone())
+    }
+
+    pub fn attach_memory(&mut self, content: &str, memory_id: String) -> Result<(), String> {
+        self.item_mut(content)
+            .ok_or_else(|| format!("unknown todo item: {content}"))?
+            .memory_id = Some(memory_id);
+        self.revision = self.revision.saturating_add(1);
         Ok(())
     }
 
@@ -330,6 +346,8 @@ pub struct GoalPlan {
     /// provider sees only `ModelTodo::prompt`, never this UI projection.
     #[serde(default)]
     pub model_todo: ModelTodo,
+    #[serde(default)]
+    pub task_memory: super::task_memory::TaskMemory,
 }
 
 impl GoalPlan {

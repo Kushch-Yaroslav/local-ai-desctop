@@ -84,7 +84,8 @@ export function TaskPlanPanel({ plan, active = false }: { plan: AgentPlan; activ
   const terminal = (status: string) => status === 'completed' || status === 'abandoned';
   const marker = (status: string) => status === 'completed' ? '✓' : status === 'abandoned' ? '–' : status === 'in_progress' ? '●' : '○';
   const completed = milestones.filter((milestone) => terminal(milestone.status)).length;
-  if (!milestones.length) return null;
+  const todoItems = plan.modelTodo?.phases.flatMap((phase) => phase.items) ?? [];
+  if (!milestones.length && !todoItems.length) return null;
   return <section className={`task-plan-panel milestone-plan${active ? ' active' : ''}${collapsed ? ' collapsed' : ''}`} aria-label="Task Planning">
     <header>
       <button type="button" className="task-plan-toggle" aria-expanded={!collapsed} aria-controls={contentId} onClick={() => setCollapsed((value) => !value)}>
@@ -93,6 +94,7 @@ export function TaskPlanPanel({ plan, active = false }: { plan: AgentPlan; activ
     </header>
     <div id={contentId} className="task-plan-collapse" inert={collapsed}>
       <div className="task-plan-content">
+        {todoItems.length > 0 && <section className="work-plan-column"><h4>Todo</h4><ol>{todoItems.map((task) => <li className={task.status} key={task.id}><i>{marker(task.status)}</i><span>{task.content}{task.memoryId ? ` → ${task.memoryId}` : ''}</span></li>)}</ol></section>}
         <div className="milestone-plan-grid">
           <section className="milestone-column"><h4>Goal / Milestones</h4><ol>{milestones.map((milestone) => <li key={milestone.id} className={`${milestone.status}${milestone.id === activeMilestone?.id ? ' active' : ''}`}><i>{marker(milestone.status)}</i><span>{milestone.label}</span>{milestone.id === activeMilestone?.id && <b>active</b>}</li>)}</ol></section>
           <section className="work-plan-column"><h4>Adaptive Work Plan</h4>{activeMilestone ? <><p className="work-plan-milestone">{activeMilestone.label}</p>{activeMilestone.workPlan.tasks.length ? <ol>{activeMilestone.workPlan.tasks.map((task) => <li className={task.status} key={task.id}><i>{marker(task.status)}</i><span>{task.label}</span></li>)}</ol> : <p className="work-plan-empty">The model will add tasks after it has enough orientation.</p>}</> : <p className="work-plan-empty">No active milestone.</p>}</section>

@@ -268,9 +268,10 @@ export interface AgentMilestone {
 /** Canonical model-facing plan persisted alongside the renderer projection.
  * IDs are stable for storage but are intentionally omitted from the provider
  * prompt, which receives only concise status/content lines. */
-export interface ModelTodoItem { id: string; content: string; status: AgentPlanStepStatus; }
+export interface ModelTodoItem { id: string; content: string; status: AgentPlanStepStatus; memoryId?: string | null; }
 export interface ModelTodoPhase { name: string; items: ModelTodoItem[]; }
 export interface ModelTodo { phases: ModelTodoPhase[]; revision?: number; }
+export interface TaskMemoryEntry { id: string; finding: string; evidence?: string; implication?: string; next?: string; todoId?: string | null; invalidated?: boolean; }
 /** Persistent agent planning state: stable milestones plus only the active
  * milestone's adaptive Work Plan in the primary UI. */
 export interface AgentPlan {
@@ -278,6 +279,7 @@ export interface AgentPlan {
   activeMilestoneId?: string | null;
   revision?: number;
   modelTodo?: ModelTodo;
+  taskMemory?: { entries: TaskMemoryEntry[]; revision?: number };
   /** Legacy persisted snapshots are normalized at the Electron boundary. */
   steps?: AgentPlanStep[];
 }

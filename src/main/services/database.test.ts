@@ -107,11 +107,12 @@ export async function runDatabaseMigrationRegression(): Promise<void> {
     fresh.addAnalysisAction(persistedRun.id, { id: 'terminal-final', label: 'Terminal', kind: 'terminal', state: 'completed', terminal: { command: 'printf done', cwd: '/project', pid: 4813, pgid: 4813, sessionId: 4813, startedAt: '2026-09-24T16:02:01.000Z', finishedAt: '2026-09-24T16:02:02.000Z', exitCode: 0, timedOut: false, cancelled: false, status: 'completed', stdout: 'done\n', stderr: '' } });
     const finalPlan = {
       milestones: [
-        { id: 'milestone-1', label: 'Inspect Project 1', status: 'completed' as const, workPlan: { tasks: [{ id: 'task-1', label: 'Map entry points', status: 'completed' as const }] } },
-        { id: 'milestone-2', label: 'Implement Project 2 change', status: 'in_progress' as const, workPlan: { tasks: [{ id: 'task-2', label: 'Apply change', status: 'in_progress' as const }] } },
+        { id: 'milestone-1', label: 'GLM context fix', status: 'in_progress' as const, workPlan: { tasks: [{ id: 'task-1', label: 'Investigate GLM context bug', status: 'completed' as const }, { id: 'task-2', label: 'Implement GLM context fix', status: 'in_progress' as const }, { id: 'task-3', label: 'Verify GLM fix', status: 'pending' as const }] } },
       ],
-      activeMilestoneId: 'milestone-2',
+      activeMilestoneId: 'milestone-1',
       revision: 3,
+      modelTodo: { phases: [{ name: 'Work', items: [{ id: 'todo-1', content: 'Investigate GLM context bug', status: 'completed' as const, memoryId: 'tm-001' }, { id: 'todo-2', content: 'Implement GLM context fix', status: 'in_progress' as const }, { id: 'todo-3', content: 'Verify GLM fix', status: 'pending' as const }] }] },
+      taskMemory: { entries: [{ id: 'tm-001', finding: 'summarize_span Ollama request omitted num_ctx', evidence: 'rust-agent/src/agent/loop_runtime.rs / summarize_span', implication: 'Ollama can reload the runner using model-native context', next: 'patch the request and add regression coverage' }] },
     };
     fresh.addAnalysisAction(persistedRun.id, { id: 'plan-update', label: 'Планирование', kind: 'planning', state: 'completed', plan: finalPlan, metadata: { steps: 2, completed_steps: 1 } });
     const actionCountedRun = fresh.addAnalysisAction(persistedRun.id, { id: 'context-1', label: 'Контекст оптимизирован', detail: '26 151 → 18 028 токенов', kind: 'context', state: 'completed', metadata: { context_window: 32_768, input_tokens_before: 26_151, input_tokens_after: 18_028, compacted_messages: 13, compacted_tool_results: 6, compaction_count: 1 } });
@@ -136,6 +137,9 @@ export async function runDatabaseMigrationRegression(): Promise<void> {
     assert.deepEqual(restoredResponse?.generationStats, { outputTokens: 4049, tokensPerSecond: 49, generationDurationMs: 82_600, timeToFirstTokenMs: 620, inputTokens: 1_200 }, 'message generation statistics were not preserved after restart');
     assert.deepEqual(loaded.actions.find((action) => action.id === 'plan-update')?.plan, finalPlan, 'last structured Agent Plan was not preserved after restart');
     assert.deepEqual(reopenedFresh.getAgentPlan(freshChat.id), finalPlan, 'canonical Goal/Work Plan was not preserved after restart');
+    const resumedPlan = reopenedFresh.getAgentPlan(freshChat.id)!;
+    assert.deepEqual(resumedPlan.taskMemory?.entries[0], finalPlan.taskMemory.entries[0], 'Task Memory handoff fields changed across database reopen');
+    assert.deepEqual(resumedPlan.modelTodo?.phases[0]?.items.map((item) => item.status), ['completed', 'in_progress', 'pending'], 'Todo lifecycle changed across database reopen');
     const context = loaded.actions.find((action) => action.id === 'context-1');
     assert.equal(context?.kind, 'context', 'context compaction semantic type was not preserved after restart');
     assert.equal(context?.metadata?.input_tokens_after, 18_028, 'context compaction details were not preserved after restart');
