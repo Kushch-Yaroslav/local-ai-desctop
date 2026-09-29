@@ -143,8 +143,11 @@ pub enum Event {
         stable_prefix_tokens: usize,
         tool_schema_tokens: usize,
         transcript_tokens_before: usize,
+        summary_prompt_tokens: usize,
         runtime_tail_tokens: usize,
-        planning_tokens: usize,
+        model_todo_tokens: usize,
+        memory_catalog_tokens: usize,
+        compaction_target_tokens: usize,
         preferred_output_tokens: usize,
         available_output_before: usize,
         available_output_after: usize,
@@ -167,8 +170,7 @@ pub enum Event {
         emergency_tool_result_projected_tokens: Option<usize>,
         emergency_tool_result_projected_chars: Option<usize>,
         emergency_tool_result_source: Option<String>,
-        active_milestone_id: Option<String>,
-        active_work_task_id: Option<String>,
+        active_todo: Option<String>,
     },
     /// Observability only: compaction occurred soon after a prior compaction.
     RapidRecompaction {

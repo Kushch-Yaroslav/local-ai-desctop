@@ -9,12 +9,10 @@ use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Default)]
 pub struct AgentState {
+    /// Persisted canonical Todo plus its renderer/UI projection.
+    /// Provider construction reads only the compact Todo representation.
     pub plan: GoalPlan,
     pub workspace_mutated_since_validation: bool,
-    /// Jan-style Todo upkeep counts mutation-capable work, not reads. The
-    /// Local hierarchical plan remains the Todo adapter.
-    pub mutations_since_plan_update: usize,
-    pub plan_nudges: usize,
     pub closeout_nudged: bool,
     pub verification_nudged: bool,
     /// Observability for optional `.ai-framework` virtual context access.
@@ -25,14 +23,6 @@ pub struct AgentState {
 }
 
 impl AgentState {
-    pub fn plan_touched(&mut self) {
-        self.mutations_since_plan_update = 0;
-    }
-
-    pub fn mutation_action_completed(&mut self) {
-        self.mutations_since_plan_update = self.mutations_since_plan_update.saturating_add(1);
-    }
-
     pub fn record_mutation(&mut self) {
         self.workspace_mutated_since_validation = true;
         self.verification_nudged = false;

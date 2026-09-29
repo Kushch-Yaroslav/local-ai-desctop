@@ -29,6 +29,12 @@ export function runRustAgentRuntimeRegression(): void {
   assert.equal(plan.activeMilestoneId, 'goal-1');
   assert.equal(plan.milestones?.[0]?.id, 'goal-1');
   assert.equal(plan.milestones?.[0]?.workPlan.tasks[1]?.id, 'work-2');
+  const todoPlan = taskPlan({
+    milestones: [{ id: 'goal-1', label: 'Inspect', status: 'in_progress', work_plan: { tasks: [{ id: 'work-1', label: 'Read runtime', status: 'in_progress' }] } }],
+    model_todo: { phases: [{ name: 'Inspect', items: [{ id: 'todo-1', content: 'Read runtime', status: 'in_progress' }] }], revision: 3 },
+  });
+  assert.equal(todoPlan.modelTodo?.revision, 3);
+  assert.equal(todoPlan.modelTodo?.phases[0]?.items[0]?.content, 'Read runtime');
   const legacy = taskPlan({ steps: [{ id: 'legacy-task', label: 'Old item', status: 'completed' }] });
   assert.equal(legacy.milestones?.[0]?.workPlan.tasks[0]?.id, 'legacy-task');
 

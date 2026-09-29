@@ -27,6 +27,267 @@ impl Status {
     }
 }
 
+/// The agent's canonical working plan. This intentionally mirrors Jan's
+/// small phased Todo contract: one active item, pending work in order, and
+/// automatic promotion after a terminal update. IDs are retained for durable
+/// product projections, but never shown in the model-facing prompt.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TodoItem {
+    pub id: String,
+    pub content: String,
+    #[serde(default)]
+    pub status: Status,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TodoPhase {
+    pub name: String,
+    #[serde(default)]
+    pub items: Vec<TodoItem>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelTodo {
+    #[serde(default)]
+    pub phases: Vec<TodoPhase>,
+    #[serde(default)]
+    pub revision: u64,
+}
+
+impl ModelTodo {
+    pub fn is_empty(&self) -> bool {
+        self.phases.iter().all(|phase| phase.items.is_empty())
+    }
+
+    pub fn has_open(&self) -> bool {
+        self.phases
+            .iter()
+            .flat_map(|phase| &phase.items)
+            .any(|item| item.status.is_open())
+    }
+
+    pub fn active(&self) -> Option<(&TodoPhase, &TodoItem)> {
+        self.phases.iter().find_map(|phase| {
+            phase
+                .items
+                .iter()
+                .find(|item| item.status == Status::InProgress)
+                .map(|item| (phase, item))
+        })
+    }
+
+    pub fn active_label(&self) -> Option<&str> {
+        self.active().map(|(_, item)| item.content.as_str())
+    }
+
+    /// The compact working representation the model sees. It deliberately
+    /// carries no UI hierarchy, revision data, or stable ids.
+    pub fn prompt(&self) -> String {
+        let mut lines = Vec::new();
+        for phase in &self.phases {
+            for item in &phase.items {
+                let status = match item.status {
+                    Status::Pending => "pending",
+                    Status::InProgress => "active",
+                    Status::Completed => "done",
+                    Status::Abandoned => "dropped",
+                };
+                let label = if phase.name.trim().is_empty() {
+                    item.content.clone()
+                } else {
+                    format!("{}: {}", phase.name, item.content)
+                };
+                lines.push(format!("[{status}] {label}"));
+            }
+        }
+        lines.join("\n")
+    }
+
+    pub fn open_summary(&self) -> Option<String> {
+        let lines = self
+            .phases
+            .iter()
+            .flat_map(|phase| {
+                phase
+                    .items
+                    .iter()
+                    .filter_map(move |item| match item.status {
+                        Status::InProgress => Some(format!("→ {}", item.content)),
+                        Status::Pending => Some(format!("• {}", item.content)),
+                        _ => None,
+                    })
+            })
+            .collect::<Vec<_>>();
+        (!lines.is_empty()).then(|| lines.join("\n"))
+    }
+
+    fn promote_next(&mut self) {
+        if self.active().is_some() {
+            return;
+        }
+        if let Some(item) = self
+            .phases
+            .iter_mut()
+            .flat_map(|phase| phase.items.iter_mut())
+            .find(|item| item.status == Status::Pending)
+        {
+            item.status = Status::InProgress;
+        }
+    }
+
+    fn item_mut(&mut self, content: &str) -> Option<&mut TodoItem> {
+        self.phases
+            .iter_mut()
+            .flat_map(|phase| phase.items.iter_mut())
+            .find(|item| item.content == content)
+    }
+
+    fn has_content(&self, content: &str) -> bool {
+        self.phases
+            .iter()
+            .flat_map(|phase| &phase.items)
+            .any(|item| item.content == content)
+    }
+
+    pub fn init(&mut self, phases: Vec<(String, Vec<String>)>) -> Result<(), String> {
+        if !self.is_empty() {
+            return Err(
+                "Todo already exists; use append, done, or drop instead of replacing it".into(),
+            );
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut next = 1_usize;
+        let mut built = Vec::new();
+        for (phase, items) in phases {
+            let name = phase.trim().to_owned();
+            let mut built_items = Vec::new();
+            for content in items {
+                let content = clean_label(&content, "todo item")?;
+                if !seen.insert(content.clone()) {
+                    return Err("Todo item labels must be unique".into());
+                }
+                built_items.push(TodoItem {
+                    id: format!("todo-{next}"),
+                    content,
+                    status: Status::Pending,
+                });
+                next += 1;
+            }
+            if !built_items.is_empty() {
+                built.push(TodoPhase {
+                    name,
+                    items: built_items,
+                });
+            }
+        }
+        if built.is_empty() {
+            return Err("Todo init requires at least one item".into());
+        }
+        self.phases = built;
+        self.revision = self.revision.saturating_add(1);
+        self.promote_next();
+        Ok(())
+    }
+
+    pub fn append(&mut self, phase_name: Option<&str>, content: String) -> Result<(), String> {
+        let content = clean_label(&content, "todo item")?;
+        if self.has_content(&content) {
+            return Err("Todo item labels must be unique".into());
+        }
+        let requested = phase_name.unwrap_or("Work").trim();
+        let next = self
+            .phases
+            .iter()
+            .flat_map(|phase| &phase.items)
+            .count()
+            .saturating_add(1);
+        let phase = self
+            .phases
+            .iter_mut()
+            .find(|phase| phase.name == requested)
+            .ok_or_else(|| format!("unknown todo phase: {requested}"))?;
+        phase.items.push(TodoItem {
+            id: format!("todo-{next}"),
+            content,
+            status: Status::Pending,
+        });
+        self.revision = self.revision.saturating_add(1);
+        self.promote_next();
+        Ok(())
+    }
+
+    pub fn start(&mut self, content: &str) -> Result<(), String> {
+        let position = self
+            .phases
+            .iter()
+            .flat_map(|phase| phase.items.iter())
+            .position(|item| item.content == content)
+            .ok_or_else(|| format!("unknown todo item: {content}"))?;
+        let earlier_open = self
+            .phases
+            .iter()
+            .flat_map(|phase| phase.items.iter())
+            .take(position)
+            .any(|item| item.status.is_open());
+        if earlier_open {
+            return Err("cannot start a Todo item before earlier open work".into());
+        }
+        for item in self
+            .phases
+            .iter_mut()
+            .flat_map(|phase| phase.items.iter_mut())
+        {
+            if item.status == Status::InProgress {
+                item.status = Status::Pending;
+            }
+        }
+        let item = self
+            .item_mut(content)
+            .ok_or_else(|| format!("unknown todo item: {content}"))?;
+        if item.status.is_terminal() {
+            return Err("cannot start completed or dropped Todo item".into());
+        }
+        item.status = Status::InProgress;
+        self.revision = self.revision.saturating_add(1);
+        Ok(())
+    }
+
+    pub fn finish(&mut self, content: &str, dropped: bool) -> Result<(), String> {
+        let item = self
+            .item_mut(content)
+            .ok_or_else(|| format!("unknown todo item: {content}"))?;
+        if item.status.is_terminal() {
+            return Ok(());
+        }
+        item.status = if dropped {
+            Status::Abandoned
+        } else {
+            Status::Completed
+        };
+        self.revision = self.revision.saturating_add(1);
+        self.promote_next();
+        Ok(())
+    }
+
+    pub fn normalize(&mut self) {
+        let mut seen_active = false;
+        for item in self
+            .phases
+            .iter_mut()
+            .flat_map(|phase| phase.items.iter_mut())
+        {
+            if item.status == Status::InProgress {
+                if seen_active {
+                    item.status = Status::Pending;
+                } else {
+                    seen_active = true;
+                }
+            }
+        }
+        self.promote_next();
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkTask {
     pub id: String,
@@ -65,9 +326,146 @@ pub struct GoalPlan {
     pub active_milestone_id: Option<String>,
     #[serde(default)]
     pub revision: u64,
+    /// Persisted model working state. The renderer uses the fields above; the
+    /// provider sees only `ModelTodo::prompt`, never this UI projection.
+    #[serde(default)]
+    pub model_todo: ModelTodo,
 }
 
 impl GoalPlan {
+    /// Bridge a legacy Local Goal/Work snapshot into the new canonical Todo so
+    /// interrupted conversations resume with one working contract.
+    pub fn ensure_model_todo(&mut self) {
+        if !self.model_todo.is_empty() {
+            self.model_todo.normalize();
+            self.sync_from_model_todo();
+            return;
+        }
+        if self.milestones.is_empty() {
+            return;
+        }
+        let phases = self
+            .milestones
+            .iter()
+            .map(|milestone| {
+                let tasks = if milestone.work_plan.tasks.is_empty() {
+                    vec![milestone.label.clone()]
+                } else {
+                    milestone
+                        .work_plan
+                        .tasks
+                        .iter()
+                        .map(|task| task.label.clone())
+                        .collect()
+                };
+                (milestone.label.clone(), tasks)
+            })
+            .collect::<Vec<_>>();
+        if self.model_todo.init(phases).is_ok() {
+            for (milestone, phase) in self.milestones.iter().zip(&mut self.model_todo.phases) {
+                let status = milestone.status;
+                for item in &mut phase.items {
+                    if let Some(task) = milestone
+                        .work_plan
+                        .tasks
+                        .iter()
+                        .find(|task| task.label == item.content)
+                    {
+                        item.status = task.status;
+                    } else if milestone.work_plan.tasks.is_empty() {
+                        item.status = status;
+                    }
+                }
+            }
+            self.model_todo.normalize();
+            self.sync_from_model_todo();
+        }
+    }
+
+    /// Product/UI adapter. It intentionally derives the rich hierarchy from
+    /// the canonical Todo after every Todo mutation instead of asking the model
+    /// to maintain a second planner.
+    pub fn sync_from_model_todo(&mut self) {
+        if self.model_todo.is_empty() {
+            return;
+        }
+        let old = self.milestones.clone();
+        let mut next_milestone = self.next_number("milestone-");
+        let mut next_task = self.next_number("task-");
+        let mut milestones = Vec::new();
+        for (phase_index, phase) in self.model_todo.phases.iter().enumerate() {
+            let label = if phase.name.trim().is_empty() {
+                format!("Phase {}", phase_index + 1)
+            } else {
+                phase.name.clone()
+            };
+            let prior = old.iter().find(|milestone| milestone.label == label);
+            let tasks = phase
+                .items
+                .iter()
+                .map(|item| {
+                    let prior_task = prior.and_then(|milestone| {
+                        milestone
+                            .work_plan
+                            .tasks
+                            .iter()
+                            .find(|task| task.label == item.content)
+                    });
+                    let id = prior_task.map(|task| task.id.clone()).unwrap_or_else(|| {
+                        let id = format!("task-{next_task}");
+                        next_task += 1;
+                        id
+                    });
+                    WorkTask {
+                        id,
+                        label: item.content.clone(),
+                        status: item.status,
+                        revision: prior_task.map_or(self.revision, |task| task.revision),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let milestone_status = if phase
+                .items
+                .iter()
+                .any(|item| item.status == Status::InProgress)
+            {
+                Status::InProgress
+            } else if phase
+                .items
+                .iter()
+                .all(|item| item.status == Status::Completed)
+            {
+                Status::Completed
+            } else if phase.items.iter().all(|item| item.status.is_terminal()) {
+                Status::Abandoned
+            } else {
+                Status::Pending
+            };
+            let id = prior
+                .map(|milestone| milestone.id.clone())
+                .unwrap_or_else(|| {
+                    let id = format!("milestone-{next_milestone}");
+                    next_milestone += 1;
+                    id
+                });
+            milestones.push(Milestone {
+                id,
+                label,
+                status: milestone_status,
+                revision: prior.map_or(self.revision, |milestone| milestone.revision),
+                work_plan: WorkPlan {
+                    tasks,
+                    revision: prior.map_or(self.revision, |milestone| milestone.work_plan.revision),
+                },
+            });
+        }
+        self.active_milestone_id = milestones
+            .iter()
+            .find(|milestone| milestone.status == Status::InProgress)
+            .map(|milestone| milestone.id.clone());
+        self.milestones = milestones;
+        self.revision = self.revision.saturating_add(1);
+    }
     /// Restores the one-active-milestone invariant for snapshots written by an
     /// interrupted run or an older renderer. This is state normalization, not
     /// a semantic decision about whether any work is complete.

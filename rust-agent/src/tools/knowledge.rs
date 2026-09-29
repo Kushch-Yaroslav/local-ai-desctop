@@ -267,196 +267,223 @@ pub fn update(root: &Path, args: &Value) -> Result<Value, String> {
     )
 }
 
-/// Keeps the rolling transcript concise while accepting optional, strictly
-/// scoped cache promotions from the existing compaction summary request.
-pub fn promote_compaction(root: &Path, run_id: &str, summary: &str) -> String {
-    let (rolling, updates) =
-        split_compaction_sections(summary).unwrap_or_else(|| (summary.to_owned(), Vec::new()));
-    if !updates.is_empty() {
-        let source_paths = updates
-            .iter()
-            .filter_map(|update| update.get("source_path").and_then(Value::as_str))
-            .collect::<Vec<_>>();
-        let update_payload = json!({"updates":updates,"source_paths":source_paths});
-        let _ = update(root, &update_payload);
-    }
-    // Transport fallbacks are not knowledge. Never create a task cache merely
-    // because compaction happened.
-    if is_semantic_knowledge(&rolling) {
-        let task = format!("tasks/{}.md", safe_name(run_id));
-        let _ = update(
-            root,
-            &json!({"updates":[{"path":task,"content":format!("# Current task knowledge\n\n## Established findings\n{}", rolling),"mode":"replace"}]}),
-        );
-    }
-    rolling
-}
-
-pub fn prompt_index(root: Option<&str>) -> String {
+/// Small progressive-disclosure catalog for the model. It advertises only
+/// available knowledge categories and paths; no document body is injected
+/// automatically. Full content remains an explicit `project_knowledge_read`.
+pub fn prompt_catalog(root: Option<&str>) -> String {
     let Some(root) = root else {
         return String::new();
     };
     let root = Path::new(root);
-    if bootstrap(root).is_err() {
-        return String::new();
-    }
-    let Ok(index) = index(root) else {
+    let Ok(root) = canonical_root(root) else {
         return String::new();
     };
-    let compact = json!({
-        "projectKnowledge": index["projectKnowledge"],
-        "modules": index["modules"],
-        "sources": index["sources"],
-        "tasks": index["tasks"],
-    });
-    let text = serde_json::to_string(&compact).unwrap_or_default();
+    if bootstrap(&root).is_err() {
+        return String::new();
+    }
+    let Ok(manifest) = load_manifest(&root, true) else {
+        return String::new();
+    };
+    let mut available = Vec::new();
+    for (name, path) in [
+        (
+            "project overview",
+            manifest.project_knowledge.overview.as_ref(),
+        ),
+        (
+            "architecture",
+            manifest.project_knowledge.architecture.as_ref(),
+        ),
+        ("product", manifest.project_knowledge.product.as_ref()),
+        (
+            "conventions",
+            manifest.project_knowledge.conventions.as_ref(),
+        ),
+    ] {
+        if let Some(path) = path {
+            available.push(format!("- {name}: `{path}`"));
+        }
+    }
+    let modules = manifest
+        .modules
+        .keys()
+        .take(12)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !modules.is_empty() {
+        available.push(format!("- modules: {}", modules.join(", ")));
+    }
+    if !manifest.tasks.is_empty() {
+        available.push(format!(
+            "- task notes: {}",
+            manifest
+                .tasks
+                .values()
+                .take(8)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    let stale = manifest
+        .sources
+        .iter()
+        .filter(|(path, entry)| source_status(&root, path, entry) != "fresh")
+        .count();
+    available.push(format!(
+        "- cached source observations: {}{}",
+        manifest.sources.len(),
+        if stale > 0 {
+            format!(" ({stale} stale)")
+        } else {
+            String::new()
+        }
+    ));
     format!(
-        "<project_knowledge_index>{}</project_knowledge_index>",
-        limit_chars(&text, 8_000)
+        "<project_knowledge_catalog>\n{}\nUse project_knowledge_index for paths/freshness and project_knowledge_read for selected documents.\n</project_knowledge_catalog>",
+        limit_chars(&available.join("\n"), 1_800)
     )
 }
 
-/// Small virtual-context projection: only materialized documents, bounded to
-/// 12K characters. Priority is task knowledge, overview, then keyword-matched
-/// architecture/product/modules.
-pub fn relevant_context(root: Option<&str>, labels: &str) -> String {
-    let Some(root) = root else {
-        return String::new();
-    };
-    let root = Path::new(root);
-    let Ok(index) = index(root) else {
-        return String::new();
-    };
-    let mut paths = Vec::new();
-    if let Some(tasks) = index["tasks"].as_object() {
-        paths.extend(
-            tasks
-                .values()
-                .filter_map(Value::as_str)
-                .take(1)
-                .map(str::to_owned),
-        );
-    }
-    if let Some(path) = index
-        .pointer("/projectKnowledge/overview")
-        .and_then(Value::as_str)
-    {
-        paths.push(path.to_owned());
-    }
-    let lower = labels.to_ascii_lowercase();
-    for slot in ["architecture", "product", "conventions"] {
-        if lower.contains(slot)
-            || (slot == "architecture" && (lower.contains("route") || lower.contains("module")))
-            || (slot == "product" && (lower.contains("purchase") || lower.contains("conversion")))
-        {
-            if let Some(path) = index
-                .pointer(&format!("/projectKnowledge/{slot}"))
-                .and_then(Value::as_str)
-            {
-                paths.push(path.to_owned());
-            }
-        }
-    }
-    if let Some(modules) = index["modules"].as_object() {
-        paths.extend(
-            modules
-                .iter()
-                .filter(|(key, _)| lower.contains(&key.to_ascii_lowercase()))
-                .filter_map(|(_, path)| path.as_str())
-                .map(str::to_owned),
-        );
-    }
-    paths.sort();
-    paths.dedup();
-    let mut output = String::new();
-    for path in paths.into_iter() {
-        let target = framework(root).join(&path);
-        if !target.is_file() {
-            continue;
-        }
-        let content = fs::read_to_string(target).unwrap_or_default();
-        let piece = format!("\n## {path}\n{content}\n");
-        if output.len().saturating_add(piece.len()) > 12_000 {
-            break;
-        }
-        output.push_str(&piece);
-    }
-    if output.is_empty() {
-        String::new()
-    } else {
-        format!("<materialized_project_knowledge>{output}</materialized_project_knowledge>")
-    }
-}
-
-fn split_compaction_sections(summary: &str) -> Option<(String, Vec<Value>)> {
-    let rolling = between(summary, "<rolling_summary>", "</rolling_summary>")
-        .unwrap_or(summary)
-        .trim()
-        .to_owned();
-    let body = between(
-        summary,
-        "<project_knowledge_updates>",
-        "</project_knowledge_updates>",
-    )?;
-    let values = serde_json::from_str::<Vec<Value>>(body.trim()).ok()?;
+/// Deterministic V1 ingestion. Successful normal project inspection creates
+/// materialized runtime observations even when a compaction model emits no
+/// semantic update block.
+pub fn observe_tool(
+    root: &Path,
+    run_id: &str,
+    objective: &str,
+    milestone: Option<&str>,
+    task: Option<&str>,
+    tool: &str,
+    args: &Value,
+    result: &Value,
+) -> Result<Value, String> {
+    let root = canonical_root(root)?;
+    bootstrap(&root)?;
     let mut updates = Vec::new();
-    for value in values.into_iter().take(12) {
-        let content = value
-            .get("content")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let kind = value
-            .get("kind")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let path = match kind {
-            "project" => value
-                .get("slot")
+    let mut source_paths = Vec::new();
+    match tool {
+        "read_file" => {
+            let path = result
+                .get("path")
+                .or_else(|| args.get("path"))
                 .and_then(Value::as_str)
-                .filter(|slot| {
-                    matches!(
-                        *slot,
-                        "overview" | "architecture" | "product" | "conventions"
-                    )
-                })
-                .map(|slot| format!("project/{slot}.md")),
-            "module" => value
-                .get("key")
-                .and_then(Value::as_str)
-                .map(|key| format!("modules/{}.md", safe_name(key))),
-            "source" => value
-                .get("source_path")
-                .and_then(Value::as_str)
-                .map(source_cache_path),
-            "task" => Some("tasks/compaction.md".into()),
-            _ => None,
-        };
-        if let Some(path) = path
-            .filter(|path| validate_cache_document(path).is_ok())
-            .filter(|_| is_semantic_knowledge(content))
-        {
-            let mut update = json!({"path":path,"content":content,"mode":"merge"});
-            if kind == "source" {
-                update["source_path"] = value["source_path"].clone();
+                .unwrap_or_default();
+            if path.is_empty() || path.starts_with(DIRECTORY) || is_sensitive_path(path) {
+                return Ok(json!({"observation":"skipped_sensitive_or_internal"}));
             }
-            updates.push(update);
+            validate_source_path(path)?;
+            let content = result
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if content.trim().is_empty() {
+                return Ok(json!({"observation":"skipped_empty"}));
+            }
+            let cache = source_cache_path(path);
+            let existing = fs::read_to_string(framework(&root).join(&cache)).unwrap_or_default();
+            let coverage = match (
+                args.get("start_line").and_then(Value::as_u64),
+                args.get("end_line").and_then(Value::as_u64),
+            ) {
+                (Some(start), Some(end)) => format!("lines {start}-{end}"),
+                (Some(start), None) => format!("lines {start}+"),
+                _ => "full file or provider-visible full projection".into(),
+            };
+            let fingerprint = fs::read(root.join(path))
+                .map(|bytes| digest(&bytes))
+                .unwrap_or_else(|_| digest(content.as_bytes()));
+            let source_doc =
+                merge_source_observation(&existing, path, &fingerprint, &coverage, content);
+            updates.push(json!({"path":cache,"content":source_doc,"mode":"replace"}));
+            source_paths.push(path.to_owned());
+            let task_doc = format!("# Objective\n{objective}\n\n# Active milestone\n{}\n\n# Active work item\n{}\n\n## Investigated sources\n- {path}\n\n## Runtime observations\n- read_file inspected `{path}`\n\n## Semantic findings\n\n## Open gaps\n", milestone.unwrap_or("not planned"), task.unwrap_or("not planned"));
+            updates.push(json!({"path":format!("tasks/{}.md", safe_name(run_id)),"content":task_doc,"mode":"merge"}));
+            let overview = format!("# Observed project\n\n## Sources inspected\n- {path}\n\n## Runtime-derived metadata\n- `{path}` was inspected through the project source tool.\n");
+            updates.push(json!({"path":"project/overview.md","content":overview,"mode":"merge"}));
         }
+        "list_directory" => {
+            let entries = result
+                .get("entries")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if entries.is_empty() {
+                return Ok(json!({"observation":"skipped_empty"}));
+            }
+            let list = entries
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|entry| !entry.starts_with(DIRECTORY))
+                .take(80)
+                .map(|entry| format!("- {entry}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            updates.push(json!({"path":"project/overview.md","content":format!("# Observed project\n\n## Known structure\n{list}\n"),"mode":"merge"}));
+        }
+        _ => return Ok(json!({"observation":"not_applicable"})),
     }
-    Some((rolling, updates))
+    if updates.is_empty() {
+        return Ok(json!({"observation":"skipped"}));
+    }
+    let before = revision(&root);
+    let result = update(
+        &root,
+        &json!({"updates":updates,"source_paths":source_paths}),
+    )?;
+    Ok(
+        json!({"observation":"persisted","revisionBefore":before,"revisionAfter":revision(&root),"result":result}),
+    )
 }
 
-fn between<'a>(text: &'a str, start: &str, end: &str) -> Option<&'a str> {
-    text.split_once(start)?
-        .1
-        .split_once(end)
-        .map(|(body, _)| body)
+fn bounded_projection(content: &str, max: usize) -> String {
+    if content.chars().count() <= max {
+        return redact(content);
+    }
+    let chars = content.chars().collect::<Vec<_>>();
+    let head = max * 2 / 3;
+    let tail = max - head;
+    redact(&format!(
+        "{}\n[... source observation truncated ...]\n{}",
+        chars[..head].iter().collect::<String>(),
+        chars[chars.len() - tail..].iter().collect::<String>()
+    ))
 }
-fn is_semantic_knowledge(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    text.trim().len() >= 80
-        && !lower.contains("earlier conversation was compacted")
-        && !lower.contains("usable summary and retained recent transcript")
-        && !lower.contains("context was optimized")
+fn merge_source_observation(
+    existing: &str,
+    path: &str,
+    fingerprint: &str,
+    coverage: &str,
+    content: &str,
+) -> String {
+    let observation = format!(
+        "### Observation — {coverage}\n\n{}\n",
+        bounded_projection(content, 24_000)
+    );
+    if existing.is_empty() {
+        return format!("# Source\n\nPath: {path}\n\nFingerprint: {fingerprint}\n\n## Coverage\n- {coverage}\n\n## Observed source content\n\n{observation}\n## Semantic findings\n\n## Relationships\n");
+    }
+    if existing.contains(&observation) {
+        return existing.to_owned();
+    }
+    let mut next = existing.to_owned();
+    if !next.contains(&format!("- {coverage}")) {
+        if let Some(index) = next.find("## Observed source content") {
+            next.insert_str(index, &format!("- {coverage}\n"));
+        }
+    }
+    let insert = next.find("## Semantic findings").unwrap_or(next.len());
+    next.insert_str(insert, &format!("{observation}\n"));
+    next
+}
+fn is_sensitive_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.contains(".env")
+        || lower.contains("credential")
+        || lower.contains("secret")
+        || lower.contains("private")
+        || lower.ends_with(".pem")
+        || lower.ends_with(".key")
 }
 
 fn canonical_root(root: &Path) -> Result<PathBuf, String> {
@@ -701,4 +728,78 @@ fn now() -> String {
 }
 fn now_compact() -> String {
     now()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unique_temp_root(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("local-ai-knowledge-{name}-{nonce}"))
+    }
+
+    #[test]
+    fn read_observation_materializes_source_task_overview_and_manifest() {
+        let root = unique_temp_root("read-observation");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("src.rs"), "pub fn answer() -> u8 { 42 }\n").unwrap();
+
+        let observed = observe_tool(
+            &root,
+            "run-42",
+            "Inspect the runtime",
+            Some("Research"),
+            Some("Read source"),
+            "read_file",
+            &json!({"path":"src.rs"}),
+            &json!({"path":"src.rs", "content":"pub fn answer() -> u8 { 42 }\n"}),
+        )
+        .unwrap();
+
+        assert_eq!(observed["observation"], "persisted");
+        assert!(observed["revisionAfter"].as_u64() > observed["revisionBefore"].as_u64());
+        let source =
+            fs::read_to_string(root.join(DIRECTORY).join(source_cache_path("src.rs"))).unwrap();
+        assert!(source.contains("pub fn answer() -> u8 { 42 }"));
+        assert!(source.contains("Fingerprint: sha256:"));
+        let task = fs::read_to_string(root.join(DIRECTORY).join("tasks/run-42.md")).unwrap();
+        assert!(task.contains("Inspect the runtime"));
+        let overview =
+            fs::read_to_string(root.join(DIRECTORY).join("project/overview.md")).unwrap();
+        assert!(overview.contains("src.rs"));
+        let index = index(&root).unwrap();
+        assert_eq!(index["sources"][0]["path"], "src.rs");
+        assert_eq!(index["sources"][0]["freshness"], "fresh");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sensitive_source_path_never_materializes_an_observation() {
+        let root = unique_temp_root("sensitive-observation");
+        fs::create_dir_all(&root).unwrap();
+        let observed = observe_tool(
+            &root,
+            "run",
+            "Inspect configuration",
+            None,
+            None,
+            "read_file",
+            &json!({"path":".env"}),
+            &json!({"path":".env", "content":"TOKEN=private"}),
+        )
+        .unwrap();
+        assert_eq!(observed["observation"], "skipped_sensitive_or_internal");
+        assert!(!root
+            .join(DIRECTORY)
+            .join(source_cache_path(".env"))
+            .exists());
+        assert!(!root.join(DIRECTORY).join("project/overview.md").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
 }

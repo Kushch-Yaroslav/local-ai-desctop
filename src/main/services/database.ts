@@ -76,7 +76,10 @@ const mapRun = (row: AnalysisRunRow, actions: AnalysisActionRow[]): AnalysisRun 
   try { stored = action.data ? JSON.parse(action.data) as Partial<ToolActivity> : {}; } catch { /* Older or corrupt telemetry remains readable. */ }
   const visible = { ...stored };
   delete visible.rawOutput;
-  return { ...visible, id: action.id, label: action.label, detail: action.detail ?? undefined };
+  // `analysis_actions.id` is a storage primary key. New rows scope that key by
+  // run, while persisted activity data retains the stable per-run ID used by
+  // timelines, approval events and the renderer.
+  return { ...visible, id: typeof stored.id === 'string' ? stored.id : action.id, label: action.label, detail: action.detail ?? undefined };
 }), createdAt: row.created_at, completedAt: row.completed_at });
 
 export class Database {
@@ -374,7 +377,8 @@ export class Database {
   }
 
   addAnalysisAction(runId: string, activity: ToolActivity): AnalysisRun {
-    const existing = this.db.prepare('SELECT id, data FROM analysis_actions WHERE id=? AND run_id=?').get(activity.id, runId) as { id: string; data: string | null } | undefined;
+    const storageId = `${runId}:${activity.id}`;
+    const existing = this.db.prepare('SELECT id, data FROM analysis_actions WHERE run_id=? AND (id=? OR id=?)').get(runId, storageId, activity.id) as { id: string; data: string | null } | undefined;
     const position = (this.db.prepare('SELECT COALESCE(MAX(position), -1) AS position FROM analysis_actions WHERE run_id=?').get(runId) as { position: number }).position + 1;
     let prior: Partial<ToolActivity> = {};
     if (existing?.data) { try { prior = JSON.parse(existing.data) as Partial<ToolActivity>; } catch { /* Corrupt legacy activity remains replaceable. */ } }
@@ -389,9 +393,9 @@ export class Database {
       }
       : undefined;
     const data = JSON.stringify({ ...prior, ...activity, ...(terminal ? { terminal } : {}), approval: undefined, attachment: undefined });
-    if (existing) this.db.prepare('UPDATE analysis_actions SET label=?, detail=?, data=? WHERE id=? AND run_id=?').run(activity.label, activity.detail ?? null, data, activity.id, runId);
+    if (existing) this.db.prepare('UPDATE analysis_actions SET label=?, detail=?, data=? WHERE id=? AND run_id=?').run(activity.label, activity.detail ?? null, data, existing.id, runId);
     else {
-      this.db.prepare('INSERT INTO analysis_actions (id, run_id, label, detail, data, position) VALUES (?, ?, ?, ?, ?, ?)').run(activity.id, runId, activity.label, activity.detail ?? null, data, position);
+      this.db.prepare('INSERT INTO analysis_actions (id, run_id, label, detail, data, position) VALUES (?, ?, ?, ?, ?, ?)').run(storageId, runId, activity.label, activity.detail ?? null, data, position);
       if (activity.kind !== 'progress') this.db.prepare('UPDATE analysis_runs SET action_count=action_count+1 WHERE id=?').run(runId);
     }
     return this.getAnalysisRun(runId)!;

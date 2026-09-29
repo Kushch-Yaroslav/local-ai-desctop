@@ -19,10 +19,9 @@ env NPM_CONFIG_CACHE="$PWD/local-cache/npm" npm start
 На рабочем столе доступны три ярлыка; их запускные скрипты не используют системные каталоги для кэша приложения:
 
 - **Local AI Desktop** — стандартный запуск, использует сервис Ollama. Скрипт: `run-local-ai-desktop.sh`.
-- **Local AI Desktop — llama.cpp MTP** — собственный `llama-server` с Qwen (GGUF symlink на Ollama blob) и ускорением `draft-mtp`.
-- **Local AI Desktop — GLM-4.7-Flash** — собственный `llama-server` с GLM-4.7-Flash (см. «Архитектура»).
+- **Local AI Desktop — llama.cpp** — один launcher-managed `llama-server`; Qwen использует MTP, а модель выбирается внутри приложения.
 
-Перед началом диалога через Ollama запустите сервис Ollama. Приложение использует три зарегистрированные локальные модели: `qwen3.8:27b-q4_K_M` и `gpt-oss:20b` (Ollama) и `glm-4.7-flash:q4_k` (llama.cpp). Ollama хранит веса через `OLLAMA_MODELS=/media/yaroslav/DATA/ollama`, GGUF для llama.cpp лежат в `/media/yaroslav/DATA/llama-models`; приложение подключается к `http://127.0.0.1:11434` и `http://127.0.0.1:8081` только как клиент. Qwen обрабатывает изображения нативно; выбранная модель без vision capability возвращает контролируемую ошибку без скрытой fallback-модели.
+Перед началом диалога через Ollama запустите сервис Ollama. Ollama хранит веса через `OLLAMA_MODELS=/media/yaroslav/DATA/ollama`, GGUF для llama.cpp лежат в `/media/yaroslav/DATA/llama-models`; модель и backend выбираются внутри приложения. Qwen обрабатывает изображения нативно; выбранная модель без vision capability возвращает контролируемую ошибку без скрытой fallback-модели.
 
 ## Что реализовано
 

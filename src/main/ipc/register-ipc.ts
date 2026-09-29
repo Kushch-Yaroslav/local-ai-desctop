@@ -9,6 +9,7 @@ import { RustAgentRuntime, type AgentProject } from '../services/rust-agent-runt
 import { paths } from '../services/paths';
 import { log } from '../services/logger';
 import { contextPresetsFor, getModelProfile, modelRegistry } from '../models/model-registry';
+import { llamaContextPresets, llamaRuntimeProfile } from '../models/llama-runtime-policy';
 import { WebBrowserService } from '../web/web-tools';
 import { WebChatService } from '../services/web-chat';
 import { chatMessagesWithSystemPrefix, chatSystemContext } from '../services/capabilities';
@@ -26,11 +27,15 @@ import { existingProjectDirectory } from '../services/project-picker';
 const database = new Database();
 const selectedBackend = process.env.LOCAL_AI_BACKEND === 'llama-cpp' ? 'llama-cpp' : 'ollama';
 const llamaRuntimeModelId = process.env.LOCAL_AI_LLAMA_MODEL_ID ?? 'qwen3.8:27b-q4_K_M';
+const defaultLlamaContext = 32_768;
+const maximumLlamaContext = llamaRuntimeProfile(llamaRuntimeModelId)?.maxContext ?? defaultLlamaContext;
+const configuredLlamaContext = Number(process.env.LOCAL_AI_LLAMA_CONTEXT ?? defaultLlamaContext);
+const llamaContextLimit = [16_384, 32_768, 65_536, 131_072].includes(configuredLlamaContext) && configuredLlamaContext <= maximumLlamaContext ? configuredLlamaContext : defaultLlamaContext;
 const ollama = new OllamaBackend();
-const llamaCpp = new LlamaCppBackend(process.env.LOCAL_AI_LLAMA_CPP_URL ?? 'http://127.0.0.1:8081', 65_536, process.env.LOCAL_AI_LLAMA_CPP_VISION === '1', llamaRuntimeModelId);
+const llamaCpp = new LlamaCppBackend(process.env.LOCAL_AI_LLAMA_CPP_URL ?? 'http://127.0.0.1:8081', llamaContextLimit, process.env.LOCAL_AI_LLAMA_CPP_VISION === '1', llamaRuntimeModelId);
 const backend = selectedBackend === 'llama-cpp' ? llamaCpp : ollama;
 const web = new WebBrowserService();
-const rustAgent = new RustAgentRuntime(process.env.LOCAL_AI_AGENT_ENDPOINT ?? (selectedBackend === 'llama-cpp' ? process.env.LOCAL_AI_LLAMA_CPP_URL ?? 'http://127.0.0.1:8081/v1/chat/completions' : 'http://127.0.0.1:11434/v1/chat/completions'));
+const rustAgent = new RustAgentRuntime(process.env.LOCAL_AI_AGENT_ENDPOINT ?? (selectedBackend === 'llama-cpp' ? process.env.LOCAL_AI_LLAMA_CPP_URL ?? 'http://127.0.0.1:8081/v1/chat/completions' : 'http://127.0.0.1:11434/api/chat'));
 const webChat = new WebChatService(backend, web);
 const attachments = new AttachmentService(database);
 const attachmentPipeline = new AttachmentPipeline(database, attachments);
@@ -38,6 +43,11 @@ type ActiveGeneration = { id: string; abort: AbortController; settled: Promise<v
 const activeGenerations = new Map<string, ActiveGeneration>();
 type PendingApproval = { approvalId: string; conversationId: string; generation: ActiveGeneration; actionId: string; category: RiskCategory; root: string; resolve: (result: ApprovalResult) => void; settled: boolean; abort: () => void; emit: (payload: Record<string, unknown>) => void };
 const pendingApprovals = new Map<string, PendingApproval>();
+async function restartLlamaRuntime(): Promise<void> {
+  if (selectedBackend !== 'llama-cpp') return;
+  try { process.kill(Number((await readFile(`${paths.dataRoot}/llama-cpp-mtp-launcher.pid`, 'utf8')).trim()), 'SIGUSR1'); }
+  catch { /* A manually managed backend has no launcher to restart. */ }
+}
 const sessionApprovals = new Map<string, { root: string; categories: Set<RiskCategory> }>();
 
 const waitFor = (promise: Promise<void>, timeoutMs: number): Promise<void> => new Promise((resolve) => {
@@ -111,10 +121,11 @@ export function registerIpc(): void {
     const nextModelId = patch.modelId ?? current.modelId;
     const profile = nextModelId ? getModelProfile(nextModelId) : undefined;
     if (nextModelId && !profile) throw new Error('Выбранная модель отсутствует в реестре приложения');
-    const allowed = profile ? contextPresetsFor(profile.maxContext) : [];
+    const allowed = profile ? (selectedBackend === 'llama-cpp' ? llamaContextPresets(nextModelId ?? '') : contextPresetsFor(profile.maxContext)) : [];
     const requestedContext = patch.contextWindow ?? current.contextWindow;
     const contextWindow = allowed.length && !allowed.includes(requestedContext) ? allowed.at(-1)! : requestedContext;
     const updated = database.updateConversation(id, { ...patch, contextWindow });
+    if (selectedBackend === 'llama-cpp' && ((patch.contextWindow !== undefined && contextWindow !== current.contextWindow) || (patch.modelId !== undefined && patch.modelId !== current.modelId))) void restartLlamaRuntime();
     if ((patch.workingDirectory !== undefined && patch.workingDirectory !== current.workingDirectory) || (patch.secondaryWorkingDirectory !== undefined && patch.secondaryWorkingDirectory !== current.secondaryWorkingDirectory)) sessionApprovals.delete(id);
     if (patch.modelId !== undefined && patch.modelId !== current.modelId) database.setContextUsage(id, null, null);
     if (selectedBackend === 'ollama' && patch.modelId !== undefined && patch.modelId !== current.modelId && current.modelId) void ollama.unloadModel(current.modelId);
@@ -228,13 +239,26 @@ export function registerIpc(): void {
     const thinkingTimeline: ThinkingTimelineEvent[] = []; const activityTimelinePositions = new Map<string, number>(); let timelinePosition = 0; let lastTimelineKind: ThinkingTimelineEvent['kind'] | null = null;
     const agentProjects: AgentProject[] = mode === 'agent' ? [...selectedProjects] : [];
     const agentRoot = agentProjects[0]?.root ?? null;
-    const enabledTools = mode === 'agent' ? ['apply_patch', 'create_file', 'delete_file', 'list_directory', 'read_file', 'run_terminal', 'task_plan', 'write_file'] : conversation.webMode === 'auto' ? ['web'] : [];
+    const enabledTools = mode === 'agent' ? ['apply_patch', 'create_file', 'delete_file', 'list_directory', 'project_knowledge_index', 'project_knowledge_read', 'project_knowledge_update', 'read_file', 'run_terminal', 'todo', 'write_file'] : conversation.webMode === 'auto' ? ['web'] : [];
     log('generation.snapshot', { generationId: generation.id, chatId: request.conversationId, mode, storedMode: conversation.mode, requestedMode: request.mode, workingDirectory: conversation.workingDirectory, resolvedWorkingDirectory: agentRoot, projects: agentProjects.map((project) => ({ id: project.id, slot: project.slot })), webMode: conversation.webMode, modelId: request.model, contextSize: conversation.contextWindow, reasoningMode: conversation.reasoningMode, enabledTools });
     run = mode === 'agent' ? database.createAnalysisRun(request.conversationId, conversation.reasoningMode) : null;
     if (run && current()) event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run });
       const context = await backend.resolveContextWindow(request.model, conversation.contextWindow, abort.signal);
       if (!current()) return;
       event.sender.send('chat:stream', { type: 'context', conversationId: request.conversationId, generationId: generation.id, ...context });
+      if (mode === 'agent' && selectedBackend === 'ollama') {
+        // Prepare the native runner before the Rust sidecar's matching native
+        // request so a stale 32K/64K allocation is reconfigured explicitly.
+        await ollama.prepareAgentContext(request.model, context.active, abort.signal);
+        if (!current()) return;
+        log('ollama.agent.transport', {
+          model: request.model,
+          selectedContext: context.active,
+          endpoint: 'http://127.0.0.1:11434/api/chat',
+          transport: 'native',
+          generationNumCtx: context.active,
+        });
+      }
       // Image descriptions are excluded for native-vision requests: the original
       // image payload is attached only to its owning user turn below.
       let history = attachmentPipeline.buildContext(request.messages, !hasImages);

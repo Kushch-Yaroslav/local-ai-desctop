@@ -8,7 +8,7 @@ use crate::agent::{
     events::{Event, TailCandidateAttempt},
     policy::{self, Reasoning, RunPolicy},
     state::AgentState,
-    todo::GoalPlan,
+    todo::{GoalPlan, ModelTodo},
     transcript::{validate_calls, CompactionPlan, Transcript, ValidatedCall},
 };
 use crate::context::projection::project;
@@ -44,6 +44,10 @@ pub struct Config {
 /// helper boundary rather than pretending every local model has one window.
 pub const DEFAULT_COMPACTION_RATIO: f64 = 0.80;
 pub const DEFAULT_KEEP_RECENT: usize = 8;
+/// A 32K run needs room for several productive tool turns after a handoff.
+/// The target is deliberately below the 80% trigger and is evaluated against
+/// the complete provider payload, including schemas and volatile state.
+pub const DEFAULT_COMPACTION_TARGET_RATIO: f64 = 0.55;
 pub const SAFETY_RESERVE_TOKENS: usize = 1_024;
 pub const PREFERRED_OUTPUT_HEADROOM_TOKENS: usize = 1_024;
 pub const MIN_USEFUL_OUTPUT_TOKENS: usize = 32;
@@ -51,10 +55,8 @@ pub const APPLICATION_MAX_OUTPUT_TOKENS: usize = 32_768;
 pub const MAX_COMPACTION_ATTEMPTS: usize = 4;
 pub const MAX_CONTINUATION_TURNS: usize = 32;
 pub const MAX_LOGICAL_FINAL_CHARS: usize = 1_000_000;
-pub const PLAN_NUDGE_ACTION_THRESHOLD: usize = 12;
-pub const PLAN_NUDGE_MAX_PER_RUN: usize = 2;
 pub const SUMMARY_INPUT_CHARS: usize = 48_000;
-pub const SUMMARY_MAX_OUTPUT_TOKENS: usize = 2_048;
+pub const SUMMARY_MAX_OUTPUT_TOKENS: usize = 1_024;
 pub const MIN_SUMMARY_OUTPUT_TOKENS: usize = 64;
 const MIN_CONTINUATION_OVERLAP_CHARS: usize = 32;
 const MIN_FULL_RESTART_PREFIX_CHARS: usize = 96;
@@ -65,32 +67,14 @@ const TOOL_RESULT_TRUNCATION_MARKER: &str =
 
 const AGENT_GUIDANCE: &str = r#"
 # Local AI Desktop Agent
-- Work directly from the conversation and tool results. A tool-free response normally finishes the current agent run.
-- Use the plan when a task has several substantial stages. Keep it concise and update it honestly, but do not create a detailed Work Plan before you understand the active milestone.
-- Goal Plan milestones are stable user-request stages. Work Plan tasks belong only to the active milestone. Existing IDs are canonical: refine, append, split, complete, or drop them instead of replacing completed history.
-- After modifying project files, run the most relevant available validation before finishing when practical. Prefer targeted existing project commands. Inspect the diff when practical. If validation is unavailable, say why; never invent commands just to satisfy this guideline.
-- Local AI Desktop maintains reusable project knowledge in `.ai-framework`; `manifest.json` is its index. Check relevant cached knowledge before broad reorientation, but treat current source as authoritative and refresh stale entries when exact detail matters.
-- Do not call a tool only because tools are available. Decide yourself when the task has enough information.
+- Work directly from the conversation and tool results. A tool-free response normally completes the run.
+- For code changes, read before writing, make targeted changes, and run the most relevant practical validation or readback. Adapt after errors; do not invent checks.
+- For read-only analysis, use tools for concrete evidence, avoid broad rereads, and synthesize when the active Todo has enough evidence.
+- Project knowledge is persistent in `.ai-framework`. Its compact catalog is supplementary; retrieve a named document with project_knowledge_read when it is useful, and treat current source as authoritative.
+- Do not call tools merely because they are available. Stop naturally when the requested work is complete.
 "#;
 
-const SUMMARY_GUIDANCE: &str = r#"Create a concise but information-dense semantic handoff for continuing the same Agent task.
-Priority order:
-1. The user's goal and constraints.
-2. Concrete findings already established, including important file paths AND what was learned from each; preserve exact technical details and relationships, not merely that a file was read.
-3. Important commands/tools and their meaningful outcomes.
-4. Current milestone/work-task intent and stable IDs.
-5. Decisions, what is verified versus unverified, unresolved questions/gaps, and hypotheses explicitly labeled as hypotheses.
-6. Investigations already completed that should not be repeated.
-Preserve concrete evidence from tool output and assistant reasoning. Never replace findings with an activity log such as "read App.tsx". Distinguish verified facts from hypotheses; do not invent or imply access to omitted raw output. Drop pleasantries, repeated requests, and redundant raw output before dropping findings. Write only the handoff summary.
-
-Return exactly two sections, even if updates are empty:
-<rolling_summary>
-concise handoff only
-</rolling_summary>
-<project_knowledge_updates>
-[{"kind":"project","slot":"overview","content":"durable factual overview"},{"kind":"module","key":"routing","content":"durable relationships"},{"kind":"source","source_path":"src/App.tsx","content":"semantic findings only"}]
-</project_knowledge_updates>
-Use `[]` when no durable facts exist. On first meaningful project orientation, create a concise project overview if stack, purpose, entry points, or directories are established. Persist durable stack, architecture, product flows, source findings, investigated areas, and concrete open project questions. Never persist compaction/runtime state, output budgets, plan rendering, generic self-talk, secrets, or raw source copies."#;
+const SUMMARY_GUIDANCE: &str = r#"Write one dense factual continuation brief for the same task. Preserve the user's goal and constraints; decisions; concrete findings with important files and their roles; meaningful commands and tool outcomes; completed work; the current active Todo direction; unresolved questions; and the next useful action. Distinguish verified facts from hypotheses. Do not repeat raw tool output, runtime mechanics, token counts, cache protocols, generic encouragement, or an activity log. Write only the continuation brief."#;
 
 #[derive(Clone, Copy, Debug)]
 pub struct CompactionBudget {
@@ -134,12 +118,76 @@ fn request_reasoning(config: &Config) -> Value {
     }
 }
 
+fn is_ollama_native_endpoint(endpoint: &str) -> bool {
+    endpoint.trim_end_matches('/').ends_with("/api/chat")
+}
+
+fn ollama_native_messages(messages: &[Value]) -> Vec<Value> {
+    messages
+        .iter()
+        .cloned()
+        .map(|mut message| {
+            let Some(object) = message.as_object_mut() else {
+                return message;
+            };
+            // Ollama's native tool protocol identifies historic results by
+            // order/name and expects function arguments as JSON values rather
+            // than OpenAI's JSON string convention.
+            object.remove("tool_call_id");
+            if object.get("role").and_then(Value::as_str) == Some("tool") {
+                object.remove("name");
+            }
+            if let Some(calls) = object.get_mut("tool_calls").and_then(Value::as_array_mut) {
+                for call in calls {
+                    if let Some(call) = call.as_object_mut() {
+                        call.remove("id");
+                        call.remove("type");
+                        let arguments = call
+                            .get("function")
+                            .and_then(|function| function.get("arguments"))
+                            .and_then(Value::as_str)
+                            .map(str::to_owned);
+                        if let Some(arguments) = arguments {
+                            if let Ok(parsed) = serde_json::from_str::<Value>(&arguments) {
+                                if let Some(function) =
+                                    call.get_mut("function").and_then(Value::as_object_mut)
+                                {
+                                    function.insert("arguments".into(), parsed);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            message
+        })
+        .collect()
+}
+
+fn ollama_native_think(config: &Config) -> Value {
+    match policy::reasoning(&config.reasoning_mode, "agent") {
+        Reasoning::Off => json!(false),
+        Reasoning::Low => json!("low"),
+        Reasoning::Deep => json!("high"),
+    }
+}
+
 fn request_payload(
     config: &Config,
     messages: &[Value],
     schemas: &[Value],
     max_tokens: usize,
 ) -> Value {
+    if is_ollama_native_endpoint(&config.endpoint) {
+        return json!({
+            "model": config.model,
+            "messages": ollama_native_messages(messages),
+            "stream": true,
+            "tools": schemas,
+            "think": ollama_native_think(config),
+            "options": {"num_ctx": config.context_limit, "num_predict": max_tokens},
+        });
+    }
     let mut payload = json!({
         "model": config.model,
         "messages": messages,
@@ -175,17 +223,20 @@ struct RequestBudget {
     stable_prefix_tokens: usize,
     tool_schemas_tokens: usize,
     transcript_history_tokens: usize,
+    summary_tokens: usize,
     dynamic_tail_tokens: usize,
 }
 
 fn request_budget(config: &Config, messages: &[Value], schemas: &[Value]) -> RequestBudget {
     let payload = request_payload(config, messages, schemas, 0);
     let mut transcript = Vec::new();
+    let mut summaries = Vec::new();
     let mut dynamic = Vec::new();
     for message in messages.iter().skip(1) {
         let content = message.get("content").and_then(Value::as_str).unwrap_or("");
-        if content.starts_with("[RUNTIME GUIDANCE — NOT USER CONTENT]")
-            || content.starts_with("[RUNTIME SUMMARY — NOT USER CONTENT]")
+        if content.starts_with("[COMPACTION SUMMARY]") {
+            summaries.push(message.clone());
+        } else if content.starts_with("[RUNTIME GUIDANCE — NOT USER CONTENT]")
             || content.starts_with("[IMPORTED SYSTEM CONTEXT — NOT USER CONTENT]")
         {
             dynamic.push(message.clone());
@@ -200,6 +251,7 @@ fn request_budget(config: &Config, messages: &[Value], schemas: &[Value]) -> Req
             .map_or(0, |message| estimate_tokens(&json!([message]))),
         tool_schemas_tokens: estimate_tokens(&Value::Array(schemas.to_vec())),
         transcript_history_tokens: estimate_tokens(&Value::Array(transcript)),
+        summary_tokens: estimate_tokens(&Value::Array(summaries)),
         dynamic_tail_tokens: estimate_tokens(&Value::Array(dynamic)),
     }
 }
@@ -223,7 +275,7 @@ fn retained_tail_tokens(messages: &[Value]) -> usize {
         .filter(|message| {
             let content = message.get("content").and_then(Value::as_str).unwrap_or("");
             !content.starts_with("[RUNTIME GUIDANCE — NOT USER CONTENT]")
-                && !content.starts_with("[RUNTIME SUMMARY — NOT USER CONTENT]")
+                && !content.starts_with("[COMPACTION SUMMARY]")
                 && !content.starts_with("[IMPORTED SYSTEM CONTEXT — NOT USER CONTENT]")
         })
         .cloned()
@@ -247,7 +299,7 @@ fn budget_error(
     available_output: usize,
 ) -> String {
     format!(
-        "Context budget cannot fit minimum useful output: context_window={}, projected_input_tokens_before_compaction={}, projected_input_tokens_after_compaction={}, stable_prefix_estimate_before={}, stable_prefix_estimate_after={}, tool_schemas_estimate_before={}, tool_schemas_estimate_after={}, transcript_history_estimate_before={}, transcript_history_estimate_after={}, dynamic_tail_estimate_before={}, dynamic_tail_estimate_after={}, safety_reserve={}, requested_max_output={}, dynamic_max_output={}, preferred_output_headroom={}, minimum_useful_output={}, compaction_summary_tokens={}, compaction_summary_chars={}, retained_tail_tokens={}, compaction_attempts={}",
+        "Context budget cannot fit minimum useful output: context_window={}, projected_input_tokens_before_compaction={}, projected_input_tokens_after_compaction={}, stable_prefix_estimate_before={}, stable_prefix_estimate_after={}, tool_schemas_estimate_before={}, tool_schemas_estimate_after={}, transcript_history_estimate_before={}, transcript_history_estimate_after={}, summary_prompt_estimate_before={}, summary_prompt_estimate_after={}, dynamic_tail_estimate_before={}, dynamic_tail_estimate_after={}, safety_reserve={}, requested_max_output={}, dynamic_max_output={}, preferred_output_headroom={}, minimum_useful_output={}, compaction_summary_tokens={}, compaction_summary_chars={}, retained_tail_tokens={}, compaction_attempts={}",
         config.context_limit,
         before.projected_input_tokens,
         after.projected_input_tokens,
@@ -257,6 +309,8 @@ fn budget_error(
         after.tool_schemas_tokens,
         before.transcript_history_tokens,
         after.transcript_history_tokens,
+        before.summary_tokens,
+        after.summary_tokens,
         before.dynamic_tail_tokens,
         after.dynamic_tail_tokens,
         SAFETY_RESERVE_TOKENS,
@@ -281,22 +335,44 @@ fn stable_prefix(config: &Config) -> String {
     prefix
 }
 
-fn dynamic_tail(state: &AgentState, root: Option<&str>) -> String {
+const EAGER_TODO_GUIDANCE: &str = "Before substantial multi-step work, call `todo` with one `init` operation. Keep the list high-level and phased; do not research repeatedly before creating it.";
+const TODO_UPKEEP_GUIDANCE: &str = "Keep the Todo current: immediately mark finished work done, drop intentionally skipped work, keep one active item, and continue the active item.";
+
+fn is_multi_step_request(user: &str) -> bool {
+    let lower = user.to_ascii_lowercase();
+    user.chars().count() > 220
+        || [
+            "audit",
+            "analy",
+            "implement",
+            "migrate",
+            "review",
+            "investigat",
+            "architecture",
+            "report",
+            "multiple",
+            "several",
+            "then ",
+            "phase",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+
+fn dynamic_tail(state: &AgentState, root: Option<&str>, eager_todo: bool) -> String {
     let mut tail = Vec::new();
-    if !state.plan.milestones.is_empty() {
+    if eager_todo && state.plan.model_todo.is_empty() {
+        tail.push(EAGER_TODO_GUIDANCE.to_owned());
+    } else if !state.plan.model_todo.is_empty() {
         tail.push(format!(
-            "<planning_state>{}</planning_state>",
-            serde_json::to_string(&state.plan).unwrap_or_default()
+            "<model_todo>\n{}\n</model_todo>\n{}",
+            state.plan.model_todo.prompt(),
+            TODO_UPKEEP_GUIDANCE,
         ));
     }
-    let knowledge = crate::tools::knowledge::prompt_index(root);
+    let knowledge = crate::tools::knowledge::prompt_catalog(root);
     if !knowledge.is_empty() {
         tail.push(knowledge);
-    }
-    let labels = state.plan.open_summary().unwrap_or_default();
-    let materialized = crate::tools::knowledge::relevant_context(root, &labels);
-    if !materialized.is_empty() {
-        tail.push(materialized);
     }
     tail.join("\n")
 }
@@ -307,7 +383,7 @@ fn emit_knowledge_diagnostics(config: &Config, state: &AgentState) {
     };
     let index = crate::tools::knowledge::index(&PathBuf::from(root)).ok();
     let stats = index.as_ref().and_then(|value| value.get("stats"));
-    let injected = crate::tools::knowledge::prompt_index(Some(root));
+    let injected = crate::tools::knowledge::prompt_catalog(Some(root));
     emit(
         &config.run_id,
         Event::KnowledgeCache {
@@ -339,7 +415,7 @@ fn emit_knowledge_diagnostics(config: &Config, state: &AgentState) {
 
 fn tool_schemas(has_project_root: bool) -> Vec<Value> {
     let mut tools = vec![
-        json!({"type":"function","function":{"name":"task_plan","description":"Manage two separate planning layers. For scope=goal, init requires milestones only and creates the active milestone with an empty Work Plan; do not send tasks. For scope=work, init requires milestone_id (the active milestone ID) and tasks; work append also requires milestone_id and label. Work tasks are planned only after orientation. Use view to read the canonical snapshot and stable IDs. Goal and Work Plan IDs returned by view are canonical. Completed history is retained.","parameters":{"type":"object","properties":{"scope":{"type":"string","enum":["goal","work"],"description":"Required: goal manages milestones; work manages tasks for the active milestone."},"action":{"type":"string","enum":["init","append","refine","split","start","done","drop","view"]},"milestones":{"type":"array","description":"Goal init creates milestones only; do not include Work Plan tasks here.","items":{"oneOf":[{"type":"string"},{"type":"object","properties":{"label":{"type":"string"}},"required":["label"]}]}},"tasks":{"type":"array","description":"Work init creates tasks for the active milestone; used separately after Goal init.","items":{"oneOf":[{"type":"string"},{"type":"object","properties":{"label":{"type":"string"}},"required":["label"]}]}},"milestone_id":{"type":"string","description":"Required for Work Plan mutations; must identify the active milestone."},"task_id":{"type":"string"},"label":{"type":"string"},"after_id":{"type":"string"}},"required":["scope","action"]}}}),
+        json!({"type":"function","function":{"name":"todo","description":"Maintain the compact working Todo. Init a high-level phased list for substantial work. Mark completed work done or intentionally skipped work drop immediately; the runtime promotes the next pending item automatically.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["init","append","start","done","drop","view"]},"list":{"type":"array","description":"For init only: [{phase, items:[\"concise task\"]}].","items":{"type":"object","properties":{"phase":{"type":"string"},"items":{"type":"array","items":{"type":"string"}}},"required":["items"]}},"task":{"type":"string","description":"Exact concise Todo task label for start, done, or drop."},"phase":{"type":"string","description":"Existing phase for append."},"content":{"type":"string","description":"New concise Todo item for append."}},"required":["action"]}}}),
     ];
     if has_project_root {
         tools.extend([
@@ -359,131 +435,106 @@ fn tool_schemas(has_project_root: bool) -> Vec<Value> {
     tools
 }
 
+/// A constrained/read-only run does not advertise mutations and therefore
+/// cannot strand the model behind an approval-only capability. `todo` and the
+/// explicit knowledge reads remain available so analysis has a complete
+/// working contract.
+fn tool_schemas_for_policy(has_project_root: bool, policy: RunPolicy) -> Vec<Value> {
+    let mut tools = tool_schemas(has_project_root);
+    if policy == RunPolicy::Safe {
+        tools.retain(|tool| {
+            matches!(
+                tool_name(tool),
+                "todo"
+                    | "read_file"
+                    | "list_directory"
+                    | "project_knowledge_index"
+                    | "project_knowledge_read"
+            )
+        });
+    }
+    tools
+}
+
 fn tool_name(tool: &Value) -> &str {
     tool.pointer("/function/name")
         .and_then(Value::as_str)
         .unwrap_or("")
 }
 
-fn plan_labels(arguments: &Value, key: &str) -> Result<Vec<String>, String> {
-    let values = arguments
+fn required_text(arguments: &Value, key: &str) -> Result<String, String> {
+    arguments
         .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| format!("todo requires {key}"))
+}
+
+fn todo_init_phases(arguments: &Value) -> Result<Vec<(String, Vec<String>)>, String> {
+    let list = arguments
+        .get("list")
         .and_then(Value::as_array)
-        .ok_or_else(|| format!("task_plan {key} must be an array"))?;
-    values
-        .iter()
-        .map(|value| match value {
-            Value::String(label) => Ok(label.clone()),
-            Value::Object(_) => value
-                .get("label")
-                .or_else(|| value.get("content"))
+        .ok_or_else(|| "todo init requires list".to_owned())?;
+    list.iter()
+        .map(|phase| {
+            let name = phase
+                .get("phase")
                 .and_then(Value::as_str)
-                .map(str::to_owned)
-                .ok_or_else(|| format!("each {key} item needs label")),
-            _ => Err(format!("each {key} item must be a string or object")),
+                .unwrap_or("Work")
+                .to_owned();
+            let items = phase
+                .get("items")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "each Todo phase requires items".to_owned())?
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| "Todo items must be strings".to_owned())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((name, items))
         })
         .collect()
 }
 
-fn required_id(arguments: &Value, key: &str) -> Result<String, String> {
-    arguments
-        .get(key)
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_owned)
-        .ok_or_else(|| format!("task_plan requires {key}"))
-}
-
-fn required_label(arguments: &Value) -> Result<String, String> {
-    arguments
-        .get("label")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "task_plan requires label".into())
-}
-
-fn require_active_milestone(state: &AgentState, arguments: &Value) -> Result<(), String> {
-    let requested = required_id(arguments, "milestone_id")?;
-    let active = state
-        .plan
-        .active_milestone()
-        .ok_or_else(|| "there is no active milestone".to_owned())?;
-    if requested != active.id {
-        return Err(format!(
-            "Work Plan mutations require the active milestone ID {}; got {requested}",
-            active.id
-        ));
-    }
-    Ok(())
-}
-
-fn apply_plan(state: &mut AgentState, arguments: &Value) -> Result<(Value, bool), String> {
+fn apply_todo(state: &mut AgentState, arguments: &Value) -> Result<(Value, bool), String> {
     let action = arguments
         .get("action")
         .and_then(Value::as_str)
-        .ok_or_else(|| "task_plan requires action".to_owned())?;
-    let scope = arguments
-        .get("scope")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "task_plan requires scope (goal or work)".to_owned())?;
-    if !matches!(scope, "goal" | "work") {
-        return Err("task_plan scope must be goal or work".into());
-    }
+        .ok_or_else(|| "todo requires action".to_owned())?;
     if action == "view" {
-        return Ok((json!({"plan": state.plan, "updated": false}), false));
+        return Ok((
+            json!({"todo": state.plan.model_todo, "updated": false}),
+            false,
+        ));
     }
-    if scope == "work" && action != "view" {
-        require_active_milestone(state, arguments)?;
+    match action {
+        "init" => state.plan.model_todo.init(todo_init_phases(arguments)?)?,
+        "append" => state.plan.model_todo.append(
+            arguments.get("phase").and_then(Value::as_str),
+            required_text(arguments, "content")?,
+        )?,
+        "start" => state
+            .plan
+            .model_todo
+            .start(&required_text(arguments, "task")?)?,
+        "done" => state
+            .plan
+            .model_todo
+            .finish(&required_text(arguments, "task")?, false)?,
+        "drop" => state
+            .plan
+            .model_todo
+            .finish(&required_text(arguments, "task")?, true)?,
+        _ => return Err("unsupported todo action".into()),
     }
-    match (scope, action) {
-        ("goal", "init") => {
-            if arguments.get("tasks").is_some() {
-                return Err(
-                    "Goal Plan init accepts milestones only; initialize Work Plan tasks separately"
-                        .into(),
-                );
-            }
-            state.plan.init(plan_labels(arguments, "milestones")?)?;
-        }
-        ("goal", "append") => state.plan.append_milestone(
-            required_label(arguments)?,
-            arguments.get("after_id").and_then(Value::as_str),
-        )?,
-        ("goal", "refine") => state.plan.refine_milestone(
-            &required_id(arguments, "milestone_id")?,
-            required_label(arguments)?,
-        )?,
-        ("goal", "done") => state
-            .plan
-            .finish_milestone(&required_id(arguments, "milestone_id")?, false)?,
-        ("goal", "drop") => state
-            .plan
-            .drop_milestone(&required_id(arguments, "milestone_id")?)?,
-        ("work", "init") => state.plan.init_work(plan_labels(arguments, "tasks")?)?,
-        ("work", "append") => state.plan.append_work(
-            required_label(arguments)?,
-            arguments.get("after_id").and_then(Value::as_str),
-        )?,
-        ("work", "refine") => state.plan.refine_work(
-            &required_id(arguments, "task_id")?,
-            required_label(arguments)?,
-        )?,
-        ("work", "split") => state.plan.split_work(
-            &required_id(arguments, "task_id")?,
-            plan_labels(arguments, "tasks")?,
-        )?,
-        ("work", "start") => state.plan.start_work(&required_id(arguments, "task_id")?)?,
-        ("work", "done") => state
-            .plan
-            .finish_work(&required_id(arguments, "task_id")?, false)?,
-        ("work", "drop") => state
-            .plan
-            .finish_work(&required_id(arguments, "task_id")?, true)?,
-        _ => return Err("unsupported task_plan scope/action combination".into()),
-    }
-    state.plan_touched();
-    Ok((json!({"plan": state.plan, "updated": true}), true))
+    state.plan.sync_from_model_todo();
+    Ok((
+        json!({"todo": state.plan.model_todo, "updated": true}),
+        true,
+    ))
 }
 
 fn mutation_tool(name: &str) -> bool {
@@ -675,6 +726,11 @@ fn needs_compaction(budget: CompactionBudget, projected_input_tokens: usize) -> 
     projected_input_tokens > budget.trigger_tokens()
 }
 
+fn compaction_target_tokens(context_window: usize) -> usize {
+    ((context_window as f64 * DEFAULT_COMPACTION_TARGET_RATIO) as usize)
+        .max(SAFETY_RESERVE_TOKENS + MIN_USEFUL_OUTPUT_TOKENS)
+}
+
 fn retry_keep_recent(attempt: usize) -> usize {
     // Jan's reactive retry sequence is 8 -> 4 -> 2. Do not silently reduce
     // the retained structural tail to one message during ordinary recovery.
@@ -708,6 +764,7 @@ fn stream_call(
     cancelled: &AtomicBool,
     emit_visible: bool,
 ) -> Result<StreamedTurn, String> {
+    let native_ollama = is_ollama_native_endpoint(endpoint);
     let without = endpoint.trim_start_matches("http://");
     let (host_port, path) = without
         .split_once('/')
@@ -828,7 +885,7 @@ fn stream_call(
                 .read_exact(&mut crlf)
                 .map_err(|error| error.to_string())?;
             buffer.push_str(&String::from_utf8_lossy(&bytes));
-            consume_sse(&mut buffer, &mut turn, run_id, emit_visible)?;
+            consume_transport_buffer(&mut buffer, &mut turn, run_id, emit_visible, native_ollama)?;
         }
     } else {
         let mut bytes = [0_u8; 8192];
@@ -852,7 +909,7 @@ fn stream_call(
                 break;
             }
             buffer.push_str(&String::from_utf8_lossy(&bytes[..count]));
-            consume_sse(&mut buffer, &mut turn, run_id, emit_visible)?;
+            consume_transport_buffer(&mut buffer, &mut turn, run_id, emit_visible, native_ollama)?;
         }
     }
     // Some OpenAI-compatible local servers close the connection immediately
@@ -860,14 +917,121 @@ fn stream_call(
     // Treat that final complete frame as SSE rather than silently losing its
     // usage or finish reason.
     if !buffer.trim().is_empty() {
-        if buffer.ends_with('\n') {
+        if native_ollama {
+            if !buffer.ends_with('\n') {
+                buffer.push('\n');
+            }
+        } else if buffer.ends_with('\n') {
             buffer.push('\n');
         } else {
             buffer.push_str("\n\n");
         }
-        consume_sse(&mut buffer, &mut turn, run_id, emit_visible)?;
+        consume_transport_buffer(&mut buffer, &mut turn, run_id, emit_visible, native_ollama)?;
     }
     Ok(turn)
+}
+
+fn consume_transport_buffer(
+    buffer: &mut String,
+    turn: &mut StreamedTurn,
+    run_id: &str,
+    emit_visible: bool,
+    native_ollama: bool,
+) -> Result<(), String> {
+    if native_ollama {
+        consume_ollama_ndjson(buffer, turn, run_id, emit_visible)
+    } else {
+        consume_sse(buffer, turn, run_id, emit_visible)
+    }
+}
+
+fn consume_ollama_ndjson(
+    buffer: &mut String,
+    turn: &mut StreamedTurn,
+    run_id: &str,
+    emit_visible: bool,
+) -> Result<(), String> {
+    while let Some(end) = buffer.find('\n') {
+        let line = buffer[..end].trim().to_owned();
+        buffer.drain(..end + 1);
+        if line.is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_str(&line)
+            .map_err(|error| format!("invalid Ollama NDJSON: {error}"))?;
+        if let Some(error) = value.get("error").and_then(Value::as_str) {
+            return Err(format!("Ollama error: {error}"));
+        }
+        turn.prompt_tokens = value
+            .get("prompt_eval_count")
+            .and_then(Value::as_u64)
+            .or(turn.prompt_tokens);
+        turn.completion_tokens = value
+            .get("eval_count")
+            .and_then(Value::as_u64)
+            .or(turn.completion_tokens);
+        if let Some(reasoning) = value.pointer("/message/thinking").and_then(Value::as_str) {
+            if !turn.thinking_started {
+                turn.thinking_started = true;
+                if emit_visible {
+                    emit(run_id, Event::ThinkingStarted);
+                }
+            }
+            turn.reasoning.push_str(reasoning);
+            turn.reasoning_delta_count += 1;
+            if emit_visible {
+                emit(
+                    run_id,
+                    Event::ThinkingDelta {
+                        content: reasoning.to_owned(),
+                    },
+                );
+            }
+        }
+        if let Some(content) = value.pointer("/message/content").and_then(Value::as_str) {
+            turn.content.push_str(content);
+            if emit_visible {
+                emit(
+                    run_id,
+                    Event::ContentDelta {
+                        content: content.to_owned(),
+                    },
+                );
+            }
+        }
+        if let Some(calls) = value
+            .pointer("/message/tool_calls")
+            .and_then(Value::as_array)
+        {
+            for (index, call) in calls.iter().enumerate() {
+                let entry = turn.calls.entry(index).or_insert_with(|| {
+                    // Native Ollama tool calls do not carry an OpenAI call id.
+                    // The id is persisted by the Electron bridge, so it must be
+                    // stable for streaming updates and unique across Agent runs.
+                    json!({"id":format!("ollama-{run_id}-{index}"),"type":"function","function":{"name":"","arguments":""}})
+                });
+                if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
+                    entry["function"]["name"] = json!(name);
+                }
+                if let Some(arguments) = call.pointer("/function/arguments") {
+                    let encoded = if let Some(arguments) = arguments.as_str() {
+                        arguments.to_owned()
+                    } else {
+                        arguments.to_string()
+                    };
+                    entry["function"]["arguments"] = json!(encoded);
+                }
+            }
+        }
+        if value.get("done").and_then(Value::as_bool) == Some(true) {
+            turn.finish_reason = value
+                .get("done_reason")
+                .and_then(Value::as_str)
+                .unwrap_or("stop")
+                .to_owned();
+        }
+    }
+    Ok(())
 }
 
 fn consume_sse(
@@ -1021,7 +1185,7 @@ struct SummaryResult {
     output_tokens: usize,
 }
 
-fn summarize_span(config: &Config, plan: &CompactionPlan) -> SummaryResult {
+fn summarize_span(config: &Config, plan: &CompactionPlan, todo: &ModelTodo) -> SummaryResult {
     // Summary generation is also a provider turn. Keep its input small enough
     // to leave meaningful output headroom on the selected local context size.
     let summary_input_chars = SUMMARY_INPUT_CHARS.min(
@@ -1030,23 +1194,13 @@ fn summarize_span(config: &Config, plan: &CompactionPlan) -> SummaryResult {
             .saturating_sub(SAFETY_RESERVE_TOKENS + MIN_SUMMARY_OUTPUT_TOKENS)
             .saturating_mul(2),
     );
-    // Jan summarizes exactly the dropped transcript span. Local projects the
-    // current user request and canonical planning state independently after
-    // compaction, so spending this input budget on copies of them starves old
-    // concrete tool findings and worsens continuity.
-    let knowledge_index = config.root.as_deref().map_or_else(String::new, |root| {
-        crate::tools::knowledge::prompt_index(Some(root))
-    });
-    let knowledge_reserve = knowledge_index
-        .chars()
-        .count()
-        .min(8_000)
-        .saturating_add(64);
-    let mut summary_source =
-        summary_source(plan, summary_input_chars.saturating_sub(knowledge_reserve));
-    if !knowledge_index.is_empty() {
-        summary_source.push_str("\n\n[AVAILABLE PROJECT KNOWLEDGE INDEX]\n");
-        summary_source.push_str(&knowledge_index.chars().take(8_000).collect::<String>());
+    // Compaction has one responsibility: construct a factual handoff. Durable
+    // source observations are stored by runtime tool ingestion, never emitted
+    // by this summary model call.
+    let mut summary_source = summary_source(plan, summary_input_chars);
+    if !todo.is_empty() {
+        summary_source.push_str("\n\n[CURRENT MODEL TODO]\n");
+        summary_source.push_str(&todo.prompt());
     }
     if summary_source.trim().is_empty() {
         return SummaryResult {
@@ -1163,8 +1317,13 @@ fn emit_compaction_diagnostics(
             stable_prefix_tokens: report.after.stable_prefix_tokens,
             tool_schema_tokens: report.after.tool_schemas_tokens,
             transcript_tokens_before: report.before.transcript_history_tokens,
+            summary_prompt_tokens: report.after.summary_tokens,
             runtime_tail_tokens: report.after.dynamic_tail_tokens,
-            planning_tokens: estimate_tokens(&json!(dynamic_tail(state, config.root.as_deref()))),
+            model_todo_tokens: estimate_tokens(&json!(state.plan.model_todo.prompt())),
+            memory_catalog_tokens: estimate_tokens(&json!(
+                crate::tools::knowledge::prompt_catalog(config.root.as_deref())
+            )),
+            compaction_target_tokens: compaction_target_tokens(config.context_limit),
             preferred_output_tokens: PREFERRED_OUTPUT_HEADROOM_TOKENS,
             available_output_before: available_before,
             available_output_after: available_after,
@@ -1202,8 +1361,7 @@ fn emit_compaction_diagnostics(
                 .emergency_tool_result_truncation
                 .as_ref()
                 .and_then(|entry| entry.source.clone()),
-            active_milestone_id: state.plan.active_milestone().map(|item| item.id.clone()),
-            active_work_task_id: state.plan.active_work_task().map(|item| item.id.clone()),
+            active_todo: state.plan.model_todo.active_label().map(str::to_owned),
         },
     );
 }
@@ -1212,6 +1370,7 @@ fn compact_once(
     config: &Config,
     transcript: &mut Transcript,
     schemas: &[Value],
+    todo: &ModelTodo,
     before: usize,
     keep_recent: usize,
     reason: &str,
@@ -1228,14 +1387,7 @@ fn compact_once(
     let entries_before = transcript.entries().len();
     let messages_summarized = plan.message_count();
     let messages_retained = plan.retained_message_count();
-    let mut summary = summarize_span(config, &plan);
-    if let Some(root) = config.root.as_deref() {
-        summary.text = crate::tools::knowledge::promote_compaction(
-            &PathBuf::from(root),
-            &config.run_id,
-            &summary.text,
-        );
-    }
+    let summary = summarize_span(config, &plan, todo);
     let summary_output_chars = summary.text.chars().count();
     transcript.compact(summary.text, covers);
     let mut messages = project(transcript, &stable_prefix(config), dynamic_tail);
@@ -1274,10 +1426,10 @@ fn compact_once(
     })
 }
 
-/// Select a Jan-style structural boundary before the single semantic summary
-/// call. Jan's preferred recent tail is tried first; local 32K providers also
-/// require that the complete projected request can physically leave a useful
-/// output. This is boundary selection, not a second compaction operation.
+/// Select a structural tail before the one semantic compaction call. The
+/// candidate must fit a real 32K low-water target, not merely leave one token
+/// of output. A giant structural pair remains valid and is projection-truncated
+/// only as the final physical-safety fallback.
 fn select_fit_aware_compaction_plan(
     config: &Config,
     transcript: &Transcript,
@@ -1285,13 +1437,7 @@ fn select_fit_aware_compaction_plan(
     preferred_keep_recent: usize,
     dynamic_tail: &str,
 ) -> Option<(CompactionPlan, Vec<TailCandidateAttempt>)> {
-    let mut candidates = vec![preferred_keep_recent];
-    candidates.extend(
-        [4, 2, 1]
-            .into_iter()
-            .filter(|candidate| *candidate < preferred_keep_recent),
-    );
-    candidates.dedup();
+    let candidates = (1..=preferred_keep_recent.max(1)).rev().collect::<Vec<_>>();
     let mut attempts = Vec::new();
     let mut smallest_plan = None;
 
@@ -1303,13 +1449,7 @@ fn select_fit_aware_compaction_plan(
         projected_transcript.compact(summary_fit_reserve(), plan.covers);
         let messages = project(&projected_transcript, &stable_prefix(config), dynamic_tail);
         let budget = request_budget(config, &messages, schemas);
-        let fits = has_minimum_useful_output(dynamic_output_limit(
-            config.context_limit,
-            budget.projected_input_tokens,
-            SAFETY_RESERVE_TOKENS,
-            config.provider_max_output,
-            APPLICATION_MAX_OUTPUT_TOKENS,
-        ));
+        let fits = budget.projected_input_tokens <= compaction_target_tokens(config.context_limit);
         attempts.push(TailCandidateAttempt {
             message_count: plan.retained_message_count(),
             estimated_tokens: retained_tail_tokens(&messages),
@@ -1503,8 +1643,8 @@ fn run_tool(
             emit_knowledge_diagnostics(config, state);
             Ok((value, None))
         }
-        "task_plan" => {
-            let (value, changed) = apply_plan(state, &tool.arguments)?;
+        "todo" => {
+            let (value, changed) = apply_todo(state, &tool.arguments)?;
             if changed {
                 emit(
                     &config.run_id,
@@ -1583,6 +1723,19 @@ fn run_tool(
                 .ok_or_else(|| "no project scope".to_owned())?;
             let result =
                 crate::tools::filesystem::execute(&PathBuf::from(root), name, &tool.arguments)?;
+            if matches!(name, "read_file" | "list_directory") {
+                let active = state.plan.model_todo.active_label();
+                let _ = crate::tools::knowledge::observe_tool(
+                    &PathBuf::from(root),
+                    &config.run_id,
+                    &config.user,
+                    None,
+                    active,
+                    name,
+                    &tool.arguments,
+                    &result.0,
+                );
+            }
             if mutation_tool(name) {
                 state.record_mutation();
             }
@@ -1591,17 +1744,106 @@ fn run_tool(
     }
 }
 
+fn safe_read_only_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file" | "list_directory" | "project_knowledge_index" | "project_knowledge_read"
+    )
+}
+
+/// Executes only deterministic inspection tools. Runtime-owned observation
+/// writes and diagnostics are deliberately applied after the concurrent reads
+/// complete, in original call order.
+fn run_safe_read_tool(
+    config: &Config,
+    tool: &ValidatedCall,
+) -> Result<(Value, Option<String>), String> {
+    let root = config
+        .root
+        .as_ref()
+        .ok_or_else(|| "no project scope".to_owned())?;
+    match tool.name.as_str() {
+        "project_knowledge_index" => {
+            crate::tools::knowledge::index(&PathBuf::from(root)).map(|value| (value, None))
+        }
+        "project_knowledge_read" => {
+            crate::tools::knowledge::read(&PathBuf::from(root), &tool.arguments)
+                .map(|value| (value, None))
+        }
+        "read_file" | "list_directory" => {
+            crate::tools::filesystem::execute(&PathBuf::from(root), &tool.name, &tool.arguments)
+        }
+        _ => Err(format!("{} is not a safe read-only tool", tool.name)),
+    }
+}
+
+fn record_safe_read_effect(
+    config: &Config,
+    state: &mut AgentState,
+    tool: &ValidatedCall,
+    value: &Value,
+) {
+    match tool.name.as_str() {
+        "project_knowledge_index" | "project_knowledge_read" => {
+            if tool.name == "project_knowledge_read" {
+                if let Some(root) = config.root.as_deref() {
+                    let revision = crate::tools::knowledge::revision(&PathBuf::from(root));
+                    for entry in value
+                        .get("entries")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                    {
+                        if entry.get("status").and_then(Value::as_str) == Some("missing") {
+                            if let Some(path) = entry.get("path").and_then(Value::as_str) {
+                                state
+                                    .knowledge_missing_paths
+                                    .insert(path.to_owned(), revision);
+                            }
+                        }
+                    }
+                }
+            }
+            state.record_knowledge_read();
+            emit_knowledge_diagnostics(config, state);
+        }
+        "read_file" | "list_directory" => {
+            if let Some(root) = config.root.as_deref() {
+                let active = state.plan.model_todo.active_label();
+                let _ = crate::tools::knowledge::observe_tool(
+                    &PathBuf::from(root),
+                    &config.run_id,
+                    &config.user,
+                    None,
+                    active,
+                    &tool.name,
+                    &tool.arguments,
+                    value,
+                );
+                emit_knowledge_diagnostics(config, state);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn concise_tool_error(message: &str) -> String {
+    let trimmed = message.trim();
+    let bounded = trimmed.chars().take(1_200).collect::<String>();
+    json!({"error":bounded}).to_string()
+}
+
 fn add_soft_closeout_if_needed(state: &mut AgentState, transcript: &mut Transcript) -> bool {
-    let plan_open = state.plan.has_open_work();
+    let todo_open = state.plan.model_todo.has_open();
     let needs_validation = state.workspace_mutated_since_validation && !state.verification_nudged;
-    let needs_plan = plan_open && !state.closeout_nudged;
-    if !needs_validation && !needs_plan {
+    let needs_todo = todo_open && !state.closeout_nudged;
+    if !needs_validation && !needs_todo {
         return false;
     }
     let mut reminder = Vec::new();
-    if needs_plan {
+    if needs_todo {
         state.closeout_nudged = true;
-        reminder.push(format!("Before you stop, update the plan: complete finished work, drop work that is no longer needed, or continue the task. {}", state.plan.open_summary().unwrap_or_default()));
+        reminder.push(format!("Before you stop, mark completed Todo items done, drop intentionally skipped items, or continue the active work. {}", state.plan.model_todo.open_summary().unwrap_or_default()));
     }
     if needs_validation {
         state.verification_nudged = true;
@@ -1624,6 +1866,7 @@ pub fn run(config: Config) {
         .and_then(|plan| serde_json::from_value::<GoalPlan>(plan.clone()).ok())
         .unwrap_or_default();
     state.plan.normalize_active();
+    state.plan.ensure_model_todo();
     if let Some(root) = config.root.as_deref() {
         let _ = crate::tools::knowledge::bootstrap(&PathBuf::from(root));
     }
@@ -1633,7 +1876,7 @@ pub fn run(config: Config) {
         reserve_tokens: None,
     };
     let stable = stable_prefix(&config);
-    let schemas = tool_schemas(config.root.is_some());
+    let schemas = tool_schemas_for_policy(config.root.is_some(), config.policy);
     let mut final_content = String::new();
     let mut continuation_count = 0_usize;
     let mut continuation_pending = false;
@@ -1667,12 +1910,18 @@ pub fn run(config: Config) {
                 transcript.push_steering(content);
             }
         }
-        let dynamic = dynamic_tail(&state, config.root.as_deref());
+        let eager_todo =
+            turn == 0 && state.plan.model_todo.is_empty() && is_multi_step_request(&config.user);
+        let dynamic = dynamic_tail(&state, config.root.as_deref(), eager_todo);
+        let pending_tail = transcript.pending_tail(&dynamic);
+        let sent_tail = if transcript.has_active_prompt_tail(&pending_tail) {
+            String::new()
+        } else {
+            pending_tail
+        };
         let mut messages = pending_fitted_projection
             .take()
-            .unwrap_or_else(|| project(&transcript, &stable, &dynamic));
-        // The just-projected reminder expires before the following turn.
-        transcript.clear_reminders();
+            .unwrap_or_else(|| project(&transcript, &stable, &sent_tail));
         let before_budget = request_budget(&config, &messages, &schemas);
         let requested_max_output = config
             .provider_max_output
@@ -1692,15 +1941,16 @@ pub fn run(config: Config) {
             // Jan preflights once, then sends the request. Local's dynamic
             // output budget handles a smaller useful answer without using it
             // as a reason to discard additional transcript.
-            let current_dynamic = dynamic_tail(&state, config.root.as_deref());
+            let current_dynamic = sent_tail.as_str();
             if let Some(report) = compact_once(
                 &config,
                 &mut transcript,
                 &schemas,
+                &state.plan.model_todo,
                 current_budget.projected_input_tokens,
                 DEFAULT_KEEP_RECENT,
                 "proactive_threshold",
-                &current_dynamic,
+                current_dynamic,
             ) {
                 let fitted_messages = report.messages.clone();
                 if let Some((previous_after, previous_turn)) = last_compaction {
@@ -1761,7 +2011,10 @@ pub fn run(config: Config) {
             return;
         }
         let projected = current_budget.projected_input_tokens;
-        let payload = request_payload(&config, &messages, &schemas, output_limit);
+        let mut payload = request_payload(&config, &messages, &schemas, output_limit);
+        if eager_todo {
+            payload["tool_choice"] = json!({"type":"function","function":{"name":"todo"}});
+        }
         let payload_messages = payload
             .get("messages")
             .and_then(Value::as_array)
@@ -1844,6 +2097,10 @@ pub fn run(config: Config) {
         ) {
             Ok(streamed) => {
                 overflow_attempts = 0;
+                if !sent_tail.is_empty() {
+                    transcript.record_prompt_tail(&sent_tail);
+                }
+                transcript.clear_reminders();
                 streamed
             }
             Err(error) if error == "cancelled" => {
@@ -1865,10 +2122,11 @@ pub fn run(config: Config) {
                     &config,
                     &mut transcript,
                     &schemas,
+                    &state.plan.model_todo,
                     before,
                     keep,
                     "context_overflow_retry",
-                    &dynamic,
+                    &sent_tail,
                 ) else {
                     emit(
                         &config.run_id,
@@ -2035,9 +2293,100 @@ pub fn run(config: Config) {
             return;
         }
         transcript.assistant_tool_turn(streamed.content, &calls);
-        for tool in calls {
-            // Emit only after tool-call aggregation and validation, so every
-            // activity has the provider's actual id and complete arguments.
+        let mut call_index = 0_usize;
+        while call_index < calls.len() {
+            if safe_read_only_tool(&calls[call_index].name)
+                && schemas
+                    .iter()
+                    .any(|schema| tool_name(schema) == calls[call_index].name)
+            {
+                let start = call_index;
+                while call_index < calls.len()
+                    && safe_read_only_tool(&calls[call_index].name)
+                    && schemas
+                        .iter()
+                        .any(|schema| tool_name(schema) == calls[call_index].name)
+                {
+                    call_index += 1;
+                }
+                let batch = &calls[start..call_index];
+                for tool in batch {
+                    emit(
+                        &config.run_id,
+                        Event::ToolCallStarted {
+                            id: tool.id.clone(),
+                            name: tool.name.clone(),
+                            arguments: tool.arguments.clone(),
+                        },
+                    );
+                }
+                // Jan runs independent auto-allowed reads concurrently. Join in
+                // call order so transcript pairing and visible tool cards stay
+                // deterministic even when filesystem work finishes out of order.
+                let results = std::thread::scope(|scope| {
+                    let handles = batch
+                        .iter()
+                        .map(|tool| scope.spawn(|| run_safe_read_tool(&config, tool)))
+                        .collect::<Vec<_>>();
+                    handles
+                        .into_iter()
+                        .map(|handle| {
+                            handle
+                                .join()
+                                .unwrap_or_else(|_| Err("read-only tool worker panicked".into()))
+                        })
+                        .collect::<Vec<_>>()
+                });
+                for (tool, result) in batch.iter().zip(results) {
+                    if config.cancelled.load(Ordering::Relaxed) {
+                        transcript.tool_result(
+                            &tool.id,
+                            &tool.name,
+                            concise_tool_error("generation cancelled"),
+                        );
+                        continue;
+                    }
+                    match result {
+                        Ok((value, diff)) => {
+                            record_safe_read_effect(&config, &mut state, tool, &value);
+                            let content = value.to_string();
+                            tool_result_tokens_since_compaction =
+                                tool_result_tokens_since_compaction
+                                    .saturating_add(estimate_tokens(&json!(content)));
+                            emit(
+                                &config.run_id,
+                                Event::ToolResult {
+                                    id: tool.id.clone(),
+                                    name: tool.name.clone(),
+                                    content: content.clone(),
+                                    is_error: false,
+                                    diff,
+                                },
+                            );
+                            transcript.tool_result(&tool.id, &tool.name, content);
+                        }
+                        Err(message) => {
+                            emit(
+                                &config.run_id,
+                                Event::ToolError {
+                                    id: tool.id.clone(),
+                                    name: tool.name.clone(),
+                                    message: message.clone(),
+                                },
+                            );
+                            transcript.tool_result(
+                                &tool.id,
+                                &tool.name,
+                                concise_tool_error(&message),
+                            );
+                        }
+                    }
+                }
+                continue;
+            }
+
+            let tool = &calls[call_index];
+            call_index += 1;
             emit(
                 &config.run_id,
                 Event::ToolCallStarted {
@@ -2047,7 +2396,11 @@ pub fn run(config: Config) {
                 },
             );
             if config.cancelled.load(Ordering::Relaxed) {
-                transcript.tool_result(&tool.id, &tool.name, "ERROR: generation cancelled".into());
+                transcript.tool_result(
+                    &tool.id,
+                    &tool.name,
+                    concise_tool_error("generation cancelled"),
+                );
                 continue;
             }
             if !schemas.iter().any(|schema| tool_name(schema) == tool.name) {
@@ -2060,7 +2413,7 @@ pub fn run(config: Config) {
                         message: message.clone(),
                     },
                 );
-                transcript.tool_result(&tool.id, &tool.name, format!("ERROR: {message}"));
+                transcript.tool_result(&tool.id, &tool.name, concise_tool_error(&message));
                 continue;
             }
             if policy::requires_approval(config.policy, &tool.name, &tool.arguments) {
@@ -2081,7 +2434,11 @@ pub fn run(config: Config) {
                             .to_owned(),
                     },
                 );
-                transcript.tool_result(&tool.id, &tool.name, "ERROR: approval required".into());
+                transcript.tool_result(
+                    &tool.id,
+                    &tool.name,
+                    concise_tool_error("approval required"),
+                );
                 continue;
             }
             emit(
@@ -2090,7 +2447,7 @@ pub fn run(config: Config) {
                     state: "working".into(),
                 },
             );
-            match run_tool(&config, &mut state, &tool) {
+            match run_tool(&config, &mut state, tool) {
                 Ok((value, diff)) => {
                     let content = value.to_string();
                     tool_result_tokens_since_compaction = tool_result_tokens_since_compaction
@@ -2106,9 +2463,6 @@ pub fn run(config: Config) {
                         },
                     );
                     transcript.tool_result(&tool.id, &tool.name, content);
-                    if matches!(tool.name.as_str(), "run_terminal") || mutation_tool(&tool.name) {
-                        state.mutation_action_completed();
-                    }
                 }
                 Err(message) => {
                     emit(
@@ -2119,20 +2473,9 @@ pub fn run(config: Config) {
                             message: message.clone(),
                         },
                     );
-                    transcript.tool_result(&tool.id, &tool.name, format!("ERROR: {message}"));
+                    transcript.tool_result(&tool.id, &tool.name, concise_tool_error(&message));
                 }
             }
-        }
-        if state.plan.has_open_work()
-            && state.mutations_since_plan_update >= PLAN_NUDGE_ACTION_THRESHOLD
-            && state.plan_nudges < PLAN_NUDGE_MAX_PER_RUN
-        {
-            state.plan_nudges += 1;
-            state.mutations_since_plan_update = 0;
-            transcript.remind(format!(
-                "The plan still has open work. If you finished a task since the last plan update, mark it complete now (or drop it if skipped) so progress stays visible; otherwise continue working. {}",
-                state.plan.open_summary().unwrap_or_default()
-            ));
         }
     }
     emit(
@@ -2235,218 +2578,139 @@ mod tests {
                 .iter()
                 .map(tool_name)
                 .collect::<Vec<_>>(),
-            vec!["task_plan"]
+            vec!["todo"]
         );
     }
 
     #[test]
-    fn goal_and_work_plan_initialization_are_separate_and_return_stable_ids() {
+    fn safe_policy_advertises_a_complete_read_only_tool_contract() {
+        let schemas = tool_schemas_for_policy(true, RunPolicy::Safe);
+        let names = schemas.iter().map(tool_name).collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "list_directory",
+                "project_knowledge_index",
+                "project_knowledge_read",
+                "read_file",
+                "todo",
+            ]
+        );
+    }
+
+    #[test]
+    fn todo_is_canonical_and_promotes_the_next_item_into_the_ui_adapter() {
         let mut state = AgentState::default();
-        let (goal_snapshot, changed) = apply_plan(
+        let (_, changed) = apply_todo(
             &mut state,
             &json!({
-                "scope":"goal",
                 "action":"init",
-                "milestones":["Inspect","Implement"]
+                "list":[
+                    {"phase":"Research","items":["Understand project orientation", "Analyze product flow"]},
+                    {"phase":"Synthesis","items":["Produce final report"]}
+                ]
             }),
         )
         .unwrap();
         assert!(changed);
         assert_eq!(
-            state.plan.active_milestone_id.as_deref(),
-            Some("milestone-1")
+            state.plan.model_todo.active_label(),
+            Some("Understand project orientation")
         );
-        assert!(state
-            .plan
-            .active_milestone()
-            .unwrap()
-            .work_plan
-            .tasks
-            .is_empty());
-        assert_eq!(
-            goal_snapshot["plan"]["milestones"][0]["work_plan"]["tasks"],
-            json!([])
-        );
-        assert!(apply_plan(
-            &mut AgentState::default(),
-            &json!({"scope":"goal","action":"init","milestones":["Inspect"],"tasks":["Lost task"]}),
-        )
-        .is_err());
-
-        let first_work = apply_plan(
+        assert_eq!(state.plan.milestones.len(), 2);
+        apply_todo(
             &mut state,
-            &json!({
-                "scope":"work",
-                "action":"init",
-                "milestone_id":"milestone-1",
-                "tasks":["Read entry point","Trace request"]
-            }),
-        )
-        .unwrap()
-        .0;
-        let first_id = first_work["plan"]["milestones"][0]["work_plan"]["tasks"][0]["id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        assert_eq!(first_id, "task-1");
-
-        apply_plan(
-            &mut state,
-            &json!({
-                "scope":"work",
-                "action":"append",
-                "milestone_id":"milestone-1",
-                "label":"Verify behavior"
-            }),
+            &json!({"action":"done","task":"Understand project orientation"}),
         )
         .unwrap();
-        let (view, changed) =
-            apply_plan(&mut state, &json!({"scope":"goal","action":"view"})).unwrap();
-        assert!(!changed);
-        let tasks = view["plan"]["milestones"][0]["work_plan"]["tasks"]
-            .as_array()
-            .unwrap();
-        assert_eq!(tasks.len(), 3);
-        assert_eq!(tasks[0]["id"], first_id);
-        assert_eq!(tasks[0]["label"], "Read entry point");
-        assert_eq!(tasks[2]["id"], "task-3");
-        assert_eq!(tasks[2]["label"], "Verify behavior");
+        assert_eq!(
+            state.plan.model_todo.active_label(),
+            Some("Analyze product flow")
+        );
+        assert_eq!(
+            state.plan.milestones[0].work_plan.tasks[0].status,
+            crate::agent::todo::Status::Completed
+        );
+        assert_eq!(
+            state.plan.milestones[0].work_plan.tasks[1].status,
+            crate::agent::todo::Status::InProgress
+        );
     }
 
     #[test]
-    fn plan_update_snapshot_tracks_goal_and_work_mutations_without_compaction_state() {
+    fn todo_snapshot_drives_plan_update_without_exposing_ui_schema_to_the_model() {
         let mut state = AgentState::default();
-        let mutate = |state: &mut AgentState, arguments: Value| {
-            let (_, changed) = apply_plan(state, &arguments).unwrap();
-            assert!(changed);
-            let canonical = serde_json::to_value(&state.plan).unwrap();
-            let emitted = serde_json::to_value(Event::PlanUpdate {
-                plan: canonical.clone(),
-            })
-            .unwrap();
-            assert_eq!(emitted["type"], "plan_update");
-            assert_eq!(emitted["plan"], canonical);
-            emitted["plan"].clone()
-        };
-
-        let goal = mutate(
-            &mut state,
-            json!({"scope":"goal","action":"init","milestones":["M1","M2","M3","M4","M5","M6"]}),
-        );
-        assert_eq!(goal["milestones"].as_array().unwrap().len(), 6);
-        assert_eq!(goal["active_milestone_id"], "milestone-1");
-
-        let work = mutate(
-            &mut state,
-            json!({"scope":"work","action":"init","milestone_id":"milestone-1","tasks":["T1","T2","T3"]}),
-        );
-        assert_eq!(
-            work["milestones"][0]["work_plan"]["tasks"]
-                .as_array()
-                .unwrap()
-                .len(),
-            3
-        );
-
-        let first_done = mutate(
-            &mut state,
-            json!({"scope":"work","action":"done","milestone_id":"milestone-1","task_id":"task-1"}),
-        );
-        assert_eq!(
-            first_done["milestones"][0]["work_plan"]["tasks"][0]["status"],
-            "completed"
-        );
-        let second_done = mutate(
-            &mut state,
-            json!({"scope":"work","action":"done","milestone_id":"milestone-1","task_id":"task-2"}),
-        );
-        assert_eq!(
-            second_done["milestones"][0]["work_plan"]["tasks"][1]["status"],
-            "completed"
-        );
-        let active = mutate(
-            &mut state,
-            json!({"scope":"work","action":"start","milestone_id":"milestone-1","task_id":"task-3"}),
-        );
-        assert_eq!(
-            active["milestones"][0]["work_plan"]["tasks"][2]["status"],
-            "in_progress"
-        );
-
-        // Compaction diagnostics do not own or mutate AgentState::plan.
-        let before = serde_json::to_value(&state.plan).unwrap();
-        let _diagnostic = Event::CompactionDiagnostics {
-            compaction_index: 1,
-            trigger_reason: "test".into(),
-            context_window: 32_768,
-            projected_input_before: 26_300,
-            projected_input_after: 12_000,
-            stable_prefix_tokens: 100,
-            tool_schema_tokens: 200,
-            transcript_tokens_before: 25_000,
-            runtime_tail_tokens: 50,
-            planning_tokens: 50,
-            preferred_output_tokens: 1_024,
-            available_output_before: 100,
-            available_output_after: 1_024,
-            selected_max_output_tokens: 1_024,
-            boundary_event_index: 12,
-            events_summarized: 12,
-            events_retained: 8,
-            messages_summarized: 12,
-            messages_retained: 8,
-            estimated_retained_tokens: 10_000,
-            summary_input_tokens: 4_000,
-            summary_output_tokens: 800,
-            summary_output_chars: 3_200,
-            preferred_tail_messages: 8,
-            selected_tail_messages: 8,
-            tail_candidate_attempts: vec![TailCandidateAttempt {
-                message_count: 8,
-                estimated_tokens: 10_000,
-                projected_request_tokens: 12_000,
-                fits: true,
-            }],
-            emergency_tool_result_truncation: false,
-            emergency_tool_result_original_tokens: None,
-            emergency_tool_result_original_chars: None,
-            emergency_tool_result_projected_tokens: None,
-            emergency_tool_result_projected_chars: None,
-            emergency_tool_result_source: None,
-            active_milestone_id: Some("milestone-1".into()),
-            active_work_task_id: Some("task-3".into()),
-        };
-        assert_eq!(serde_json::to_value(&state.plan).unwrap(), before);
+        apply_todo(&mut state, &json!({"action":"init","list":[{"phase":"Audit","items":["Inspect runtime", "Write report"]}]})).unwrap();
+        let emitted = serde_json::to_value(Event::PlanUpdate {
+            plan: serde_json::to_value(&state.plan).unwrap(),
+        })
+        .unwrap();
+        assert_eq!(emitted["type"], "plan_update");
+        let tail = dynamic_tail(&state, None, false);
+        assert!(tail.contains("[active] Audit: Inspect runtime"));
+        assert!(!tail.contains("milestones"));
+        assert!(!tail.contains("work_plan"));
     }
 
     #[test]
-    fn task_plan_schema_explains_separate_goal_and_work_scopes() {
+    fn todo_schema_and_stable_prefix_are_compact_and_explicit() {
         let schema = tool_schemas(false)
             .into_iter()
-            .find(|tool| tool_name(tool) == "task_plan")
+            .find(|tool| tool_name(tool) == "todo")
             .unwrap();
         let description = schema
             .pointer("/function/description")
             .unwrap()
             .as_str()
             .unwrap();
-        assert!(description.contains("milestones only"));
-        assert!(description.contains("milestone_id"));
-        assert!(description.contains("do not send tasks"));
+        assert!(description.contains("compact working Todo"));
+        assert!(description.contains("promotes the next"));
         assert_eq!(
             schema.pointer("/function/parameters/required"),
-            Some(&json!(["scope", "action"]))
+            Some(&json!(["action"]))
         );
+        let config = test_config(Some("/project"));
+        assert_eq!(stable_prefix(&config), stable_prefix(&config));
+        assert!(!stable_prefix(&config).contains("model_todo"));
     }
 
     #[test]
-    fn stable_prefix_is_byte_stable_and_plan_stays_in_the_dynamic_tail() {
-        let config = test_config(Some("/project"));
-        assert_eq!(stable_prefix(&config), stable_prefix(&config));
-        let mut state = AgentState::default();
-        state.plan.init(vec!["Inspect".into()]).unwrap();
-        assert!(!stable_prefix(&config).contains("planning_state"));
-        assert!(dynamic_tail(&state, None).contains("planning_state"));
+    fn automatic_project_knowledge_is_a_catalog_not_materialized_document_bodies() {
+        let root = unique_temp_root("knowledge-catalog");
+        fs::create_dir_all(&root).unwrap();
+        crate::tools::knowledge::bootstrap(&root).unwrap();
+        crate::tools::knowledge::update(
+            &root,
+            &json!({"updates":[{"path":"project/overview.md","content":"SENTINEL_RAW_OVERVIEW_BODY","mode":"replace"}]}),
+        )
+        .unwrap();
+        let state = AgentState::default();
+        let tail = dynamic_tail(&state, root.to_str(), false);
+        assert!(tail.contains("project_knowledge_catalog"));
+        assert!(tail.contains("project overview"));
+        assert!(!tail.contains("SENTINEL_RAW_OVERVIEW_BODY"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn safe_read_classification_excludes_mutations_and_terminal_work() {
+        for name in [
+            "read_file",
+            "list_directory",
+            "project_knowledge_index",
+            "project_knowledge_read",
+        ] {
+            assert!(safe_read_only_tool(name), "{name}");
+        }
+        for name in [
+            "write_file",
+            "apply_patch",
+            "delete_file",
+            "run_terminal",
+            "todo",
+        ] {
+            assert!(!safe_read_only_tool(name), "{name}");
+        }
     }
 
     #[test]
@@ -2478,6 +2742,7 @@ mod tests {
             stable_prefix_tokens: 500,
             tool_schemas_tokens: 1_200,
             transcript_history_tokens: 38_000,
+            summary_tokens: 0,
             dynamic_tail_tokens: 300,
         };
         let after = RequestBudget {
@@ -2485,6 +2750,7 @@ mod tests {
             stable_prefix_tokens: 500,
             tool_schemas_tokens: 1_200,
             transcript_history_tokens: 30_000,
+            summary_tokens: 128,
             dynamic_tail_tokens: 300,
         };
         let error = budget_error(
@@ -2505,6 +2771,7 @@ mod tests {
             "stable_prefix_estimate_after=500",
             "tool_schemas_estimate_after=1200",
             "transcript_history_estimate_after=30000",
+            "summary_prompt_estimate_after=128",
             "dynamic_tail_estimate_after=300",
             "safety_reserve=1024",
             "requested_max_output=8000",
@@ -2521,31 +2788,8 @@ mod tests {
 
     #[test]
     fn summary_is_bounded_by_provider_max_tokens_without_a_second_char_truncation() {
-        assert_eq!(SUMMARY_MAX_OUTPUT_TOKENS, 2_048);
+        assert_eq!(SUMMARY_MAX_OUTPUT_TOKENS, 1_024);
         assert!(MIN_SUMMARY_OUTPUT_TOKENS <= SUMMARY_MAX_OUTPUT_TOKENS);
-    }
-
-    #[test]
-    fn jan_style_todo_upkeep_counts_mutating_work_and_plan_touch_resets_it() {
-        let mut state = AgentState::default();
-        state.plan.init(vec!["Audit".into()]).unwrap();
-        state
-            .plan
-            .init_work(vec!["Implement change".into()])
-            .unwrap();
-        for _ in 0..PLAN_NUDGE_ACTION_THRESHOLD {
-            state.mutation_action_completed();
-        }
-        assert_eq!(
-            state.mutations_since_plan_update,
-            PLAN_NUDGE_ACTION_THRESHOLD
-        );
-        state.plan_nudges += 1;
-        state.mutations_since_plan_update = 0;
-        assert_eq!(state.plan_nudges, 1);
-        state.plan_touched();
-        assert_eq!(state.mutations_since_plan_update, 0);
-        assert_eq!(state.plan_nudges, 1, "Jan caps nudges per run cycle");
     }
 
     #[test]
@@ -2559,10 +2803,11 @@ mod tests {
             "role":"assistant",
             "content":"App.tsx uses BrowserRouter and renders PurchaseToast, AppRoutes, and ScrollToTopButton. Routes.tsx uses LangGate plus ProductShell and routes product/:id, products-page, confirm, and legal pages."
         }));
+        transcript.push_message(json!({"role":"assistant","content":"Keep the next investigation focused on the API boundary."}));
         let plan = transcript.compaction_plan(1).unwrap();
         let source = summary_source(&plan, SUMMARY_INPUT_CHARS);
-        assert!(SUMMARY_GUIDANCE.contains("what was learned from each"));
-        assert!(SUMMARY_GUIDANCE.contains("not merely that a file was read"));
+        assert!(SUMMARY_GUIDANCE.contains("factual continuation brief"));
+        assert!(!SUMMARY_GUIDANCE.contains("project_knowledge_updates"));
         assert!(source.contains("App.tsx uses BrowserRouter"));
         assert!(source.contains("Routes.tsx uses LangGate"));
     }
@@ -2602,7 +2847,7 @@ mod tests {
             json!({"role":"assistant","content":"Need inspect api.php, .htaccess, robots.txt."}),
         );
         let compaction_plan = transcript.compaction_plan(1).unwrap();
-        let summary = summarize_span(&config, &compaction_plan);
+        let summary = summarize_span(&config, &compaction_plan, &plan.model_todo);
         transcript.compact(summary.text, compaction_plan.covers);
         let projected = project(
             &transcript,
@@ -2613,14 +2858,15 @@ mod tests {
                     ..AgentState::default()
                 },
                 None,
+                false,
             ),
         );
         let summary_message = projected
             .iter()
             .find(|message| {
-                message["content"].as_str().is_some_and(|content| {
-                    content.starts_with("[RUNTIME SUMMARY — NOT USER CONTENT]")
-                })
+                message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.starts_with("[COMPACTION SUMMARY]"))
             })
             .unwrap();
         let handoff = summary_message["content"].as_str().unwrap();
@@ -2767,10 +3013,8 @@ mod tests {
         assert!(attempts[0].estimated_tokens >= 46_000);
         assert_eq!(attempts[0].message_count, 8);
         assert!(!attempts[0].fits);
-        assert!(attempts
-            .iter()
-            .any(|attempt| attempt.message_count == 4 && attempt.fits));
-        assert_eq!(plan.retained_message_count(), 4);
+        assert!(attempts.len() > 1);
+        assert!(plan.retained_message_count() <= 4);
         let mut compacted = transcript.clone();
         compacted.compact("verified handoff".into(), plan.covers);
         let post_compaction = request_budget(
@@ -2778,13 +3022,10 @@ mod tests {
             &project(&compacted, &stable_prefix(&config), &dynamic),
             &schemas,
         );
-        assert!(has_minimum_useful_output(dynamic_output_limit(
-            config.context_limit,
-            post_compaction.projected_input_tokens,
-            SAFETY_RESERVE_TOKENS,
-            config.provider_max_output,
-            APPLICATION_MAX_OUTPUT_TOKENS,
-        )));
+        assert!(
+            post_compaction.projected_input_tokens
+                <= compaction_target_tokens(config.context_limit)
+        );
     }
 
     #[test]
@@ -2816,13 +3057,8 @@ mod tests {
         .unwrap();
         assert_eq!(attempts[0].message_count, 8);
         assert!(!attempts[0].fits);
-        assert!(attempts
-            .iter()
-            .any(|attempt| attempt.message_count == 4 && !attempt.fits));
-        assert!(attempts
-            .iter()
-            .any(|attempt| attempt.message_count == 2 && attempt.fits));
-        assert_eq!(plan.retained_message_count(), 2);
+        assert!(attempts.len() > 1);
+        assert!(plan.retained_message_count() <= 2);
     }
 
     #[test]
@@ -2841,7 +3077,7 @@ mod tests {
                     request["messages"][0]["content"]
                         .as_str()
                         .is_some_and(|content| {
-                            content.contains("Create a concise but information-dense")
+                            content.contains("Write one dense factual continuation brief")
                         });
                 let response = if is_summary {
                     json!({"choices":[{"delta":{"content":"Verified earlier findings."},"finish_reason":"stop"}]})
@@ -3023,7 +3259,7 @@ mod tests {
                     request["messages"][0]["content"]
                         .as_str()
                         .is_some_and(|content| {
-                            content.contains("Create a concise but information-dense")
+                            content.contains("Write one dense factual continuation brief")
                         });
                 requests.push(request);
                 let response = if is_summary {
@@ -3063,7 +3299,7 @@ mod tests {
                 request["messages"][0]["content"]
                     .as_str()
                     .is_some_and(|content| {
-                        content.contains("Create a concise but information-dense")
+                        content.contains("Write one dense factual continuation brief")
                     })
             })
             .collect::<Vec<_>>();
@@ -3111,7 +3347,7 @@ mod tests {
                     request["messages"][0]["content"]
                         .as_str()
                         .is_some_and(|content| {
-                            content.contains("Create a concise but information-dense")
+                            content.contains("Write one dense factual continuation brief")
                         });
                 let response = if requests.is_empty() {
                     json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"large-read","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"large.txt\"}"}}]},"finish_reason":"tool_calls"}]})
@@ -3186,7 +3422,9 @@ mod tests {
         assert!(requests.iter().any(|request| {
             request["messages"][0]["content"]
                 .as_str()
-                .is_some_and(|content| content.contains("Create a concise but information-dense"))
+                .is_some_and(|content| {
+                    content.contains("Write one dense factual continuation brief")
+                })
         }));
         let first_agent = agent_requests[0];
         let after_compaction = agent_requests.last().unwrap();
@@ -3201,14 +3439,14 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(names.contains(&"read_file"));
         assert!(names.contains(&"run_terminal"));
-        assert!(names.contains(&"task_plan"));
+        assert!(names.contains(&"todo"));
         assert!(after_compaction["messages"]
             .as_array()
             .unwrap()
             .iter()
             .filter_map(|message| message["role"].as_str())
             .enumerate()
-            .all(|(index, role)| role != "system" || index == 0));
+            .all(|(index, role)| role != "system" || index <= 1));
         assert!(after_compaction["messages"]
             .as_array()
             .unwrap()

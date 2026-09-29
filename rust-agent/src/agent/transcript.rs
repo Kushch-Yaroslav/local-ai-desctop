@@ -11,9 +11,16 @@ pub struct Transcript {
 pub enum Entry {
     Message(Value),
     RunUser(Value),
-    Compaction { summary: String, covers: usize },
+    Compaction {
+        summary: String,
+        covers: usize,
+    },
     Steering(String),
     Reminder(String),
+    /// Volatile guidance becomes durable only after the provider accepted the
+    /// request. Keeping it at this exact point prevents a moving synthetic
+    /// tail from rewriting model history on every tool turn.
+    PromptTail(String),
 }
 
 /// A Jan-style compaction decision: the concrete projected messages to
@@ -77,6 +84,39 @@ impl Transcript {
         self.entries.push(Entry::Reminder(content));
     }
 
+    pub fn record_prompt_tail(&mut self, content: &str) {
+        if !content.trim().is_empty() && !self.has_active_prompt_tail(content) {
+            self.entries.push(Entry::PromptTail(content.to_owned()));
+        }
+    }
+
+    pub fn pending_tail(&self, volatile: &str) -> String {
+        let reminders = self
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Reminder(value) => Some(value.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        [volatile.trim(), reminders.trim()]
+            .into_iter()
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    /// A covered tail is not projected, so it must be allowed to reappear
+    /// below a later compaction summary exactly as Jan does.
+    pub fn has_active_prompt_tail(&self, content: &str) -> bool {
+        let boundary = self.compaction_boundary().unwrap_or(0);
+        self.entries
+            .iter()
+            .skip(boundary)
+            .any(|entry| matches!(entry, Entry::PromptTail(existing) if existing == content))
+    }
+
     /// Reminders are intentionally one-request tail instructions. Retiring old
     /// ones keeps the stable system prefix and prevents policy loops.
     pub fn clear_reminders(&mut self) {
@@ -138,6 +178,10 @@ impl Transcript {
                     );
                     sources.push(index);
                 }
+                Entry::PromptTail(content) => {
+                    messages.push(prompt_tail_message(content));
+                    sources.push(index);
+                }
                 Entry::Compaction { .. } | Entry::Reminder(_) | Entry::Message(_) => {}
             }
         }
@@ -186,6 +230,10 @@ impl Transcript {
             retained_message_count: messages.len().saturating_sub(cut),
         })
     }
+}
+
+pub fn prompt_tail_message(content: &str) -> Value {
+    json!({"role":"user", "content":format!("[RUNTIME GUIDANCE — NOT USER CONTENT]\n{content}")})
 }
 
 fn is_tool_message(message: &Value) -> bool {
@@ -310,6 +358,32 @@ mod tests {
         assert!(validate_calls(malformed.as_array().unwrap(), Some("tool_calls")).is_err());
         let complete = json!([{"id":"x","function":{"name":"write_file","arguments":"{}"}}]);
         assert!(validate_calls(complete.as_array().unwrap(), Some("length")).is_err());
+    }
+
+    #[test]
+    fn accepted_prompt_tail_stays_before_the_following_tool_turn_and_reappears_after_compaction() {
+        let mut transcript = Transcript::default();
+        transcript.push_run_user(json!({"role":"user","content":"audit"}));
+        transcript.record_prompt_tail("<model_todo>\n[active] Inspect project\n</model_todo>");
+        transcript.assistant_message("I will inspect the project.".into());
+        let projected = crate::context::projection::project(&transcript, "stable", "");
+        let tail = projected
+            .iter()
+            .position(|message| {
+                message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("model_todo"))
+            })
+            .unwrap();
+        let assistant = projected
+            .iter()
+            .position(|message| message["role"] == "assistant")
+            .unwrap();
+        assert!(tail < assistant);
+
+        transcript.compact("factual handoff".into(), 2);
+        assert!(!transcript
+            .has_active_prompt_tail("<model_todo>\n[active] Inspect project\n</model_todo>"));
     }
 
     #[test]

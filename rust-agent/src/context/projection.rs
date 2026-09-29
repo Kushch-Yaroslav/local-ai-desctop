@@ -1,9 +1,9 @@
-use crate::agent::transcript::{Entry, Transcript};
+use crate::agent::transcript::{prompt_tail_message, Entry, Transcript};
 use serde_json::{json, Value};
 
 /// A pure request projection. The first system message is byte-stable within a
-/// session. Summaries and transient reminders are placed after it so they do
-/// not rewrite the cacheable prefix.
+/// session. Accepted volatile tails remain at their original transcript
+/// position; only genuinely new guidance is appended below history.
 #[must_use]
 pub fn project(transcript: &Transcript, stable_prefix: &str, dynamic_tail: &str) -> Vec<Value> {
     let (summary, start) = transcript
@@ -21,7 +21,7 @@ pub fn project(transcript: &Transcript, stable_prefix: &str, dynamic_tail: &str)
         }
     }
     if let Some(summary) = summary {
-        messages.push(json!({"role":"user", "content":format!("[RUNTIME SUMMARY — NOT USER CONTENT]\n{summary}")}));
+        messages.push(json!({"role":"user", "content":format!("[RUNTIME COMPACTION SUMMARY — NOT USER CONTENT]\n{summary}")}));
     }
     if !imported_system.is_empty() {
         messages.push(json!({"role":"user", "content":format!("[IMPORTED SYSTEM CONTEXT — NOT USER CONTENT]\n{}", imported_system.join("\n\n"))}));
@@ -58,8 +58,8 @@ pub fn project(transcript: &Transcript, stable_prefix: &str, dynamic_tail: &str)
                 messages.push(message.clone());
                 included_run_user = true;
             }
-            Entry::Steering(content) => messages
-                .push(json!({"role":"user", "content":content, "metadata":{"steering":true}})),
+            Entry::Steering(content) => messages.push(json!({"role":"user", "content":format!("[RUNTIME STEERING — NOT USER CONTENT]\n{content}"), "metadata":{"steering":true}})),
+            Entry::PromptTail(content) => messages.push(prompt_tail_message(content)),
             Entry::Compaction { .. } | Entry::Reminder(_) | Entry::Message(_) => {}
         }
     }
@@ -70,23 +70,11 @@ pub fn project(transcript: &Transcript, stable_prefix: &str, dynamic_tail: &str)
             messages.push(message);
         }
     }
-    let reminders = transcript
-        .entries()
-        .iter()
-        .filter_map(|entry| match entry {
-            Entry::Reminder(value) => Some(value.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    let tail = [dynamic_tail.trim(), &reminders.join("\n\n")]
-        .into_iter()
-        .filter(|value| !value.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    if !tail.is_empty() {
+    if !dynamic_tail.trim().is_empty() && !transcript.has_active_prompt_tail(dynamic_tail) {
         // Dynamic data belongs after accepted conversation so cache providers
-        // can reuse the leading system/history prefix.
-        messages.push(json!({"role":"user", "content":format!("[RUNTIME GUIDANCE — NOT USER CONTENT]\n{tail}")}));
+        // can reuse the leading system/history prefix. The run records it only
+        // after the provider accepts this exact request.
+        messages.push(prompt_tail_message(dynamic_tail));
     }
     messages
 }
@@ -101,7 +89,8 @@ mod tests {
         let mut transcript = Transcript::default();
         transcript.push_run_user(json!({"role":"user","content":"audit"}));
         transcript.remind("update plan".into());
-        let projected = project(&transcript, "stable", "active plan");
+        let tail = transcript.pending_tail("active plan");
+        let projected = project(&transcript, "stable", &tail);
         assert_eq!(projected[0]["content"], "stable");
         assert_eq!(projected.last().unwrap()["role"], "user");
         assert!(projected.last().unwrap()["content"]
@@ -124,6 +113,27 @@ mod tests {
         assert!(projected
             .iter()
             .any(|message| message["content"] == "recent"));
+    }
+
+    #[test]
+    fn only_the_stable_prefix_uses_the_system_role() {
+        let mut transcript = Transcript::default();
+        transcript.push_run_user(json!({"role":"user","content":"audit"}));
+        transcript.record_prompt_tail("<model_todo>\n[active] Inspect\n</model_todo>");
+        transcript.push_message(json!({"role":"assistant","content":"reading"}));
+        transcript.compact("important finding".into(), 0);
+        let projected = project(&transcript, "stable", "");
+        assert_eq!(projected[0]["role"], "system");
+        assert!(projected
+            .iter()
+            .skip(1)
+            .all(|message| message["role"] != "system"));
+        assert!(projected
+            .iter()
+            .any(|message| message["content"]
+                .as_str()
+                .is_some_and(|content| content
+                    .starts_with("[RUNTIME COMPACTION SUMMARY — NOT USER CONTENT]"))));
     }
 
     #[test]
@@ -211,7 +221,7 @@ mod tests {
     }
 
     #[test]
-    fn realistic_projection_has_only_a_leading_system_message() {
+    fn realistic_projection_keeps_runtime_messages_out_of_the_system_role() {
         let mut transcript = Transcript::default();
         transcript.push_message(json!({"role":"user","content":"previous request"}));
         transcript.push_message(json!({"role":"assistant","content":"previous answer"}));
@@ -227,7 +237,11 @@ mod tests {
         transcript.compact("condensed earlier transcript".into(), 2);
         transcript.remind("verify the result".into());
 
-        let projected = project(&transcript, "stable prefix", "<planning_state />");
+        let projected = project(
+            &transcript,
+            "stable prefix",
+            &transcript.pending_tail("<model_todo />"),
+        );
         let system_positions = projected
             .iter()
             .enumerate()
@@ -235,9 +249,9 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(system_positions, vec![0]);
         assert!(projected.iter().any(|message| message["role"] == "user"
-            && message["content"]
-                .as_str()
-                .is_some_and(|content| content.contains("[RUNTIME SUMMARY — NOT USER CONTENT]"))));
+            && message["content"].as_str().is_some_and(
+                |content| content.contains("[RUNTIME COMPACTION SUMMARY — NOT USER CONTENT]")
+            )));
         assert!(projected.iter().any(|message| message["role"] == "user"
             && message["content"]
                 .as_str()

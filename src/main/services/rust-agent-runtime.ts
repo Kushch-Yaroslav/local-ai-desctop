@@ -2,7 +2,7 @@ import { createInterface } from 'node:readline';
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
-import type { AgentPlan, AgentPlanStepStatus, ChatMessage, ReasoningMode, StreamEvent, TerminalExecution, WebMode } from '../../shared/types';
+import type { AgentPlan, AgentPlanStepStatus, ChatMessage, ModelTodo, ReasoningMode, StreamEvent, TerminalExecution, WebMode } from '../../shared/types';
 import { maxOutputTokens } from '../models/model-registry';
 
 /** Project identity is a transport value, not an orchestration subsystem. */
@@ -37,6 +37,23 @@ export function splitAgentRunHistory(history: ChatMessage[]): { user: string; pr
 const status = (value: unknown): AgentPlanStepStatus => value === 'completed' || value === 'abandoned' || value === 'in_progress' ? value : 'pending';
 const label = (value: unknown, fallback: string) => typeof value === 'string' && value.trim() ? value : fallback;
 
+function modelTodo(value: unknown): ModelTodo | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  if (!Array.isArray(raw.phases)) return undefined;
+  return {
+    phases: raw.phases.map((candidate, phaseIndex) => {
+      const phase = candidate && typeof candidate === 'object' ? candidate as Record<string, unknown> : {};
+      const items = Array.isArray(phase.items) ? phase.items.map((candidateItem, itemIndex) => {
+        const item = candidateItem && typeof candidateItem === 'object' ? candidateItem as Record<string, unknown> : {};
+        return { id: label(item.id, `todo-${phaseIndex + 1}-${itemIndex + 1}`), content: label(item.content ?? item.label, 'Todo item'), status: status(item.status) };
+      }) : [];
+      return { name: typeof phase.name === 'string' ? phase.name : 'Work', items };
+    }).filter((phase) => phase.items.length > 0),
+    ...(typeof raw.revision === 'number' ? { revision: raw.revision } : {}),
+  };
+}
+
 /** Converts both pre-migration snapshots and Rust GoalPlan payloads to the UI
  * shape. Old plan data remains readable while new runs always receive stable
  * milestone/task IDs. */
@@ -44,6 +61,7 @@ export function taskPlan(value: unknown): AgentPlan {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return { milestones: [] };
   const raw = value as Record<string, unknown>;
   if (Array.isArray(raw.milestones)) {
+    const todo = modelTodo(raw.model_todo ?? raw.modelTodo);
     return {
       milestones: raw.milestones.map((candidate, milestoneIndex) => {
         const milestone = candidate && typeof candidate === 'object' ? candidate as Record<string, unknown> : {};
@@ -61,6 +79,7 @@ export function taskPlan(value: unknown): AgentPlan {
       }),
       ...(typeof raw.active_milestone_id === 'string' ? { activeMilestoneId: raw.active_milestone_id } : typeof raw.activeMilestoneId === 'string' ? { activeMilestoneId: raw.activeMilestoneId } : {}),
       ...(typeof raw.revision === 'number' ? { revision: raw.revision } : {}),
+      ...(todo ? { modelTodo: todo } : {}),
     };
   }
   const steps = Array.isArray(raw.steps) ? raw.steps.map((candidate, index) => {
@@ -71,7 +90,8 @@ export function taskPlan(value: unknown): AgentPlan {
     const active = steps.find((step) => step.status === 'in_progress');
     return { milestones: [{ id: 'legacy-milestone-1', label: 'Previous plan', status: active ? 'in_progress' : steps.every((step) => step.status === 'completed' || step.status === 'abandoned') ? 'completed' : 'pending', workPlan: { tasks: steps } }], activeMilestoneId: active ? 'legacy-milestone-1' : undefined };
   }
-  return { milestones: [] };
+  const todo = modelTodo(raw.model_todo ?? raw.modelTodo);
+  return { milestones: [], ...(todo ? { modelTodo: todo } : {}) };
 }
 
 /** A successful Rust planning mutation cannot produce an empty Goal Plan.
@@ -184,10 +204,10 @@ export class RustAgentRuntime {
 }
 
 function activityLabel(name?: string): string {
-  return ({ list_directory: 'Просмотр структуры проекта', read_file: 'Чтение файла', write_file: 'Изменение файла', create_file: 'Создание файла', apply_patch: 'Изменение проекта', delete_file: 'Удаление файла', run_terminal: 'Запуск terminal', task_plan: 'Планирование', project_knowledge_index: 'Индекс знаний проекта', project_knowledge_read: 'Чтение знаний проекта', project_knowledge_update: 'Обновление знаний проекта' } as Record<string, string>)[name ?? ''] ?? 'Действие агента';
+  return ({ list_directory: 'Просмотр структуры проекта', read_file: 'Чтение файла', write_file: 'Изменение файла', create_file: 'Создание файла', apply_patch: 'Изменение проекта', delete_file: 'Удаление файла', run_terminal: 'Запуск terminal', todo: 'Todo', project_knowledge_index: 'Индекс знаний проекта', project_knowledge_read: 'Чтение знаний проекта', project_knowledge_update: 'Обновление знаний проекта' } as Record<string, string>)[name ?? ''] ?? 'Действие агента';
 }
 function activityKind(name?: string): NonNullable<import('../../shared/types').ToolActivity['kind']> {
-  return name === 'run_terminal' ? 'terminal' : name === 'task_plan' ? 'planning' : name === 'read_file' || name === 'project_knowledge_read' || name === 'project_knowledge_index' ? 'file_read' : name === 'list_directory' ? 'directory' : 'mutation';
+  return name === 'run_terminal' ? 'terminal' : name === 'todo' ? 'planning' : name === 'read_file' || name === 'project_knowledge_read' || name === 'project_knowledge_index' ? 'file_read' : name === 'list_directory' ? 'directory' : 'mutation';
 }
 function timestamp(value: number | undefined): string | undefined { return typeof value === 'number' && Number.isFinite(value) ? new Date(value).toISOString() : undefined; }
 function terminalResult(raw: string | undefined): TerminalExecution | undefined {

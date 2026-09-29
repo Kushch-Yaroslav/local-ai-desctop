@@ -85,6 +85,15 @@ export async function runDatabaseMigrationRegression(): Promise<void> {
       generationStats: { outputTokens: 4049, tokensPerSecond: 49, generationDurationMs: 82_600, timeToFirstTokenMs: 620, inputTokens: 1_200 },
     });
     const persistedRun = fresh.createAnalysisRun(freshChat.id, 'fast');
+    // `analysis_actions.id` is globally unique storage identity. Agent event
+    // ids can repeat across runs (for example, a protocol error), while their
+    // visible ids must still remain stable after a reopen.
+    const firstProtocolRun = fresh.createAnalysisRun(freshChat.id, 'fast');
+    const secondProtocolRun = fresh.createAnalysisRun(freshChat.id, 'fast');
+    fresh.addAnalysisAction(firstProtocolRun.id, { id: 'protocol', label: 'Protocol error', kind: 'other', state: 'error' });
+    fresh.addAnalysisAction(secondProtocolRun.id, { id: 'protocol', label: 'Protocol error', kind: 'other', state: 'error' });
+    assert.equal(fresh.listAnalysisRuns(freshChat.id).find((run) => run.id === firstProtocolRun.id)?.actions[0]?.id, 'protocol', 'first run did not retain its Agent event id');
+    assert.equal(fresh.listAnalysisRuns(freshChat.id).find((run) => run.id === secondProtocolRun.id)?.actions[0]?.id, 'protocol', 'second run collided with the first run event id');
     // Streaming terminal updates use the same action id. A partial stdout
     // snapshot must append output without losing the immutable execution
     // identity needed after an interrupted Electron/session shutdown.

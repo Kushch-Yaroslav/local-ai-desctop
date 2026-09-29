@@ -10,7 +10,7 @@ type OllamaChunk = { message?: { content?: string; thinking?: string }; done?: b
 
 type OllamaToolResponse = { message?: ToolMessage; error?: string; done_reason?: string } & OllamaMetrics;
 type OllamaShowResponse = { model_info?: Record<string, unknown>; parameters?: string };
-type OllamaRunningModels = { models?: Array<{ name: string; model?: string }> };
+type OllamaRunningModels = { models?: Array<{ name: string; model?: string; context_length?: number; details?: { context_length?: number } }> };
 
 export type ContextWindow = { requested: number; active: number; supported?: number };
 
@@ -58,6 +58,11 @@ export class OllamaBackend implements LlmBackend, ToolCallingBackend {
   }
 
   private async modelContextLimit(model: string, fallback: number): Promise<number> {
+    // Qwen's /api/show metadata can report the context used by an existing
+    // runner or a Modelfile default (for example 64K). It is not this
+    // application's selectable capability: requests set num_ctx explicitly.
+    // Keep the registry's 256K Qwen capability separate from runner state.
+    if (model === 'qwen3.8:27b-q4_K_M') return fallback;
     try {
       const response = await fetch(`${this.baseUrl}/api/show`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model }) });
       if (!response.ok) return fallback;
@@ -85,6 +90,12 @@ export class OllamaBackend implements LlmBackend, ToolCallingBackend {
   async resolveContextWindow(model: string, requested: number, signal: AbortSignal): Promise<ContextWindow> {
     const profile = getModelProfile(model);
     if (!profile) throw new Error('Выбранная модель отсутствует в реестре приложения');
+    // See modelContextLimit: /api/show is not a reliable Qwen context
+    // capability endpoint when a runner is already loaded with a smaller
+    // num_ctx. The selected value is carried by each native /api/chat request.
+    if (model === 'qwen3.8:27b-q4_K_M') {
+      return { requested, active: Math.min(requested, profile.maxContext), supported: profile.maxContext };
+    }
     try {
       const response = await fetch(`${this.baseUrl}/api/show`, {
         method: 'POST', signal, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model }),
@@ -116,6 +127,53 @@ export class OllamaBackend implements LlmBackend, ToolCallingBackend {
       const data = await response.json() as OllamaRunningModels;
       return (data.models ?? []).some((candidate) => candidate.name === model || candidate.model === model);
     } catch { return false; }
+  }
+
+  /**
+   * Prime the selected runner through `/api/chat` before the sidecar begins
+   * its first turn. This makes a context transition explicit and observable;
+   * the Rust Agent's native generation request repeats the same num_ctx.
+   */
+  async prepareAgentContext(model: string, selectedContext: number, signal: AbortSignal): Promise<void> {
+    const profile = getModelProfile(model);
+    if (!profile) throw new Error('Выбранная модель отсутствует в реестре приложения');
+    const requestedContext = Math.min(selectedContext, profile.maxContext);
+    this.usedModels.add(model);
+    log('ollama.agent.context', {
+      model,
+      selectedContext,
+      requestedContext,
+      transport: 'native-preparation',
+      runnerPrepare: requestedContext,
+      mechanism: 'native_api_chat.options.num_ctx',
+    });
+    try {
+      const response = await fetch(`${this.baseUrl}/api/chat`, {
+        method: 'POST', signal, headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model,
+          stream: false,
+          keep_alive: '5m',
+          messages: [{ role: 'user', content: 'OK' }],
+          think: false,
+          options: { num_ctx: requestedContext, num_predict: 1 },
+        }),
+      });
+      const data = await response.json() as OllamaToolResponse;
+      if (!response.ok || data.error) throw new Error(data.error ?? `HTTP ${response.status}`);
+      const running = await fetch(`${this.baseUrl}/api/ps`, { signal });
+      const runningData = running.ok ? await running.json() as OllamaRunningModels : undefined;
+      const entry = runningData?.models?.find((candidate) => candidate.name === model || candidate.model === model);
+      const effectiveContext = entry?.context_length ?? entry?.details?.context_length;
+      log('ollama.agent.context.prepared', { model, selectedContext, requestedContext, effectiveContext: effectiveContext ?? null });
+      if (effectiveContext !== undefined && effectiveContext !== requestedContext) {
+        throw new Error(`Ollama runner context mismatch: requested ${requestedContext}, active ${effectiveContext}`);
+      }
+    } catch (error) {
+      const classified = this.readableError(error, signal);
+      log('ollama.agent.context.failed', { model, selectedContext, requestedContext, ...ollamaErrorDiagnostics(classified) });
+      throw classified;
+    }
   }
 
   async unloadModel(model: string): Promise<void> {
@@ -159,9 +217,16 @@ export class OllamaBackend implements LlmBackend, ToolCallingBackend {
     const effective = outputBudget(contextWindow, inputTokens);
     if (effective < 1) throw new OllamaRequestError('context_exhausted', 'Контекстное окно заполнено. Уменьшите историю или выберите больший контекст, затем продолжите ответ.', { causeDetail: `input_tokens=${inputTokens}; context_limit=${contextWindow}` });
     const diagnostics: InferenceDiagnostics = { reasoningMode, requestedMaxOutputTokens: requested, effectiveMaxOutputTokens: effective, contextLimit: contextWindow, inputTokens };
+    const requestedContext = Math.min(contextWindow, profile.maxContext);
     log('inference.options', diagnostics);
+    log('ollama.context.request', {
+      model,
+      selectedContext: contextWindow,
+      requestedContext,
+      effectiveBackendContext: requestedContext,
+    });
     const think = ollamaReasoning(reasoningMode, profile);
-    return { ...(think === undefined ? {} : { think }), options: { num_ctx: Math.min(contextWindow, profile.maxContext), num_predict: effective }, diagnostics };
+    return { ...(think === undefined ? {} : { think }), options: { num_ctx: requestedContext, num_predict: effective }, diagnostics };
   }
 
   /** A one-token preflight gives the same chat-template/token count that Ollama will use for the actual request. */

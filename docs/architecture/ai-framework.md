@@ -65,18 +65,19 @@ Three optional dedicated tools keep cache access inside its namespace:
 tool call is required to read source, update a plan, finish work, or answer the
 user.
 
-## Automatic compaction assistance
+## Compaction boundary
 
-The existing compaction summary request may append optional, bounded
-`[PROJECT KNOWLEDGE UPDATES]` blocks. Runtime parses only allowlisted cache
-markdown paths, redacts obvious secret assignments, applies updates best-effort,
-and removes the section from the rolling transcript summary. Compaction still
-succeeds if parsing or cache writing fails. Every compaction also stores its
-concise rolling handoff in `tasks/<run-id>.md`; this is supplementary working
-knowledge, not transcript persistence or a completion protocol.
+Compaction does not write or curate `.ai-framework`. Runtime-owned source and
+directory observations continue to update the cache deterministically, while
+the model may make an explicit `project_knowledge_update` for durable facts.
+The compaction request has one job: create a dense factual continuation brief
+for the active Todo. It never asks the model to emit cache-update JSON or
+requires cache persistence as a condition of a successful handoff.
 
-This avoids a second LLM call. It also means accumulated durable knowledge can
-remain on disk after old source reads leave the physical transcript.
+This keeps a rolling transcript summary separate from persistent project
+knowledge. Cached knowledge remains on disk after old source reads leave the
+physical transcript, but it is recalled only through the small catalog or an
+explicit read.
 
 ## Safety, traversal, and persistence
 
@@ -127,13 +128,29 @@ successful mutation increments a monotonic `revision`.
 
 `project_knowledge_read` returns a structured `missing` result for an absent
 logical cache path, with no OS error or alternate root spelling. Repeated
-missing reads short-circuit until the revision changes. The compaction contract
-now requires `<rolling_summary>` plus a JSON array in
-`<project_knowledge_updates>`. It distinguishes durable project facts from
-runtime transport metadata. Generic fallback text never creates a task cache.
+missing reads short-circuit until the revision changes. Generic fallback text
+never creates a task cache.
 
-After compaction and on later requests, runtime injects only materialized
-knowledge, capped at 12K characters: task knowledge, project overview, then
-keyword-relevant architecture/product/module documents. This gives a clean
-first run a path from source research to real cache documents, and lets a
-second run start from actual saved knowledge rather than ghost manifest paths.
+Normal requests contain only the bounded availability catalog: known project
+documents, a small module list, task paths, and fresh/stale source-observation
+counts. They never automatically materialize task, overview, module, or source
+document bodies. The model requests selected bodies with
+`project_knowledge_read`, which supports useful path batches. This avoids
+duplicating a recent raw source result, its observation, and a project overview
+inside the same 32K request.
+
+## Deterministic runtime observations
+
+Semantic extraction is enrichment, not the only ingestion path. A successful
+normal `read_file` now writes a bounded source document containing path,
+fingerprint, read mode, redacted head/tail observation, and empty semantic
+findings/related-areas sections. The same durable mutation updates the source
+manifest entry, task document (objective, active plan labels, investigated
+sources), and observed project overview. `list_directory` adds compact observed
+structure to the overview. Each successful materialized mutation advances the
+manifest revision before the first compaction is required.
+
+Sensitive/internal paths (`.env`, credential/secret/private-key patterns and
+`.ai-framework`) never receive raw observations. Later model-produced semantic
+facts merge into these runtime-created documents rather than replacing the
+observation layer.
