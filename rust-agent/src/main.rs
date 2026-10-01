@@ -60,6 +60,7 @@ fn main() {
                 web_mode: _,
                 policy,
                 history,
+                evidence_dir,
                 task_memory,
                 provider_max_output,
             } => {
@@ -88,6 +89,7 @@ fn main() {
                             RunPolicy::Auto
                         },
                         history,
+                        evidence_dir,
                         task_memory,
                         provider_max_output,
                         cancelled: control.cancelled,

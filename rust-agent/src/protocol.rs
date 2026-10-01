@@ -18,6 +18,8 @@ pub enum Request {
         policy: String,
         #[serde(default)]
         history: Vec<Value>,
+        #[serde(default)]
+        evidence_dir: Option<String>,
         /// Durable semantic findings from an earlier turn of this user task.
         /// This carries Task Memory only; it is never interpreted as a plan.
         #[serde(default)]

@@ -1,15 +1,19 @@
 //! Transcript-first local agent loop.
 //!
-//! The runtime owns transport, capability safety, durable planning and bounded
+//! The runtime owns transport, capability safety, durable evidence and bounded
 //! recovery. It does not certify evidence, decide exploration coverage, or make
 //! semantic completion decisions for the model.
 
 use crate::agent::{
     events::{Event, TailCandidateAttempt},
+    evidence::classify_source_read,
     policy::{self, Reasoning, RunPolicy},
+    research::ResearchController,
     state::AgentState,
-    transcript::{validate_calls, CompactionPlan, Transcript, ValidatedCall},
+    transcript::{validate_calls, CompactionPlan, ToolResultPolicy, Transcript, ValidatedCall},
+    working_evidence,
 };
+use crate::context::evidence_projection::{attach_historical_index, fold_to_budget};
 use crate::context::projection::project;
 use crate::protocol::emit;
 use serde_json::{json, Value};
@@ -34,6 +38,7 @@ pub struct Config {
     pub reasoning_mode: String,
     pub policy: RunPolicy,
     pub history: Vec<Value>,
+    pub evidence_dir: Option<String>,
     pub task_memory: Option<Value>,
     pub provider_max_output: Option<usize>,
     pub cancelled: Arc<AtomicBool>,
@@ -70,14 +75,19 @@ const AGENT_GUIDANCE: &str = r#"
 - Work directly from the conversation and tool results. A tool-free response normally completes the run.
 - For code changes, read before writing, make targeted changes, and run the most relevant practical validation or readback. Adapt after errors; do not invent checks.
 - For substantial tasks, reason about an approach before acting, adapt as you learn, use tools for concrete evidence, avoid broad rereads, and continue until the user's task is complete.
-- Respond and narrate visible reasoning/progress in the user's language. Keep code, identifiers, paths, commands, APIs, and quoted source in their original language.
+- Use the latest user's language for all user-visible natural-language text: streamed reasoning/progress, tool preambles, brief status updates, and the final answer. Follow an explicit language request if present. Keep code, paths, identifiers, commands, API/tool syntax, and literal source quotations in their original form. Do not translate protocol fields.
+- For non-trivial architecture relationships, use a compact multiline Mermaid flowchart when it improves readability, or a properly indented multiline tree. Do not compress a diagram into one long arrow chain; avoid decorative box art.
 - Task Memory = durable semantic continuity for this task. Record meaningful findings, decisions, blockers, and next actions. After compaction, trust a precise Task Memory finding from an unchanged inspected file; reread only for a missing fact, ambiguity, possible change, exact detail, or targeted verification.
+- When a source establishes an important audit finding, use evidence_record with its observation ID and one concise claim. A read or generic Task Memory note is only a lead, not proof that a requested area is understood. Established evidence remains visible after compaction; observation_read is for a specific exact detail or contradiction.
+- Follow a material local execution dependency discovered in inspected source (for example a UI call into a local service) before claiming its end-to-end behavior is understood. The runtime shows open evidence frontiers; close one by inspecting its target or record a concrete blocker. Do not chase unrelated imports.
+- When requested areas have grounded findings and material execution frontiers are closed, begin_finalization marks the shift to synthesis. In the final answer, answer the user's sections directly, distinguish facts from hypotheses, prioritize concrete effects over generic advice, state blocked limits, and avoid duplicate points or meta-progress narration. Treat AI-assisted development claims conservatively; ordinary code style is weak evidence. Then write one user-facing answer from established evidence.
+- For project archaeology with run_terminal, prefer one scoped read-only command such as git -C <project> log --oneline; avoid compound shell wrappers and unsafe pipelines that require approval.
 - Project Knowledge = reusable observations already derived from this project. Use relevant fresh knowledge before broad rereading; source remains authoritative when exact current code or an unresolved detail is needed. It is project-level; Task Memory is task-level.
 - After compaction: use the continuation brief, Task Memory, then relevant Project Knowledge; read source only for genuinely new or verification-specific information.
 - Do not call tools merely because they are available. Stop naturally when the requested work is complete.
 "#;
 
-const SUMMARY_GUIDANCE: &str = r#"Write one dense factual continuation brief for the same task. Preserve the user's goal and constraints; decisions; concrete findings with important files and their roles; meaningful commands and tool outcomes; completed work; the current focus or line of investigation; meaningful unresolved work or questions; blockers or approval-required operations; relevant Task Memory references; relevant Project Knowledge availability; and the next useful action. Distinguish verified facts from hypotheses. Do not repeat raw tool output, runtime mechanics, token counts, cache protocols, generic encouragement, or an activity log. Write only the continuation brief."#;
+const SUMMARY_GUIDANCE: &str = r#"Create an AGENT CONTINUATION CHECKPOINT, not a generic conversation summary. Use these concise headings: Established work; Current focus; Unresolved work; Coverage; Findings and evidence; Blocked or failed operations; Finalization state; Next useful intent. Preserve explicit user constraints and distinguish verified facts from hypotheses. If research is complete or final synthesis has begun, say so explicitly and direct the next context not to restart broad discovery. Do not invent a plan, task IDs, lifecycle, or checklist. Do not repeat raw tool output, token counts, runtime mechanics, generic encouragement, or an activity log."#;
 
 #[derive(Clone, Copy, Debug)]
 pub struct CompactionBudget {
@@ -137,6 +147,9 @@ fn ollama_native_messages(messages: &[Value]) -> Vec<Value> {
             // order/name and expects function arguments as JSON values rather
             // than OpenAI's JSON string convention.
             object.remove("tool_call_id");
+            object.remove("_observation_id");
+            object.remove("_result_policy");
+            object.remove("_rehydration");
             if object.get("role").and_then(Value::as_str) == Some("tool") {
                 object.remove("name");
             }
@@ -175,6 +188,21 @@ fn ollama_native_think(config: &Config) -> Value {
     }
 }
 
+fn wire_messages(messages: &[Value]) -> Vec<Value> {
+    messages
+        .iter()
+        .cloned()
+        .map(|mut message| {
+            if let Some(object) = message.as_object_mut() {
+                object.remove("_observation_id");
+                object.remove("_result_policy");
+                object.remove("_rehydration");
+            }
+            message
+        })
+        .collect()
+}
+
 fn request_payload(
     config: &Config,
     messages: &[Value],
@@ -191,9 +219,10 @@ fn request_payload(
             "options": {"num_ctx": config.context_limit, "num_predict": max_tokens},
         });
     }
+    let wire_messages = wire_messages(messages);
     let mut payload = json!({
         "model": config.model,
-        "messages": messages,
+        "messages": wire_messages,
         "stream": true,
         "stream_options": {"include_usage": true},
         "max_tokens": max_tokens,
@@ -257,6 +286,48 @@ fn request_budget(config: &Config, messages: &[Value], schemas: &[Value]) -> Req
         summary_tokens: estimate_tokens(&Value::Array(summaries)),
         dynamic_tail_tokens: estimate_tokens(&Value::Array(dynamic)),
     }
+}
+
+fn project_evidence(
+    config: &Config,
+    transcript: &Transcript,
+    stable: &str,
+    dynamic: &str,
+) -> Vec<Value> {
+    let mut messages = project(transcript, stable, dynamic);
+    for message in &mut messages {
+        let Some(id) = message.get("_observation_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(meta) = transcript.observation(id) else {
+            continue;
+        };
+        let Some(body) = message.get("content").and_then(Value::as_str) else {
+            continue;
+        };
+        if body.starts_with("[historical tool observation]") {
+            continue;
+        }
+        message["content"] = json!(format!("{body}\n[observation id={} source={} historical_revision={}; use this ID in evidence_record for an established finding]", meta.id, meta.source.as_deref().unwrap_or("none"), meta.source_revision.as_deref().unwrap_or("unknown")));
+    }
+    attach_historical_index(
+        transcript,
+        &mut messages,
+        config.context_limit.saturating_div(20).clamp(1_200, 4_000),
+    );
+    messages
+}
+
+fn fold_evidence_to_target(
+    config: &Config,
+    transcript: &Transcript,
+    schemas: &[Value],
+    messages: &mut [Value],
+) -> Vec<String> {
+    let target = compaction_target_tokens(config.context_limit);
+    fold_to_budget(transcript, messages, target, |candidate| {
+        request_budget(config, candidate, schemas).projected_input_tokens
+    })
 }
 
 fn summary_size_tokens(transcript: &Transcript) -> usize {
@@ -330,6 +401,10 @@ fn budget_error(
 
 fn stable_prefix(config: &Config) -> String {
     let mut prefix = format!("{}\n{}", config.system.trim(), AGENT_GUIDANCE.trim());
+    prefix.push_str(&format!(
+        "\nPreferred visible prose language for this run: {}.",
+        crate::agent::transcript::preferred_visible_language(&config.user)
+    ));
     if let Some(root) = &config.root {
         prefix.push_str("\n<working_directory>");
         prefix.push_str(root);
@@ -338,17 +413,93 @@ fn stable_prefix(config: &Config) -> String {
     prefix
 }
 
-fn dynamic_tail(state: &AgentState, root: Option<&str>) -> String {
+fn lifecycle_label(transcript: &Transcript) -> &'static str {
+    if transcript.is_finalizing() {
+        "finalizing"
+    } else if transcript.is_closeout_requested() {
+        "research_targeted_closeout"
+    } else {
+        "researching"
+    }
+}
+
+fn dynamic_tail(
+    state: &AgentState,
+    root: Option<&str>,
+    objective: &str,
+    transcript: &Transcript,
+    context_window: usize,
+) -> String {
     let mut tail = Vec::new();
-    let memory = state.task_memory.prompt();
+    if transcript.is_finalizing() {
+        tail.push("<runtime_mode>Finalizing: broad investigation is complete. Answer the user's requested sections directly in the preferred visible language. The final answer payload contains only the user-facing report, with no progress narration, promises to continue, or repeated introduction. Use a tool only for a specific unresolved contradiction or critical exact fact.</runtime_mode>".to_owned());
+    }
+    let facts = working_evidence::collect(transcript, &state.task_memory);
+    let evidence_budget = context_window.saturating_div(10).clamp(2_000, 8_000);
+    let (evidence, _) = working_evidence::project(&facts, objective, evidence_budget);
+    if !evidence.is_empty() {
+        tail.push(format!("<established_evidence>\nDirect records cite an observation. Source-associated assistant/task-memory notes are leads, not proof of every clause. Synthesize from established claims and provenance; recover exact bodies only for a specific missing detail or contradiction.\n{evidence}\n</established_evidence>"));
+    }
+    if !transcript.is_finalizing() {
+        let open = transcript
+            .frontiers()
+            .into_iter()
+            .filter(|frontier| {
+                !crate::agent::frontiers::resolved_by_evidence(
+                    frontier,
+                    transcript.observations(),
+                    &facts,
+                ) && !transcript.frontier_dispositions().iter().any(|d| {
+                    d.id == frontier.id && matches!(d.outcome.as_str(), "blocked" | "irrelevant")
+                })
+            })
+            .take(5)
+            .map(|f| {
+                format!(
+                    "{}: {} -> {} [local target: {}; {}] (from {})",
+                    f.id,
+                    f.source,
+                    f.target,
+                    f.resolved_path.as_deref().unwrap_or("unresolved"),
+                    f.resolution.as_deref().unwrap_or("resolution unavailable"),
+                    f.from_observation
+                )
+            })
+            .collect::<Vec<_>>();
+        if !open.is_empty() {
+            tail.push(format!("<open_evidence_frontiers>\n{}\nThese are verified local execution edges, not a task list. Read the listed local target and record a direct finding; use evidence_frontier with the exact frontier ID only for a target-specific failed read or grounded blocker.\n</open_evidence_frontiers>",open.join("\n")));
+        }
+    }
+    let memory = if transcript.is_finalizing() || transcript.is_closeout_requested() {
+        state.task_memory.prompt_for_closeout(objective)
+    } else {
+        state.task_memory.prompt_for(objective)
+    };
     if !memory.is_empty() {
         tail.push(format!("<task_memory>\n{memory}\n</task_memory>"));
     }
-    let knowledge = crate::tools::knowledge::prompt_catalog(root);
-    if !knowledge.is_empty() {
-        tail.push(knowledge);
+    if !transcript.is_finalizing() {
+        let knowledge = crate::tools::knowledge::prompt_catalog(root);
+        if !knowledge.is_empty() {
+            tail.push(knowledge);
+        }
     }
     tail.join("\n")
+}
+
+fn lifecycle_tail(
+    state: &AgentState,
+    root: Option<&str>,
+    objective: &str,
+    transcript: &Transcript,
+    research: &ResearchController,
+    context_window: usize,
+) -> String {
+    let mut tail = dynamic_tail(state, root, objective, transcript, context_window);
+    if transcript.is_closeout_requested() && !transcript.is_finalizing() {
+        tail.push_str(&format!("\n<runtime_closeout>Research remains open only for concrete requested-area gaps: {}. Open material dependencies: {}. For evidence-gathering tools, name one exact closeout_gap and explain the specific closeout_reason. Read a new target or range, recover an existing observation, or give a source-anchored verification reason for an unchanged repeat. Record a direct finding or grounded blocker for the named gap, then synthesize. Earlier broad research next-steps are superseded by this durable phase.</runtime_closeout>", research.missing_areas().join(", "), research.open_frontier_summary()));
+    }
+    tail
 }
 
 fn emit_knowledge_diagnostics(config: &Config, state: &AgentState) {
@@ -390,6 +541,11 @@ fn emit_knowledge_diagnostics(config: &Config, state: &AgentState) {
 fn tool_schemas(has_project_root: bool) -> Vec<Value> {
     let mut tools = vec![
         json!({"type":"function","function":{"name":"task_memory","description":"Durable semantic memory for the current task across compaction. Record/update meaningful findings, decisions, blockers, or unresolved questions; view reads it; invalidate needs id. Record/update requires finding and may include evidence, implication, next, id, supersedes. Trust precise unchanged-file memory; reread only for a concrete missing, ambiguous, changed, exact-detail, or verification need.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["record","update","invalidate","view"]},"id":{"type":"string"},"finding":{"type":"string"},"evidence":{"type":"string"},"implication":{"type":"string"},"next":{"type":"string"},"supersedes":{"type":"string"}},"required":["action"]}}}),
+        json!({"type":"function","function":{"name":"observation_index","description":"List historical tool observations by stable ID, with source and outcome metadata. Use when a needed old observation is no longer in the active prompt.","parameters":{"type":"object","properties":{"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":50}}}}}),
+        json!({"type":"function","function":{"name":"observation_read","description":"Recover a bounded exact slice of a stored historical tool result by observation ID. The response distinguishes historical evidence from current source and reports whether the source changed.","parameters":{"type":"object","properties":{"id":{"type":"string"},"offset_chars":{"type":"integer","minimum":0},"max_chars":{"type":"integer","minimum":1,"maximum":16000}},"required":["id"]}}}),
+        json!({"type":"function","function":{"name":"evidence_record","description":"Preserve one concise finding already established from a specific historical observation. This is evidence for later synthesis, not a plan. Set inference=true when the claim is an interpretation rather than directly visible in the result.","parameters":{"type":"object","properties":{"observation_id":{"type":"string"},"claim":{"type":"string"},"inference":{"type":"boolean"}},"required":["observation_id","claim"]}}}),
+        json!({"type":"function","function":{"name":"evidence_frontier","description":"Use the advertised frontier-... ID (a unique source observation ID is also accepted). Blocked requires a target-specific failed/approval observation. Irrelevant requires reading the actual local target and recording a direct finding first. Unsupported external assertions do not close a verified local target.","parameters":{"type":"object","properties":{"id":{"type":"string"},"outcome":{"type":"string","enum":["blocked","irrelevant"]},"reason":{"type":"string"},"observation_id":{"type":"string"}},"required":["id","outcome","reason"]}}}),
+        json!({"type":"function","function":{"name":"begin_finalization","description":"Mark evidence gathering complete and move to final synthesis. The runtime checks requested-area evidence and returns any genuine gap instead of restarting broad discovery. This is a lifecycle transition, not a task plan.","parameters":{"type":"object","properties":{}}}}),
     ];
     if has_project_root {
         tools.extend([
@@ -397,13 +553,30 @@ fn tool_schemas(has_project_root: bool) -> Vec<Value> {
             json!({"type":"function","function":{"name":"create_file","description":"Create a new project file.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}),
             json!({"type":"function","function":{"name":"delete_file","description":"Delete a project file when allowed.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}),
             json!({"type":"function","function":{"name":"list_directory","description":"List a project directory.","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}),
-            json!({"type":"function","function":{"name":"read_file","description":"Read a project file. Use a line range only when it helps answer a specific question.","parameters":{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1}},"required":["path"]}}}),
+            json!({"type":"function","function":{"name":"read_file","description":"Read up to 64 KiB of a project file. A truncated result provides next_offset_chars; use that offset or a specific line range for more.","parameters":{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1},"offset_chars":{"type":"integer","minimum":0}},"required":["path"]}}}),
             json!({"type":"function","function":{"name":"project_knowledge_index","description":"Read the small .ai-framework manifest index and source freshness map. Use it before repeating broad project orientation.","parameters":{"type":"object","properties":{}}}}),
             json!({"type":"function","function":{"name":"project_knowledge_read","description":"Read selected reusable project observations from .ai-framework: paths is required. Prefer relevant fresh knowledge before broad rereads; do not reread unchanged source only to reconstruct context. Read source for exact current code or a concrete unresolved/verification detail.","parameters":{"type":"object","properties":{"paths":{"type":"array","items":{"type":"string"}}},"required":["paths"]}}}),
             json!({"type":"function","function":{"name":"project_knowledge_update","description":"Optionally persist durable, reusable semantic project knowledge in .ai-framework. This is never required for normal work. Only use project/, modules/, sources/, or tasks/ markdown paths.","parameters":{"type":"object","properties":{"updates":{"type":"array","items":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["replace","merge"]}},"required":["path","content"]}},"source_paths":{"type":"array","items":{"type":"string"}}},"required":["updates"]}}}),
             json!({"type":"function","function":{"name":"run_terminal","description":"Run an existing relevant project command. After code changes, prefer a focused test, typecheck, lint, build, or check when available.","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1}},"required":["command"]}}}),
             json!({"type":"function","function":{"name":"write_file","description":"Write a project file.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}),
         ]);
+    }
+    for schema in &mut tools {
+        let name = tool_name(schema).to_owned();
+        if matches!(
+            name.as_str(),
+            "observation_read" | "read_file" | "project_knowledge_read" | "run_terminal"
+        ) {
+            if let Some(properties) = schema
+                .pointer_mut("/function/parameters/properties")
+                .and_then(Value::as_object_mut)
+            {
+                properties.insert("verification_reason".into(),json!({"type":"string","description":"In Finalizing only: the specific contradiction or exact missing fact being checked."}));
+                if name != "observation_read" {
+                    properties.insert("verification_of".into(),json!({"type":"string","description":"In Finalizing only: stable observation ID grounding this targeted check."}));
+                }
+            }
+        }
     }
     tools.sort_by(|left, right| tool_name(left).cmp(tool_name(right)));
     tools
@@ -419,6 +592,10 @@ fn tool_schemas_for_policy(has_project_root: bool, policy: RunPolicy) -> Vec<Val
             matches!(
                 tool_name(tool),
                 "task_memory"
+                    | "evidence_record"
+                    | "begin_finalization"
+                    | "observation_index"
+                    | "observation_read"
                     | "read_file"
                     | "list_directory"
                     | "project_knowledge_index"
@@ -479,6 +656,38 @@ fn write_task_memory(
             .and_then(Value::as_str)
             .map(str::to_owned),
     )
+}
+
+fn task_memory_conflict(
+    state: &AgentState,
+    transcript: &Transcript,
+    arguments: &Value,
+) -> Option<String> {
+    let replacing = arguments
+        .get("supersedes")
+        .or_else(|| arguments.get("id"))
+        .and_then(Value::as_str)?;
+    let prior = state
+        .task_memory
+        .entries
+        .iter()
+        .find(|e| e.id == replacing && !e.invalidated)?;
+    let cited = transcript
+        .observations()
+        .iter()
+        .find(|o| prior.evidence.contains(&o.id))?;
+    let new_evidence = arguments
+        .get("evidence")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if transcript
+        .observations()
+        .iter()
+        .any(|o| o.id != cited.id && new_evidence.contains(&o.id))
+    {
+        return None;
+    }
+    Some(format!("Potential evidence conflict: {} cites exact historical observation {}. Retrieve that observation with observation_read and cite a verified observation before replacing this finding.", prior.id, cited.id))
 }
 
 fn apply_task_memory(state: &mut AgentState, arguments: &Value) -> Result<(Value, bool), String> {
@@ -549,13 +758,47 @@ fn continuation_tail(content: &str) -> String {
 
 fn continuation_reminder(content: &str) -> String {
     format!(
-        "Continue immediately after the exact ending below. Do not restart, repeat headings, summarize, or reproduce earlier text. If more investigation is needed, use the available tools normally.\n<previous_tail>\n{}\n</previous_tail>",
+        "Continue immediately after the exact ending below. Do not restart, repeat headings, summarize, or reproduce earlier text. Finalization is in progress; use a tool only for a specific unresolved contradiction or critical missing fact.\n<previous_tail>\n{}\n</previous_tail>",
         continuation_tail(content)
     )
 }
 
 fn append_final_text(accumulator: &mut String, delta: &str) {
     accumulator.push_str(delta);
+}
+
+fn can_continue_final_length(transcript: &Transcript, research: &ResearchController) -> bool {
+    !research.has_open_frontiers()
+        && (transcript.is_finalizing()
+            || !research.has_requested_areas()
+            || research.synthesis_ready())
+}
+
+fn can_begin_finalization(research: &ResearchController, facts_count: usize) -> bool {
+    !research.has_open_frontiers()
+        && (research.synthesis_ready() || (!research.has_requested_areas() && facts_count > 0))
+}
+
+fn emit_accepted_final_content(run_id: &str, content: &str) {
+    if !content.is_empty() {
+        emit(
+            run_id,
+            Event::ContentDelta {
+                content: content.to_owned(),
+            },
+        );
+    }
+}
+
+fn emit_status(run_id: &str, content: &str) {
+    if !content.trim().is_empty() {
+        emit(
+            run_id,
+            Event::AgentStatus {
+                content: content.to_owned(),
+            },
+        );
+    }
 }
 
 #[derive(Default)]
@@ -692,6 +935,14 @@ fn append_continuation_text(accumulator: &mut String, continuation: &str) -> Str
     accepted
 }
 
+/// A provider may put its tool syntax in ordinary content without emitting a
+/// structured call. That text is neither an executable call nor a final
+/// answer. Reasoning text is deliberately excluded: a valid structured call
+/// can coexist with a redundant textual rendering in reasoning.
+fn unstructured_tool_call_content(content: &str) -> bool {
+    content.trim_start().starts_with("<tool_call>")
+}
+
 fn needs_compaction(budget: CompactionBudget, projected_input_tokens: usize) -> bool {
     projected_input_tokens > budget.trigger_tokens()
 }
@@ -738,6 +989,100 @@ fn trace_forensics(run_id: &str, kind: &str, data: Value) {
     }
 }
 
+fn trace_projection(run_id: &str, transcript: &Transcript, messages: &[Value], tokens: usize) {
+    let recoveries = messages.iter().filter(|m| ToolResultPolicy::from_message(m) == ToolResultPolicy::Rehydrated)
+        .map(|m| json!({"source_observation_id":m.pointer("/_rehydration/id"),
+            "tool_call_id":m.get("tool_call_id"),"visible_exact_chars":m.get("content").and_then(Value::as_str).map(|s| s.chars().count())}))
+        .collect::<Vec<_>>();
+    let decisions = transcript
+        .observations()
+        .iter()
+        .map(|o| {
+            let result = messages.iter().find(|m| {
+                m.get("role").and_then(Value::as_str) == Some("tool")
+                    && m.get("_observation_id").and_then(Value::as_str) == Some(o.id.as_str())
+            });
+            let disposition = if let Some(m) = result {
+                let content = m.get("content").and_then(Value::as_str).unwrap_or("");
+                if content.starts_with("[historical tool observation]") {
+                    "receipt"
+                } else if content.contains("tool result projection truncated") {
+                    "truncated"
+                } else {
+                    "verbatim"
+                }
+            } else if messages.iter().any(|m| {
+                m.get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| s.contains(&o.id))
+            }) {
+                "index"
+            } else {
+                "covered_index_page"
+            };
+            json!({"event_id":o.event_id,"observation_id":o.id,"tool_call_id":o.call_id,
+            "tool":o.tool,"source":o.source,"revision":o.source_revision,"disposition":disposition})
+        })
+        .collect::<Vec<_>>();
+    trace_forensics(
+        run_id,
+        "projection_decisions",
+        json!({"estimated_tokens":tokens,"observations":decisions,"rehydrated_results":recoveries,
+        "compaction_boundary":transcript.compaction_boundary()}),
+    );
+}
+
+fn record_read_evidence(config: &Config, transcript: &Transcript, tool: &ValidatedCall) {
+    if tool.name == "observation_read" {
+        trace_forensics(
+            &config.run_id,
+            "evidence_replayed",
+            json!({
+                "id":tool.arguments.get("id"),"offset_chars":tool.arguments.get("offset_chars"),
+                "semantic_gain":false,"recoverable":tool.arguments.get("id").and_then(Value::as_str).is_some_and(|id| transcript.read_observation(id,0,1).is_ok())
+            }),
+        );
+        return;
+    }
+    if tool.name != "read_file" {
+        return;
+    }
+    let Some(current) = transcript.observation_for_call(&tool.id) else {
+        return;
+    };
+    let prior = transcript
+        .observations()
+        .iter()
+        .position(|observation| observation.id == current.id)
+        .unwrap_or(0);
+    let kind = classify_source_read(current, transcript.observations()[..prior].iter());
+    trace_forensics(
+        &config.run_id,
+        "source_read",
+        json!({"observation_id":current.id,"source":current.source,
+        "revision":current.source_revision,"range":current.requested_range,"kind":kind}),
+    );
+}
+
+fn tool_turn_is_replay(calls: &[ValidatedCall], transcript: &Transcript) -> bool {
+    !calls.is_empty()
+        && calls.iter().all(|call| match call.name.as_str() {
+            "observation_read" | "observation_index" => true,
+            "read_file" => transcript
+                .observation_for_call(&call.id)
+                .is_some_and(|current| {
+                    let prior = transcript
+                        .observations()
+                        .iter()
+                        .position(|observation| observation.id == current.id)
+                        .unwrap_or(0);
+                    classify_source_read(current, transcript.observations()[..prior].iter())
+                        == "unchanged_duplicate"
+                }),
+            _ => false,
+        })
+}
+
 /// Dependency-free OpenAI-compatible SSE transport. Visible content is emitted
 /// at the delta boundary; finalization never becomes the first visible output.
 fn stream_call(
@@ -746,6 +1091,7 @@ fn stream_call(
     run_id: &str,
     cancelled: &AtomicBool,
     emit_visible: bool,
+    emit_content: bool,
 ) -> Result<StreamedTurn, String> {
     let native_ollama = is_ollama_native_endpoint(endpoint);
     let without = endpoint.trim_start_matches("http://");
@@ -759,6 +1105,7 @@ fn stream_call(
         run_id,
         "provider_request",
         json!({
+            "payload":payload,
             "payload_chars":body.len(),
             "message_roles":payload.pointer("/messages").and_then(Value::as_array).map(|messages| messages.iter().filter_map(|message| message.get("role").and_then(Value::as_str)).collect::<Vec<_>>()),
             "tool_choice":payload.get("tool_choice"),
@@ -879,7 +1226,14 @@ fn stream_call(
                 .read_exact(&mut crlf)
                 .map_err(|error| error.to_string())?;
             buffer.push_str(&String::from_utf8_lossy(&bytes));
-            consume_transport_buffer(&mut buffer, &mut turn, run_id, emit_visible, native_ollama)?;
+            consume_transport_buffer(
+                &mut buffer,
+                &mut turn,
+                run_id,
+                emit_visible,
+                emit_content,
+                native_ollama,
+            )?;
         }
     } else {
         let mut bytes = [0_u8; 8192];
@@ -903,7 +1257,14 @@ fn stream_call(
                 break;
             }
             buffer.push_str(&String::from_utf8_lossy(&bytes[..count]));
-            consume_transport_buffer(&mut buffer, &mut turn, run_id, emit_visible, native_ollama)?;
+            consume_transport_buffer(
+                &mut buffer,
+                &mut turn,
+                run_id,
+                emit_visible,
+                emit_content,
+                native_ollama,
+            )?;
         }
     }
     // Some OpenAI-compatible local servers close the connection immediately
@@ -920,7 +1281,14 @@ fn stream_call(
         } else {
             buffer.push_str("\n\n");
         }
-        consume_transport_buffer(&mut buffer, &mut turn, run_id, emit_visible, native_ollama)?;
+        consume_transport_buffer(
+            &mut buffer,
+            &mut turn,
+            run_id,
+            emit_visible,
+            emit_content,
+            native_ollama,
+        )?;
     }
     trace_forensics(
         run_id,
@@ -940,12 +1308,13 @@ fn consume_transport_buffer(
     turn: &mut StreamedTurn,
     run_id: &str,
     emit_visible: bool,
+    emit_content: bool,
     native_ollama: bool,
 ) -> Result<(), String> {
     if native_ollama {
-        consume_ollama_ndjson(buffer, turn, run_id, emit_visible)
+        consume_ollama_ndjson(buffer, turn, run_id, emit_visible, emit_content)
     } else {
-        consume_sse(buffer, turn, run_id, emit_visible)
+        consume_sse(buffer, turn, run_id, emit_visible, emit_content)
     }
 }
 
@@ -954,6 +1323,7 @@ fn consume_ollama_ndjson(
     turn: &mut StreamedTurn,
     run_id: &str,
     emit_visible: bool,
+    emit_content: bool,
 ) -> Result<(), String> {
     while let Some(end) = buffer.find('\n') {
         let line = buffer[..end].trim().to_owned();
@@ -994,7 +1364,7 @@ fn consume_ollama_ndjson(
         }
         if let Some(content) = value.pointer("/message/content").and_then(Value::as_str) {
             turn.content.push_str(content);
-            if emit_visible {
+            if emit_content {
                 emit(
                     run_id,
                     Event::ContentDelta {
@@ -1043,6 +1413,7 @@ fn consume_sse(
     turn: &mut StreamedTurn,
     run_id: &str,
     emit_visible: bool,
+    emit_content: bool,
 ) -> Result<(), String> {
     while let Some(end) = buffer.find("\n\n") {
         let block = buffer[..end].replace('\r', "");
@@ -1054,7 +1425,10 @@ fn consume_sse(
             if line == "[DONE]" {
                 continue;
             }
-            trace_forensics(run_id, "raw_sse", json!({"data":line}));
+            // This trace is explicitly opt-in. Keep the exact frame: lengths
+            // alone cannot distinguish textual tool markup from a structured
+            // tool-call delta in a historical protocol failure.
+            trace_forensics(run_id, "raw_sse_frame", json!({"frame":line}));
             let value: Value =
                 serde_json::from_str(line).map_err(|error| format!("invalid SSE JSON: {error}"))?;
             if let Some(usage) = value.get("usage") {
@@ -1117,7 +1491,7 @@ fn consume_sse(
                 trace_forensics(
                     run_id,
                     "parsed_reasoning_delta",
-                    json!({"content":reasoning}),
+                    json!({"chars":reasoning.chars().count()}),
                 );
                 if !turn.thinking_started {
                     turn.thinking_started = true;
@@ -1140,9 +1514,13 @@ fn consume_sse(
                 .and_then(|delta| delta.get("content"))
                 .and_then(Value::as_str)
             {
-                trace_forensics(run_id, "parsed_content_delta", json!({"content":content}));
+                trace_forensics(
+                    run_id,
+                    "parsed_content_delta",
+                    json!({"chars":content.chars().count()}),
+                );
                 turn.content.push_str(content);
-                if emit_visible {
+                if emit_content {
                     emit(
                         run_id,
                         Event::ContentDelta {
@@ -1155,7 +1533,11 @@ fn consume_sse(
                 .and_then(|delta| delta.get("tool_calls"))
                 .and_then(Value::as_array)
             {
-                trace_forensics(run_id, "parsed_tool_delta", json!({"calls":calls}));
+                trace_forensics(
+                    run_id,
+                    "parsed_tool_delta",
+                    json!({"calls":calls.len(),"names":calls.iter().filter_map(|call| call.pointer("/function/name").and_then(Value::as_str)).collect::<Vec<_>>()}),
+                );
                 for call in calls {
                     let index = call
                         .get("index")
@@ -1242,7 +1624,7 @@ fn summarize_span(config: &Config, plan: &CompactionPlan) -> SummaryResult {
         "stream": true,
         "max_tokens": max_tokens,
     });
-    match stream_call(&config.endpoint, &payload, &config.run_id, &config.cancelled, false) {
+    match stream_call(&config.endpoint, &payload, &config.run_id, &config.cancelled, false, false) {
         Ok(turn) if !turn.content.trim().is_empty() => {
             let text = turn.content.trim().to_owned();
             SummaryResult {
@@ -1263,6 +1645,79 @@ fn summarize_span(config: &Config, plan: &CompactionPlan) -> SummaryResult {
 
 fn summary_source(plan: &CompactionPlan, max_chars: usize) -> String {
     plan.render(max_chars)
+}
+
+fn continuation_checkpoint(transcript: &Transcript, generated: String) -> String {
+    if transcript.is_finalizing() {
+        return format!("[AGENT CONTINUATION CHECKPOINT — NOT USER CONTENT]\nPreferred visible prose language: {}.\nPhase: FINALIZING (authoritative durable runtime state). Broad research is complete. Continue the single final response from the established evidence and recent exact tail. Earlier research next-steps and summary prose are not instructions. Verify only a specific contradiction or critical missing exact fact; merge overlapping conclusions and state each once.", transcript.language_preference());
+    }
+    let objective = transcript
+        .entries()
+        .iter()
+        .rev()
+        .find_map(|entry| match entry {
+            crate::agent::transcript::Entry::RunUser(message) => {
+                message.get("content").and_then(Value::as_str)
+            }
+            _ => None,
+        })
+        .unwrap_or("Continue the current user task.");
+    let objective_length = objective.chars().count();
+    let objective = if objective_length > 12_000 {
+        format!(
+            "{}\n[Checkpoint excerpt: {} of {} characters. The exact objective is separately projected as the current user message.]",
+            objective.chars().take(12_000).collect::<String>(),
+            12_000,
+            objective_length
+        )
+    } else {
+        objective.to_owned()
+    };
+    let headings = [
+        "Established work",
+        "Current focus",
+        "Unresolved work",
+        "Coverage",
+        "Findings and evidence",
+        "Blocked or failed operations",
+        "Finalization state",
+        "Next useful intent",
+    ];
+    let prior = transcript
+        .latest_summary()
+        .map(|(summary, _)| summary)
+        .unwrap_or_default();
+    let mut state = generated;
+    for heading in headings {
+        if state
+            .to_ascii_lowercase()
+            .contains(&heading.to_ascii_lowercase())
+        {
+            continue;
+        }
+        if let Some(value) = checkpoint_section(prior, heading, &headings) {
+            state.push_str(&format!("\n\n{heading}:\n{value}"));
+        }
+    }
+    let lifecycle = if transcript.is_closeout_requested() {
+        "\nRuntime closeout request (authoritative): remain in research only for concrete requested-area evidence gaps or an open material frontier. Earlier broad research next-steps do not override this targeted gap review. Once those gaps are grounded, transition to final synthesis."
+    } else {
+        ""
+    };
+    format!("[AGENT CONTINUATION CHECKPOINT — NOT USER CONTENT]\nPreferred visible prose language: {}.\nOriginal user objective and constraints (the separately projected current user message is authoritative):\n{objective}\n\nProcedural and factual continuation state:\n{state}{lifecycle}\n\nUse this checkpoint to continue the current line of work. Do not restart broad project discovery unless a specific missing or changed fact requires it.", transcript.language_preference())
+}
+
+fn checkpoint_section<'a>(text: &'a str, heading: &str, headings: &[&str]) -> Option<&'a str> {
+    let start = text.find(heading)? + heading.len();
+    let remainder = text[start..].trim_start_matches([':', '\n', ' ']);
+    let end = headings
+        .iter()
+        .filter(|candidate| **candidate != heading)
+        .filter_map(|candidate| remainder.find(candidate))
+        .min()
+        .unwrap_or(remainder.len());
+    let value = remainder[..end].trim();
+    (!value.is_empty()).then_some(value)
 }
 
 struct CompactionReport {
@@ -1386,16 +1841,50 @@ fn compact_once(
     let covers = plan.covers;
     let before_budget = request_budget(
         config,
-        &project(transcript, &stable_prefix(config), dynamic_tail),
+        &project_evidence(config, transcript, &stable_prefix(config), dynamic_tail),
         schemas,
     );
     let entries_before = transcript.entries().len();
     let messages_summarized = plan.message_count();
     let messages_retained = plan.retained_message_count();
-    let summary = summarize_span(config, &plan);
-    let summary_output_chars = summary.text.chars().count();
-    transcript.compact(summary.text, covers);
-    let mut messages = project(transcript, &stable_prefix(config), dynamic_tail);
+    let summary = if transcript.is_finalizing() {
+        SummaryResult {
+            text: String::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+        }
+    } else {
+        summarize_span(config, &plan)
+    };
+    let checkpoint = continuation_checkpoint(transcript, summary.text);
+    let summary_output_chars = checkpoint.chars().count();
+    trace_forensics(
+        &config.run_id,
+        "compaction_checkpoint",
+        json!({
+            "covered_entries": covers,
+            "summarized_messages": messages_summarized,
+            "retained_messages": messages_retained,
+            "checkpoint_chars": summary_output_chars,
+            "summary_input_tokens": summary.input_tokens,
+            "summary_output_tokens": summary.output_tokens,
+            "target_tokens": compaction_target_tokens(config.context_limit),
+            "lifecycle_before":lifecycle_label(transcript),
+        }),
+    );
+    transcript.compact(checkpoint, covers);
+    trace_forensics(
+        &config.run_id,
+        "compaction_lifecycle",
+        json!({"lifecycle_after":lifecycle_label(transcript),"boundary":covers}),
+    );
+    let mut messages = project_evidence(config, transcript, &stable_prefix(config), dynamic_tail);
+    let folded = fold_evidence_to_target(config, transcript, schemas, &mut messages);
+    trace_forensics(
+        &config.run_id,
+        "projection_folding",
+        json!({"observations":folded,"reason":"after_semantic_compaction"}),
+    );
     let emergency_tool_result_truncation =
         truncate_retained_tool_result_to_fit(config, schemas, &mut messages);
     let after_budget = request_budget(config, &messages, schemas);
@@ -1452,7 +1941,12 @@ fn select_fit_aware_compaction_plan(
         };
         let mut projected_transcript = transcript.clone();
         projected_transcript.compact(summary_fit_reserve(), plan.covers);
-        let messages = project(&projected_transcript, &stable_prefix(config), dynamic_tail);
+        let mut messages = project(&projected_transcript, &stable_prefix(config), dynamic_tail);
+        attach_historical_index(
+            transcript,
+            &mut messages,
+            config.context_limit.saturating_div(2).min(32_000),
+        );
         let budget = request_budget(config, &messages, schemas);
         let fits = budget.projected_input_tokens <= compaction_target_tokens(config.context_limit);
         attempts.push(TailCandidateAttempt {
@@ -1501,16 +1995,24 @@ fn truncate_retained_tool_result_to_fit(
             .iter()
             .enumerate()
             .filter(|(_, message)| message.get("role").and_then(Value::as_str) == Some("tool"))
+            .filter(|(_, message)| {
+                ToolResultPolicy::from_message(message) != ToolResultPolicy::Rehydrated
+            })
             .filter_map(|(index, message)| {
                 message
                     .get("content")
                     .and_then(Value::as_str)
-                    .filter(|content| content != &TOOL_RESULT_TRUNCATION_MARKER)
+                    .filter(|content| !content.starts_with(TOOL_RESULT_TRUNCATION_MARKER))
                     .map(|content| (index, content.to_owned()))
             })
             .max_by_key(|(_, content)| content.chars().count())?;
         let original_chars = original.chars().count();
         let original_tokens = estimate_tokens(&json!(original));
+        let recovery = messages[index]
+            .get("_observation_id")
+            .and_then(Value::as_str)
+            .map(|id| format!("\nExact historical result: observation_read(id=\"{id}\")."))
+            .unwrap_or_default();
         // First try to retain as much as possible from this largest result.
         // If it alone cannot bring the projection under the target, collapse
         // it and continue with the next largest result.  Tool messages stay
@@ -1520,7 +2022,7 @@ fn truncate_retained_tool_result_to_fit(
         let mut best = None;
         while low <= high {
             let middle = low + (high - low) / 2;
-            let candidate = truncate_tool_result_content(&original, middle);
+            let candidate = truncate_tool_result_content(&original, middle, &recovery);
             messages[index]["content"] = Value::String(candidate.clone());
             if request_budget(config, messages, schemas).projected_input_tokens <= target {
                 best = Some(candidate);
@@ -1531,7 +2033,8 @@ fn truncate_retained_tool_result_to_fit(
                 high = middle - 1;
             }
         }
-        let projected = best.unwrap_or_else(|| truncate_tool_result_content(&original, 0));
+        let projected =
+            best.unwrap_or_else(|| truncate_tool_result_content(&original, 0, &recovery));
         messages[index]["content"] = Value::String(projected.clone());
         diagnostic = Some(EmergencyToolResultTruncation {
             original_tokens,
@@ -1552,25 +2055,26 @@ fn truncate_retained_tool_result_to_fit(
     })
 }
 
-fn truncate_tool_result_content(content: &str, target_chars: usize) -> String {
+fn truncate_tool_result_content(content: &str, target_chars: usize, recovery: &str) -> String {
     if content.chars().count() <= target_chars {
         return content.to_owned();
     }
-    let marker_chars = TOOL_RESULT_TRUNCATION_MARKER.chars().count();
+    let marker_chars = TOOL_RESULT_TRUNCATION_MARKER.chars().count() + recovery.chars().count();
     if target_chars <= marker_chars {
-        return TOOL_RESULT_TRUNCATION_MARKER.to_owned();
+        return format!("{TOOL_RESULT_TRUNCATION_MARKER}{recovery}");
     }
     let preserved = target_chars.saturating_sub(marker_chars);
     let head = preserved / 2;
     let tail = preserved.saturating_sub(head);
     let chars = content.chars().collect::<Vec<_>>();
     format!(
-        "{}{}{}",
+        "{}{}{}{}",
         chars[..head].iter().collect::<String>(),
         TOOL_RESULT_TRUNCATION_MARKER,
         chars[chars.len().saturating_sub(tail)..]
             .iter()
-            .collect::<String>()
+            .collect::<String>(),
+        recovery
     )
 }
 
@@ -1863,18 +2367,111 @@ fn add_soft_closeout_if_needed(state: &mut AgentState, transcript: &mut Transcri
     true
 }
 
-pub fn run(config: Config) {
-    let mut transcript = Transcript::default();
-    for message in config.history.clone() {
-        transcript.push_message(message);
+enum FinalCandidateReview {
+    Accept,
+    ValidationPending,
+    EvidenceGap(String),
+}
+
+fn review_tool_free_final(
+    state: &mut AgentState,
+    transcript: &mut Transcript,
+    research: &mut ResearchController,
+) -> FinalCandidateReview {
+    if transcript.is_finalizing() && !research.has_open_frontiers() {
+        return FinalCandidateReview::Accept;
     }
-    transcript.push_run_user(json!({"role":"user", "content":config.user}));
+    if add_soft_closeout_if_needed(state, transcript) {
+        return FinalCandidateReview::ValidationPending;
+    }
+    if let Some(nudge) = research.final_nudge(
+        !transcript.observations().is_empty(),
+        transcript.is_finalizing(),
+    ) {
+        return FinalCandidateReview::EvidenceGap(nudge);
+    }
+    if research.has_open_frontiers()
+        || (research.has_requested_areas() && !research.synthesis_ready())
+    {
+        return FinalCandidateReview::EvidenceGap(format!(
+            "Final answer remains blocked by requested evidence gaps: {}. Open execution dependencies: {}. Resolve these exact gaps or record a grounded target-specific blocker.",
+            research.missing_areas().join(", "),
+            research.open_frontier_summary()
+        ));
+    }
+    transcript.mark_finalizing();
+    FinalCandidateReview::Accept
+}
+
+/// Coverage is assessed by ResearchController; only this runtime transition
+/// owns the durable phase. A new read without a new established finding does
+/// not indefinitely postpone a ready synthesis.
+fn advance_lifecycle(
+    transcript: &mut Transcript,
+    research: &ResearchController,
+) -> Option<&'static str> {
+    if transcript.is_finalizing() {
+        return None;
+    }
+    if transcript.is_closeout_requested() && research.synthesis_ready() {
+        transcript.mark_finalizing();
+        return Some("targeted_closeout_gaps_satisfied");
+    }
+    if research.closeout_candidate() && !transcript.is_closeout_requested() {
+        transcript.mark_closeout_requested();
+        return Some("grounded_coverage_with_specific_remaining_gaps");
+    }
+    if transcript.last_tool_turn_gained_evidence() {
+        return None;
+    }
+    if research.synthesis_ready() {
+        transcript.mark_finalizing();
+        Some("established_coverage_without_new_semantic_evidence")
+    } else {
+        None
+    }
+}
+
+pub fn run(config: Config) {
+    let mut transcript = if let Some(dir) = &config.evidence_dir {
+        match Transcript::durable(
+            &PathBuf::from(dir),
+            &config.run_id,
+            &config.history,
+            config.root.as_deref(),
+        ) {
+            Ok(transcript) => transcript,
+            Err(error) => {
+                emit(
+                    &config.run_id,
+                    Event::AgentError {
+                        code: "evidence_store".into(),
+                        message: error,
+                    },
+                );
+                return;
+            }
+        }
+    } else {
+        let mut transcript = Transcript::default();
+        transcript.set_project_root(config.root.as_deref().map(std::path::Path::new));
+        for message in config.history.clone() {
+            transcript.push_message(message);
+        }
+        transcript
+    };
+    if !transcript.has_current_run_user(&config.user) {
+        transcript.push_run_user(json!({"role":"user", "content":config.user}));
+    }
     let mut state = AgentState::default();
+    let mut research =
+        ResearchController::with_depth(&config.user, config.reasoning_mode == "deep");
     state.task_memory = config
         .task_memory
         .as_ref()
         .and_then(|memory| serde_json::from_value(memory.clone()).ok())
         .unwrap_or_default();
+    research.refresh_from_memory(&state.task_memory, transcript.observations());
     if let Some(root) = config.root.as_deref() {
         let _ = crate::tools::knowledge::bootstrap(&PathBuf::from(root));
     }
@@ -1895,6 +2492,7 @@ pub fn run(config: Config) {
     // An emergency tool-result reduction belongs only to the next provider
     // projection. The append-only transcript remains verbatim.
     let mut pending_fitted_projection: Option<Vec<Value>> = None;
+    let mut previous_tool_turn_replayed = false;
 
     emit(
         &config.run_id,
@@ -1904,6 +2502,16 @@ pub fn run(config: Config) {
     );
     emit_knowledge_diagnostics(&config, &state);
     for turn in 0..128_usize {
+        if let Some(error) = transcript.storage_error() {
+            emit(
+                &config.run_id,
+                Event::AgentError {
+                    code: "evidence_store".into(),
+                    message: error.into(),
+                },
+            );
+            return;
+        }
         if config.cancelled.load(Ordering::Relaxed) {
             emit(
                 &config.run_id,
@@ -1918,8 +2526,64 @@ pub fn run(config: Config) {
                 transcript.push_steering(content);
             }
         }
-        let request_schemas = &schemas;
-        let dynamic = dynamic_tail(&state, config.root.as_deref());
+        let facts = working_evidence::collect(&transcript, &state.task_memory);
+        research.refresh_from_evidence(&state.task_memory, transcript.observations(), &facts);
+        research.refresh_frontiers(
+            &transcript.frontiers(),
+            &transcript.frontier_dispositions(),
+            transcript.observations(),
+            &facts,
+        );
+        let semantic_gain = transcript.last_tool_turn_gained_evidence();
+        if let Some(reason) = advance_lifecycle(&mut transcript, &research) {
+            trace_forensics(
+                &config.run_id,
+                "lifecycle_transition",
+                json!({"state":lifecycle_label(&transcript),"reason":reason,"turn":turn+1,"evidence_count":facts.len(),"coverage":research.trace(),"last_tool_turn_semantic_gain":semantic_gain,"last_tool_turn_replay_only":previous_tool_turn_replayed}),
+            );
+        }
+        // Sibling calls in this assistant turn use the phase advertised in
+        // this request, even if one call changes the durable phase mid-turn.
+        let closeout_at_request = transcript.is_closeout_requested() && !transcript.is_finalizing();
+        let finalizing_schemas = if transcript.is_finalizing() {
+            schemas
+                .iter()
+                .filter(|schema| {
+                    crate::agent::lifecycle::advertise_in_finalizing(tool_name(schema))
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let closeout_schemas = if closeout_at_request {
+            crate::agent::lifecycle::closeout_schemas(&schemas, &research.closeout_targets())
+        } else {
+            Vec::new()
+        };
+        let request_schemas = if transcript.is_finalizing() {
+            &finalizing_schemas
+        } else if closeout_at_request {
+            &closeout_schemas
+        } else {
+            &schemas
+        };
+        let dynamic = lifecycle_tail(
+            &state,
+            config.root.as_deref(),
+            &config.user,
+            &transcript,
+            &research,
+            config.context_limit,
+        );
+        let evidence_budget = config.context_limit.saturating_div(10).clamp(2_000, 8_000);
+        let (evidence_text, evidence_ids) =
+            working_evidence::project(&facts, &config.user, evidence_budget);
+        trace_forensics(
+            &config.run_id,
+            "evidence_projection",
+            json!({"turn":turn+1,"facts":facts.len(),"projected_ids":evidence_ids,"projected_chars":evidence_text.chars().count(),"budget_chars":evidence_budget,"lifecycle":lifecycle_label(&transcript),"coverage":research.trace(),"semantic_gain_last_turn":semantic_gain}),
+        );
         let pending_tail = transcript.pending_tail(&dynamic);
         let sent_tail = if transcript.has_active_prompt_tail(&pending_tail) {
             String::new()
@@ -1928,13 +2592,28 @@ pub fn run(config: Config) {
         };
         let mut messages = pending_fitted_projection
             .take()
-            .unwrap_or_else(|| project(&transcript, &stable, &sent_tail));
+            .unwrap_or_else(|| project_evidence(&config, &transcript, &stable, &sent_tail));
         let before_budget = request_budget(&config, &messages, request_schemas);
+        let folded = if needs_compaction(budget, before_budget.projected_input_tokens) {
+            fold_evidence_to_target(&config, &transcript, request_schemas, &mut messages)
+        } else {
+            Vec::new()
+        };
+        if !folded.is_empty() {
+            trace_forensics(
+                &config.run_id,
+                "projection_folding",
+                json!({
+                    "turn":turn+1,"observations":folded,"before_tokens":before_budget.projected_input_tokens,
+                    "after_tokens":request_budget(&config, &messages, request_schemas).projected_input_tokens
+                }),
+            );
+        }
         let requested_max_output = config
             .provider_max_output
             .unwrap_or(APPLICATION_MAX_OUTPUT_TOKENS)
             .min(APPLICATION_MAX_OUTPUT_TOKENS);
-        let mut current_budget = before_budget;
+        let mut current_budget = request_budget(&config, &messages, request_schemas);
         let mut output_limit = dynamic_output_limit(
             config.context_limit,
             current_budget.projected_input_tokens,
@@ -2017,6 +2696,7 @@ pub fn run(config: Config) {
             return;
         }
         let projected = current_budget.projected_input_tokens;
+        trace_projection(&config.run_id, &transcript, &messages, projected);
         let payload = request_payload(&config, &messages, request_schemas, output_limit);
         trace_forensics(
             &config.run_id,
@@ -2024,8 +2704,9 @@ pub fn run(config: Config) {
             json!({
                 "turn":turn + 1,
                 "projected_input_tokens":projected,
-                "dynamic_tail":dynamic,
-                "task_memory":state.task_memory.prompt(),
+                "dynamic_tail_chars":dynamic.chars().count(),
+                "task_memory_entries":state.task_memory.entries.iter().filter(|entry| !entry.invalidated).count(),
+                "lifecycle":lifecycle_label(&transcript),
                 "compaction_boundary":transcript.compaction_boundary(),
                 "message_shape":request_shape(&messages),
             }),
@@ -2109,6 +2790,7 @@ pub fn run(config: Config) {
             &config.run_id,
             &config.cancelled,
             !continuation_pending,
+            false,
         ) {
             Ok(streamed) => {
                 overflow_attempts = 0;
@@ -2136,7 +2818,7 @@ pub fn run(config: Config) {
                 let Some(report) = compact_once(
                     &config,
                     &mut transcript,
-                    &schemas,
+                    request_schemas,
                     before,
                     keep,
                     "context_overflow_retry",
@@ -2195,14 +2877,6 @@ pub fn run(config: Config) {
             }
         };
         let was_continuation = continuation_pending;
-        if was_continuation {
-            let accepted = append_continuation_text(&mut final_content, &streamed.content);
-            streamed.content = accepted.clone();
-            if !accepted.is_empty() {
-                emit(&config.run_id, Event::ContentDelta { content: accepted });
-            }
-            continuation_pending = false;
-        }
         if streamed.thinking_started {
             emit(&config.run_id, Event::ThinkingFinished);
         }
@@ -2254,7 +2928,52 @@ pub fn run(config: Config) {
             }
         };
         if calls.is_empty() {
+            if unstructured_tool_call_content(&streamed.content) {
+                transcript.assistant_withheld_draft(
+                    streamed.content,
+                    "unstructured provider tool-call markup",
+                );
+                emit(
+                    &config.run_id,
+                    Event::ToolError {
+                        id: "protocol".into(),
+                        name: "tool_protocol".into(),
+                        message: "The provider emitted tool-call markup as ordinary content; no structured tool call was executed".into(),
+                    },
+                );
+                transcript.remind("The previous response contained textual tool-call markup, which was not executed. Emit a complete structured tool call, or answer normally without tool markup.".into());
+                continue;
+            }
+            if was_continuation && can_continue_final_length(&transcript, &research) {
+                let accepted = append_continuation_text(&mut final_content, &streamed.content);
+                streamed.content = accepted.clone();
+                emit_accepted_final_content(&config.run_id, &accepted);
+                continuation_pending = false;
+            }
+            trace_forensics(
+                &config.run_id,
+                "final_attempt",
+                json!({"turn":turn+1,"finish_reason":streamed.finish_reason,"phase":lifecycle_label(&transcript),"coverage":research.trace(),"ready":research.synthesis_ready(),"continuation_pending":was_continuation}),
+            );
             if streamed.finish_reason == "length" {
+                if !can_continue_final_length(&transcript, &research) {
+                    transcript.assistant_withheld_draft(
+                        streamed.content,
+                        "incomplete final with requested evidence gaps",
+                    );
+                    transcript.mark_closeout_requested();
+                    let nudge=research.final_nudge(!transcript.observations().is_empty(),false).unwrap_or_else(|| format!("The attempted final answer still lacks direct findings for: {}. Open material dependencies: {}. Resolve only those concrete gaps or state a grounded blocker before synthesizing.",research.missing_areas().join(", "),research.open_frontier_summary()));
+                    transcript.remind(nudge);
+                    trace_forensics(
+                        &config.run_id,
+                        "finalization_decision",
+                        json!({"decision":"withhold_incomplete_length_draft","coverage":research.trace(),"phase":lifecycle_label(&transcript)}),
+                    );
+                    continue;
+                }
+                if !was_continuation {
+                    emit_accepted_final_content(&config.run_id, &streamed.content);
+                }
                 if !was_continuation {
                     append_final_text(&mut final_content, &streamed.content);
                 }
@@ -2275,6 +2994,12 @@ pub fn run(config: Config) {
                 }
                 continuation_count += 1;
                 continuation_pending = true;
+                transcript.mark_finalizing();
+                trace_forensics(
+                    &config.run_id,
+                    "finalization_transition",
+                    json!({"state":"finalizing","turn":turn+1}),
+                );
                 transcript.remind(continuation_reminder(&final_content));
                 emit(
                     &config.run_id,
@@ -2287,14 +3012,60 @@ pub fn run(config: Config) {
                 );
                 continue;
             }
+            match review_tool_free_final(&mut state, &mut transcript, &mut research) {
+                FinalCandidateReview::ValidationPending => {
+                    transcript.assistant_withheld_draft(streamed.content, "pending validation");
+                    continue;
+                }
+                FinalCandidateReview::EvidenceGap(nudge) => {
+                    transcript.mark_closeout_requested();
+                    trace_forensics(
+                        &config.run_id,
+                        "research_controller",
+                        json!({"decision":"evidence_gap","final_attempt":true,"state":research.trace()}),
+                    );
+                    transcript
+                        .assistant_withheld_draft(streamed.content, "a specific evidence gap");
+                    transcript.remind(nudge);
+                    continue;
+                }
+                FinalCandidateReview::Accept => {}
+            }
+            if !was_continuation {
+                emit_accepted_final_content(&config.run_id, &streamed.content);
+            }
             if !was_continuation {
                 append_final_text(&mut final_content, &streamed.content);
             }
-            if add_soft_closeout_if_needed(&mut state, &mut transcript) {
-                transcript.assistant_message(streamed.content);
-                continue;
-            }
             transcript.assistant_message(streamed.content);
+            transcript.mark_run_complete();
+            trace_forensics(
+                &config.run_id,
+                "finalization_transition",
+                json!({"state":"complete","turn":turn+1}),
+            );
+            if let Some(error) = transcript.storage_error() {
+                emit(
+                    &config.run_id,
+                    Event::AgentError {
+                        code: "evidence_store".into(),
+                        message: error.into(),
+                    },
+                );
+                return;
+            }
+            if let Err(error) =
+                transcript.finish_durable(&config.history, &config.user, &final_content)
+            {
+                emit(
+                    &config.run_id,
+                    Event::AgentError {
+                        code: "evidence_store".into(),
+                        message: error,
+                    },
+                );
+                return;
+            }
             emit(
                 &config.run_id,
                 Event::Final {
@@ -2306,16 +3077,21 @@ pub fn run(config: Config) {
             );
             return;
         }
+        emit_status(&config.run_id, &streamed.content);
         let canonical_content = streamed.content.clone();
+        // Coverage is updated only from a Task Memory entry that cites a real
+        // observation. Read novelty is recorded after the tool result exists.
         transcript.assistant_tool_turn(streamed.content, &calls);
         trace_forensics(
             &config.run_id,
             "canonical_assistant_tool_turn",
-            json!({"content":canonical_content,"calls":calls.iter().map(ValidatedCall::wire).collect::<Vec<_>>() }),
+            json!({"content_chars":canonical_content.chars().count(),"calls":calls.iter().map(|call| json!({"id":call.id,"name":call.name})).collect::<Vec<_>>() }),
         );
         let mut call_index = 0_usize;
         while call_index < calls.len() {
-            if safe_read_only_tool(&calls[call_index].name)
+            if !transcript.is_finalizing()
+                && !closeout_at_request
+                && safe_read_only_tool(&calls[call_index].name)
                 && schemas
                     .iter()
                     .any(|schema| tool_name(schema) == calls[call_index].name)
@@ -2383,7 +3159,15 @@ pub fn run(config: Config) {
                                     diff,
                                 },
                             );
-                            transcript.tool_result(&tool.id, &tool.name, content);
+                            transcript.tool_result(&tool.id, &tool.name, content.clone());
+                            for frontier in transcript.discover_frontiers(&tool.id, &content) {
+                                trace_forensics(
+                                    &config.run_id,
+                                    "evidence_frontier",
+                                    json!({"id":frontier.id,"source":frontier.source,"target":frontier.target,"state":"discovered"}),
+                                );
+                            }
+                            record_read_evidence(&config, &transcript, tool);
                         }
                         Err(message) => {
                             emit(
@@ -2399,6 +3183,7 @@ pub fn run(config: Config) {
                                 &tool.name,
                                 concise_tool_error(&message),
                             );
+                            record_read_evidence(&config, &transcript, tool);
                         }
                     }
                 }
@@ -2436,7 +3221,71 @@ pub fn run(config: Config) {
                 transcript.tool_result(&tool.id, &tool.name, concise_tool_error(&message));
                 continue;
             }
-            if policy::requires_approval(config.policy, &tool.name, &tool.arguments) {
+            if closeout_at_request && !transcript.is_finalizing() {
+                if let Err(message) = crate::agent::lifecycle::closeout_decision(
+                    tool,
+                    &transcript,
+                    &research,
+                    config.root.as_deref().map(std::path::Path::new),
+                ) {
+                    trace_forensics(
+                        &config.run_id,
+                        "closeout_decision",
+                        json!({"decision":"redirected","tool":tool.name,"reason":message,"remaining":research.closeout_targets()}),
+                    );
+                    emit(
+                        &config.run_id,
+                        Event::ToolError {
+                            id: tool.id.clone(),
+                            name: tool.name.clone(),
+                            message: message.clone(),
+                        },
+                    );
+                    transcript.inline_tool_result(
+                        &tool.id,
+                        &tool.name,
+                        concise_tool_error(&message),
+                    );
+                    continue;
+                }
+            }
+            if transcript.is_finalizing() {
+                match crate::agent::lifecycle::verification_decision(tool, &transcript) {
+                    Ok(kind) => trace_forensics(
+                        &config.run_id,
+                        "finalization_verification",
+                        json!({"decision":"allowed","kind":kind,"tool":tool.name,"observation_id":tool.arguments.get("verification_of").or_else(||tool.arguments.get("id"))}),
+                    ),
+                    Err(reason) => {
+                        let message = format!("Finalization is active; this exploratory call was not executed ({reason}). Continue the final answer from established evidence. For a concrete contradiction or critical exact fact, provide verification_reason and an existing observation ID (verification_of for live/source reads).");
+                        trace_forensics(
+                            &config.run_id,
+                            "finalization_verification",
+                            json!({"decision":"redirected","reason":reason,"tool":tool.name}),
+                        );
+                        emit(
+                            &config.run_id,
+                            Event::ToolError {
+                                id: tool.id.clone(),
+                                name: tool.name.clone(),
+                                message: message.clone(),
+                            },
+                        );
+                        transcript.inline_tool_result(
+                            &tool.id,
+                            &tool.name,
+                            concise_tool_error(&message),
+                        );
+                        continue;
+                    }
+                }
+            }
+            if policy::requires_approval_in_root(
+                config.policy,
+                &tool.name,
+                &tool.arguments,
+                config.root.as_deref().map(std::path::Path::new),
+            ) {
                 emit(
                     &config.run_id,
                     Event::ApprovalRequired {
@@ -2457,7 +3306,9 @@ pub fn run(config: Config) {
                 transcript.tool_result(
                     &tool.id,
                     &tool.name,
-                    concise_tool_error("approval required"),
+                    concise_tool_error(if tool.name == "run_terminal" && tool.arguments.get("command").and_then(Value::as_str).is_some_and(|c| c.contains("git ")) {
+                        "approval required for shell composition. For read-only history, retry as one scoped command: git -C <selected-project> log --oneline -30. Do not treat this attempt as evidence of repository history."
+                    } else { "approval required" }),
                 );
                 continue;
             }
@@ -2467,7 +3318,121 @@ pub fn run(config: Config) {
                     state: "working".into(),
                 },
             );
-            match run_tool(&config, &mut state, tool) {
+            let outcome = match tool.name.as_str() {
+                "observation_index" => Ok((
+                    transcript.observation_index(
+                        tool.arguments
+                            .get("offset")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0) as usize,
+                        tool.arguments
+                            .get("limit")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(20) as usize,
+                    ),
+                    None,
+                )),
+                "evidence_record" => {
+                    let prior = transcript.entries().len();
+                    transcript.record_established_evidence(
+                        tool.arguments.get("claim").and_then(Value::as_str).unwrap_or(""),
+                        tool.arguments.get("observation_id").and_then(Value::as_str).unwrap_or(""),
+                        tool.arguments.get("inference").and_then(Value::as_bool).unwrap_or(false),
+                    ).and_then(|fact| {
+                        trace_forensics(&config.run_id, if transcript.entries().len()>prior {"evidence_established"} else {"evidence_replayed"}, json!({"evidence_id":fact.id,"observation_id":fact.observation_id,"source":fact.source,"semantic_gain":transcript.entries().len()>prior}));
+                        serde_json::to_value(fact).map_err(|error| error.to_string())
+                    }).map(|value| (value, None))
+                }
+                "evidence_frontier" => transcript
+                    .dispose_frontier(
+                        tool.arguments
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or(""),
+                        tool.arguments
+                            .get("outcome")
+                            .and_then(Value::as_str)
+                            .unwrap_or(""),
+                        tool.arguments
+                            .get("reason")
+                            .and_then(Value::as_str)
+                            .unwrap_or(""),
+                        tool.arguments.get("observation_id").and_then(Value::as_str),
+                    )
+                    .map(|()| (json!({"recorded":true}), None)),
+                "begin_finalization" => {
+                    trace_forensics(
+                        &config.run_id,
+                        "finalization_request",
+                        json!({"turn":turn+1,"phase":lifecycle_label(&transcript),"coverage_before":research.trace()}),
+                    );
+                    let facts = working_evidence::collect(&transcript, &state.task_memory);
+                    research.refresh_from_evidence(
+                        &state.task_memory,
+                        transcript.observations(),
+                        &facts,
+                    );
+                    research.refresh_frontiers(
+                        &transcript.frontiers(),
+                        &transcript.frontier_dispositions(),
+                        transcript.observations(),
+                        &facts,
+                    );
+                    if can_begin_finalization(&research, facts.len()) {
+                        transcript.mark_finalizing();
+                        trace_forensics(
+                            &config.run_id,
+                            "lifecycle_transition",
+                            json!({"state":"finalizing","reason":"explicit_evidence_checked_handoff","turn":turn+1,"coverage":research.trace()}),
+                        );
+                        Ok((
+                            json!({"state":"finalizing","evidence_count":facts.len()}),
+                            None,
+                        ))
+                    } else {
+                        let missing = research.missing_areas();
+                        trace_forensics(
+                            &config.run_id,
+                            "finalization_decision",
+                            json!({"decision":"targeted_gap","missing":missing,"coverage":research.trace()}),
+                        );
+                        transcript.mark_closeout_requested();
+                        Err(format!("Cannot establish finalization yet. Requested areas without established direct evidence: {}. Open execution dependencies: {}. The runtime now retains a targeted gap-review state across compaction. Record a specific source-backed finding or grounded blocker; inspect only the named material gap.", missing.join(", "), research.open_frontier_summary()))
+                    }
+                }
+                "observation_read" => transcript
+                    .read_observation(
+                        tool.arguments
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or(""),
+                        tool.arguments
+                            .get("offset_chars")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0) as usize,
+                        tool.arguments
+                            .get("max_chars")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(8_000) as usize,
+                    )
+                    .map(|value| (value, None)),
+                "task_memory"
+                    if matches!(
+                        tool.arguments.get("action").and_then(Value::as_str),
+                        Some("update" | "record") | None
+                    ) =>
+                {
+                    if let Some(conflict) =
+                        task_memory_conflict(&state, &transcript, &tool.arguments)
+                    {
+                        Err(conflict)
+                    } else {
+                        run_tool(&config, &mut state, tool)
+                    }
+                }
+                _ => run_tool(&config, &mut state, tool),
+            };
+            match outcome {
                 Ok((value, diff)) => {
                     let content = value.to_string();
                     tool_result_tokens_since_compaction = tool_result_tokens_since_compaction
@@ -2482,7 +3447,69 @@ pub fn run(config: Config) {
                             diff,
                         },
                     );
-                    transcript.tool_result(&tool.id, &tool.name, content);
+                    if tool.name == "observation_read" {
+                        let source_id = value
+                            .pointer("/observation/id")
+                            .or_else(|| tool.arguments.get("id"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let offset = tool
+                            .arguments
+                            .get("offset_chars")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0) as usize;
+                        let limit = tool
+                            .arguments
+                            .get("max_chars")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(8_000) as usize;
+                        transcript.rehydrated_tool_result(
+                            &tool.id, &tool.name, source_id, offset, limit, &value,
+                        );
+                    } else if matches!(
+                        tool.name.as_str(),
+                        "observation_index"
+                            | "evidence_record"
+                            | "evidence_frontier"
+                            | "begin_finalization"
+                    ) {
+                        transcript.inline_tool_result(&tool.id, &tool.name, content);
+                    } else {
+                        transcript.tool_result(&tool.id, &tool.name, content.clone());
+                        for frontier in transcript.discover_frontiers(&tool.id, &content) {
+                            trace_forensics(
+                                &config.run_id,
+                                "evidence_frontier",
+                                json!({"id":frontier.id,"source":frontier.source,"target":frontier.target,"state":"discovered"}),
+                            );
+                        }
+                    }
+                    if matches!(
+                        tool.name.as_str(),
+                        "task_memory"
+                            | "evidence_record"
+                            | "evidence_frontier"
+                            | "begin_finalization"
+                    ) {
+                        let facts = working_evidence::collect(&transcript, &state.task_memory);
+                        research.refresh_from_evidence(
+                            &state.task_memory,
+                            transcript.observations(),
+                            &facts,
+                        );
+                        research.refresh_frontiers(
+                            &transcript.frontiers(),
+                            &transcript.frontier_dispositions(),
+                            transcript.observations(),
+                            &facts,
+                        );
+                        trace_forensics(
+                            &config.run_id,
+                            "finalization_decision",
+                            json!({"eligible_coverage":research.synthesis_ready(),"awaiting_synthesis_or_replay_saturation":!transcript.is_finalizing(),"coverage":research.trace()}),
+                        );
+                    }
+                    record_read_evidence(&config, &transcript, tool);
                 }
                 Err(message) => {
                     emit(
@@ -2493,10 +3520,43 @@ pub fn run(config: Config) {
                             message: message.clone(),
                         },
                     );
-                    transcript.tool_result(&tool.id, &tool.name, concise_tool_error(&message));
+                    if matches!(
+                        tool.name.as_str(),
+                        "observation_read"
+                            | "observation_index"
+                            | "evidence_record"
+                            | "begin_finalization"
+                    ) {
+                        transcript.inline_tool_result(
+                            &tool.id,
+                            &tool.name,
+                            concise_tool_error(&message),
+                        );
+                    } else {
+                        transcript.tool_result(&tool.id, &tool.name, concise_tool_error(&message));
+                    }
+                    record_read_evidence(&config, &transcript, tool);
                 }
             }
         }
+        previous_tool_turn_replayed = tool_turn_is_replay(&calls, &transcript);
+        let current_facts = working_evidence::collect(&transcript, &state.task_memory);
+        research.refresh_from_evidence(
+            &state.task_memory,
+            transcript.observations(),
+            &current_facts,
+        );
+        research.refresh_frontiers(
+            &transcript.frontiers(),
+            &transcript.frontier_dispositions(),
+            transcript.observations(),
+            &current_facts,
+        );
+        trace_forensics(
+            &config.run_id,
+            "research_controller",
+            json!({"turn":turn+1,"replay_only":previous_tool_turn_replayed,"semantic_gain":transcript.last_tool_turn_gained_evidence(),"evidence_count":current_facts.len(),"synthesis_ready":research.synthesis_ready(),"targeted_closeout_candidate":research.closeout_candidate(),"coverage":research.trace(),"lifecycle":lifecycle_label(&transcript)}),
+        );
     }
     emit(
         &config.run_id,
@@ -2518,12 +3578,487 @@ mod tests {
     use super::*;
 
     #[test]
+    fn historical_seo_markup_and_structured_calls_remain_distinct() {
+        let mut turn = StreamedTurn::default();
+        let reasoning = "Продолжаю анализ. Изучаю SEO и analytics.\n<tool_call>read_file<arg_key>path</arg_key><arg_value>ProductSEO.tsx</arg_value></tool_call>";
+        let mut frames = String::new();
+        for delta in [
+            json!({"reasoning_content":reasoning}),
+            json!({"content":"Продолжаю анализ. Изучаю SEO и analytics."}),
+            json!({"tool_calls":[{"index":0,"id":"seo-1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"Product"}}]}),
+            json!({"tool_calls":[{"index":0,"function":{"arguments":"SEO.tsx\"}"}}]}),
+            json!({"tool_calls":[{"index":1,"id":"seo-2","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"CatalogSEO.tsx\"}"}}]}),
+            json!({"tool_calls":[{"index":2,"id":"seo-3","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"canonical.ts\"}"}}]}),
+        ] {
+            frames.push_str(&format!(
+                "data: {}\n\n",
+                json!({"choices":[{"delta":delta}]})
+            ));
+        }
+        frames.push_str(&format!(
+            "data: {}\n\n",
+            json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})
+        ));
+        consume_sse(&mut frames, &mut turn, "fixture", false, false).unwrap();
+        assert!(frames.is_empty());
+        assert_eq!(turn.reasoning, reasoning);
+        assert_eq!(turn.content, "Продолжаю анализ. Изучаю SEO и analytics.");
+        let raw = turn.calls.into_values().collect::<Vec<_>>();
+        let calls = validate_calls(&raw, Some(&turn.finish_reason)).unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| call.arguments["path"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["ProductSEO.tsx", "CatalogSEO.tsx", "canonical.ts"]
+        );
+        let mut transcript = Transcript::default();
+        transcript.push_run_user(json!({"role":"user","content":"audit"}));
+        transcript.assistant_tool_turn(turn.content, &calls);
+        for call in &calls {
+            transcript.tool_result(&call.id, &call.name, "source body".into());
+        }
+        let before = serde_json::to_value(transcript.entries()).unwrap();
+        let projected = project(&transcript, "system", "");
+        assert_eq!(serde_json::to_value(transcript.entries()).unwrap(), before);
+        assert!(!serde_json::to_string(&projected)
+            .unwrap()
+            .contains("<tool_call>"));
+        for call in &calls {
+            assert!(projected
+                .iter()
+                .any(|message| message["tool_call_id"] == call.id));
+        }
+    }
+
+    #[test]
+    fn content_only_tool_markup_is_not_a_tool_or_final_answer() {
+        let mut turn = StreamedTurn::default();
+        let mut frames = format!(
+            "data: {}\n\n",
+            json!({"choices":[{"delta":{"content":"<tool_call>read_file<arg_key>path</arg_key><arg_value>ProductSEO.tsx</arg_value></tool_call>"},"finish_reason":"stop"}]})
+        );
+        consume_sse(&mut frames, &mut turn, "fixture", false, false).unwrap();
+        assert!(turn.calls.is_empty());
+        assert!(unstructured_tool_call_content(&turn.content));
+        assert!(!unstructured_tool_call_content(
+            "A report discussing <tool_call> syntax"
+        ));
+        let mut transcript = Transcript::default();
+        transcript.push_run_user(json!({"role":"user","content":"audit"}));
+        let before = transcript.entries().len();
+        transcript.assistant_withheld_draft(turn.content, "unstructured provider tool-call markup");
+        let projected = project(&transcript, "system", "");
+        assert!(!serde_json::to_string(&projected)
+            .unwrap()
+            .contains("<tool_call>"));
+        assert_eq!(transcript.entries().len(), before + 1);
+    }
+
+    #[test]
+    fn closeout_survives_irrelevant_rereads_and_rejected_final_until_gaps_close() {
+        fn establish(transcript: &mut Transcript, id: &str, path: &str, claim: &str) {
+            transcript.assistant_tool_turn(
+                String::new(),
+                &[ValidatedCall {
+                    id: id.into(),
+                    name: "read_file".into(),
+                    arguments: json!({"path":path}),
+                }],
+            );
+            transcript.tool_result(
+                id,
+                "read_file",
+                json!({"path":path,"content":claim}).to_string(),
+            );
+            let observation_id = transcript.observation_for_call(id).unwrap().id.clone();
+            transcript
+                .record_established_evidence(claim, &observation_id, false)
+                .unwrap();
+        }
+        let base = std::env::temp_dir().join(format!(
+            "closeout-run-shape-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        for file in ["ProductSEO.tsx", "order.ts", "history.txt"] {
+            std::fs::write(root.join(file), file).unwrap();
+        }
+        let objective = "audit product backend order flow history implementation quality";
+        let mut transcript =
+            Transcript::durable(&base.join("store"), "run", &[], root.to_str()).unwrap();
+        transcript.push_run_user(json!({"role":"user","content":objective}));
+        let seo = root.join("ProductSEO.tsx").to_string_lossy().into_owned();
+        establish(
+            &mut transcript,
+            "seo-first",
+            &seo,
+            "Product catalog SEO is present",
+        );
+        let mut state = AgentState::default();
+        let mut research = ResearchController::with_depth(objective, true);
+        let refresh = |research: &mut ResearchController,
+                       transcript: &Transcript,
+                       state: &AgentState| {
+            let facts = working_evidence::collect(transcript, &state.task_memory);
+            research.refresh_from_evidence(&state.task_memory, transcript.observations(), &facts);
+            research.refresh_frontiers(
+                &transcript.frontiers(),
+                &transcript.frontier_dispositions(),
+                transcript.observations(),
+                &facts,
+            );
+        };
+        refresh(&mut research, &transcript, &state);
+        assert!(research.closeout_candidate());
+        assert_eq!(
+            advance_lifecycle(&mut transcript, &research),
+            Some("grounded_coverage_with_specific_remaining_gaps")
+        );
+        assert!(transcript.is_closeout_requested());
+        assert_eq!(
+            research.missing_areas(),
+            vec![
+                "backend/order flow",
+                "history/evolution",
+                "implementation quality"
+            ]
+        );
+        let tail = lifecycle_tail(
+            &state,
+            root.to_str(),
+            objective,
+            &transcript,
+            &research,
+            65_536,
+        );
+        transcript.record_prompt_tail(&tail);
+        let duplicate = ValidatedCall {
+            id: "seo-again".into(),
+            name: "read_file".into(),
+            arguments: json!({"path":seo,"closeout_gap":"backend/order flow","closeout_reason":"inspect checkout flow"}),
+        };
+        let error = crate::agent::lifecycle::closeout_decision(
+            &duplicate,
+            &transcript,
+            &research,
+            Some(&root),
+        )
+        .unwrap_err();
+        transcript.assistant_tool_turn(
+            "Продолжаю анализ. Изучаю SEO и analytics.".into(),
+            &[duplicate],
+        );
+        transcript.inline_tool_result("seo-again", "read_file", concise_tool_error(&error));
+        assert_eq!(transcript.observations().len(), 1);
+        refresh(&mut research, &transcript, &state);
+        assert_eq!(advance_lifecycle(&mut transcript, &research), None);
+        assert!(matches!(
+            review_tool_free_final(&mut state, &mut transcript, &mut research),
+            FinalCandidateReview::EvidenceGap(_)
+        ));
+        transcript.mark_closeout_requested();
+        transcript.assistant_withheld_draft(String::new(), "a specific evidence gap");
+        transcript.remind("Remain on the three exact gaps".into());
+        let retry_tail = transcript.pending_tail(&lifecycle_tail(
+            &state,
+            root.to_str(),
+            objective,
+            &transcript,
+            &research,
+            65_536,
+        ));
+        assert!(retry_tail.contains("backend/order flow"));
+        transcript.record_prompt_tail(&retry_tail);
+        transcript.clear_reminders();
+        let clean_tail = lifecycle_tail(
+            &state,
+            root.to_str(),
+            objective,
+            &transcript,
+            &research,
+            65_536,
+        );
+        transcript.record_prompt_tail(&clean_tail);
+        transcript.assistant_message("Further status text".into());
+        let projected = project(&transcript, "system", "");
+        assert!(projected.last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .contains("<runtime_closeout>"));
+        assert!(!transcript.is_finalizing());
+        establish(
+            &mut transcript,
+            "backend",
+            &root.join("order.ts").to_string_lossy(),
+            "backend order submission exists",
+        );
+        establish(
+            &mut transcript,
+            "history",
+            &root.join("history.txt").to_string_lossy(),
+            "history evolution recorded",
+        );
+        transcript.assistant_tool_turn(
+            String::new(),
+            &[ValidatedCall {
+                id: "quality-blocker".into(),
+                name: "read_file".into(),
+                arguments: json!({"path":"missing-tests"}),
+            }],
+        );
+        transcript.tool_result(
+            "quality-blocker",
+            "read_file",
+            json!({"error":"test source unavailable","path":"missing-tests"}).to_string(),
+        );
+        let blocker = transcript
+            .observation_for_call("quality-blocker")
+            .unwrap()
+            .id
+            .clone();
+        state
+            .task_memory
+            .upsert(
+                Some("quality"),
+                "quality tests unavailable".into(),
+                blocker,
+                "implementation quality is blocked".into(),
+                String::new(),
+                None,
+            )
+            .unwrap();
+        refresh(&mut research, &transcript, &state);
+        assert!(research.synthesis_ready(), "coverage: {}", research.trace());
+        assert_eq!(
+            advance_lifecycle(&mut transcript, &research),
+            Some("targeted_closeout_gaps_satisfied")
+        );
+        assert_eq!(advance_lifecycle(&mut transcript, &research), None);
+        assert_eq!(
+            transcript
+                .entries()
+                .iter()
+                .filter(|entry| matches!(entry, crate::agent::transcript::Entry::CloseoutRequested))
+                .count(),
+            1
+        );
+        assert_eq!(
+            transcript
+                .entries()
+                .iter()
+                .filter(|entry| matches!(entry, crate::agent::transcript::Entry::Finalizing))
+                .count(),
+            1
+        );
+        assert!(matches!(
+            review_tool_free_final(&mut state, &mut transcript, &mut research),
+            FinalCandidateReview::Accept
+        ));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+    use crate::agent::research::Coverage;
+
+    fn test_config(window: usize) -> Config {
+        Config {
+            run_id: "test".into(),
+            endpoint: "http://localhost/v1/chat/completions".into(),
+            model: "test".into(),
+            system: "system".into(),
+            user: "audit".into(),
+            root: None,
+            context_limit: window,
+            reasoning_mode: "fast".into(),
+            policy: RunPolicy::Safe,
+            history: Vec::new(),
+            evidence_dir: None,
+            task_memory: None,
+            provider_max_output: None,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            steering: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    #[test]
+    fn premature_final_stays_in_research_with_only_specific_gaps() {
+        let mut transcript = Transcript::default();
+        transcript.push_run_user(json!({"role":"user","content":"audit backend and history"}));
+        let mut research = ResearchController::with_depth("audit backend and history", true);
+        research.evidence(
+            "backend/order flow",
+            Coverage::Sufficient,
+            "obs-backed backend claim",
+        );
+        let mut state = AgentState::default();
+        let result = review_tool_free_final(&mut state, &mut transcript, &mut research);
+        assert!(
+            matches!(result,FinalCandidateReview::EvidenceGap(ref gap) if gap.contains("history/evolution") && !gap.contains("backend/order flow"))
+        );
+        transcript.mark_closeout_requested();
+        assert!(!transcript.is_finalizing());
+        assert_eq!(lifecycle_label(&transcript), "research_targeted_closeout");
+    }
+
+    #[test]
+    fn sufficient_coverage_and_no_semantic_gain_enters_monotonic_finalization() {
+        let mut transcript = Transcript::default();
+        transcript.push_run_user(json!({"role":"user","content":"audit backend and history"}));
+        let mut research = ResearchController::with_depth("audit backend and history", true);
+        research.evidence(
+            "backend/order flow",
+            Coverage::Sufficient,
+            "direct backend evidence",
+        );
+        research.blocked(
+            "history/evolution",
+            "recorded read-only git approval denial",
+        );
+        for n in 0..150 {
+            transcript.assistant_message(format!("productive earlier step {n}"));
+        }
+        assert_eq!(
+            advance_lifecycle(&mut transcript, &research),
+            Some("established_coverage_without_new_semantic_evidence")
+        );
+        assert!(transcript.is_finalizing());
+        assert_eq!(
+            advance_lifecycle(&mut transcript, &ResearchController::new("backend audit")),
+            None
+        );
+        assert!(transcript.is_finalizing());
+        let mut state = AgentState::default();
+        assert!(matches!(
+            review_tool_free_final(&mut state, &mut transcript, &mut research),
+            FinalCandidateReview::Accept
+        ));
+        transcript.assistant_message("final report".into());
+        transcript.mark_run_complete();
+        assert_eq!(
+            transcript
+                .entries()
+                .iter()
+                .filter(|e| matches!(e, crate::agent::transcript::Entry::RunComplete))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn fresh_semantic_evidence_delays_automatic_synthesis_without_action_threshold() {
+        let base = std::env::temp_dir().join(format!(
+            "lifecycle-gain-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let mut transcript = Transcript::durable(&base, "run", &[], None).unwrap();
+        transcript.push_run_user(json!({"role":"user","content":"audit backend"}));
+        transcript.assistant_tool_turn(
+            String::new(),
+            &[ValidatedCall {
+                id: "read".into(),
+                name: "read_file".into(),
+                arguments: json!({"path":"src/service.ts"}),
+            }],
+        );
+        transcript.tool_result(
+            "read",
+            "read_file",
+            json!({"content":"source-backed result"}).to_string(),
+        );
+        let id = transcript.observations()[0].id.clone();
+        transcript
+            .record_established_evidence("backend endpoint accepts requests", &id, false)
+            .unwrap();
+        let mut research = ResearchController::with_depth("audit backend", true);
+        research.evidence(
+            "backend/order flow",
+            Coverage::Sufficient,
+            "new direct finding",
+        );
+        assert!(transcript.last_tool_turn_gained_evidence());
+        assert_eq!(advance_lifecycle(&mut transcript, &research), None);
+        assert!(!transcript.is_finalizing());
+        transcript.assistant_tool_turn(
+            String::new(),
+            &[ValidatedCall {
+                id: "replay".into(),
+                name: "observation_read".into(),
+                arguments: json!({"id":id}),
+            }],
+        );
+        transcript.rehydrated_tool_result(
+            "replay",
+            "observation_read",
+            &id,
+            0,
+            100,
+            &transcript.read_observation(&id, 0, 100).unwrap(),
+        );
+        assert!(!transcript.last_tool_turn_gained_evidence());
+        assert!(advance_lifecycle(&mut transcript, &research).is_some());
+        assert!(transcript.is_finalizing());
+        drop(transcript);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn finalization_checkpoint_does_not_replay_stale_research_instructions() {
+        let mut transcript = Transcript::default();
+        transcript.push_run_user(json!({"role":"user","content":"audit"}));
+        transcript.compact(
+            "Next useful intent: list the repository again".into(),
+            transcript.entries().len(),
+        );
+        transcript.mark_finalizing();
+        let checkpoint =
+            continuation_checkpoint(&transcript, "Unresolved work: broad research".into());
+        assert!(checkpoint.contains("Phase: FINALIZING"));
+        assert!(!checkpoint.contains("list the repository again"));
+        assert!(!checkpoint.contains("Unresolved work: broad research"));
+    }
+
+    #[test]
+    fn closeout_compaction_keeps_targeted_mode_and_drops_old_memory_next() {
+        let mut transcript = Transcript::default();
+        transcript.push_run_user(json!({"role":"user","content":"audit backend"}));
+        transcript.mark_closeout_requested();
+        transcript.compact(
+            "Old next step: list all directories".into(),
+            transcript.entries().len(),
+        );
+        let mut state = AgentState::default();
+        state
+            .task_memory
+            .upsert(
+                None,
+                "backend finding".into(),
+                "obs-00000001".into(),
+                String::new(),
+                "read every file again".into(),
+                None,
+            )
+            .unwrap();
+        let tail = dynamic_tail(&state, None, "audit backend", &transcript, 65_536);
+        let checkpoint =
+            continuation_checkpoint(&transcript, "Established work: backend inspected.".into());
+        assert!(transcript.is_closeout_requested());
+        assert!(checkpoint.contains("Runtime closeout request"));
+        assert!(tail.contains("backend finding"));
+        assert!(!tail.contains("read every file again"));
+    }
+
+    #[test]
     fn experimental_toolset_excludes_todo_and_keeps_production_capabilities() {
         let schemas = tool_schemas(true);
         let names = schemas.iter().map(tool_name).collect::<Vec<_>>();
         assert!(!names.contains(&"todo"));
         for name in [
             "task_memory",
+            "observation_index",
+            "observation_read",
             "read_file",
             "list_directory",
             "run_terminal",
@@ -2544,9 +4079,355 @@ mod tests {
     }
 
     #[test]
+    fn evidence_identity_is_internal_to_projection_not_provider_wire() {
+        let projected = vec![
+            json!({"role":"tool","tool_call_id":"x","content":"result","_observation_id":"obs-1","_result_policy":"rehydrated","_rehydration":{"id":"obs-1","offset_chars":0,"max_chars":10}}),
+        ];
+        assert!(wire_messages(&projected)[0]
+            .get("_observation_id")
+            .is_none());
+        assert!(ollama_native_messages(&projected)[0]
+            .get("_observation_id")
+            .is_none());
+        for wire in [
+            wire_messages(&projected),
+            ollama_native_messages(&projected),
+        ] {
+            assert!(wire[0].get("_result_policy").is_none());
+            assert!(wire[0].get("_rehydration").is_none());
+            assert_eq!(wire[0]["content"], "result");
+        }
+    }
+
+    #[test]
+    fn stable_guidance_adapts_visible_language_and_uses_compact_architecture_format() {
+        let mut config = test_config(65_536);
+        config.user = "Проверь архитектуру проекта".into();
+        let prompt = stable_prefix(&config);
+        assert!(prompt.contains("latest user's language"));
+        assert!(prompt.contains("streamed reasoning/progress"));
+        assert!(prompt.contains("Keep code, paths, identifiers, commands"));
+        assert!(prompt.contains("multiline Mermaid flowchart"));
+        assert!(prompt.contains("Do not compress a diagram into one long arrow chain"));
+        assert!(!prompt.contains("if model =="));
+    }
+
+    #[test]
+    fn incomplete_final_cannot_continue_until_finalization_is_valid() {
+        let mut transcript = Transcript::default();
+        transcript.push_run_user(json!({"role":"user","content":"backend history audit"}));
+        let research = ResearchController::new("backend history audit");
+        assert!(!can_continue_final_length(&transcript, &research));
+        transcript.mark_finalizing();
+        assert!(can_continue_final_length(&transcript, &research));
+        let reminder = continuation_reminder("Final section already started");
+        assert!(reminder.contains("specific unresolved contradiction"));
+        assert!(!reminder.contains("more investigation"));
+    }
+
+    #[test]
+    fn tool_free_final_review_accepts_completed_work_and_targets_premature_gaps() {
+        let mut transcript = Transcript::default();
+        transcript.push_run_user(json!({"role":"user","content":"backend audit"}));
+        let mut state = AgentState::default();
+        let mut no_requested_area = ResearchController::new("explain this project");
+        assert!(matches!(
+            review_tool_free_final(&mut state, &mut transcript, &mut no_requested_area),
+            FinalCandidateReview::Accept
+        ));
+        assert!(transcript.is_finalizing());
+
+        let mut transcript = Transcript::default();
+        transcript.push_run_user(json!({"role":"user","content":"backend audit"}));
+        let mut missing = ResearchController::new("backend audit");
+        assert!(matches!(
+            review_tool_free_final(&mut state, &mut transcript, &mut missing),
+            FinalCandidateReview::EvidenceGap(_)
+        ));
+        transcript.mark_finalizing();
+        let mut fresh_controller = ResearchController::new("backend audit");
+        assert!(matches!(
+            review_tool_free_final(&mut state, &mut transcript, &mut fresh_controller),
+            FinalCandidateReview::Accept
+        ));
+    }
+
+    #[test]
+    fn failed_frontier_close_cannot_exhaust_the_finalization_gate() {
+        use crate::agent::frontiers::{EvidenceFrontier, FrontierDisposition};
+        let frontier = EvidenceFrontier {
+            id: "frontier-obs-00000030-00".into(),
+            from_observation: "obs-00000030".into(),
+            source: "/project/src/OrderForm.tsx".into(),
+            target: "api.php".into(),
+            resolved_path: Some("/project/public/api.php".into()),
+            project_relative_path: Some("public/api.php".into()),
+            resolution: Some("project public root; document base /".into()),
+        };
+        let mut transcript = Transcript::default();
+        transcript.push_run_user(json!({"role":"user","content":"audit backend"}));
+        let mut research = ResearchController::with_depth("audit backend", true);
+        research.evidence(
+            "backend/order flow",
+            Coverage::Sufficient,
+            "direct local finding",
+        );
+        research.refresh_frontiers(&[frontier.clone()], &[], &[], &[]);
+        assert!(!can_begin_finalization(&research, 1));
+        assert!(!can_continue_final_length(&transcript, &research));
+        let mut state = AgentState::default();
+        assert!(matches!(
+            review_tool_free_final(&mut state, &mut transcript, &mut research),
+            FinalCandidateReview::EvidenceGap(_)
+        ));
+        // The previous one-shot nudge has been spent, as in the GLM journal.
+        // A second tool-free draft still cannot bypass the open frontier.
+        assert!(matches!(
+            review_tool_free_final(&mut state, &mut transcript, &mut research),
+            FinalCandidateReview::EvidenceGap(_)
+        ));
+        assert!(!transcript.is_finalizing());
+        research.refresh_frontiers(
+            &[frontier.clone()],
+            &[FrontierDisposition {
+                id: frontier.id.clone(),
+                outcome: "blocked".into(),
+                reason: "target-specific permission denial".into(),
+                observation_id: Some("obs-denied".into()),
+            }],
+            &[],
+            &[],
+        );
+        assert!(can_begin_finalization(&research, 1));
+        assert!(matches!(
+            review_tool_free_final(&mut state, &mut transcript, &mut research),
+            FinalCandidateReview::Accept
+        ));
+        assert!(transcript.is_finalizing());
+        research.refresh_frontiers(&[frontier], &[], &[], &[]);
+        assert!(matches!(
+            review_tool_free_final(&mut state, &mut transcript, &mut research),
+            FinalCandidateReview::EvidenceGap(_)
+        ));
+        assert!(!can_continue_final_length(&transcript, &research));
+        assert!(
+            transcript.is_finalizing(),
+            "a valid finalization transition is monotonic"
+        );
+    }
+
+    #[test]
+    fn emergency_truncation_keeps_recovery_identity_and_pairing() {
+        let config = test_config(32_768);
+        let mut messages = vec![
+            json!({"role":"system","content":"system"}),
+            json!({"role":"user","content":"audit"}),
+            json!({"role":"assistant","content":"","tool_calls":[{"id":"call-1","type":"function","function":{"name":"read_file","arguments":"{}"}}]}),
+            json!({"role":"tool","tool_call_id":"call-1","_observation_id":"obs-1","content":"x".repeat(150_000)}),
+        ];
+        assert!(truncate_retained_tool_result_to_fit(&config, &[], &mut messages).is_some());
+        assert!(messages[3]["content"]
+            .as_str()
+            .unwrap()
+            .contains("observation_read(id=\"obs-1\")"));
+        assert_eq!(
+            messages[3]["tool_call_id"],
+            messages[2]["tool_calls"][0]["id"]
+        );
+    }
+
+    #[test]
+    fn emergency_fallback_cannot_turn_rehydrated_evidence_into_a_pointer() {
+        let config = test_config(32_768);
+        let exact = json!({"historical":true,"content":"ORDER_SUBMISSION_EXACT","observation":{"id":"obs-1"}}).to_string();
+        let mut messages = vec![
+            json!({"role":"system","content":"x".repeat(100_000)}),
+            json!({"role":"user","content":"audit"}),
+            json!({"role":"assistant","content":"","tool_calls":[{"id":"recover","type":"function","function":{"name":"observation_read","arguments":"{}"}}]}),
+            json!({"role":"tool","tool_call_id":"recover","name":"observation_read","_result_policy":"rehydrated","content":exact}),
+        ];
+        assert!(truncate_retained_tool_result_to_fit(&config, &[], &mut messages).is_none());
+        assert!(messages[3]["content"]
+            .as_str()
+            .unwrap()
+            .contains("ORDER_SUBMISSION_EXACT"));
+    }
+
+    #[test]
+    fn recovered_slice_reaches_the_actual_provider_payload_after_folding() {
+        let base = std::env::temp_dir().join(format!(
+            "local-agent-wire-recovery-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut transcript = Transcript::durable(&base, "test-run", &[], None).unwrap();
+        transcript.push_run_user(json!({"role":"user","content":"audit"}));
+        transcript.assistant_tool_turn(
+            "".into(),
+            &[ValidatedCall {
+                id: "source-call".into(),
+                name: "read_file".into(),
+                arguments: json!({"path":"api.php"}),
+            }],
+        );
+        transcript.tool_result("source-call", "read_file", "x".repeat(90_000));
+        let source_id = transcript.observations()[0].id.clone();
+        transcript.assistant_message("source inspected".into());
+        let plan = transcript.compaction_plan(2).unwrap();
+        transcript.compact("source inspected".into(), plan.covers);
+        let recovered = transcript.read_observation(&source_id, 100, 32).unwrap();
+        transcript.assistant_tool_turn(
+            "".into(),
+            &[ValidatedCall {
+                id: "recover-call".into(),
+                name: "observation_read".into(),
+                arguments: json!({"id":source_id,"offset_chars":100,"max_chars":32}),
+            }],
+        );
+        transcript.rehydrated_tool_result(
+            "recover-call",
+            "observation_read",
+            &source_id,
+            100,
+            32,
+            &recovered,
+        );
+        let config = test_config(32_768);
+        let mut messages = project_evidence(&config, &transcript, "system", "");
+        fold_to_budget(&transcript, &mut messages, 200, |m| {
+            serde_json::to_string(m).unwrap().len() / 3
+        });
+        let payload = request_payload(&config, &messages, &[], 1_024);
+        let visible = payload["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["tool_call_id"] == "recover-call")
+            .unwrap();
+        let exact: Value = serde_json::from_str(visible["content"].as_str().unwrap()).unwrap();
+        assert_eq!(exact["content"], "x".repeat(32));
+        assert!(visible.get("_result_policy").is_none());
+        assert_eq!(transcript.observations().len(), 1);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn established_evidence_and_finalization_reach_provider_after_compaction_without_source_replay()
+    {
+        let base = std::env::temp_dir().join(format!(
+            "agent-evidence-provider-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let root = base.join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("api.php"), "<?php WorldFilia();").unwrap();
+        let mut transcript =
+            Transcript::durable(&base.join("store"), "run", &[], root.to_str()).unwrap();
+        transcript.push_run_user(json!({"role":"user","content":"audit backend order flow"}));
+        transcript.assistant_tool_turn(
+            "".into(),
+            &[ValidatedCall {
+                id: "read".into(),
+                name: "read_file".into(),
+                arguments: json!({"path":"api.php"}),
+            }],
+        );
+        transcript.tool_result(
+            "read",
+            "read_file",
+            format!("exact API source {}", "x".repeat(90_000)),
+        );
+        let id = transcript.observations()[0].id.clone();
+        transcript
+            .record_established_evidence("api.php forwards orders to WorldFilia", &id, false)
+            .unwrap();
+        for n in 0..4 {
+            transcript.assistant_message(format!("later work {n}"));
+        }
+        transcript.mark_finalizing();
+        let plan = transcript.compaction_plan(2).unwrap();
+        transcript.compact("procedural checkpoint".into(), plan.covers);
+        let state = AgentState::default();
+        let config = test_config(65_536);
+        let tail = dynamic_tail(
+            &state,
+            None,
+            "audit backend order flow",
+            &transcript,
+            65_536,
+        );
+        let messages = project_evidence(
+            &config,
+            &transcript,
+            "system",
+            &transcript.pending_tail(&tail),
+        );
+        let payload = request_payload(&config, &messages, &[], 1_024).to_string();
+        assert!(payload.contains("api.php forwards orders to WorldFilia"));
+        assert!(payload.contains(&id));
+        assert!(payload.contains("MODE: FINALIZING"));
+        assert!(!payload.contains(&"x".repeat(1_000)));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn replay_saturation_distinguishes_existing_body_from_new_source_version() {
+        let base = std::env::temp_dir().join(format!(
+            "agent-replay-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let root = base.join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("api.php"), "version A").unwrap();
+        let mut t = Transcript::durable(&base.join("store"), "run", &[], root.to_str()).unwrap();
+        t.push_run_user(json!({"role":"user","content":"backend audit"}));
+        let call = |id: &str| ValidatedCall {
+            id: id.into(),
+            name: "read_file".into(),
+            arguments: json!({"path":"api.php"}),
+        };
+        t.assistant_tool_turn("".into(), &[call("first")]);
+        t.tool_result("first", "read_file", "A".into());
+        assert!(!tool_turn_is_replay(&[call("first")], &t));
+        let id = t.observations()[0].id.clone();
+        t.assistant_tool_turn(
+            "".into(),
+            &[ValidatedCall {
+                id: "recover".into(),
+                name: "observation_read".into(),
+                arguments: json!({"id":id}),
+            }],
+        );
+        let result = t.read_observation(&id, 0, 10).unwrap();
+        t.rehydrated_tool_result("recover", "observation_read", &id, 0, 10, &result);
+        assert!(tool_turn_is_replay(
+            &[ValidatedCall {
+                id: "recover".into(),
+                name: "observation_read".into(),
+                arguments: json!({"id":id})
+            }],
+            &t
+        ));
+        assert_eq!(t.observations().len(), 1);
+        t.assistant_tool_turn("".into(), &[call("duplicate")]);
+        t.tool_result("duplicate", "read_file", "A".into());
+        assert!(tool_turn_is_replay(&[call("duplicate")], &t));
+        std::fs::write(root.join("api.php"), "version B").unwrap();
+        t.assistant_tool_turn("".into(), &[call("changed")]);
+        t.tool_result("changed", "read_file", "B".into());
+        assert!(!tool_turn_is_replay(&[call("changed")], &t));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn dynamic_tail_contains_memory_and_knowledge_without_plan_state() {
         let state = AgentState::default();
-        let tail = dynamic_tail(&state, None);
+        let tail = dynamic_tail(&state, None, "", &Transcript::default(), 65_536);
         assert!(!tail.to_ascii_lowercase().contains("todo"));
         assert!(!tail.contains("model_todo"));
     }
@@ -2564,5 +4445,82 @@ mod tests {
                 APPLICATION_MAX_OUTPUT_TOKENS
             ) >= PREFERRED_OUTPUT_HEADROOM_TOKENS
         );
+    }
+
+    #[test]
+    fn checkpoint_keeps_objective_constraints_and_procedural_state_across_generations() {
+        let mut transcript = Transcript::default();
+        transcript.push_run_user(json!({"role":"user","content":"Audit the project. Do not modify files or commit. Inspect architecture, then produce the final report."}));
+        let first = continuation_checkpoint(&transcript, "Established work: architecture sufficiently investigated.\nCurrent focus: final synthesis.\nBlocked or failed operations: terminal approval pending.\nFinalization state: research complete; do not restart discovery.".into());
+        transcript.compact(first, 0);
+        transcript.assistant_message("Preparing report".into());
+        let second = continuation_checkpoint(&transcript, "Established work: architecture remains covered.\nCurrent focus: final synthesis.\nUnresolved work: write report.".into());
+        assert!(second.contains("Do not modify files or commit"));
+        assert!(second.contains("Current focus: final synthesis"));
+        assert!(second.contains("architecture remains covered"));
+        assert!(second.contains("terminal approval pending"));
+    }
+
+    #[test]
+    fn unsupported_semantic_reversal_points_to_exact_evidence() {
+        let base = std::env::temp_dir().join(format!("local-conflict-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("project")).unwrap();
+        std::fs::write(base.join("project/api.php"), "submit_order()").unwrap();
+        let mut transcript = Transcript::durable(
+            &base.join("events"),
+            "conflict",
+            &[],
+            base.join("project").to_str(),
+        )
+        .unwrap();
+        transcript.push_run_user(json!({"role":"user","content":"audit backend"}));
+        transcript.assistant_tool_turn(
+            "".into(),
+            &[ValidatedCall {
+                id: "read".into(),
+                name: "read_file".into(),
+                arguments: json!({"path":"api.php"}),
+            }],
+        );
+        transcript.tool_result(
+            "read",
+            "read_file",
+            json!({"path":"api.php","content":"submit_order()"}).to_string(),
+        );
+        let mut state = AgentState::default();
+        state
+            .task_memory
+            .upsert(
+                Some("backend"),
+                "api.php submits orders".into(),
+                transcript.observations()[0].id.clone(),
+                "backend exists".into(),
+                "".into(),
+                None,
+            )
+            .unwrap();
+        state
+            .task_memory
+            .upsert(
+                Some("product"),
+                "product exists".into(),
+                "".into(),
+                "".into(),
+                "".into(),
+                None,
+            )
+            .unwrap();
+        let conflict = task_memory_conflict(
+            &state,
+            &transcript,
+            &json!({"supersedes":"backend","finding":"no backend","evidence":""}),
+        )
+        .unwrap();
+        assert!(conflict.contains("observation_read"));
+        assert!(conflict.contains(&transcript.observations()[0].id));
+        assert!(!state.task_memory.entries[0].invalidated);
+        assert!(!state.task_memory.entries[1].invalidated);
+        std::fs::remove_dir_all(base).unwrap();
     }
 }

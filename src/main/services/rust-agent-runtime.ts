@@ -2,7 +2,10 @@ import { createInterface } from 'node:readline';
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
-import type { AgentPlan, AgentPlanStepStatus, ChatMessage, ModelTodo, ReasoningMode, StreamEvent, TerminalExecution, WebMode } from '../../shared/types';
+import { join } from 'node:path';
+import { createHash } from 'node:crypto';
+import { paths } from './paths';
+import type { AgentPlan, AgentPlanStepStatus, ChatMessage, ModelTodo, ReasoningMode, StreamEvent, TerminalExecution, ToolActivity, WebMode } from '../../shared/types';
 import { maxOutputTokens } from '../models/model-registry';
 
 /** Project identity is a transport value, not an orchestration subsystem. */
@@ -25,7 +28,25 @@ type RuntimeRequest = {
   type: 'run'; run_id: string; endpoint: string; model: string; system: string; user: string;
   project_root?: string; secondary_project_root?: string; context_limit: number; reasoning_mode: ReasoningMode;
   web_mode: WebMode; policy: 'auto' | 'safe'; history: unknown[]; task_memory?: AgentPlan['taskMemory']; provider_max_output?: number;
+  evidence_dir?: string;
 };
+
+export function statusActivity(runId: string, ordinal: number, content: string): ToolActivity {
+  return {
+    id: `agent-status-${runId}-${ordinal}`,
+    label: 'Progress',
+    detail: content.trim().split('\n')[0].slice(0, 160),
+    kind: 'progress',
+    state: 'completed',
+    output: content,
+  };
+}
+
+export function runtimeTextEvent(event: Pick<RuntimeEvent, 'type' | 'content'>, runId: string, statusOrdinal: number): StreamEvent | null {
+  if (event.type === 'content_delta' || event.type === 'final_delta') return { type: 'token', content: event.content ?? '' };
+  if (event.type === 'agent_status') return { type: 'tool', activity: statusActivity(runId, statusOrdinal, event.content ?? '') };
+  return null;
+}
 
 /** The latest actual user node owns an Agent run. */
 export function splitAgentRunHistory(history: ChatMessage[]): { user: string; prior: ChatMessage[] } {
@@ -100,7 +121,7 @@ export function taskPlan(value: unknown): AgentPlan {
 export class RustAgentRuntime {
   constructor(private readonly endpoint: string, private readonly binary = process.env.LOCAL_AI_AGENT_RUNTIME ?? resolve(process.cwd(), 'rust-agent', 'target', 'debug', 'local-ai-agent-runtime')) {}
 
-  async *stream(model: string, history: ChatMessage[], projects: AgentProject[], signal: AbortSignal, contextLimit: number, reasoningMode: ReasoningMode, webMode: WebMode, runId: string, persistedTaskMemory?: AgentPlan['taskMemory']): AsyncIterable<StreamEvent> {
+  async *stream(model: string, history: ChatMessage[], projects: AgentProject[], signal: AbortSignal, contextLimit: number, reasoningMode: ReasoningMode, webMode: WebMode, runId: string, persistedTaskMemory?: AgentPlan['taskMemory'], conversationId?: string): AsyncIterable<StreamEvent> {
     if (!existsSync(this.binary)) throw new Error(`Rust Agent Runtime V2 не собран: ${this.binary}. Выполните cargo build в rust-agent.`);
     const child = spawn(this.binary, [], { stdio: 'pipe' });
     let stopped = false;
@@ -118,12 +139,14 @@ export class RustAgentRuntime {
       user: current.user, project_root: projects[0]?.root, secondary_project_root: projects[1]?.root,
       context_limit: contextLimit, reasoning_mode: reasoningMode, web_mode: webMode, policy: 'auto',
       history: current.prior.filter((message) => !message.agentError && !message.agentCancelled).map((message) => ({ role: message.role, content: message.content })),
+      ...(conversationId ? { evidence_dir: join(paths.userData, 'agent-evidence', createHash('sha256').update(conversationId).digest('hex')) } : {}),
       ...(persistedTaskMemory ? { task_memory: persistedTaskMemory } : {}),
       provider_max_output: maxOutputTokens,
     };
     child.stdin.write(`${JSON.stringify(request)}\n`);
     const lines = createInterface({ input: child.stdout });
     let compactions = 0;
+    let statusCount = 0;
     let terminalFinal = false;
     let terminalFailure = false;
     let terminalFinishReason: 'stop' | 'length' = 'stop';
@@ -135,7 +158,10 @@ export class RustAgentRuntime {
         try { event = JSON.parse(line) as RuntimeEvent; } catch { continue; }
         if (event.type === 'thinking_delta') yield { type: 'thinking', content: event.content ?? '' };
         else if (event.type === 'turn_started') yield { type: 'agent-telemetry', telemetry: { turn: event.index ?? 0 } };
-        else if (event.type === 'content_delta' || event.type === 'final_delta') yield { type: 'token', content: event.content ?? '' };
+        else if (event.type === 'content_delta' || event.type === 'final_delta' || event.type === 'agent_status') {
+          if (event.type === 'agent_status') statusCount += 1;
+          yield runtimeTextEvent(event, runId, statusCount)!;
+        }
         else if (event.type === 'tool_call_started') {
           const command = event.name === 'run_terminal' && typeof event.arguments?.command === 'string' ? event.arguments.command : undefined;
           yield { type: 'tool', activity: { id: event.id ?? crypto.randomUUID(), label: activityLabel(event.name), detail: command ?? event.name, kind: activityKind(event.name), state: 'running', ...(command ? { terminal: { command, status: 'running' } } : {}) } };

@@ -2,6 +2,33 @@ use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+const MAX_READ_RESULT_BYTES: usize = 64 * 1024;
+
+fn bounded_read_content(content: &str, offset_chars: usize) -> (String, bool, usize) {
+    let start = content
+        .char_indices()
+        .nth(offset_chars)
+        .map_or(content.len(), |(index, _)| index);
+    let remainder = &content[start..];
+    if remainder.len() <= MAX_READ_RESULT_BYTES {
+        return (
+            remainder.to_owned(),
+            false,
+            offset_chars + remainder.chars().count(),
+        );
+    }
+    let end = remainder
+        .char_indices()
+        .take_while(|(index, _)| *index < MAX_READ_RESULT_BYTES)
+        .last()
+        .map_or(0, |(index, character)| index + character.len_utf8());
+    (
+        remainder[..end].to_owned(),
+        true,
+        offset_chars + remainder[..end].chars().count(),
+    )
+}
+
 fn scoped(root: &Path, path: &str) -> Result<PathBuf, String> {
     let candidate = root.join(path);
     let normalized = match fs::canonicalize(&candidate) {
@@ -94,6 +121,10 @@ pub fn execute(root: &Path, name: &str, args: &Value) -> Result<(Value, Option<S
                 .get("end_line")
                 .and_then(Value::as_u64)
                 .map(|line| line.max(1) as usize);
+            let offset_chars = object
+                .get("offset_chars")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize;
             if start_line.is_some() || end_line.is_some() {
                 let start = start_line.unwrap_or(1);
                 let end = end_line.unwrap_or(lines.len()).max(start);
@@ -104,13 +135,17 @@ pub fn execute(root: &Path, name: &str, args: &Value) -> Result<(Value, Option<S
                     .copied()
                     .collect::<Vec<_>>()
                     .join("\n");
+                let (selected, truncated, next_offset_chars) =
+                    bounded_read_content(&selected, offset_chars);
                 Ok((
-                    json!({"path":path,"content":selected,"start_line":start,"end_line":end,"total_lines":lines.len(),"targeted":true}),
+                    json!({"path":path,"content":selected,"start_line":start,"end_line":end,"total_lines":lines.len(),"targeted":true,"truncated":truncated,"offset_chars":offset_chars,"next_offset_chars":next_offset_chars,"read_result_limit_bytes":MAX_READ_RESULT_BYTES}),
                     None,
                 ))
             } else {
+                let (content, truncated, next_offset_chars) =
+                    bounded_read_content(&content, offset_chars);
                 Ok((
-                    json!({"path":path,"content":content,"total_lines":lines.len(),"targeted":false}),
+                    json!({"path":path,"content":content,"total_lines":lines.len(),"targeted":false,"truncated":truncated,"offset_chars":offset_chars,"next_offset_chars":next_offset_chars,"read_result_limit_bytes":MAX_READ_RESULT_BYTES}),
                     None,
                 ))
             }
@@ -317,6 +352,43 @@ fn interpret_hunk(hunk: &[String]) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn large_read_is_bounded_and_addressable_by_offset() {
+        let root = std::env::temp_dir().join(format!(
+            "local-ai-desktop-bounded-read-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let body = "é".repeat(70_000);
+        fs::write(root.join("large.txt"), &body).unwrap();
+        let first = execute(&root, "read_file", &json!({"path":"large.txt"}))
+            .unwrap()
+            .0;
+        assert_eq!(first["truncated"], true);
+        let first_text = first["content"].as_str().unwrap();
+        assert!(first_text.len() <= MAX_READ_RESULT_BYTES);
+        let offset = first["next_offset_chars"].as_u64().unwrap();
+        let second = execute(
+            &root,
+            "read_file",
+            &json!({"path":"large.txt","offset_chars":offset}),
+        )
+        .unwrap()
+        .0;
+        assert_eq!(second["offset_chars"], offset);
+        assert!(second["content"].as_str().unwrap().len() <= MAX_READ_RESULT_BYTES);
+        assert_eq!(
+            format!("{}{}", first_text, second["content"].as_str().unwrap())
+                .chars()
+                .count(),
+            second["next_offset_chars"].as_u64().unwrap() as usize
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn apply_patch_update_add_delete_roundtrip() {

@@ -68,6 +68,11 @@ pub enum Event {
     ContentDelta {
         content: String,
     },
+    /// A completed research turn's visible narration. Electron places this
+    /// in the timeline, never in the final-answer accumulator.
+    AgentStatus {
+        content: String,
+    },
     ToolCallStarted {
         id: String,
         name: String,

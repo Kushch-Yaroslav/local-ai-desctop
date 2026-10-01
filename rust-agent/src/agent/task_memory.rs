@@ -76,18 +76,52 @@ impl TaskMemory {
         Ok(())
     }
     pub fn prompt(&self) -> String {
-        // Keep a small recency-bounded handoff window. The model decides its
-        // own work sequence; memory stores findings rather than plan state.
-        let mut entries: Vec<&TaskMemoryEntry> = Vec::new();
-        for entry in self.entries.iter().rev() {
-            if entries.len() == 4 {
-                break;
-            }
-            if entry.invalidated || entries.iter().any(|selected| selected.id == entry.id) {
-                continue;
-            }
-            entries.push(entry);
-        }
+        self.prompt_for("")
+    }
+
+    pub fn prompt_for(&self, objective: &str) -> String {
+        self.prompt_for_mode(objective, true)
+    }
+
+    /// Once closeout has been requested, findings remain useful but old
+    /// procedural `next` fields no longer govern the run.
+    pub fn prompt_for_closeout(&self, objective: &str) -> String {
+        self.prompt_for_mode(objective, false)
+    }
+
+    fn prompt_for_mode(&self, objective: &str, include_next: bool) -> String {
+        // Select a small, useful handoff instead of allowing four recent
+        // low-value notes to evict a cited blocker or relevant older finding.
+        let words = objective
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|word| word.chars().count() >= 4)
+            .map(str::to_lowercase)
+            .collect::<Vec<_>>();
+        let mut ranked = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| !e.invalidated)
+            .map(|(i, e)| {
+                let text = format!("{} {} {}", e.finding, e.evidence, e.implication).to_lowercase();
+                let relevance = words
+                    .iter()
+                    .filter(|word| text.contains(word.as_str()))
+                    .count()
+                    .min(4);
+                let score = relevance * 4
+                    + usize::from(include_next && !e.next.is_empty()) * 2
+                    + usize::from(e.evidence.contains("obs-")) * 3
+                    + usize::from(text.contains("block") || text.contains("contradict")) * 2;
+                (score, i, e)
+            })
+            .collect::<Vec<_>>();
+        ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+        let entries = ranked
+            .into_iter()
+            .take(4)
+            .map(|(_, _, e)| e)
+            .collect::<Vec<_>>();
         entries
             .into_iter()
             .map(|e| {
@@ -98,7 +132,7 @@ impl TaskMemory {
                 if !e.implication.is_empty() {
                     v.push(format!("  implication: {}", e.implication));
                 }
-                if !e.next.is_empty() {
+                if include_next && !e.next.is_empty() {
                     v.push(format!("  next: {}", e.next));
                 }
                 v.join("\n")
@@ -168,6 +202,61 @@ mod tests {
         let prompt = memory.prompt();
         assert!(prompt.contains("tm-001: confirmed project structure"));
         assert!(prompt.contains("evidence: src/main.tsx"));
+    }
+
+    #[test]
+    fn closeout_retains_facts_but_drops_stale_research_next_steps() {
+        let mut memory = TaskMemory::default();
+        memory
+            .upsert(
+                None,
+                "endpoint handles checkout".into(),
+                "obs-00000001".into(),
+                "business flow established".into(),
+                "list every directory again".into(),
+                None,
+            )
+            .unwrap();
+        assert!(memory
+            .prompt_for("checkout")
+            .contains("list every directory again"));
+        let closeout = memory.prompt_for_closeout("checkout");
+        assert!(closeout.contains("endpoint handles checkout"));
+        assert!(closeout.contains("obs-00000001"));
+        assert!(!closeout.contains("list every directory again"));
+    }
+
+    #[test]
+    fn relevant_cited_older_finding_survives_recent_noise() {
+        let mut memory = TaskMemory::default();
+        memory
+            .upsert(
+                Some("backend"),
+                "api.php handles order submission".into(),
+                "obs-00000042".into(),
+                "backend exists".into(),
+                "".into(),
+                None,
+            )
+            .unwrap();
+        for n in 0..6 {
+            memory
+                .upsert(
+                    None,
+                    format!("unrelated note {n}"),
+                    "".into(),
+                    "".into(),
+                    "".into(),
+                    None,
+                )
+                .unwrap();
+        }
+        assert!(memory
+            .prompt_for("Explain backend order flow")
+            .contains("api.php handles order submission"));
+        assert!(!memory
+            .prompt_for("Explain backend order flow")
+            .contains("unrelated note 0"));
     }
 }
 fn clean(value: &str, required: bool) -> Result<String, String> {

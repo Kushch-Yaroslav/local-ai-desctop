@@ -1,4 +1,4 @@
-use crate::agent::transcript::{prompt_tail_message, Entry, Transcript};
+use crate::agent::transcript::{project_accepted_message, prompt_tail_message, Entry, Transcript};
 use serde_json::{json, Value};
 
 /// A pure request projection. The first system message is byte-stable within a
@@ -20,7 +20,10 @@ pub fn project(transcript: &Transcript, stable_prefix: &str, dynamic_tail: &str)
             }
         }
     }
-    if let Some(summary) = summary {
+    if let Some(summary) = summary.filter(|text| {
+        !transcript.is_finalizing()
+            || text.contains("Phase: FINALIZING (authoritative durable runtime state)")
+    }) {
         messages.push(json!({"role":"user", "content":format!("[RUNTIME COMPACTION SUMMARY — NOT USER CONTENT]\n{summary}")}));
     }
     if !imported_system.is_empty() {
@@ -36,6 +39,14 @@ pub fn project(transcript: &Transcript, stable_prefix: &str, dynamic_tail: &str)
             _ => None,
         });
     let mut included_run_user = false;
+    let latest_tail = transcript
+        .entries()
+        .iter()
+        .enumerate()
+        .skip(start.max(transcript.finalization_index().unwrap_or(0)))
+        .rfind(|(_, entry)| matches!(entry, Entry::PromptTail(_)))
+        .map(|(index, _)| index);
+    let mut closeout_tail = None;
     if let Some((index, message)) = &run_user {
         if *index < start {
             // The summary may cover the original prompt, but tool-result tail
@@ -44,7 +55,7 @@ pub fn project(transcript: &Transcript, stable_prefix: &str, dynamic_tail: &str)
             included_run_user = true;
         }
     }
-    for entry in transcript.entries().iter().skip(start) {
+    for (index, entry) in transcript.entries().iter().enumerate().skip(start) {
         match entry {
             Entry::Message(message)
                 if message.get("role").and_then(Value::as_str) != Some("system") =>
@@ -52,15 +63,22 @@ pub fn project(transcript: &Transcript, stable_prefix: &str, dynamic_tail: &str)
                 // Jan projects the retained structural tail verbatim. A
                 // separate per-tool truncation here made the model lose the
                 // exact detail it deliberately kept and encouraged rereads.
-                messages.push(message.clone())
+                messages.push(project_accepted_message(message))
             }
             Entry::RunUser(message) => {
                 messages.push(message.clone());
                 included_run_user = true;
             }
             Entry::Steering(content) => messages.push(json!({"role":"user", "content":format!("[RUNTIME STEERING — NOT USER CONTENT]\n{content}"), "metadata":{"steering":true}})),
-            Entry::PromptTail(content) => messages.push(prompt_tail_message(content)),
-            Entry::Compaction { .. } | Entry::Reminder(_) | Entry::Message(_) => {}
+            Entry::PromptTail(content) if dynamic_tail.trim().is_empty() && latest_tail == Some(index) => {
+                let tail = prompt_tail_message(content);
+                if transcript.is_closeout_requested() && !transcript.is_finalizing() {
+                    closeout_tail = Some(tail);
+                } else {
+                    messages.push(tail);
+                }
+            },
+            Entry::Compaction { .. } | Entry::Reminder(_) | Entry::ClearReminders | Entry::Finalizing | Entry::CloseoutRequested | Entry::RunComplete | Entry::LanguagePreference(_) | Entry::Evidence(_) | Entry::Frontier(_) | Entry::FrontierDisposition(_) | Entry::Message(_) | Entry::PromptTail(_) => {}
         }
     }
     // Retain an exact current prompt even if an unusually small context made
@@ -69,6 +87,12 @@ pub fn project(transcript: &Transcript, stable_prefix: &str, dynamic_tail: &str)
         if let Some((_, message)) = run_user {
             messages.push(message);
         }
+    }
+    // A durable CloseoutRequested event must remain the current provider
+    // boundary. A previously accepted tail can otherwise drift behind many
+    // unrelated assistant/tool turns while the phase itself remains active.
+    if let Some(tail) = closeout_tail {
+        messages.push(tail);
     }
     if !dynamic_tail.trim().is_empty() && !transcript.has_active_prompt_tail(dynamic_tail) {
         // Dynamic data belongs after accepted conversation so cache providers
@@ -85,6 +109,34 @@ mod tests {
     use crate::agent::transcript::Transcript;
 
     #[test]
+    fn durable_closeout_tail_stays_at_the_request_boundary_after_rejected_work() {
+        let base = std::env::temp_dir().join(format!(
+            "closeout-tail-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let mut transcript = Transcript::durable(&base, "run", &[], None).unwrap();
+        transcript.push_run_user(json!({"role":"user","content":"audit"}));
+        transcript.mark_closeout_requested();
+        transcript
+            .record_prompt_tail("<runtime_closeout>backend/order flow remains</runtime_closeout>");
+        transcript.assistant_withheld_draft(String::new(), "a specific evidence gap");
+        transcript.assistant_message("Research status after rejected final".into());
+        drop(transcript);
+        let resumed = Transcript::durable(&base, "resume", &[], None).unwrap();
+        assert!(resumed.is_closeout_requested());
+        let before = serde_json::to_value(resumed.entries()).unwrap();
+        let messages = project(&resumed, "system", "");
+        assert!(messages.last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .contains("backend/order flow remains"));
+        assert_eq!(serde_json::to_value(resumed.entries()).unwrap(), before);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn dynamic_reminder_stays_outside_stable_prefix() {
         let mut transcript = Transcript::default();
         transcript.push_run_user(json!({"role":"user","content":"audit"}));
@@ -97,6 +149,63 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("update plan"));
+    }
+
+    #[test]
+    fn finalizing_projection_omits_stale_research_checkpoint() {
+        let mut transcript = Transcript::default();
+        transcript.push_run_user(json!({"role":"user","content":"audit"}));
+        transcript.assistant_message("old research".into());
+        transcript.compact("Next useful intent: restart broad discovery".into(), 2);
+        transcript.mark_finalizing();
+        let projected = project(
+            &transcript,
+            "system",
+            "MODE: FINALIZING; synthesize established evidence",
+        );
+        assert!(!projected.iter().any(|m| m
+            .get("content")
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.contains("restart broad discovery"))));
+        assert!(projected.iter().any(|m| m
+            .get("content")
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.contains("MODE: FINALIZING"))));
+        transcript.compact(
+            "Phase: FINALIZING (authoritative durable runtime state). Continue one final response."
+                .into(),
+            transcript.entries().len(),
+        );
+        let after = project(
+            &transcript,
+            "system",
+            "MODE: FINALIZING; synthesize established evidence",
+        );
+        assert!(after.iter().any(|m| m
+            .get("content")
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.contains("Phase: FINALIZING"))));
+    }
+
+    #[test]
+    fn changing_evidence_tail_replaces_stale_projection_without_erasing_events() {
+        let mut transcript = Transcript::default();
+        transcript.push_run_user(json!({"role":"user","content":"audit"}));
+        transcript.record_prompt_tail("old evidence receipt");
+        transcript.assistant_message("work".into());
+        transcript.record_prompt_tail("new established evidence");
+        assert!(!transcript.has_active_prompt_tail("old evidence receipt"));
+        assert!(transcript.has_active_prompt_tail("new established evidence"));
+        let messages = project(&transcript, "system", "");
+        assert!(!messages.iter().any(|m| m["content"]
+            .as_str()
+            .is_some_and(|s| s.contains("old evidence receipt"))));
+        assert!(messages.iter().any(|m| m["content"]
+            .as_str()
+            .is_some_and(|s| s.contains("new established evidence"))));
+        assert!(transcript.entries().iter().any(
+            |entry| matches!(entry, Entry::PromptTail(value) if value=="old evidence receipt")
+        ));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import type { ChatMessage } from '../../shared/types';
-import { splitAgentRunHistory, taskPlan } from './rust-agent-runtime';
+import { runtimeTextEvent, splitAgentRunHistory, taskPlan } from './rust-agent-runtime';
 import { displayToolResult, toolResultSummary } from '../../renderer/components/AgentTimeline';
 
 const message = (role: ChatMessage['role'], content: string): ChatMessage => ({
@@ -35,6 +35,17 @@ export function runRustAgentRuntimeRegression(): void {
   assert.match(toolResultSummary(knowledgeActivity) ?? '', /^2 knowledge entries/);
   const legacy = taskPlan({ steps: [{ id: 'legacy-task', label: 'Old item', status: 'completed' }] });
   assert.equal(legacy.milestones?.[0]?.workPlan.tasks[0]?.id, 'legacy-task');
+
+  const statusAndFinal = [
+    runtimeTextEvent({ type: 'agent_status', content: 'Planning the audit' }, 'run', 1),
+    runtimeTextEvent({ type: 'agent_status', content: 'Continuing source inspection' }, 'run', 2),
+    runtimeTextEvent({ type: 'content_delta', content: 'Accepted final answer' }, 'run', 2),
+  ];
+  assert.deepEqual(statusAndFinal.map((event) => event?.type), ['tool', 'tool', 'token']);
+  assert.equal(statusAndFinal.filter((event) => event?.type === 'token').map((event) => event?.type === 'token' ? event.content : '').join(''), 'Accepted final answer');
+  assert.equal(statusAndFinal[0]?.type === 'tool' && statusAndFinal[0].activity.kind, 'progress');
+  assert.equal(statusAndFinal[1]?.type === 'tool' && statusAndFinal[1].activity.output, 'Continuing source inspection');
+  assert.equal(runtimeTextEvent({ type: 'withheld_draft', content: 'Rejected answer' }, 'run', 2), null);
 
 }
 
