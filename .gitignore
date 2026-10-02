@@ -16,3 +16,10 @@ local-cache/
 /runtime/*.pid
 *.log
 .idea/
+
+# Local agent/runtime generated state
+.ai-framework/
+.jan/
+
+# Rust build artifacts
+rust-agent/target/

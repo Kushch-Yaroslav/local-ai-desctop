@@ -1,0 +1,124 @@
+# Agent investigation state and completion
+
+This document records where the Agent runtime draws the line between what the
+runtime owns and what the model owns during long, evidence-heavy work (for
+example a repository audit). It replaces the earlier research controller,
+model-facing evidence grading and finalization lifecycle.
+
+## The principle
+
+**The runtime owns facts it can verify mechanically. The model owns every
+semantic judgement.**
+
+| Runtime owns (mechanical, verifiable) | Model owns (semantic) |
+| --- | --- |
+| Tool-call validity and call/result pairing | What to read, in what order, and why |
+| Immutable storage of every tool result and exact recovery (`observation_read`) | Whether the evidence is enough to answer |
+| Refusing an *exact unchanged* repeat read (same path, range, file revision) | Whether a finding is supported by a source |
+| Whether a read/listing was complete or truncated, and whether an operation failed | Whether an absence claim is justified, and its scope |
+| Which listed entries and statically referenced local files were never opened | Whether an unopened file matters to the question |
+| Compaction, context fit, output budget, restart/resume | Planning, task memory contents, the final answer |
+| Never leaving the user without an answer (turn budget → synthesis-only turn) | When the work is done |
+
+Anything that needs to decide *meaning* — "is this claim about the backend?",
+"does this observation support that sentence?", "is this requested area
+covered?" — is not decidable by the runtime without a lexical proxy. The
+previous design used such proxies (keyword lists naming areas, term-overlap
+grading of claims, negation word lists). They produced both false coverage
+(prose naming an area counted as investigating it; a claim "there is no API"
+counted as covering the backend) and unsatisfiable gates (a final answer
+blocked for gaps the runtime could not name). The proxies were removed rather
+than patched.
+
+## Investigation state (`agent/ledger.rs`)
+
+`Ledger::build` is a pure function of the run's transcript plus a bounded index
+of the project's files. It is recomputed every turn, so it needs no storage of
+its own and survives compaction and restart. It is projected in the dynamic tail
+as `<investigation_state>` and contains:
+
+- **Files read** with their observation IDs, marking partial reads. This is the
+  source → observation map that makes recovery one hop and prevents rereads
+  after the original result has left the context. It spans the whole
+  conversation lineage.
+- **Requests**: unopened local files that a source calls or submits to
+  (`fetch`, `axios`, `action=`, …). A string literal in a read file that
+  resolves structurally (relative to the file, relative to the project root, or
+  by unique path suffix, which covers import aliases and directories served
+  from a sub-folder) to an existing project file. Ambiguous literals resolve to
+  nothing. They stay visible until opened.
+- **Working-set neighbourhood**: unopened local files referenced by the
+  sources read in the last few provider turns, grouped by referencing source
+  (target names stay visible so the model can judge relevance itself), and
+  unopened entries of recently listed directories (dependency/build
+  directories, lock files, assets and `.env*` are not offered). These fade
+  after `WORKING_SET_TURNS` turns. A permanent list of every unopened import
+  and entry reads as a task list and drives breadth-first crawling; locality
+  gives "what did the file I just read point to?" without maintaining a
+  frontier for the model to drain. Nothing is lost — the facts stay derivable.
+- **Failed operations** and **commands run** with their outcome, so an absence
+  claim can name the scope that was actually covered.
+
+The ledger never says that something is relevant, missing, or required. The
+stable guidance states this explicitly and states the grounding principles the
+model applies itself: a source that was not opened is unknown, not absent; an
+absence claim must name the scope it covers; a failed or approval-blocked
+operation is a blocker, not evidence.
+
+## Completion
+
+A tool-free response completes the run. The only exceptions, both bounded:
+
+1. the existing post-mutation validation reminder;
+2. one reminder, per run, naming concrete unopened *request* targets when a
+   draft answer arrives while such targets exist. The draft is withheld once;
+   whatever the model answers next is accepted.
+
+Neither can repeat, so neither can block a final answer.
+
+A response with neither content nor a structured tool call (for example a tool
+call written inside the reasoning stream, which is never executed) is not an
+answer: it gets a reminder and the turn is retried. After
+`MAX_CONSECUTIVE_EMPTY_TURNS` such turns tools are withdrawn so the next turns
+can only be an answer.
+
+When the turn budget (`MAX_INVESTIGATION_TURNS`) is exhausted the runtime does
+not end in an error: it withdraws tools, marks the transcript as synthesis-only
+and gives the model up to `MAX_SYNTHESIS_TURNS` turns to answer, telling it to
+state what remained unexamined.
+
+## Context safety (mechanical, window-relative)
+
+- **Tool results are bounded by the window at creation.** One result may use
+  about a quarter of the window in raw characters and a whole provider turn
+  about two thirds (roughly 15% and 40% of the window in estimated tokens once
+  serialization overhead is counted); parallel results share the turn budget
+  (small results take what they need, large ones split the rest). A cut result
+  is reported as truncated with its continuation offset exactly like one cut by
+  the tool maximum. The model's call is stored unchanged; the limit is an
+  internal argument. Without this, a burst of large reads at a small window (or
+  recovered observations, which are exact by contract and therefore cannot be
+  folded) could not be made to fit and ended the run in a `context_budget`
+  error.
+- **The compaction summarizer sees the whole span.** Its input is every message
+  of the span with tool results shown as bounded excerpts (their exact bodies
+  are recoverable by observation ID), clamped in the middle if still too long.
+  It previously stopped at the first message that exceeded the budget, so after
+  a burst of large results the summary never saw most of the span.
+- **The summary request uses the run's protocol options** (context size,
+  reasoning off). On Ollama a request without `num_ctx` is truncated to the
+  server default and reloads the model.
+
+## Memory
+
+Task Memory remains the model-authored semantic handoff (findings, decisions,
+blockers, next steps). Entries cite the observation IDs they rest on; the
+runtime resolves nothing semantically from the prose. Project Knowledge is
+unchanged.
+
+## Journal compatibility
+
+Journals written by earlier runtimes contain `Evidence`, `EvidenceRejection`,
+`Frontier`, `FrontierDisposition` and `CloseoutRequested` entries. They are
+still deserialized (as opaque values) and ignored, so old conversations resume
+intact; an unparseable line would otherwise be treated as a torn tail.

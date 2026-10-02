@@ -19,10 +19,9 @@ env NPM_CONFIG_CACHE="$PWD/local-cache/npm" npm start
 На рабочем столе доступны три ярлыка; их запускные скрипты не используют системные каталоги для кэша приложения:
 
 - **Local AI Desktop** — стандартный запуск, использует сервис Ollama. Скрипт: `run-local-ai-desktop.sh`.
-- **Local AI Desktop — llama.cpp MTP** — собственный `llama-server` с Qwen (GGUF symlink на Ollama blob) и ускорением `draft-mtp`.
-- **Local AI Desktop — GLM-4.7-Flash** — собственный `llama-server` с GLM-4.7-Flash (см. «Архитектура»).
+- **Local AI Desktop — llama.cpp** — один launcher-managed `llama-server`; Qwen использует MTP, а модель выбирается внутри приложения.
 
-Перед началом диалога через Ollama запустите сервис Ollama. Приложение использует три зарегистрированные локальные модели: `qwen3.8:27b-q4_K_M` и `gpt-oss:20b` (Ollama) и `glm-4.7-flash:q4_k` (llama.cpp). Ollama хранит веса через `OLLAMA_MODELS=/media/yaroslav/DATA/ollama`, GGUF для llama.cpp лежат в `/media/yaroslav/DATA/llama-models`; приложение подключается к `http://127.0.0.1:11434` и `http://127.0.0.1:8081` только как клиент. Qwen обрабатывает изображения нативно; выбранная модель без vision capability возвращает контролируемую ошибку без скрытой fallback-модели.
+Перед началом диалога через Ollama запустите сервис Ollama. Ollama хранит веса через `OLLAMA_MODELS=/media/yaroslav/DATA/ollama`, GGUF для llama.cpp лежат в `/media/yaroslav/DATA/llama-models`; модель и backend выбираются внутри приложения. Qwen обрабатывает изображения нативно; выбранная модель без vision capability возвращает контролируемую ошибку без скрытой fallback-модели.
 
 ## Что реализовано
 
@@ -42,6 +41,22 @@ env NPM_CONFIG_CACHE="$PWD/local-cache/npm" npm start
 - Обновление RAM и показателей NVIDIA через лёгкий опрос `nvidia-smi` каждые две секунды. Когда драйвер или `nvidia-smi` недоступны, остаётся мониторинг RAM и понятный статус GPU.
 - Верхняя панель разделяет вторичный runtime monitoring (RAM, VRAM, GPU и скорость generation) и основные controls. Скорость ответа после завершения берётся из `eval_count / eval_duration` Ollama; tooltip показывает доступные prompt/eval counters и TTFT. Во время streaming приложение не оценивает tokens по символам и ждёт authoritative runtime metric.
 - Изолированный Electron renderer: `contextIsolation`, отключённый `nodeIntegration`, типизированный preload IPC. Доступ к SQLite, выбору папки, процессам и мониторингу остаётся в main process.
+
+## Версии и этапы развития
+
+| Версия | Git anchor | Архитектура / этап | Что умеет | Ограничения | Статус |
+| --- | --- | --- | --- | --- | --- |
+| V1 / v0.1 | `1c13d0954c22bad493516177e9f75d31cb533321` — `Harden terminal command classification` | Первая стабильная генерация | Сильный локальный Chat, локальные LLM, контекст проекта и инструменты; Agent решает небольшие задачи и делает простые правки; удобный общий UX чата | Агент слабее на крупных автономных coding-задачах: ограничены планирование, оркестрация и длительный workflow | Завершена, историческая стабильная версия |
+| V2 / v0.2.0 | `44f2c6ba4dd63fb6d620a08956f013e8df5a7751` — merge V2 migration | Ядро Agent runtime перенесено в Rust | Гораздо более глубокий анализ репозиториев, усиленные lifecycle/context handling и архитектура агента; Deep может выпускать подробные технические и продуктовые аудиты | После миграции проявились регрессии: в некоторых сценариях Agent становился фактически read-only, глубокий анализ был чрезмерно долгим, а saturation/closeout мог преждевременно вести к synthesis/final | Основа влита; стабилизация продолжается |
+| V2 stabilization / планируемая v0.2.1 | Локальная незакоммиченная работа | Доводка Rust runtime и UX длительного запуска | Сохраняет глубину и доказательность лучшего V2 Deep-анализа, сокращая повторные исследования; возвращает надёжные write/patch и проверку через tools/tests; развивает timeline, краткие progress narration, сворачиваемые Thought/reasoning, inline actions и корректный live auto-scroll | Нужны реальные длительные benchmark-прогоны | В работе |
+
+V2 будет считаться завершённой, когда Deep остаётся действительно глубоким без преждевременного synthesis и повторных обходов, Agent надёжно анализирует и изменяет проекты, проверяет результат tools/tests, а длительный запуск остаётся понятным в UI.
+
+### V3 / future
+
+V3 — следующий шаг к автономной оркестрации, а не просто редизайн интерфейса. Текущий эксперимент проверяет работу без внешнего Todo/Task Planning протокола: модель самостоятельно выбирает ход работы, а runtime сохраняет возможности, семантическую компакцию, Task Memory и Project Knowledge. Автоматическое продолжение между model turns и при output limits, background jobs и устойчивое resume/recovery остаются отдельными направлениями развития.
+
+Long-term Experience / Memory рассматривается позже как отдельная возможность. Inference/prompt cache не является долгосрочной памятью: он ускоряет или удерживает контекст текущего запуска, но не хранит опыт агента между задачами.
 
 ## Локальные модели
 
@@ -124,7 +139,4 @@ SQLite хранит полную историю, а не KV-кэш модели.
 
 ## Следующие этапы
 
-1. MCP-подключение внешних инструментов (planned-компонент со схемы, п. 1).
-2. Long-term Experience / Memory (planned-компонент со схемы, п. 1).
-3. Lightweight Diff / Review UX (низкий приоритет).
-4. Multi-Agent Mode (позже, самый сложный пункт).
+Дальнейшая дорожная карта описана в разделе «V3 / future» выше; туда входят MCP-подключения, автономная оркестрация и позднее отдельная возможность Long-term Experience / Memory.

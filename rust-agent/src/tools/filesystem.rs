@@ -2,6 +2,49 @@ use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+const MAX_READ_RESULT_BYTES: usize = 64 * 1024;
+
+/// Largest read result this call may return: the tool maximum, optionally
+/// lowered by the runtime through the internal `_result_limit_bytes` argument
+/// (never part of the model-facing schema) so one turn's results fit the window.
+fn read_limit(object: &serde_json::Map<String, Value>) -> usize {
+    object
+        .get("_result_limit_bytes")
+        .and_then(Value::as_u64)
+        .map_or(MAX_READ_RESULT_BYTES, |limit| {
+            (limit as usize).clamp(1, MAX_READ_RESULT_BYTES)
+        })
+}
+
+fn bounded_read_content(
+    content: &str,
+    offset_chars: usize,
+    limit_bytes: usize,
+) -> (String, bool, usize) {
+    let start = content
+        .char_indices()
+        .nth(offset_chars)
+        .map_or(content.len(), |(index, _)| index);
+    let remainder = &content[start..];
+    if remainder.len() <= limit_bytes {
+        return (
+            remainder.to_owned(),
+            false,
+            offset_chars + remainder.chars().count(),
+        );
+    }
+    let end = remainder
+        .char_indices()
+        .take_while(|(index, _)| *index < limit_bytes)
+        .last()
+        .map_or(0, |(index, character)| index + character.len_utf8());
+    (
+        remainder[..end].to_owned(),
+        true,
+        offset_chars + remainder[..end].chars().count(),
+    )
+}
+
 fn scoped(root: &Path, path: &str) -> Result<PathBuf, String> {
     let candidate = root.join(path);
     let normalized = match fs::canonicalize(&candidate) {
@@ -41,6 +84,17 @@ fn is_runtime_temporary(root: &Path, target: &Path) -> bool {
         || (root.file_name().and_then(|name| name.to_str()) == Some("runtime")
             && components.first() == Some(&".tmp"))
 }
+
+/// `.ai-framework` is accessed only through the dedicated knowledge tools.
+/// Treating it as application source would make broad repository traversal
+/// recursively audit the cache itself.
+fn is_knowledge_cache(root: &Path, target: &Path) -> bool {
+    target
+        .strip_prefix(root)
+        .ok()
+        .and_then(|relative| relative.components().next())
+        .is_some_and(|component| component.as_os_str() == ".ai-framework")
+}
 pub fn execute(root: &Path, name: &str, args: &Value) -> Result<(Value, Option<String>), String> {
     let object = args
         .as_object()
@@ -49,28 +103,35 @@ pub fn execute(root: &Path, name: &str, args: &Value) -> Result<(Value, Option<S
     match name {
         "list_directory" => {
             let target = scoped(root, path)?;
-            if is_runtime_temporary(root, &target) {
+            if is_runtime_temporary(root, &target) || is_knowledge_cache(root, &target) {
                 return Err(
-                    "runtime acceptance artifacts are excluded from project discovery".to_owned(),
+                    "internal runtime/cache files are excluded from project discovery".to_owned(),
                 );
             }
-            let mut items = fs::read_dir(target)
-                .map_err(|e| e.to_string())?
-                .filter_map(Result::ok)
-                .filter(|entry| !is_runtime_temporary(root, &entry.path()))
-                .map(|x| x.file_name().to_string_lossy().to_string())
-                .collect::<Vec<_>>();
+            let mut items = Vec::new();
+            let mut complete = true;
+            for entry in fs::read_dir(target).map_err(|e| e.to_string())? {
+                let entry = entry.map_err(|e| e.to_string())?;
+                if is_runtime_temporary(root, &entry.path())
+                    || is_knowledge_cache(root, &entry.path())
+                {
+                    complete = false;
+                    continue;
+                }
+                items.push(entry.file_name().to_string_lossy().to_string());
+            }
             items.sort();
-            Ok((json!({"entries":items}), None))
+            Ok((json!({"entries":items,"complete":complete}), None))
         }
         "read_file" => {
             let target = scoped(root, path)?;
-            if is_runtime_temporary(root, &target) {
+            if is_runtime_temporary(root, &target) || is_knowledge_cache(root, &target) {
                 return Err(
-                    "runtime acceptance artifacts are excluded from project discovery".to_owned(),
+                    "internal runtime/cache files are excluded from project discovery".to_owned(),
                 );
             }
             let content = fs::read_to_string(target).map_err(|e| e.to_string())?;
+            let limit = read_limit(object);
             let lines = content.lines().collect::<Vec<_>>();
             let start_line = object
                 .get("start_line")
@@ -80,6 +141,10 @@ pub fn execute(root: &Path, name: &str, args: &Value) -> Result<(Value, Option<S
                 .get("end_line")
                 .and_then(Value::as_u64)
                 .map(|line| line.max(1) as usize);
+            let offset_chars = object
+                .get("offset_chars")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize;
             if start_line.is_some() || end_line.is_some() {
                 let start = start_line.unwrap_or(1);
                 let end = end_line.unwrap_or(lines.len()).max(start);
@@ -90,13 +155,17 @@ pub fn execute(root: &Path, name: &str, args: &Value) -> Result<(Value, Option<S
                     .copied()
                     .collect::<Vec<_>>()
                     .join("\n");
+                let (selected, truncated, next_offset_chars) =
+                    bounded_read_content(&selected, offset_chars, limit);
                 Ok((
-                    json!({"path":path,"content":selected,"start_line":start,"end_line":end,"total_lines":lines.len(),"targeted":true}),
+                    json!({"path":path,"content":selected,"start_line":start,"end_line":end,"total_lines":lines.len(),"targeted":true,"truncated":truncated,"offset_chars":offset_chars,"next_offset_chars":next_offset_chars,"read_result_limit_bytes":limit}),
                     None,
                 ))
             } else {
+                let (content, truncated, next_offset_chars) =
+                    bounded_read_content(&content, offset_chars, limit);
                 Ok((
-                    json!({"path":path,"content":content,"total_lines":lines.len(),"targeted":false}),
+                    json!({"path":path,"content":content,"total_lines":lines.len(),"targeted":false,"truncated":truncated,"offset_chars":offset_chars,"next_offset_chars":next_offset_chars,"read_result_limit_bytes":limit}),
                     None,
                 ))
             }
@@ -120,13 +189,325 @@ pub fn execute(root: &Path, name: &str, args: &Value) -> Result<(Value, Option<S
                 Some(format!("--- {path}\n+++ {path}\n-{}\n+{}", before, content)),
             ))
         }
+        "apply_patch" => apply_patch(root, object),
+        "delete_file" => {
+            let content = object
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "path is required".to_owned())?;
+            let target = scoped(root, content)?;
+            if !target.is_file() {
+                return Err("only regular files can be deleted".to_owned());
+            }
+            fs::remove_file(&target).map_err(|e| e.to_string())?;
+            Ok((json!({"path":content,"deleted":true}), None))
+        }
         _ => Err(format!("unsupported filesystem tool: {name}")),
     }
+}
+
+/// Apply a `*** Begin Patch` style patch (Add/Update/Delete sections). The
+/// body of an Update section is either a classic unified diff (context `/ -/ +`
+/// lines) or a literal old/new block when context is absent; both forms
+/// round-trip against the same file content. A section failure leaves the file
+/// untouched because the rewrite happens in memory until the last byte is
+/// validated.
+fn apply_patch(
+    root: &Path,
+    object: &serde_json::Map<String, Value>,
+) -> Result<(Value, Option<String>), String> {
+    let patch = object
+        .get("patch")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "patch is required".to_owned())?;
+    let lines: Vec<String> = patch
+        .replace("\r\n", "\n")
+        .split('\n')
+        .map(str::to_owned)
+        .collect();
+    if lines
+        .first()
+        .map(|l| l.trim())
+        .is_some_and(|h| h != "*** Begin Patch")
+    {
+        return Err("patch must start with *** Begin Patch".to_owned());
+    }
+    let mut cursor = 1;
+    let mut changed: Vec<String> = Vec::new();
+    while cursor < lines.len() {
+        let header = lines[cursor].trim();
+        cursor += 1;
+        if header == "*** End Patch" {
+            break;
+        }
+        if let Some(rel) = header.strip_prefix("*** Add File: ") {
+            let rel = rel.trim();
+            let target = scoped(root, rel)?;
+            if target.exists() {
+                return Err(format!("file already exists: {rel}"));
+            }
+            let body = collect_body(&lines, &mut cursor);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            let mut content = body
+                .iter()
+                .filter(|line| line.starts_with('+'))
+                .map(|line| line[1..].to_owned())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !content.is_empty() && !content.ends_with('\n') {
+                content.push('\n');
+            }
+            fs::write(&target, &content).map_err(|e| e.to_string())?;
+            changed.push(rel.to_owned());
+            continue;
+        }
+        if let Some(rel) = header.strip_prefix("*** Delete File: ") {
+            let rel = rel.trim();
+            let target = scoped(root, rel)?;
+            if !target.is_file() {
+                return Err(format!("only regular files can be deleted: {rel}"));
+            }
+            fs::remove_file(&target).map_err(|e| e.to_string())?;
+            changed.push(rel.to_owned());
+            continue;
+        }
+        if let Some(rel) = header.strip_prefix("*** Update File: ") {
+            let rel = rel.trim();
+            let target = scoped(root, rel)?;
+            let before =
+                fs::read_to_string(&target).map_err(|e| format!("cannot read {rel}: {e}"))?;
+            let body = collect_body(&lines, &mut cursor);
+            let mut content = before.clone();
+            for hunk in hunk_blocks(&body) {
+                let (old, new) = interpret_hunk(&hunk);
+                if old.trim().is_empty() {
+                    return Err(format!(
+                        "patch for {rel} must remove or replace existing content"
+                    ));
+                }
+                // Apply each hunk against the latest in-memory content so a
+                // multi-hunk section edits the same file consistently.
+                let position = content
+                    .find(&old)
+                    .ok_or_else(|| format!("patch does not match current content: {rel}"))?;
+                content = format!(
+                    "{}{}{}",
+                    &content[..position],
+                    new,
+                    &content[position + old.len()..]
+                );
+            }
+            fs::write(&target, &content).map_err(|e| e.to_string())?;
+            changed.push(rel.to_owned());
+            continue;
+        }
+        return Err(format!("unknown patch section: {header}"));
+    }
+    if changed.is_empty() {
+        return Err("patch contains no file sections".to_owned());
+    }
+    Ok((
+        json!({"applied":true,"files":changed}),
+        Some(changed.join(", ")),
+    ))
+}
+
+/// Body lines run up to (and excluding) the next `*** ` header or `*** End
+/// Patch`; the cursor is left on that header so the outer loop re-reads it.
+fn collect_body(lines: &[String], cursor: &mut usize) -> Vec<String> {
+    let mut body = Vec::new();
+    while *cursor < lines.len() {
+        let trimmed = lines[*cursor].trim();
+        if trimmed == "*** End Patch" || trimmed.starts_with("*** ") {
+            break;
+        }
+        body.push(lines[*cursor].clone());
+        *cursor += 1;
+    }
+    body
+}
+
+fn hunk_blocks(body: &[String]) -> Vec<Vec<String>> {
+    let mut blocks: Vec<Vec<String>> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    for line in body {
+        if line.trim() == "@@" {
+            if !current.is_empty() {
+                blocks.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(line.to_owned());
+        }
+    }
+    if !current.is_empty() {
+        blocks.push(current);
+    }
+    blocks
+}
+
+/// Interpret one hunk body. Classic unified form keeps ` ` context lines and
+/// uses `-`/`+` for the old/new halves; a compact literal form pairs trailing
+/// `-` lines with trailing `+` lines and has no context. Both must produce a
+/// non-empty old half; the outer caller rejects otherwise.
+fn interpret_hunk(hunk: &[String]) -> (String, String) {
+    let mut old: Vec<&str> = Vec::new();
+    let mut new: Vec<&str> = Vec::new();
+    for line in hunk {
+        if line.starts_with("-") {
+            old.push(&line[1..]);
+        } else if line.starts_with("+") {
+            new.push(&line[1..]);
+        } else if let Some(rest) = line.strip_prefix(' ') {
+            // Context lines belong to both halves and let the anchor match a
+            // wider window than a bare old-content search.
+            old.push(rest);
+            new.push(rest);
+        }
+    }
+    (old.join("\n"), new.join("\n"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_result_limit_truncates_with_a_continuation_offset() {
+        let root = std::env::temp_dir().join(format!("fs-limit-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("big.txt"), "abcdefghij".repeat(100)).unwrap();
+        let (first, _) = execute(
+            &root,
+            "read_file",
+            &json!({"path":"big.txt","_result_limit_bytes":100}),
+        )
+        .unwrap();
+        assert_eq!(first["truncated"], true);
+        assert_eq!(first["content"].as_str().unwrap().len(), 100);
+        assert_eq!(first["next_offset_chars"], 100);
+        assert_eq!(first["read_result_limit_bytes"], 100);
+        let (second, _) = execute(
+            &root,
+            "read_file",
+            &json!({"path":"big.txt","offset_chars":100,"_result_limit_bytes":100}),
+        )
+        .unwrap();
+        assert!(second["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("abcdefghij"));
+        // the internal limit can only lower the tool maximum
+        let (all, _) = execute(
+            &root,
+            "read_file",
+            &json!({"path":"big.txt","_result_limit_bytes":10_000_000}),
+        )
+        .unwrap();
+        assert_eq!(all["truncated"], false);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn large_read_is_bounded_and_addressable_by_offset() {
+        let root = std::env::temp_dir().join(format!(
+            "local-ai-desktop-bounded-read-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let body = "é".repeat(70_000);
+        fs::write(root.join("large.txt"), &body).unwrap();
+        let first = execute(&root, "read_file", &json!({"path":"large.txt"}))
+            .unwrap()
+            .0;
+        assert_eq!(first["truncated"], true);
+        let first_text = first["content"].as_str().unwrap();
+        assert!(first_text.len() <= MAX_READ_RESULT_BYTES);
+        let offset = first["next_offset_chars"].as_u64().unwrap();
+        let second = execute(
+            &root,
+            "read_file",
+            &json!({"path":"large.txt","offset_chars":offset}),
+        )
+        .unwrap()
+        .0;
+        assert_eq!(second["offset_chars"], offset);
+        assert!(second["content"].as_str().unwrap().len() <= MAX_READ_RESULT_BYTES);
+        assert_eq!(
+            format!("{}{}", first_text, second["content"].as_str().unwrap())
+                .chars()
+                .count(),
+            second["next_offset_chars"].as_u64().unwrap() as usize
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn apply_patch_update_add_delete_roundtrip() {
+        let root = std::env::temp_dir().join(format!(
+            "local-ai-desktop-patch-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).expect("root");
+        fs::write(root.join("src/a.txt"), "alpha\nbeta\ngamma\n").expect("write");
+        fs::write(root.join("src/old.txt"), "gone\n").expect("write");
+
+        let patch = [
+            "*** Begin Patch",
+            "*** Update File: src/a.txt",
+            "-beta",
+            "+BETA",
+            "*** Add File: src/new.txt",
+            "+hello",
+            "*** Delete File: src/old.txt",
+            "*** End Patch",
+        ]
+        .join("\n");
+        let result = apply_patch(
+            &root,
+            &serde_json::json!({"patch": patch})
+                .as_object()
+                .cloned()
+                .unwrap(),
+        )
+        .expect("patch applies");
+        assert!(result.0["applied"] == true);
+
+        assert_eq!(
+            fs::read_to_string(root.join("src/a.txt")).unwrap(),
+            "alpha\nBETA\ngamma\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("src/new.txt")).unwrap(),
+            "hello\n"
+        );
+        assert!(!root.join("src/old.txt").exists());
+
+        let bad = apply_patch(
+            &root,
+            &serde_json::json!({"patch":"*** Begin Patch\n*** Update File: src/a.txt\n-DOES-NOT-EXIST\n+X\n*** End Patch"})
+                .as_object()
+                .cloned()
+                .unwrap(),
+        )
+        .expect_err("mismatch must fail");
+        assert!(bad.contains("does not match"), "{bad}");
+        // File must remain untouched after a failed patch.
+        assert_eq!(
+            fs::read_to_string(root.join("src/a.txt")).unwrap(),
+            "alpha\nBETA\ngamma\n"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -154,11 +535,13 @@ mod tests {
             .expect("entries")
             .iter()
             .any(|item| item == ".tmp"));
+        assert_eq!(root_listing["complete"], true);
         assert!(!runtime_listing["entries"]
             .as_array()
             .expect("entries")
             .iter()
             .any(|item| item == ".tmp"));
+        assert_eq!(runtime_listing["complete"], false);
         assert!(execute(
             &root,
             "read_file",

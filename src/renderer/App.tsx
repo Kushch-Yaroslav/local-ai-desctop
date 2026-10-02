@@ -67,7 +67,7 @@ function GenerationStatsView({ stats }: { stats: GenerationStats }) {
 }
 
 export function App() {
-  const { initialize, refreshHardware, handleStream, activeId, conversations, messages, isGenerating, generationState, toolActivities, analysisRuns, editMessage, regenerateMessage, continueGeneration, lastFinishReason } = useAppStore();
+  const { initialize, refreshHardware, handleStream, activeId, conversations, messages, isGenerating, generationState, toolActivities, analysisRuns, editMessage, regenerateMessage, lastFinishReason } = useAppStore();
   const endRef = useRef<HTMLDivElement>(null); const conversationRef = useRef<HTMLElement>(null); const followStream = useRef(true);
   const [editingId, setEditingId] = useState<string | null>(null); const [editingText, setEditingText] = useState('');
   const [agentClock, setAgentClock] = useState(() => Date.now());
@@ -78,7 +78,7 @@ export function App() {
   useLayoutEffect(() => { const conversation = conversationRef.current; if (!conversation || !followStream.current) return; conversation.scrollTo({ top: conversation.scrollHeight, behavior: isGenerating ? 'auto' : 'smooth' }); }, [messages, isGenerating, toolActivities]);
   const updateFollowState = () => { const element = conversationRef.current; if (element) followStream.current = element.scrollHeight - element.scrollTop - element.clientHeight < 96; };
   return <div className="app-shell"><Sidebar /><main className="main"><Toolbar /><section ref={conversationRef} onScroll={updateFollowState} className="conversation">
-    {active?.mode === 'agent' && <div className="agent-notice"><Bot size={17} /> {active.workingDirectory ? 'Файловые инструменты ограничены выбранным проектом; terminal стартует в его корне и может работать с пользовательскими путями.' : 'Файловые инструменты проекта отключены; terminal стартует в домашней папке и может выполнять контролируемые системные задачи.'}{active.webMode === 'auto' ? ' Также доступен изолированный web.' : ''}</div>}
+    {active?.mode === 'agent' && <div className="agent-notice"><Bot size={17} /> {active.workingDirectory ? 'Файловые инструменты ограничены выбранным проектом; terminal стартует в его корне.' : 'Без выбранного проекта доступны conversation и planning; файловые инструменты и terminal отключены.'}</div>}
     {messages.length === 0 && <div className="welcome"><Bot size={34} /><h1>Чем могу помочь?</h1><p>Выберите одну из локальных моделей и начните разговор.</p></div>}
     {messages.map((message) => {
       const run = analysisRuns.find((candidate) => candidate.assistantMessageId === message.id);
@@ -89,7 +89,7 @@ export function App() {
       const editing = editingId === message.id;
       return <article className={`message ${message.role} ${editing ? 'is-editing' : ''} ${message.id.startsWith('stream-') && isGenerating ? 'is-generating' : ''}`} key={message.id}>{message.role === 'user' ? <div className="user-message-stack"><div className="message-content">{body}</div>{!editing && <UserMessageActions content={message.content} onEdit={() => { setEditingId(message.id); setEditingText(message.content); }} onRegenerate={() => { void regenerateMessage(message); }} regenerateDisabled={isGenerating} />}</div> : <div className="message-content">{body}</div>}</article>;
     })}
-    {lastFinishReason === 'length' && !isGenerating && <button className="continue-button" onClick={() => void continueGeneration()}>Продолжить ответ</button>}
+    {lastFinishReason === 'length' && !isGenerating && <p className="truncation-notice" role="status">Ответ сохранён, но достигнут safety limit продолжения. Текст выше не потерян.</p>}
     <div ref={endRef} />
   </section><Composer /></main></div>;
 }

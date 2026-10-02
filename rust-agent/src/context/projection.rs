@@ -1,184 +1,362 @@
-use crate::agent::transcript::{Entry, Transcript};
+use crate::agent::transcript::{project_accepted_message, prompt_tail_message, Entry, Transcript};
 use serde_json::{json, Value};
 
-/// A pure view over append-only history. llama.cpp's Qwen template requires
-/// every system instruction at the beginning, so all runtime control material
-/// is folded into the first system message instead of becoming pseudo-turns.
+/// A pure request projection. The first system message is byte-stable within a
+/// session. Accepted volatile tails remain at their original transcript
+/// position; only genuinely new guidance is appended below history.
 #[must_use]
-pub fn project(transcript: &Transcript, system: &str, runtime_working_state: &str) -> Vec<Value> {
-    let boundary = transcript
-        .entries()
-        .iter()
-        .rev()
-        .find_map(|entry| match entry {
-            Entry::Compaction { summary, covers } => Some((summary, *covers)),
-            _ => None,
-        });
-    let start = boundary.as_ref().map_or(0, |(_, covers)| *covers);
-    let mut control = system.to_owned();
-    if let Some((summary, _)) = boundary {
-        control.push_str(&format!("\n<context_summary>{summary}</context_summary>"));
-    }
-    if !runtime_working_state.is_empty() {
-        // The caller already separates Plan, Notes and source evidence. The
-        // former wrapper mislabeled all of that control data as Task Notes,
-        // making compaction state look self-contradictory to Qwen.
-        control.push_str(&format!(
-            "\n<runtime_working_state>{runtime_working_state}</runtime_working_state>"
-        ));
-    }
-    // Jan's `Transcript::from_history` records historic system nodes as
-    // prompts, then projects them at the system boundary. Imported Electron
-    // attachment/reference context has the same meaning. It must never become
-    // a synthetic user query: Qwen's multi-step-tool template treats user
-    // nodes as ownership boundaries.
+pub fn project(transcript: &Transcript, stable_prefix: &str, dynamic_tail: &str) -> Vec<Value> {
+    let (summary, start) = transcript
+        .latest_summary()
+        .map_or((None, 0), |(summary, covers)| (Some(summary), covers));
+    let mut messages = vec![json!({"role":"system", "content":stable_prefix})];
+    let mut imported_system = Vec::new();
     for entry in transcript.entries() {
         if let Entry::Message(message) = entry {
             if message.get("role").and_then(Value::as_str) == Some("system") {
                 if let Some(content) = message.get("content").and_then(Value::as_str) {
-                    control.push_str(&format!("\n<imported_context>{content}</imported_context>"));
+                    imported_system.push(content);
                 }
             }
         }
     }
-    for entry in transcript.entries().iter().skip(start) {
-        if let Entry::Reminder(reminder) = entry {
-            control.push_str(&format!(
-                "\n<runtime_reminder>{reminder}</runtime_reminder>"
-            ));
-        }
+    if let Some(summary) = summary {
+        messages.push(json!({"role":"user", "content":format!("[RUNTIME COMPACTION SUMMARY — NOT USER CONTENT]\n{summary}")}));
     }
-    let mut messages = vec![json!({"role":"system", "content":control})];
-    // Jan keeps the placed prompt outside of a compacted conversation. The
-    // active run has the same invariant: its user query must precede any
-    // retained assistant/tool suffix even if its canonical entry was covered.
-    for entry in transcript.entries() {
-        if let Entry::RunUser(message) = entry {
+    if !imported_system.is_empty() {
+        messages.push(json!({"role":"user", "content":format!("[IMPORTED SYSTEM CONTEXT — NOT USER CONTENT]\n{}", imported_system.join("\n\n"))}));
+    }
+    let run_user = transcript
+        .entries()
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, entry)| match entry {
+            Entry::RunUser(message) => Some((index, message.clone())),
+            _ => None,
+        });
+    let mut included_run_user = false;
+    let latest_tail = transcript
+        .entries()
+        .iter()
+        .enumerate()
+        .skip(start.max(transcript.finalization_index().unwrap_or(0)))
+        .rfind(|(_, entry)| matches!(entry, Entry::PromptTail(_)))
+        .map(|(index, _)| index);
+    if let Some((index, message)) = &run_user {
+        if *index < start {
+            // The summary may cover the original prompt, but tool-result tail
+            // still needs that exact prompt before any retained assistant turn.
             messages.push(message.clone());
+            included_run_user = true;
         }
     }
-    for entry in transcript.entries().iter().skip(start) {
-        append(&mut messages, entry);
+    for (index, entry) in transcript.entries().iter().enumerate().skip(start) {
+        match entry {
+            Entry::Message(message)
+                if message.get("role").and_then(Value::as_str) != Some("system") =>
+            {
+                // Jan projects the retained structural tail verbatim. A
+                // separate per-tool truncation here made the model lose the
+                // exact detail it deliberately kept and encouraged rereads.
+                messages.push(project_accepted_message(message))
+            }
+            Entry::RunUser(message) => {
+                messages.push(message.clone());
+                included_run_user = true;
+            }
+            Entry::Steering(content) => messages.push(json!({"role":"user", "content":format!("[RUNTIME STEERING — NOT USER CONTENT]\n{content}"), "metadata":{"steering":true}})),
+            Entry::PromptTail(content) if dynamic_tail.trim().is_empty() && latest_tail == Some(index) => {
+                messages.push(prompt_tail_message(content));
+            }
+            Entry::Compaction { .. } | Entry::Reminder(_) | Entry::ClearReminders | Entry::Finalizing | Entry::CloseoutRequested | Entry::RunComplete | Entry::LanguagePreference(_) | Entry::Evidence(_) | Entry::EvidenceRejection { .. } | Entry::Frontier(_) | Entry::FrontierDisposition(_) | Entry::Message(_) | Entry::PromptTail(_) => {}
+        }
+    }
+    // Retain an exact current prompt even if an unusually small context made
+    // the compaction boundary more aggressive than expected.
+    if !included_run_user {
+        if let Some((_, message)) = run_user {
+            messages.push(message);
+        }
+    }
+    if !dynamic_tail.trim().is_empty() && !transcript.has_active_prompt_tail(dynamic_tail) {
+        // Dynamic data belongs after accepted conversation so cache providers
+        // can reuse the leading system/history prefix. The run records it only
+        // after the provider accepts this exact request.
+        messages.push(prompt_tail_message(dynamic_tail));
     }
     messages
-}
-
-fn append(messages: &mut Vec<Value>, entry: &Entry) {
-    match entry {
-        Entry::Message(message) => {
-            if message.get("role").and_then(Value::as_str) != Some("system") {
-                messages.push(compact_tool_payload(message));
-            }
-        }
-        Entry::RunUser(_) => {}
-        Entry::Steering(content) => {
-            messages.push(json!({"role":"user","content":content,"metadata":{"steering":true}}))
-        }
-        Entry::Compaction { .. } | Entry::Reminder(_) => {}
-    }
-}
-
-/// Context projection is a bounded working set. Full tool results remain in
-/// the append-only transcript/UI; large raw results are shaped only here.
-#[must_use]
-pub fn compact_tool_payload(message: &Value) -> Value {
-    if message.get("role").and_then(Value::as_str) != Some("tool") {
-        return message.clone();
-    }
-    let Some(content) = message.get("content").and_then(Value::as_str) else {
-        return message.clone();
-    };
-    const KEEP: usize = 3_000;
-    if content.len() <= KEEP {
-        return message.clone();
-    }
-    // Tool output is UTF-8. Byte offsets can land in the middle of a Cyrillic
-    // or other multi-byte character, so retain by scalar values rather than
-    // slicing arbitrary bytes.
-    let head = content.chars().take(1_800).collect::<String>();
-    let tail = content
-        .chars()
-        .rev()
-        .take(900)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<String>();
-    let mut projected = message.clone();
-    projected["content"] = json!(json!({
-        "context_compacted": true,
-        "original_chars": content.len(),
-        "important_result": format!("{head}\n… [raw output omitted; canonical transcript preserved] …\n{tail}"),
-    })
-    .to_string());
-    projected
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::agent::transcript::Transcript;
+
     #[test]
-    fn compaction_is_a_projection_boundary_not_deletion() {
-        let mut transcript = Transcript::default();
-        transcript.push_message(json!({"role":"user","content":"a"}));
-        transcript.compact(json!("a"), 1);
-        assert_eq!(transcript.entries().len(), 2);
-        let projected = project(&transcript, "s", "");
-        assert_eq!(projected.len(), 1);
-        assert_eq!(projected[0]["role"], "system");
-    }
-    #[test]
-    fn runtime_control_remains_at_system_boundary() {
-        let mut transcript = Transcript::default();
-        transcript.push_message(json!({"role":"user","content":"work"}));
-        transcript.remind("finish verification".into());
-        let projected = project(&transcript, "base", "note");
-        assert_eq!(projected[0]["role"], "system");
-        assert_eq!(projected[1]["role"], "user");
-    }
-    #[test]
-    fn runtime_working_state_is_not_recast_as_task_notes_or_conversation() {
+    fn dynamic_reminder_stays_outside_stable_prefix() {
         let mut transcript = Transcript::default();
         transcript.push_run_user(json!({"role":"user","content":"audit"}));
-        let projected = project(&transcript, "base", "<task_plan>inspect</task_plan><investigated_evidence>SOURCE: App.tsx</investigated_evidence>");
-        assert_eq!(projected.len(), 2);
-        assert_eq!(projected[0]["role"], "system");
-        let control = projected[0]["content"].as_str().unwrap();
-        assert!(control.contains("<runtime_working_state>"));
-        assert!(!control.contains("<task_notes><task_plan>"));
-        assert_eq!(projected[1]["role"], "user");
-    }
-    #[test]
-    fn imported_system_history_is_hoisted_not_recast_as_user() {
-        let mut transcript = Transcript::default();
-        transcript.push_message(json!({"role":"system","content":"attachment context"}));
-        transcript.push_message(json!({"role":"user","content":"current query"}));
-        let projected = project(&transcript, "base", "");
-        assert_eq!(projected.len(), 2);
-        assert_eq!(projected[0]["role"], "system");
-        assert!(projected[0]["content"]
+        transcript.remind("update plan".into());
+        let tail = transcript.pending_tail("active plan");
+        let projected = project(&transcript, "stable", &tail);
+        assert_eq!(projected[0]["content"], "stable");
+        assert_eq!(projected.last().unwrap()["role"], "user");
+        assert!(projected.last().unwrap()["content"]
             .as_str()
             .unwrap()
-            .contains("attachment context"));
-        assert_eq!(projected[1]["role"], "user");
+            .contains("update plan"));
     }
+
+    /// Failure shape: the compaction summary is the only carrier of findings
+    /// that left the retained tail. Synthesis (no tools) must still receive it.
     #[test]
-    fn compaction_keeps_run_user_and_bounds_raw_tool_payload() {
+    fn finalizing_projection_keeps_the_findings_of_an_earlier_checkpoint() {
         let mut transcript = Transcript::default();
+        transcript.push_run_user(json!({"role":"user","content":"audit"}));
+        transcript.assistant_message("old research".into());
+        transcript.compact("Findings and evidence: orders go through api.php".into(), 2);
+        transcript.mark_finalizing();
+        let projected = project(&transcript, "system", "MODE: FINALIZING; write the answer");
+        let text = serde_json::to_string(&projected).unwrap();
+        assert!(text.contains("orders go through api.php"));
+        assert!(text.contains("MODE: FINALIZING"));
+        assert!(projected[0]["role"] == "system");
+        assert!(projected.iter().skip(1).all(|m| m["role"] != "system"));
+    }
+
+    #[test]
+    fn changing_evidence_tail_replaces_stale_projection_without_erasing_events() {
+        let mut transcript = Transcript::default();
+        transcript.push_run_user(json!({"role":"user","content":"audit"}));
+        transcript.record_prompt_tail("old evidence receipt");
+        transcript.assistant_message("work".into());
+        transcript.record_prompt_tail("new established evidence");
+        assert!(!transcript.has_active_prompt_tail("old evidence receipt"));
+        assert!(transcript.has_active_prompt_tail("new established evidence"));
+        let messages = project(&transcript, "system", "");
+        assert!(!messages.iter().any(|m| m["content"]
+            .as_str()
+            .is_some_and(|s| s.contains("old evidence receipt"))));
+        assert!(messages.iter().any(|m| m["content"]
+            .as_str()
+            .is_some_and(|s| s.contains("new established evidence"))));
+        assert!(transcript.entries().iter().any(
+            |entry| matches!(entry, Entry::PromptTail(value) if value=="old evidence receipt")
+        ));
+    }
+
+    #[test]
+    fn summary_and_recent_tail_are_projected() {
+        let mut transcript = Transcript::default();
+        transcript.push_message(json!({"role":"user","content":"old"}));
         transcript.push_run_user(json!({"role":"user","content":"current"}));
-        transcript.push_message(json!({"role":"assistant","content":"","tool_calls":[{"id":"call","function":{"name":"read_file","arguments":"{}"}}]}));
-        transcript.push_message(
-            json!({"role":"tool","tool_call_id":"call","content":"x".repeat(12_000)}),
+        transcript.push_message(json!({"role":"assistant","content":"recent"}));
+        transcript.compact("important old decision".into(), 1);
+        let projected = project(&transcript, "stable", "");
+        assert!(projected.iter().any(|message| message["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("important old decision"))));
+        assert!(projected
+            .iter()
+            .any(|message| message["content"] == "recent"));
+    }
+
+    #[test]
+    fn only_the_stable_prefix_uses_the_system_role() {
+        let mut transcript = Transcript::default();
+        transcript.push_run_user(json!({"role":"user","content":"audit"}));
+        transcript.record_prompt_tail("<task_memory>\nInspect findings\n</task_memory>");
+        transcript.push_message(json!({"role":"assistant","content":"reading"}));
+        transcript.compact("important finding".into(), 0);
+        let projected = project(&transcript, "stable", "");
+        assert_eq!(projected[0]["role"], "system");
+        assert!(projected
+            .iter()
+            .skip(1)
+            .all(|message| message["role"] != "system"));
+        assert!(projected
+            .iter()
+            .any(|message| message["content"]
+                .as_str()
+                .is_some_and(|content| content
+                    .starts_with("[RUNTIME COMPACTION SUMMARY — NOT USER CONTENT]"))));
+    }
+
+    #[test]
+    fn assistant_tool_call_and_result_are_replayed_in_order() {
+        let mut transcript = Transcript::default();
+        transcript.push_run_user(json!({"role":"user","content":"inspect"}));
+        transcript.push_message(json!({
+            "role":"assistant",
+            "content":"",
+            "tool_calls":[{"id":"read-1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"src/main.rs\"}"}}]
+        }));
+        transcript.tool_result("read-1", "read_file", "source contents".into());
+        let projected = project(&transcript, "stable", "");
+        let assistant = projected
+            .iter()
+            .position(|message| message["role"] == "assistant")
+            .unwrap();
+        let tool = projected
+            .iter()
+            .position(|message| message["role"] == "tool")
+            .unwrap();
+        assert!(assistant < tool);
+        assert_eq!(projected[tool]["tool_call_id"], "read-1");
+    }
+
+    #[test]
+    fn retained_large_tool_result_is_replayed_verbatim() {
+        let mut transcript = Transcript::default();
+        transcript.push_run_user(json!({"role":"user","content":"inspect"}));
+        transcript.push_message(json!({
+            "role":"assistant",
+            "tool_calls":[{"id":"read-1","type":"function","function":{"name":"read_file","arguments":"{}"}}]
+        }));
+        let output = "concrete source detail ".repeat(900);
+        transcript.tool_result("read-1", "read_file", output.clone());
+        let projected = project(&transcript, "stable", "");
+        let tool = projected
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .unwrap();
+        assert_eq!(tool["content"], output);
+    }
+
+    #[test]
+    fn current_user_stays_after_prior_transcript_tail() {
+        let mut transcript = Transcript::default();
+        transcript.push_message(json!({"role":"user","content":"old request"}));
+        transcript.push_message(json!({"role":"assistant","content":"old response"}));
+        transcript.push_run_user(json!({"role":"user","content":"current request"}));
+        let projected = project(&transcript, "stable", "");
+        let contents = projected
+            .iter()
+            .filter_map(|message| message["content"].as_str())
+            .collect::<Vec<_>>();
+        let old = contents
+            .iter()
+            .position(|content| *content == "old response")
+            .unwrap();
+        let current = contents
+            .iter()
+            .position(|content| *content == "current request")
+            .unwrap();
+        assert!(old < current);
+    }
+
+    #[test]
+    fn actual_user_turns_are_projected_once_in_chronological_order() {
+        let mut transcript = Transcript::default();
+        transcript.push_message(json!({"role":"user","content":"first request"}));
+        transcript.push_message(json!({"role":"assistant","content":"first answer"}));
+        transcript.push_message(json!({"role":"user","content":"second request"}));
+        transcript.push_message(json!({"role":"assistant","content":"second answer"}));
+        transcript.push_run_user(json!({"role":"user","content":"current request"}));
+
+        let projected = project(&transcript, "stable", "");
+        let user_turns = projected
+            .iter()
+            .filter(|message| message["role"] == "user")
+            .filter_map(|message| message["content"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            user_turns,
+            vec!["first request", "second request", "current request"]
         );
-        transcript.compact(json!({"summary":"older"}), 1);
-        let projected = project(&transcript, "base", "notes");
-        assert_eq!(projected[1]["role"], "user");
-        assert_eq!(projected[1]["content"], "current");
-        assert!(projected[3]["content"].as_str().unwrap().len() < 3_000);
-        let Entry::Message(raw_tool) = &transcript.entries()[2] else {
-            panic!("tool result must remain canonical")
-        };
-        assert!(raw_tool["content"].as_str().unwrap().len() > 10_000);
+    }
+
+    #[test]
+    fn realistic_projection_keeps_runtime_messages_out_of_the_system_role() {
+        let mut transcript = Transcript::default();
+        transcript.push_message(json!({"role":"user","content":"previous request"}));
+        transcript.push_message(json!({"role":"assistant","content":"previous answer"}));
+        transcript.push_run_user(json!({"role":"user","content":"current request"}));
+        transcript.push_message(json!({
+            "role":"assistant",
+            "content":"",
+            "tool_calls":[{"id":"read-1","type":"function","function":{"name":"read_file","arguments":"{}"}}]
+        }));
+        transcript.tool_result("read-1", "read_file", "file contents".into());
+        transcript.assistant_message("tool follow-up".into());
+        transcript.push_message(json!({"role":"system","content":"legacy runtime instruction"}));
+        transcript.compact("condensed earlier transcript".into(), 2);
+        transcript.remind("verify the result".into());
+
+        let projected = project(
+            &transcript,
+            "stable prefix",
+            &transcript.pending_tail("<task_memory />"),
+        );
+        let system_positions = projected
+            .iter()
+            .enumerate()
+            .filter_map(|(index, message)| (message["role"] == "system").then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(system_positions, vec![0]);
+        assert!(projected.iter().any(|message| message["role"] == "user"
+            && message["content"].as_str().is_some_and(
+                |content| content.contains("[RUNTIME COMPACTION SUMMARY — NOT USER CONTENT]")
+            )));
+        assert!(projected.iter().any(|message| message["role"] == "user"
+            && message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("[RUNTIME GUIDANCE — NOT USER CONTENT]"))));
+    }
+
+    #[test]
+    fn compaction_does_not_repeat_the_current_user_turn_in_summary() {
+        let mut transcript = Transcript::default();
+        transcript.push_message(json!({"role":"user","content":"older request"}));
+        transcript.push_message(json!({"role":"assistant","content":"older answer"}));
+        transcript.push_run_user(json!({"role":"user","content":"current request appears once"}));
+        transcript.compact("summary of older request and answer".into(), 2);
+
+        let projected = project(&transcript, "stable", "");
+        let occurrences = projected
+            .iter()
+            .filter_map(|message| message["content"].as_str())
+            .filter(|content| content.contains("current request appears once"))
+            .count();
+        assert_eq!(occurrences, 1);
+        let current_index = projected
+            .iter()
+            .position(|message| message["content"] == "current request appears once")
+            .unwrap();
+        assert_eq!(projected[current_index]["role"], "user");
+    }
+
+    #[test]
+    fn current_user_survives_a_compaction_boundary_past_its_position_once() {
+        let mut transcript = Transcript::default();
+        transcript.push_run_user(json!({"role":"user","content":"current request exactly once"}));
+        for index in 0..6 {
+            transcript
+                .push_message(json!({"role":"assistant","content":format!("response {index}")}));
+            transcript.push_message(json!({"role":"user","content":format!("follow-up {index}")}));
+        }
+        let plan = transcript.compaction_plan(2).unwrap();
+        assert!(plan.covers > 0);
+        let summary = plan.render(10_000);
+        assert!(!summary.contains("current request exactly once"));
+        transcript.compact(summary, plan.covers);
+
+        let projected = project(&transcript, "stable", "");
+        let current_occurrences = projected
+            .iter()
+            .filter_map(|message| message["content"].as_str())
+            .filter(|content| content.contains("current request exactly once"))
+            .count();
+        assert_eq!(current_occurrences, 1);
+        let current = projected
+            .iter()
+            .find(|message| {
+                message["content"]
+                    .as_str()
+                    .is_some_and(|content| content == "current request exactly once")
+            })
+            .unwrap();
+        assert_eq!(current["role"], "user");
     }
 }

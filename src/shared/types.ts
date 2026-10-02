@@ -91,6 +91,16 @@ export interface AgentTelemetry {
   tokensPerSecond?: number;
   actions: number;
   compactions?: number;
+  /** Provider-reported prompt/KV cache reads, never a synthetic estimate. */
+  cachedTokens?: number;
+  /** Provider-reported prompt/KV cache writes. */
+  cacheWriteTokens?: number;
+  /** `.ai-framework` diagnostics; content remains on disk and is not exposed here. */
+  knowledgeCacheFiles?: number;
+  knowledgeCacheBytes?: number;
+  knowledgeCacheHits?: number;
+  knowledgeCacheStale?: number;
+  knowledgeCacheInjectedBytes?: number;
   startedAt: string;
   finishedAt?: string;
 }
@@ -235,7 +245,7 @@ export interface TerminalExecution {
   exitCode?: number | null;
   timedOut?: boolean;
   cancelled?: boolean;
-  status?: 'running' | 'completed' | 'error' | 'cancelled' | 'timed_out';
+  status?: 'running' | 'completed' | 'partial_success' | 'error' | 'cancelled' | 'timed_out';
   stdout?: string;
   stderr?: string;
 }
@@ -244,9 +254,35 @@ export type ThinkingTimelineEvent =
   | { id: string; kind: 'reasoning'; content: string; position: number; startedAt?: string; completedAt?: string }
   | { id: string; kind: 'activity'; activityId: string; position: number };
 
-export type AgentPlanStepStatus = 'pending' | 'in_progress' | 'completed';
+export type AgentPlanStepStatus = 'pending' | 'in_progress' | 'completed' | 'abandoned';
+/** Kept optional for reading messages saved by the pre-milestone renderer. */
 export interface AgentPlanStep { id: string; label: string; status: AgentPlanStepStatus; }
-export interface AgentPlan { steps: AgentPlanStep[]; }
+export interface AgentWorkTask { id: string; label: string; status: AgentPlanStepStatus; revision?: number; }
+export interface AgentMilestone {
+  id: string;
+  label: string;
+  status: AgentPlanStepStatus;
+  revision?: number;
+  workPlan: { tasks: AgentWorkTask[]; revision?: number };
+}
+/** Canonical model-facing plan persisted alongside the renderer projection.
+ * IDs are stable for storage but are intentionally omitted from the provider
+ * prompt, which receives only concise status/content lines. */
+export interface ModelTodoItem { id: string; content: string; status: AgentPlanStepStatus; memoryId?: string | null; }
+export interface ModelTodoPhase { name: string; items: ModelTodoItem[]; }
+export interface ModelTodo { phases: ModelTodoPhase[]; revision?: number; }
+export interface TaskMemoryEntry { id: string; finding: string; evidence?: string; implication?: string; next?: string; todoId?: string | null; invalidated?: boolean; }
+/** Persistent agent planning state: stable milestones plus only the active
+ * milestone's adaptive Work Plan in the primary UI. */
+export interface AgentPlan {
+  milestones?: AgentMilestone[];
+  activeMilestoneId?: string | null;
+  revision?: number;
+  modelTodo?: ModelTodo;
+  taskMemory?: { entries: TaskMemoryEntry[]; revision?: number };
+  /** Legacy persisted snapshots are normalized at the Electron boundary. */
+  steps?: AgentPlanStep[];
+}
 
 export interface AnalysisRun {
   id: string;
@@ -268,7 +304,7 @@ export interface AnalysisProgress {
 export type StreamEvent =
   | { type: 'token'; content: string }
   | { type: 'thinking'; content: string; timelinePosition?: number }
-  | { type: 'task-plan'; plan: AgentPlan }
+  | { type: 'task-memory'; memory: NonNullable<AgentPlan['taskMemory']> }
   | { type: 'tool'; activity: ToolActivity; runId?: string }
   | { type: 'attachment'; activity: ToolActivity }
   | { type: 'approval-request'; actionId: string; approval: ActionApproval }
@@ -291,6 +327,7 @@ export interface LocalAiApi {
     delete(id: string): Promise<void>;
   };
   messages: { list(conversationId: string): Promise<ChatMessage[]>; edit(id: string, content: string, fallback?: Pick<ChatMessage, 'conversationId' | 'content'>): Promise<ChatMessage[]>; regenerate(id: string): Promise<ChatMessage[]> };
+  agentPlans: { get(conversationId: string): Promise<AgentPlan | null> };
   projects: { search(conversationId: string, query: string): Promise<ProjectSuggestion[]> };
   attachments: {
     import(input: AttachmentInput): Promise<Attachment>;

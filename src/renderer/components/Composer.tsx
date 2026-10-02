@@ -1,8 +1,8 @@
-import { File, Folder, Paperclip, Send, Square, X } from 'lucide-react';
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { ChevronDown, File, Folder, Paperclip, Send, Square, X } from 'lucide-react';
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import { useAppStore } from '../store/app-store';
 import { ContextUsage } from './ContextUsage';
-import type { AgentPlan, ProjectReference, ProjectSuggestion } from '../../shared/types';
+import type { AgentPlan, ModelTodoItem, ProjectReference, ProjectSuggestion } from '../../shared/types';
 import { removeProjectReferenceQuery } from '../../shared/project-references';
 
 const isImageFile = (file: File): boolean => file.type.startsWith('image/') || /\.(png|jpe?g|webp)$/i.test(file.name);
@@ -10,7 +10,7 @@ const isImageFile = (file: File): boolean => file.type.startsWith('image/') || /
 export function Composer() {
   const [value, setValue] = useState(''); const [files, setFiles] = useState<File[]>([]); const [projectReferences, setProjectReferences] = useState<ProjectReference[]>([]); const [suggestions, setSuggestions] = useState<ProjectSuggestion[]>([]); const [referenceQuery, setReferenceQuery] = useState<{ start: number; text: string } | null>(null); const [activeSuggestion, setActiveSuggestion] = useState(0); const [attachmentError, setAttachmentError] = useState<string | null>(null); const ref = useRef<HTMLTextAreaElement>(null); const inputRef = useRef<HTMLInputElement>(null);
   const manualHeight = useRef<number | null>(null); const resizeHandle = useRef(false);
-  const { sendMessage, stop, isGenerating, conversations, activeId, activeTaskPlan } = useAppStore();
+  const { sendMessage, stop, isGenerating, conversations, activeId } = useAppStore();
   const chat = conversations.find((item) => item.id === activeId);
   const projectEnabled = Boolean(chat?.workingDirectory);
   const resetHeight = () => { const textarea = ref.current; if (!textarea) return; manualHeight.current = null; textarea.style.height = ''; textarea.style.overflowY = 'hidden'; };
@@ -65,7 +65,7 @@ export function Composer() {
     resizeHandle.current = false;
     window.requestAnimationFrame(() => { if (ref.current) { manualHeight.current = ref.current.offsetHeight; ref.current.style.overflowY = 'auto'; } });
   };
-  return <div className="composer-wrap">{activeTaskPlan && <TaskPlanPanel plan={activeTaskPlan} active />}<div className="composer" onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); addFiles([...event.dataTransfer.files]); }}>
+  return <div className="composer-wrap"><div className="composer" onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); addFiles([...event.dataTransfer.files]); }}>
     {(files.length > 0 || projectReferences.length > 0) && <div className="attachment-draft">{projectReferences.map((reference) => <ProjectReferenceChip key={reference.id} reference={reference} onRemove={() => setProjectReferences((items) => items.filter((item) => item.id !== reference.id))} />)}{files.map((file, index) => <DraftAttachment key={`${file.name}-${index}`} file={file} index={isImageFile(file) ? files.slice(0, index + 1).filter(isImageFile).length - 1 : index} onRemove={() => { setFiles((items) => items.filter((_, itemIndex) => itemIndex !== index)); setAttachmentError(null); }} />)}</div>}
     <input ref={inputRef} className="attachment-input" type="file" multiple accept=".png,.jpg,.jpeg,.webp,.txt,.md,.json,.csv,.log,.js,.ts,.jsx,.tsx,.html,.css,.yaml,.yml,.xml,.docx,.xlsx,.xls,.pdf" onChange={(event) => { addFiles([...(event.target.files ?? [])]); event.currentTarget.value = ''; }} />
     <button className="attach-button" type="button" disabled={isGenerating} title="Прикрепить файлы" onClick={() => inputRef.current?.click()}><Paperclip size={18} /></button>
@@ -75,9 +75,31 @@ export function Composer() {
   </div>{attachmentError && <p className="attachment-error" role="status">{attachmentError}</p>}<p>Enter — отправить · Shift+Enter — новая строка · вставьте или перетащите файлы</p></div>;
 }
 
+export function taskPlanningItems(plan: AgentPlan): ModelTodoItem[] {
+  const legacy = plan.steps ?? [];
+  const milestones = plan.milestones ?? (legacy.length ? [{ id: 'legacy-plan', label: 'Previous plan', status: legacy.some((step) => step.status === 'in_progress') ? 'in_progress' as const : 'pending' as const, workPlan: { tasks: legacy } }] : []);
+  return plan.modelTodo?.phases.flatMap((phase) => phase.items) ?? milestones.flatMap((milestone) => milestone.workPlan.tasks.map((task) => ({ id: task.id, content: task.label, status: task.status })));
+}
+
 export function TaskPlanPanel({ plan, active = false }: { plan: AgentPlan; active?: boolean }) {
-  const completed = plan.steps.filter((step) => step.status === 'completed').length;
-  return <details className={`task-plan-panel${active ? ' active' : ''}`} open={active}><summary>Task Plan · {completed}/{plan.steps.length}{active && plan.steps.find((step) => step.status === 'in_progress') ? ` · ${plan.steps.find((step) => step.status === 'in_progress')!.label}` : ''}</summary><ol>{plan.steps.map((step) => <li className={step.status} key={step.id}>{step.status === 'completed' ? '✓' : step.status === 'in_progress' ? '●' : '○'} {step.label}</li>)}</ol></details>;
+  const [collapsed, setCollapsed] = useState(false);
+  const contentId = useId();
+  const marker = (status: string) => status === 'completed' ? '✓' : status === 'abandoned' ? '–' : status === 'in_progress' ? '●' : '○';
+  const todoItems = taskPlanningItems(plan);
+  if (!todoItems.length) return null;
+  const completed = todoItems.filter((task) => task.status === 'completed' || task.status === 'abandoned').length;
+  return <section className={`task-plan-panel milestone-plan${active ? ' active' : ''}${collapsed ? ' collapsed' : ''}`} aria-label="Task Planning">
+    <header>
+      <button type="button" className="task-plan-toggle" aria-expanded={!collapsed} aria-controls={contentId} onClick={() => setCollapsed((value) => !value)}>
+        <strong>Task Planning</strong><span>{completed}/{todoItems.length}</span><ChevronDown size={15} aria-hidden="true" />
+      </button>
+    </header>
+    <div id={contentId} className="task-plan-collapse" inert={collapsed}>
+      <div className="task-plan-content">
+        <ol className="task-plan-todo">{todoItems.map((task) => <li className={task.status} key={task.id}><i>{marker(task.status)}</i><span>{task.content}{'memoryId' in task && task.memoryId ? ` → ${task.memoryId}` : ''}</span></li>)}</ol>
+      </div>
+    </div>
+  </section>;
 }
 
 function ProjectReferenceChip({ reference, onRemove }: { reference: ProjectReference; onRemove: () => void }) {

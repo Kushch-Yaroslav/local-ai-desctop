@@ -18,6 +18,16 @@ pub enum Request {
         policy: String,
         #[serde(default)]
         history: Vec<Value>,
+        #[serde(default)]
+        evidence_dir: Option<String>,
+        /// Durable semantic findings from an earlier turn of this user task.
+        /// This carries Task Memory only; it is never interpreted as a plan.
+        #[serde(default)]
+        task_memory: Option<Value>,
+        /// Optional backend/model output ceiling. The runtime intersects this
+        /// with selected context capacity and its application ceiling.
+        #[serde(default)]
+        provider_max_output: Option<usize>,
     },
     Cancel {
         run_id: String,

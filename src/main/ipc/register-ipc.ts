@@ -5,24 +5,21 @@ import { Database } from '../services/database';
 import { getHardwareStats } from '../services/hardware';
 import { OllamaBackend } from '../backends/ollama-backend';
 import { LlamaCppBackend } from '../backends/llama-cpp-backend';
-import { ProjectChatService, type AgentProject } from '../services/project-chat';
-import { RustAgentRuntime } from '../services/rust-agent-runtime';
+import { RustAgentRuntime, taskPlan, type AgentProject } from '../services/rust-agent-runtime';
 import { paths } from '../services/paths';
 import { log } from '../services/logger';
 import { contextPresetsFor, getModelProfile, modelRegistry } from '../models/model-registry';
+import { llamaContextPresets, llamaRuntimeProfile } from '../models/llama-runtime-policy';
 import { WebBrowserService } from '../web/web-tools';
-import { webToolDefinitions } from '../web/web-tools';
 import { WebChatService } from '../services/web-chat';
 import { chatMessagesWithSystemPrefix, chatSystemContext } from '../services/capabilities';
-import { projectToolDefinitions, ReadonlyProjectTools, reportProgressToolDefinition, terminalToolDefinition, type ApprovalResult, type ConfirmAction } from '../tools/project-tools';
+import { ReadonlyProjectTools, type ApprovalResult, type ConfirmAction } from '../tools/project-tools';
 import { AttachmentService } from '../services/attachment-service';
 import { AttachmentPipeline } from '../services/attachment-pipeline';
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { ollamaErrorDiagnostics } from '../backends/ollama-errors';
 import { saveGenerationDiagnosticsBestEffort } from '../services/generation-diagnostics';
-import { taskNotesToolDefinition } from '../services/task-notes';
-import { agentPlanToolDefinition } from '../services/agent-plan';
 import { projectDirectoryName } from '../../shared/project-references';
 import { executionMode } from '../../shared/generation-mode';
 import { existingProjectDirectory } from '../services/project-picker';
@@ -30,14 +27,15 @@ import { existingProjectDirectory } from '../services/project-picker';
 const database = new Database();
 const selectedBackend = process.env.LOCAL_AI_BACKEND === 'llama-cpp' ? 'llama-cpp' : 'ollama';
 const llamaRuntimeModelId = process.env.LOCAL_AI_LLAMA_MODEL_ID ?? 'qwen3.8:27b-q4_K_M';
+const defaultLlamaContext = 32_768;
+const maximumLlamaContext = llamaRuntimeProfile(llamaRuntimeModelId)?.maxContext ?? defaultLlamaContext;
+const configuredLlamaContext = Number(process.env.LOCAL_AI_LLAMA_CONTEXT ?? defaultLlamaContext);
+const llamaContextLimit = [16_384, 32_768, 65_536, 131_072].includes(configuredLlamaContext) && configuredLlamaContext <= maximumLlamaContext ? configuredLlamaContext : defaultLlamaContext;
 const ollama = new OllamaBackend();
-const llamaCpp = new LlamaCppBackend(process.env.LOCAL_AI_LLAMA_CPP_URL ?? 'http://127.0.0.1:8081', 65_536, process.env.LOCAL_AI_LLAMA_CPP_VISION === '1', llamaRuntimeModelId);
+const llamaCpp = new LlamaCppBackend(process.env.LOCAL_AI_LLAMA_CPP_URL ?? 'http://127.0.0.1:8081', llamaContextLimit, process.env.LOCAL_AI_LLAMA_CPP_VISION === '1', llamaRuntimeModelId);
 const backend = selectedBackend === 'llama-cpp' ? llamaCpp : ollama;
 const web = new WebBrowserService();
-const projectChat = new ProjectChatService(backend, web);
-// Agent V2 owns orchestration and tools. ProjectChatService remains only for
-// legacy compatibility until its code can be deleted after acceptance tests.
-const rustAgent = new RustAgentRuntime(process.env.LOCAL_AI_AGENT_ENDPOINT ?? (selectedBackend === 'llama-cpp' ? process.env.LOCAL_AI_LLAMA_CPP_URL ?? 'http://127.0.0.1:8081/v1/chat/completions' : 'http://127.0.0.1:11434/v1/chat/completions'));
+const rustAgent = new RustAgentRuntime(process.env.LOCAL_AI_AGENT_ENDPOINT ?? (selectedBackend === 'llama-cpp' ? process.env.LOCAL_AI_LLAMA_CPP_URL ?? 'http://127.0.0.1:8081/v1/chat/completions' : 'http://127.0.0.1:11434/api/chat'));
 const webChat = new WebChatService(backend, web);
 const attachments = new AttachmentService(database);
 const attachmentPipeline = new AttachmentPipeline(database, attachments);
@@ -45,6 +43,11 @@ type ActiveGeneration = { id: string; abort: AbortController; settled: Promise<v
 const activeGenerations = new Map<string, ActiveGeneration>();
 type PendingApproval = { approvalId: string; conversationId: string; generation: ActiveGeneration; actionId: string; category: RiskCategory; root: string; resolve: (result: ApprovalResult) => void; settled: boolean; abort: () => void; emit: (payload: Record<string, unknown>) => void };
 const pendingApprovals = new Map<string, PendingApproval>();
+async function restartLlamaRuntime(): Promise<void> {
+  if (selectedBackend !== 'llama-cpp') return;
+  try { process.kill(Number((await readFile(`${paths.dataRoot}/llama-cpp-mtp-launcher.pid`, 'utf8')).trim()), 'SIGUSR1'); }
+  catch { /* A manually managed backend has no launcher to restart. */ }
+}
 const sessionApprovals = new Map<string, { root: string; categories: Set<RiskCategory> }>();
 
 const waitFor = (promise: Promise<void>, timeoutMs: number): Promise<void> => new Promise((resolve) => {
@@ -118,10 +121,11 @@ export function registerIpc(): void {
     const nextModelId = patch.modelId ?? current.modelId;
     const profile = nextModelId ? getModelProfile(nextModelId) : undefined;
     if (nextModelId && !profile) throw new Error('Выбранная модель отсутствует в реестре приложения');
-    const allowed = profile ? contextPresetsFor(profile.maxContext) : [];
+    const allowed = profile ? (selectedBackend === 'llama-cpp' ? llamaContextPresets(nextModelId ?? '') : contextPresetsFor(profile.maxContext)) : [];
     const requestedContext = patch.contextWindow ?? current.contextWindow;
     const contextWindow = allowed.length && !allowed.includes(requestedContext) ? allowed.at(-1)! : requestedContext;
     const updated = database.updateConversation(id, { ...patch, contextWindow });
+    if (selectedBackend === 'llama-cpp' && ((patch.contextWindow !== undefined && contextWindow !== current.contextWindow) || (patch.modelId !== undefined && patch.modelId !== current.modelId))) void restartLlamaRuntime();
     if ((patch.workingDirectory !== undefined && patch.workingDirectory !== current.workingDirectory) || (patch.secondaryWorkingDirectory !== undefined && patch.secondaryWorkingDirectory !== current.secondaryWorkingDirectory)) sessionApprovals.delete(id);
     if (patch.modelId !== undefined && patch.modelId !== current.modelId) database.setContextUsage(id, null, null);
     if (selectedBackend === 'ollama' && patch.modelId !== undefined && patch.modelId !== current.modelId && current.modelId) void ollama.unloadModel(current.modelId);
@@ -129,6 +133,7 @@ export function registerIpc(): void {
   });
   ipcMain.handle('conversations:delete', async (_event, id: string) => { sessionApprovals.delete(id); await attachments.removeManagedFiles(database.deleteConversation(id)); });
   ipcMain.handle('messages:list', (_event, conversationId: string) => database.listMessages(conversationId));
+  ipcMain.handle('agent-plan:get', (_event, conversationId: string) => database.getAgentPlan(conversationId));
   ipcMain.handle('messages:edit', async (_event, messageId: string, content: string, fallback?: { conversationId: string; content: string }) => {
     const message = database.getMessage(messageId) ?? (fallback ? database.findUserMessage(fallback.conversationId, fallback.content) : null); if (!message) throw new Error('Сообщение не найдено');
     const before = database.listAttachmentsForConversation(message.conversationId);
@@ -230,23 +235,37 @@ export function registerIpc(): void {
     if (!current()) return;
     await backend.ensureModelAvailable(request.model);
     if (!current()) return;
-    let output = ''; let thinking = ''; let taskPlan: import('../../shared/types').AgentPlan | undefined; let messageDiagnostics: import('../../shared/types').GenerationDiagnostics | undefined; let completed = false; let failed = false; let finishReason: 'stop' | 'length' = 'stop';
+    let output = ''; let thinking = ''; let messageDiagnostics: import('../../shared/types').GenerationDiagnostics | undefined; let completed = false; let failed = false; let finishReason: 'stop' | 'length' = 'stop';
     const thinkingTimeline: ThinkingTimelineEvent[] = []; const activityTimelinePositions = new Map<string, number>(); let timelinePosition = 0; let lastTimelineKind: ThinkingTimelineEvent['kind'] | null = null;
     const agentProjects: AgentProject[] = mode === 'agent' ? [...selectedProjects] : [];
     const agentRoot = agentProjects[0]?.root ?? null;
-    const enabledTools = mode === 'agent' ? [taskNotesToolDefinition.function.name, agentPlanToolDefinition.function.name, reportProgressToolDefinition.function.name, terminalToolDefinition.function.name, ...(agentProjects.length ? projectToolDefinitions.map((tool) => tool.function.name) : []), ...(conversation.webMode === 'auto' ? webToolDefinitions.map((tool) => tool.function.name) : [])] : conversation.webMode === 'auto' ? webToolDefinitions.map((tool) => tool.function.name) : [];
+    const enabledTools = mode === 'agent' ? ['apply_patch', 'create_file', 'delete_file', 'list_directory', 'project_knowledge_index', 'project_knowledge_read', 'project_knowledge_update', 'read_file', 'run_terminal', 'task_memory', 'write_file'] : conversation.webMode === 'auto' ? ['web'] : [];
     log('generation.snapshot', { generationId: generation.id, chatId: request.conversationId, mode, storedMode: conversation.mode, requestedMode: request.mode, workingDirectory: conversation.workingDirectory, resolvedWorkingDirectory: agentRoot, projects: agentProjects.map((project) => ({ id: project.id, slot: project.slot })), webMode: conversation.webMode, modelId: request.model, contextSize: conversation.contextWindow, reasoningMode: conversation.reasoningMode, enabledTools });
     run = mode === 'agent' ? database.createAnalysisRun(request.conversationId, conversation.reasoningMode) : null;
     if (run && current()) event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run });
       const context = await backend.resolveContextWindow(request.model, conversation.contextWindow, abort.signal);
       if (!current()) return;
       event.sender.send('chat:stream', { type: 'context', conversationId: request.conversationId, generationId: generation.id, ...context });
+      if (mode === 'agent' && selectedBackend === 'ollama') {
+        // Prepare the native runner before the Rust sidecar's matching native
+        // request so a stale 32K/64K allocation is reconfigured explicitly.
+        await ollama.prepareAgentContext(request.model, context.active, abort.signal);
+        if (!current()) return;
+        log('ollama.agent.transport', {
+          model: request.model,
+          selectedContext: context.active,
+          endpoint: 'http://127.0.0.1:11434/api/chat',
+          transport: 'native',
+          generationNumCtx: context.active,
+        });
+      }
       // Image descriptions are excluded for native-vision requests: the original
       // image payload is attached only to its owning user turn below.
       let history = attachmentPipeline.buildContext(request.messages, !hasImages);
       if (nativeVision) history = await attachmentPipeline.prepareNativeImages(history, abort.signal);
+      const persistedTaskMemory = mode === 'agent' ? taskPlan(database.getAgentPlan(request.conversationId) ?? {}).taskMemory : undefined;
       const stream = mode === 'agent'
-        ? rustAgent.stream(request.model, history, agentProjects, abort.signal, context.active, conversation.reasoningMode, conversation.webMode, generation.id)
+        ? rustAgent.stream(request.model, history, agentProjects, abort.signal, context.active, conversation.reasoningMode, conversation.webMode, generation.id, persistedTaskMemory, request.conversationId)
         : conversation.webMode === 'auto'
           ? webChat.stream(request.model, history, abort.signal, context.active, conversation.reasoningMode)
           : backend.streamChat(request.model, chatMessagesWithSystemPrefix(history, [chatSystemContext({ webAvailable: false }, conversation.reasoningMode === 'deep' ? 'deep' : 'fast')], request.conversationId, `capability-${request.conversationId}`), abort.signal, context.active, conversation.reasoningMode);
@@ -261,9 +280,8 @@ export function registerIpc(): void {
             chunk = { ...chunk, timelinePosition };
           }
         }
-        if (chunk.type === 'task-plan') {
-          taskPlan = structuredClone(chunk.plan);
-          event.sender.send('chat:stream', { ...chunk, conversationId: request.conversationId, generationId: generation.id });
+        if (chunk.type === 'task-memory') {
+          database.saveAgentPlan(request.conversationId, { milestones: [], taskMemory: structuredClone(chunk.memory) });
           continue;
         }
         if (chunk.type === 'context-usage') {
@@ -306,7 +324,7 @@ export function registerIpc(): void {
         ...(messageDiagnostics.timeToFirstTokenMs !== undefined ? { timeToFirstTokenMs: messageDiagnostics.timeToFirstTokenMs } : {}),
         ...(inputTokens !== undefined ? { inputTokens } : {}),
       };
-      const assistant = output ? database.addMessage(request.conversationId, 'assistant', output, undefined, [], { ...(thinking.trim() ? { thinking } : {}), ...(thinkingTimeline.length ? { thinkingTimeline } : {}), ...(taskPlan ? { taskPlan } : {}), ...(generationStats ? { generationStats } : {}) }) : null;
+      const assistant = output ? database.addMessage(request.conversationId, 'assistant', output, undefined, [], { ...(thinking.trim() ? { thinking } : {}), ...(thinkingTimeline.length ? { thinkingTimeline } : {}), ...(generationStats ? { generationStats } : {}) }) : null;
       if (run) event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run: database.finishAnalysisRun(run.id, 'completed', assistant?.id ?? null) });
       event.sender.send('chat:stream', { type: 'done', conversationId: request.conversationId, generationId: generation.id, assistant, finishReason });
     } catch (error) {
