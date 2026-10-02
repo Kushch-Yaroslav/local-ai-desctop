@@ -35,7 +35,7 @@ pub fn attach_historical_index(
         selected.push(receipt);
     }
     selected.reverse();
-    let content = format!("[HISTORICAL OBSERVATION LOCATORS — NOT USER CONTENT]\n{} of {} older observations listed; observation_index retrieves all IDs. These are locators, not missing research. Use established evidence for synthesis; observation_read(id) is for a specific exact detail or contradiction. Exact bodies remain in canonical storage.\n{}",
+    let content = format!("[HISTORICAL OBSERVATION LOCATORS — NOT USER CONTENT]\n{} of {} older observations listed; observation_index retrieves all IDs. These are locators, not missing research. Rely on Task Memory findings for synthesis; observation_read(id) is for a specific exact detail or contradiction. Exact bodies remain in canonical storage.\n{}",
         selected.len(), hidden.len(), selected.join("\n"));
     // Before the current user turn and recent assistant/tool tail.
     let insert = messages
@@ -374,14 +374,12 @@ mod tests {
         let resumed =
             Transcript::durable(&base.join("evidence"), "worker-2", &[], root.to_str()).unwrap();
         assert!(resumed.is_finalizing());
-        assert!(resumed
-            .pending_tail("")
-            .contains("specific unresolved contradiction"));
+        assert!(resumed.pending_tail("").contains("tools are unavailable"));
         assert!(project(&resumed, "system", &resumed.pending_tail(""))
             .iter()
             .any(|m| m["content"]
                 .as_str()
-                .is_some_and(|s| s.contains("being finalized"))));
+                .is_some_and(|s| s.contains("MODE: FINALIZING"))));
         fs::remove_dir_all(base).unwrap();
     }
 

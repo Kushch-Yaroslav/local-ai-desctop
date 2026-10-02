@@ -12,8 +12,12 @@ pub struct AgentState {
     /// Durable semantic findings for the current task. This is not a plan.
     pub task_memory: TaskMemory,
     pub workspace_mutated_since_validation: bool,
-    pub closeout_nudged: bool,
+    /// Count of successful project mutations, used to refresh derived views.
+    pub mutations: usize,
     pub verification_nudged: bool,
+    /// The single reminder about unopened requested local files was already
+    /// given for this run; it never repeats.
+    pub request_review_given: bool,
     /// Observability for optional `.ai-framework` virtual context access.
     pub knowledge_reads: usize,
     pub knowledge_writes: usize,
@@ -23,6 +27,7 @@ pub struct AgentState {
 
 impl AgentState {
     pub fn record_mutation(&mut self) {
+        self.mutations = self.mutations.saturating_add(1);
         self.workspace_mutated_since_validation = true;
         self.verification_nudged = false;
     }

@@ -39,7 +39,7 @@ impl Observation {
     }
     pub fn receipt(&self) -> String {
         format!(
-            "[historical tool observation] id={} tool={} outcome={} source={} revision={} requested={} returned={} bytes={} sha256={}\nStored historical evidence. Recover with observation_read(id=\"{}\") only for a specific missing exact detail or contradiction; established findings are projected separately.",
+            "[historical tool observation] id={} tool={} outcome={} source={} revision={} requested={} returned={} bytes={} sha256={}\nStored historical evidence. Recover with observation_read(id=\"{}\") only for a specific missing exact detail or contradiction; findings you rely on belong in Task Memory.",
             self.id, self.tool, if self.error { "error/blocker" } else { "success" },
             self.source.as_deref().unwrap_or("none"),
             self.source_revision.as_deref().unwrap_or("unknown"),

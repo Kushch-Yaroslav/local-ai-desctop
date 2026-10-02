@@ -1,11 +1,9 @@
 pub mod events;
 pub mod evidence;
-pub mod frontiers;
-pub mod lifecycle;
+pub mod ledger;
 pub mod loop_runtime;
 pub mod policy;
-pub mod research;
+pub mod reads;
 pub mod state;
 pub mod task_memory;
 pub mod transcript;
-pub mod working_evidence;

@@ -4,13 +4,29 @@ use std::path::{Path, PathBuf};
 
 const MAX_READ_RESULT_BYTES: usize = 64 * 1024;
 
-fn bounded_read_content(content: &str, offset_chars: usize) -> (String, bool, usize) {
+/// Largest read result this call may return: the tool maximum, optionally
+/// lowered by the runtime through the internal `_result_limit_bytes` argument
+/// (never part of the model-facing schema) so one turn's results fit the window.
+fn read_limit(object: &serde_json::Map<String, Value>) -> usize {
+    object
+        .get("_result_limit_bytes")
+        .and_then(Value::as_u64)
+        .map_or(MAX_READ_RESULT_BYTES, |limit| {
+            (limit as usize).clamp(1, MAX_READ_RESULT_BYTES)
+        })
+}
+
+fn bounded_read_content(
+    content: &str,
+    offset_chars: usize,
+    limit_bytes: usize,
+) -> (String, bool, usize) {
     let start = content
         .char_indices()
         .nth(offset_chars)
         .map_or(content.len(), |(index, _)| index);
     let remainder = &content[start..];
-    if remainder.len() <= MAX_READ_RESULT_BYTES {
+    if remainder.len() <= limit_bytes {
         return (
             remainder.to_owned(),
             false,
@@ -19,7 +35,7 @@ fn bounded_read_content(content: &str, offset_chars: usize) -> (String, bool, us
     }
     let end = remainder
         .char_indices()
-        .take_while(|(index, _)| *index < MAX_READ_RESULT_BYTES)
+        .take_while(|(index, _)| *index < limit_bytes)
         .last()
         .map_or(0, |(index, character)| index + character.len_utf8());
     (
@@ -115,6 +131,7 @@ pub fn execute(root: &Path, name: &str, args: &Value) -> Result<(Value, Option<S
                 );
             }
             let content = fs::read_to_string(target).map_err(|e| e.to_string())?;
+            let limit = read_limit(object);
             let lines = content.lines().collect::<Vec<_>>();
             let start_line = object
                 .get("start_line")
@@ -139,16 +156,16 @@ pub fn execute(root: &Path, name: &str, args: &Value) -> Result<(Value, Option<S
                     .collect::<Vec<_>>()
                     .join("\n");
                 let (selected, truncated, next_offset_chars) =
-                    bounded_read_content(&selected, offset_chars);
+                    bounded_read_content(&selected, offset_chars, limit);
                 Ok((
-                    json!({"path":path,"content":selected,"start_line":start,"end_line":end,"total_lines":lines.len(),"targeted":true,"truncated":truncated,"offset_chars":offset_chars,"next_offset_chars":next_offset_chars,"read_result_limit_bytes":MAX_READ_RESULT_BYTES}),
+                    json!({"path":path,"content":selected,"start_line":start,"end_line":end,"total_lines":lines.len(),"targeted":true,"truncated":truncated,"offset_chars":offset_chars,"next_offset_chars":next_offset_chars,"read_result_limit_bytes":limit}),
                     None,
                 ))
             } else {
                 let (content, truncated, next_offset_chars) =
-                    bounded_read_content(&content, offset_chars);
+                    bounded_read_content(&content, offset_chars, limit);
                 Ok((
-                    json!({"path":path,"content":content,"total_lines":lines.len(),"targeted":false,"truncated":truncated,"offset_chars":offset_chars,"next_offset_chars":next_offset_chars,"read_result_limit_bytes":MAX_READ_RESULT_BYTES}),
+                    json!({"path":path,"content":content,"total_lines":lines.len(),"targeted":false,"truncated":truncated,"offset_chars":offset_chars,"next_offset_chars":next_offset_chars,"read_result_limit_bytes":limit}),
                     None,
                 ))
             }
@@ -355,6 +372,42 @@ fn interpret_hunk(hunk: &[String]) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_result_limit_truncates_with_a_continuation_offset() {
+        let root = std::env::temp_dir().join(format!("fs-limit-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("big.txt"), "abcdefghij".repeat(100)).unwrap();
+        let (first, _) = execute(
+            &root,
+            "read_file",
+            &json!({"path":"big.txt","_result_limit_bytes":100}),
+        )
+        .unwrap();
+        assert_eq!(first["truncated"], true);
+        assert_eq!(first["content"].as_str().unwrap().len(), 100);
+        assert_eq!(first["next_offset_chars"], 100);
+        assert_eq!(first["read_result_limit_bytes"], 100);
+        let (second, _) = execute(
+            &root,
+            "read_file",
+            &json!({"path":"big.txt","offset_chars":100,"_result_limit_bytes":100}),
+        )
+        .unwrap();
+        assert!(second["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("abcdefghij"));
+        // the internal limit can only lower the tool maximum
+        let (all, _) = execute(
+            &root,
+            "read_file",
+            &json!({"path":"big.txt","_result_limit_bytes":10_000_000}),
+        )
+        .unwrap();
+        assert_eq!(all["truncated"], false);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn large_read_is_bounded_and_addressable_by_offset() {
