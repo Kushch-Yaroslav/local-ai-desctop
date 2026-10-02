@@ -217,7 +217,7 @@ pub fn project(
                 "agent-reported direct" | "task-memory cited"
             ) {
                 2
-            } else if fact.origin == "agent inference" {
+            } else if fact.origin.starts_with("agent inference") {
                 0
             } else {
                 1

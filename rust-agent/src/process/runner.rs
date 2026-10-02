@@ -5,6 +5,94 @@ use std::{
     time::Duration,
 };
 
+#[derive(Default)]
+struct CapturedPipeline {
+    exit_code: Option<i32>,
+    statuses: Vec<i32>,
+    pending_empty_stdout: usize,
+}
+
+fn flush_empty_stdout(count: usize, stdout: &mut String, output: &mut impl FnMut(&str, &str)) {
+    for _ in 0..count {
+        output("stdout", "");
+        stdout.push('\n');
+    }
+}
+
+fn capture_line(
+    stream: &str,
+    line: String,
+    marker: &str,
+    stdout: &mut String,
+    stderr: &mut String,
+    pipeline: &mut CapturedPipeline,
+    output: &mut impl FnMut(&str, &str),
+) {
+    if stream == "stdout" {
+        if let Some(metadata) = line.strip_prefix(marker) {
+            if let Some((exit_code, statuses)) = metadata.split_once('|') {
+                let parsed_exit = exit_code.parse::<i32>();
+                let parsed_statuses = statuses
+                    .split_whitespace()
+                    .map(str::parse::<i32>)
+                    .collect::<Result<Vec<_>, _>>();
+                if let (Ok(exit_code), Ok(statuses)) = (parsed_exit, parsed_statuses) {
+                    pipeline.exit_code = Some(exit_code);
+                    pipeline.statuses = statuses;
+                    flush_empty_stdout(
+                        pipeline.pending_empty_stdout.saturating_sub(1),
+                        stdout,
+                        output,
+                    );
+                    pipeline.pending_empty_stdout = 0;
+                    return;
+                }
+            }
+        }
+        if stream == "stdout" && line.is_empty() {
+            pipeline.pending_empty_stdout += 1;
+            return;
+        }
+        if stream == "stdout" && pipeline.pending_empty_stdout > 0 {
+            flush_empty_stdout(pipeline.pending_empty_stdout, stdout, output);
+            pipeline.pending_empty_stdout = 0;
+        }
+    }
+    output(stream, &line);
+    let target = if stream == "stdout" { stdout } else { stderr };
+    target.push_str(&line);
+    target.push('\n');
+}
+
+fn is_truncated_search_pipeline(
+    command: &str,
+    exit_code: i32,
+    statuses: &[i32],
+    stdout: &str,
+) -> bool {
+    if exit_code != 141 || statuses != [141, 0] || stdout.trim().is_empty() {
+        return false;
+    }
+    let mut stages = command.split('|');
+    let (Some(producer), Some(consumer), None) = (stages.next(), stages.next(), stages.next())
+    else {
+        return false;
+    };
+    fn executable(stage: &str) -> &str {
+        stage
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+    }
+    matches!(executable(producer), "grep" | "egrep" | "fgrep" | "rg")
+        && executable(consumer) == "head"
+        && !producer.trim_end().ends_with('&')
+        && !consumer.trim_start().starts_with('&')
+}
+
 /// Runs each shell turn in a dedicated session. `setsid` makes the bash PID a
 /// process-group leader, allowing cancellation to terminate npm/vite/test
 /// descendants instead of leaving background workers behind.
@@ -16,6 +104,17 @@ pub fn run_streaming(
     mut started_event: impl FnMut(u32, u32, u32, u128),
     mut output: impl FnMut(&str, &str),
 ) -> serde_json::Value {
+    let marker = format!(
+        "__LOCAL_AI_PIPE_STATUS_{}_{}__",
+        std::process::id(),
+        now_ms()
+    );
+    // Capture PIPESTATUS before any other shell command can overwrite it. The
+    // wrapper exits with the user's original pipeline status, so diagnostics
+    // and shell failure semantics remain intact.
+    let wrapped_command = format!(
+        "{command}\n__local_ai_runner_exit=$? __local_ai_runner_pipeline=(\"${{PIPESTATUS[@]}}\"); printf '\\n{marker}%s|%s\\n' \"$__local_ai_runner_exit\" \"${{__local_ai_runner_pipeline[*]}}\"; exit \"$__local_ai_runner_exit\""
+    );
     let mut child = match Command::new("setsid")
         .arg("bash")
         // Preserve the actual failure status for common diagnostic pipelines
@@ -23,7 +122,7 @@ pub fn run_streaming(
         .arg("-o")
         .arg("pipefail")
         .arg("-lc")
-        .arg(command)
+        .arg(&wrapped_command)
         .current_dir(cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -59,31 +158,64 @@ pub fn run_streaming(
     let mut timed_out = false;
     let mut was_cancelled = false;
     let mut terminated = false;
+    let mut pipeline = CapturedPipeline::default();
     loop {
         while let Ok((stream, line)) = receiver.try_recv() {
-            output(stream, &line);
-            let target = if stream == "stdout" {
-                &mut stdout
-            } else {
-                &mut stderr
-            };
-            target.push_str(&line);
-            target.push('\n');
+            capture_line(
+                stream,
+                line,
+                &marker,
+                &mut stdout,
+                &mut stderr,
+                &mut pipeline,
+                &mut output,
+            );
         }
         match child.try_wait() {
             Ok(Some(status)) => {
                 while let Ok((stream, line)) = receiver.try_recv() {
-                    output(stream, &line);
-                    let target = if stream == "stdout" {
-                        &mut stdout
-                    } else {
-                        &mut stderr
-                    };
-                    target.push_str(&line);
-                    target.push('\n');
+                    capture_line(
+                        stream,
+                        line,
+                        &marker,
+                        &mut stdout,
+                        &mut stderr,
+                        &mut pipeline,
+                        &mut output,
+                    );
+                }
+                if pipeline.exit_code.is_none() && pipeline.pending_empty_stdout > 0 {
+                    flush_empty_stdout(pipeline.pending_empty_stdout, &mut stdout, &mut output);
+                    pipeline.pending_empty_stdout = 0;
                 }
                 let cancelled_status = was_cancelled;
-                return serde_json::json!({"command":command,"cwd":cwd,"pid":pid,"pgid":pid,"session_id":pid,"started_at":started_at,"finished_at":now_ms(),"stdout":stdout,"stderr":stderr,"exit_code":status.code(),"timed_out":timed_out,"cancelled":cancelled_status,"status":if cancelled_status {"cancelled"} else if timed_out {"timed_out"} else if status.success() {"completed"} else {"error"}});
+                let exit_code = status.code();
+                let pipeline_captured = pipeline.exit_code == exit_code;
+                let partial_success = !cancelled_status
+                    && !timed_out
+                    && pipeline_captured
+                    && exit_code.is_some_and(|code| {
+                        is_truncated_search_pipeline(command, code, &pipeline.statuses, &stdout)
+                    });
+                let mut result = serde_json::json!({
+                    "command":command,
+                    "cwd":cwd,
+                    "pid":pid,
+                    "pgid":pid,
+                    "session_id":pid,
+                    "started_at":started_at,
+                    "finished_at":now_ms(),
+                    "stdout":stdout,
+                    "stderr":stderr,
+                    "exit_code":exit_code,
+                    "timed_out":timed_out,
+                    "cancelled":cancelled_status,
+                    "status":if cancelled_status {"cancelled"} else if timed_out {"timed_out"} else if partial_success {"partial_success"} else if status.success() {"completed"} else {"error"}
+                });
+                if pipeline_captured {
+                    result["pipeline_statuses"] = serde_json::json!(pipeline.statuses);
+                }
+                return result;
             }
             Ok(None) => {}
             Err(error) => {
@@ -139,5 +271,65 @@ mod tests {
         assert_eq!(value["started_at"].as_u64(), Some(identity.3 as u64));
         assert!(value["finished_at"].as_u64().is_some());
         assert_eq!(value["stdout"].as_str(), Some("first\nsecond\n"));
+    }
+
+    #[test]
+    fn truncated_search_preserves_output_and_reports_partial_success() {
+        let value = run_streaming(
+            "grep -n . src/agent/loop_runtime.rs | head -n 1",
+            ".",
+            5_000,
+            || false,
+            |_, _, _, _| {},
+            |_, _| {},
+        );
+        assert_eq!(value["exit_code"], 141);
+        assert_eq!(value["status"], "partial_success");
+        assert_eq!(value["pipeline_statuses"], serde_json::json!([141, 0]));
+        assert!(value["stdout"]
+            .as_str()
+            .is_some_and(|text| !text.trim().is_empty()));
+    }
+
+    #[test]
+    fn ordinary_nonzero_search_and_other_sigpipe_remain_errors() {
+        let no_match = run_streaming(
+            "grep 'no-such-test-pattern' src/agent/loop_runtime.rs",
+            ".",
+            5_000,
+            || false,
+            |_, _, _, _| {},
+            |_, _| {},
+        );
+        assert_eq!(no_match["exit_code"], 1);
+        assert_eq!(no_match["status"], "error");
+        assert_eq!(no_match["stdout"], "");
+
+        let unrelated_sigpipe = run_streaming(
+            "seq 1000000 | head -n 1",
+            ".",
+            5_000,
+            || false,
+            |_, _, _, _| {},
+            |_, _| {},
+        );
+        assert_eq!(unrelated_sigpipe["exit_code"], 141);
+        assert_eq!(unrelated_sigpipe["status"], "error");
+        assert_eq!(unrelated_sigpipe["stdout"], "1\n");
+    }
+
+    #[test]
+    fn nonzero_command_keeps_useful_stdout_and_is_not_partial_success() {
+        let value = run_streaming(
+            "printf 'useful diagnostic\\n'; exit 7",
+            ".",
+            5_000,
+            || false,
+            |_, _, _, _| {},
+            |_, _| {},
+        );
+        assert_eq!(value["exit_code"], 7);
+        assert_eq!(value["status"], "error");
+        assert_eq!(value["stdout"], "useful diagnostic\n");
     }
 }

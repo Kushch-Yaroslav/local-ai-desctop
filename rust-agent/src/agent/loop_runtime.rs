@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -78,7 +78,7 @@ const AGENT_GUIDANCE: &str = r#"
 - Use the latest user's language for all user-visible natural-language text: streamed reasoning/progress, tool preambles, brief status updates, and the final answer. Follow an explicit language request if present. Keep code, paths, identifiers, commands, API/tool syntax, and literal source quotations in their original form. Do not translate protocol fields.
 - For non-trivial architecture relationships, use a compact multiline Mermaid flowchart when it improves readability, or a properly indented multiline tree. Do not compress a diagram into one long arrow chain; avoid decorative box art.
 - Task Memory = durable semantic continuity for this task. Record meaningful findings, decisions, blockers, and next actions. After compaction, trust a precise Task Memory finding from an unchanged inspected file; reread only for a missing fact, ambiguity, possible change, exact detail, or targeted verification.
-- When a source establishes an important audit finding, use evidence_record with its observation ID and one concise claim. A read or generic Task Memory note is only a lead, not proof that a requested area is understood. Established evidence remains visible after compaction; observation_read is for a specific exact detail or contradiction.
+- When a source establishes an important audit finding, use evidence_record with its observation ID and one concise claim. For a direct claim, use at least two meaningful terms visible in the observation content; a file path or observation ID alone is not support. Quoted or slash-delimited short code tokens and uppercase acronyms count when present in the observation; ordinary short words do not. A direct negative claim needs source-level negation anchored to at least two meaningful terms from the same claim in one source sentence or line, or a complete read_file observation named in a file-scoped absence claim, or a complete list_directory observation of the exact parent directory that omits the named child. Never infer repository-wide absence from a narrow source. A failed read is a blocker, not direct success evidence: cite its observation ID in a Task Memory finding to record a grounded blocker. Otherwise set inference=true and keep it distinct from direct coverage. A read or generic Task Memory note is only a lead, not proof that a requested area is understood. Established evidence remains visible after compaction; observation_read is for a specific exact detail or contradiction.
 - Follow a material local execution dependency discovered in inspected source (for example a UI call into a local service) before claiming its end-to-end behavior is understood. The runtime shows open evidence frontiers; close one by inspecting its target or record a concrete blocker. Do not chase unrelated imports.
 - When requested areas have grounded findings and material execution frontiers are closed, begin_finalization marks the shift to synthesis. In the final answer, answer the user's sections directly, distinguish facts from hypotheses, prioritize concrete effects over generic advice, state blocked limits, and avoid duplicate points or meta-progress narration. Treat AI-assisted development claims conservatively; ordinary code style is weak evidence. Then write one user-facing answer from established evidence.
 - For project archaeology with run_terminal, prefer one scoped read-only command such as git -C <project> log --oneline; avoid compound shell wrappers and unsafe pipelines that require approval.
@@ -467,7 +467,7 @@ fn dynamic_tail(
             })
             .collect::<Vec<_>>();
         if !open.is_empty() {
-            tail.push(format!("<open_evidence_frontiers>\n{}\nThese are verified local execution edges, not a task list. Read the listed local target and record a direct finding; use evidence_frontier with the exact frontier ID only for a target-specific failed read or grounded blocker.\n</open_evidence_frontiers>",open.join("\n")));
+            tail.push(format!("<open_evidence_frontiers>\n{}\nThese are verified local execution edges, not a task list. Read the listed local target and record a direct finding with evidence_record; that finding closes the frontier automatically. Use evidence_frontier only when a target-specific read actually failed or requires approval, and cite that exact failed/approval observation with outcome=blocked. Do not use a disposition for a successful target read.\n</open_evidence_frontiers>",open.join("\n")));
         }
     }
     let memory = if transcript.is_finalizing() || transcript.is_closeout_requested() {
@@ -478,7 +478,7 @@ fn dynamic_tail(
     if !memory.is_empty() {
         tail.push(format!("<task_memory>\n{memory}\n</task_memory>"));
     }
-    if !transcript.is_finalizing() {
+    if !transcript.is_finalizing() && !user_requests_read_only(objective) {
         let knowledge = crate::tools::knowledge::prompt_catalog(root);
         if !knowledge.is_empty() {
             tail.push(knowledge);
@@ -503,6 +503,9 @@ fn lifecycle_tail(
 }
 
 fn emit_knowledge_diagnostics(config: &Config, state: &AgentState) {
+    if user_requests_read_only(&config.user) {
+        return;
+    }
     let Some(root) = config.root.as_deref() else {
         return;
     };
@@ -541,10 +544,10 @@ fn emit_knowledge_diagnostics(config: &Config, state: &AgentState) {
 fn tool_schemas(has_project_root: bool) -> Vec<Value> {
     let mut tools = vec![
         json!({"type":"function","function":{"name":"task_memory","description":"Durable semantic memory for the current task across compaction. Record/update meaningful findings, decisions, blockers, or unresolved questions; view reads it; invalidate needs id. Record/update requires finding and may include evidence, implication, next, id, supersedes. Trust precise unchanged-file memory; reread only for a concrete missing, ambiguous, changed, exact-detail, or verification need.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["record","update","invalidate","view"]},"id":{"type":"string"},"finding":{"type":"string"},"evidence":{"type":"string"},"implication":{"type":"string"},"next":{"type":"string"},"supersedes":{"type":"string"}},"required":["action"]}}}),
-        json!({"type":"function","function":{"name":"observation_index","description":"List historical tool observations by stable ID, with source and outcome metadata. Use when a needed old observation is no longer in the active prompt.","parameters":{"type":"object","properties":{"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":50}}}}}),
+        json!({"type":"function","function":{"name":"observation_index","description":"List historical tool observations by stable ID, with source path and outcome metadata. Use source to select the raw observation for the needed file. If more=true, continue at the returned next_offset. Observation IDs start with obs-; established-evidence IDs (ev-) are not observation IDs.","parameters":{"type":"object","properties":{"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":50}}}}}),
         json!({"type":"function","function":{"name":"observation_read","description":"Recover a bounded exact slice of a stored historical tool result by observation ID. The response distinguishes historical evidence from current source and reports whether the source changed.","parameters":{"type":"object","properties":{"id":{"type":"string"},"offset_chars":{"type":"integer","minimum":0},"max_chars":{"type":"integer","minimum":1,"maximum":16000}},"required":["id"]}}}),
-        json!({"type":"function","function":{"name":"evidence_record","description":"Preserve one concise finding already established from a specific historical observation. This is evidence for later synthesis, not a plan. Set inference=true when the claim is an interpretation rather than directly visible in the result.","parameters":{"type":"object","properties":{"observation_id":{"type":"string"},"claim":{"type":"string"},"inference":{"type":"boolean"}},"required":["observation_id","claim"]}}}),
-        json!({"type":"function","function":{"name":"evidence_frontier","description":"Use the advertised frontier-... ID (a unique source observation ID is also accepted). Blocked requires a target-specific failed/approval observation. Irrelevant requires reading the actual local target and recording a direct finding first. Unsupported external assertions do not close a verified local target.","parameters":{"type":"object","properties":{"id":{"type":"string"},"outcome":{"type":"string","enum":["blocked","irrelevant"]},"reason":{"type":"string"},"observation_id":{"type":"string"}},"required":["id","outcome","reason"]}}}),
+        json!({"type":"function","function":{"name":"evidence_record","description":"Preserve one concise, source-backed finding from a specific historical observation. Direct claims require a raw source observation; project knowledge, task-memory, and observation indexes are leads, not proof. Every sentence must match at least 2 meaningful terms and at least 25% of its meaningful terms in the observation. Quoted or slash-delimited short code tokens and uppercase acronyms count when present in the observation; ordinary short words do not. Split compound or multi-source claims into separate records; keep each claim to 800 characters or fewer. A path or ID alone is not support. A direct negative claim needs source-level negation anchored to at least 2 meaningful terms from the same claim in one source sentence or line, or a complete read_file observation explicitly named for a file-scoped absence, or a complete list_directory observation of the exact parent directory omitting the named child. A narrow source cannot establish repository-wide absence. A failed read cannot establish direct success; cite its observation ID in Task Memory to record a grounded blocker. Set inference=true for interpretations or claims not directly supported by the observation. Inference is kept distinct from direct coverage; do not retry a rejected claim/observation pair unchanged.","parameters":{"type":"object","properties":{"observation_id":{"type":"string"},"claim":{"type":"string","maxLength":800},"inference":{"type":"boolean"}},"required":["observation_id","claim"]}}}),
+        json!({"type":"function","function":{"name":"evidence_frontier","description":"Record outcome=blocked only for an advertised frontier whose resolved local target read failed or required approval. Cite the exact target-specific error/approval observation and give a concrete reason. A successful target read with an accepted direct evidence_record closes the frontier automatically; no disposition is needed.","parameters":{"type":"object","properties":{"id":{"type":"string"},"outcome":{"type":"string","enum":["blocked"]},"reason":{"type":"string"},"observation_id":{"type":"string"}},"required":["id","outcome","reason","observation_id"]}}}),
         json!({"type":"function","function":{"name":"begin_finalization","description":"Mark evidence gathering complete and move to final synthesis. The runtime checks requested-area evidence and returns any genuine gap instead of restarting broad discovery. This is a lifecycle transition, not a task plan.","parameters":{"type":"object","properties":{}}}}),
     ];
     if has_project_root {
@@ -552,7 +555,7 @@ fn tool_schemas(has_project_root: bool) -> Vec<Value> {
             json!({"type":"function","function":{"name":"apply_patch","description":"Apply a project patch.","parameters":{"type":"object","properties":{"patch":{"type":"string"}},"required":["patch"]}}}),
             json!({"type":"function","function":{"name":"create_file","description":"Create a new project file.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}),
             json!({"type":"function","function":{"name":"delete_file","description":"Delete a project file when allowed.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}),
-            json!({"type":"function","function":{"name":"list_directory","description":"List a project directory.","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}),
+            json!({"type":"function","function":{"name":"list_directory","description":"List a project directory. complete=true means all directory entries are represented; false means internal runtime entries were omitted.","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}),
             json!({"type":"function","function":{"name":"read_file","description":"Read up to 64 KiB of a project file. A truncated result provides next_offset_chars; use that offset or a specific line range for more.","parameters":{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1},"offset_chars":{"type":"integer","minimum":0}},"required":["path"]}}}),
             json!({"type":"function","function":{"name":"project_knowledge_index","description":"Read the small .ai-framework manifest index and source freshness map. Use it before repeating broad project orientation.","parameters":{"type":"object","properties":{}}}}),
             json!({"type":"function","function":{"name":"project_knowledge_read","description":"Read selected reusable project observations from .ai-framework: paths is required. Prefer relevant fresh knowledge before broad rereads; do not reread unchanged source only to reconstruct context. Read source for exact current code or a concrete unresolved/verification detail.","parameters":{"type":"object","properties":{"paths":{"type":"array","items":{"type":"string"}}},"required":["paths"]}}}),
@@ -602,6 +605,53 @@ fn tool_schemas_for_policy(has_project_root: bool, policy: RunPolicy) -> Vec<Val
                     | "project_knowledge_read"
             )
         });
+    }
+    tools
+}
+
+fn is_project_side_effect_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "apply_patch"
+            | "create_file"
+            | "delete_file"
+            | "project_knowledge_index"
+            | "project_knowledge_read"
+            | "project_knowledge_update"
+            | "write_file"
+    )
+}
+
+fn user_requests_read_only(user: &str) -> bool {
+    let user = user.to_lowercase();
+    [
+        "не изменяй файлы",
+        "не изменяйте файлы",
+        "не изменять файлы",
+        "не меняй файлы",
+        "не меняйте файлы",
+        "не редактируй файлы",
+        "не изменяй код",
+        "ничего не меняй",
+        "ничего не изменяй",
+        "read-only",
+        "read only",
+        "do not modify",
+        "don't modify",
+        "do not edit",
+        "don't edit",
+        "do not change files",
+        "don't change files",
+        "no file changes",
+    ]
+    .iter()
+    .any(|marker| user.contains(marker))
+}
+
+fn tool_schemas_for_request(has_project_root: bool, policy: RunPolicy, user: &str) -> Vec<Value> {
+    let mut tools = tool_schemas_for_policy(has_project_root, policy);
+    if user_requests_read_only(user) {
+        tools.retain(|tool| !is_project_side_effect_tool(tool_name(tool)));
     }
     tools
 }
@@ -1089,6 +1139,7 @@ fn stream_call(
     endpoint: &str,
     payload: &Value,
     run_id: &str,
+    turn_index: usize,
     cancelled: &AtomicBool,
     emit_visible: bool,
     emit_content: bool,
@@ -1230,6 +1281,7 @@ fn stream_call(
                 &mut buffer,
                 &mut turn,
                 run_id,
+                turn_index,
                 emit_visible,
                 emit_content,
                 native_ollama,
@@ -1261,6 +1313,7 @@ fn stream_call(
                 &mut buffer,
                 &mut turn,
                 run_id,
+                turn_index,
                 emit_visible,
                 emit_content,
                 native_ollama,
@@ -1285,6 +1338,7 @@ fn stream_call(
             &mut buffer,
             &mut turn,
             run_id,
+            turn_index,
             emit_visible,
             emit_content,
             native_ollama,
@@ -1307,12 +1361,13 @@ fn consume_transport_buffer(
     buffer: &mut String,
     turn: &mut StreamedTurn,
     run_id: &str,
+    turn_index: usize,
     emit_visible: bool,
     emit_content: bool,
     native_ollama: bool,
 ) -> Result<(), String> {
     if native_ollama {
-        consume_ollama_ndjson(buffer, turn, run_id, emit_visible, emit_content)
+        consume_ollama_ndjson(buffer, turn, run_id, turn_index, emit_visible, emit_content)
     } else {
         consume_sse(buffer, turn, run_id, emit_visible, emit_content)
     }
@@ -1322,6 +1377,7 @@ fn consume_ollama_ndjson(
     buffer: &mut String,
     turn: &mut StreamedTurn,
     run_id: &str,
+    turn_index: usize,
     emit_visible: bool,
     emit_content: bool,
 ) -> Result<(), String> {
@@ -1381,8 +1437,8 @@ fn consume_ollama_ndjson(
                 let entry = turn.calls.entry(index).or_insert_with(|| {
                     // Native Ollama tool calls do not carry an OpenAI call id.
                     // The id is persisted by the Electron bridge, so it must be
-                    // stable for streaming updates and unique across Agent runs.
-                    json!({"id":format!("ollama-{run_id}-{index}"),"type":"function","function":{"name":"","arguments":""}})
+                    // stable for streaming updates and unique across Agent turns.
+                    json!({"id":format!("ollama-{run_id}-{turn_index}-{index}"),"type":"function","function":{"name":"","arguments":""}})
                 });
                 if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
                     entry["function"]["name"] = json!(name);
@@ -1624,7 +1680,15 @@ fn summarize_span(config: &Config, plan: &CompactionPlan) -> SummaryResult {
         "stream": true,
         "max_tokens": max_tokens,
     });
-    match stream_call(&config.endpoint, &payload, &config.run_id, &config.cancelled, false, false) {
+    match stream_call(
+        &config.endpoint,
+        &payload,
+        &config.run_id,
+        0,
+        &config.cancelled,
+        false,
+        false,
+    ) {
         Ok(turn) if !turn.content.trim().is_empty() => {
             let text = turn.content.trim().to_owned();
             SummaryResult {
@@ -1782,9 +1846,13 @@ fn emit_compaction_diagnostics(
             transcript_tokens_before: report.before.transcript_history_tokens,
             summary_prompt_tokens: report.after.summary_tokens,
             runtime_tail_tokens: report.after.dynamic_tail_tokens,
-            memory_catalog_tokens: estimate_tokens(&json!(
-                crate::tools::knowledge::prompt_catalog(config.root.as_deref())
-            )),
+            memory_catalog_tokens: if user_requests_read_only(&config.user) {
+                0
+            } else {
+                estimate_tokens(&json!(crate::tools::knowledge::prompt_catalog(
+                    config.root.as_deref()
+                )))
+            },
             compaction_target_tokens: compaction_target_tokens(config.context_limit),
             preferred_output_tokens: PREFERRED_OUTPUT_HEADROOM_TOKENS,
             available_output_before: available_before,
@@ -2220,22 +2288,12 @@ fn run_tool(
                     )
                 },
             )?;
-            let failed = value
-                .get("exit_code")
-                .and_then(Value::as_i64)
-                .is_some_and(|code| code != 0)
-                || value
-                    .get("timed_out")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-                || value
-                    .get("cancelled")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-            if failed {
+            if terminal_execution_failed(&value) {
                 return Err(value.to_string());
             }
-            if validation_command(&command) {
+            if value.get("status").and_then(Value::as_str) == Some("completed")
+                && validation_command(&command)
+            {
                 state.record_validation();
             }
             Ok((value, None))
@@ -2247,7 +2305,9 @@ fn run_tool(
                 .ok_or_else(|| "no project scope".to_owned())?;
             let result =
                 crate::tools::filesystem::execute(&PathBuf::from(root), name, &tool.arguments)?;
-            if matches!(name, "read_file" | "list_directory") {
+            if matches!(name, "read_file" | "list_directory")
+                && !user_requests_read_only(&config.user)
+            {
                 let _ = crate::tools::knowledge::observe_tool(
                     &PathBuf::from(root),
                     &config.run_id,
@@ -2272,6 +2332,57 @@ fn safe_read_only_tool(name: &str) -> bool {
         name,
         "read_file" | "list_directory" | "project_knowledge_index" | "project_knowledge_read"
     )
+}
+
+fn can_parallelize_safe_read(
+    call: &ValidatedCall,
+    prior_batch: &[ValidatedCall],
+    transcript: &Transcript,
+    project_root: Option<&Path>,
+) -> bool {
+    if call.name != "read_file" {
+        return true;
+    }
+    if crate::agent::lifecycle::repeated_file_read_decision(call, transcript, project_root).is_err()
+    {
+        return false;
+    }
+    let Some(path) = call.arguments.get("path").and_then(Value::as_str) else {
+        return true;
+    };
+    !prior_batch.iter().any(|prior| {
+        prior.name == "read_file"
+            && prior.arguments.get("path").and_then(Value::as_str) == Some(path)
+    })
+}
+
+fn terminal_execution_failed(value: &Value) -> bool {
+    if value.get("error").is_some()
+        || value
+            .get("timed_out")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        || value
+            .get("cancelled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        return true;
+    }
+    let exit_code = value.get("exit_code").and_then(Value::as_i64);
+    match value.get("status").and_then(Value::as_str) {
+        Some("completed") => exit_code != Some(0),
+        Some("partial_success") => {
+            let statuses = value.get("pipeline_statuses").and_then(Value::as_array);
+            exit_code != Some(141)
+                || statuses != Some(&vec![json!(141), json!(0)])
+                || value
+                    .get("stdout")
+                    .and_then(Value::as_str)
+                    .is_none_or(|stdout| stdout.trim().is_empty())
+        }
+        _ => true,
+    }
 }
 
 /// Executes only deterministic inspection tools. Runtime-owned observation
@@ -2331,18 +2442,20 @@ fn record_safe_read_effect(
             emit_knowledge_diagnostics(config, state);
         }
         "read_file" | "list_directory" => {
-            if let Some(root) = config.root.as_deref() {
-                let _ = crate::tools::knowledge::observe_tool(
-                    &PathBuf::from(root),
-                    &config.run_id,
-                    &config.user,
-                    None,
-                    None,
-                    &tool.name,
-                    &tool.arguments,
-                    value,
-                );
-                emit_knowledge_diagnostics(config, state);
+            if !user_requests_read_only(&config.user) {
+                if let Some(root) = config.root.as_deref() {
+                    let _ = crate::tools::knowledge::observe_tool(
+                        &PathBuf::from(root),
+                        &config.run_id,
+                        &config.user,
+                        None,
+                        None,
+                        &tool.name,
+                        &tool.arguments,
+                        value,
+                    );
+                    emit_knowledge_diagnostics(config, state);
+                }
             }
         }
         _ => {}
@@ -2472,8 +2585,10 @@ pub fn run(config: Config) {
         .and_then(|memory| serde_json::from_value(memory.clone()).ok())
         .unwrap_or_default();
     research.refresh_from_memory(&state.task_memory, transcript.observations());
-    if let Some(root) = config.root.as_deref() {
-        let _ = crate::tools::knowledge::bootstrap(&PathBuf::from(root));
+    if !user_requests_read_only(&config.user) {
+        if let Some(root) = config.root.as_deref() {
+            let _ = crate::tools::knowledge::bootstrap(&PathBuf::from(root));
+        }
     }
     let budget = CompactionBudget {
         context_window: config.context_limit,
@@ -2481,7 +2596,7 @@ pub fn run(config: Config) {
         reserve_tokens: None,
     };
     let stable = stable_prefix(&config);
-    let schemas = tool_schemas_for_policy(config.root.is_some(), config.policy);
+    let schemas = tool_schemas_for_request(config.root.is_some(), config.policy, &config.user);
     let mut final_content = String::new();
     let mut continuation_count = 0_usize;
     let mut continuation_pending = false;
@@ -2545,19 +2660,25 @@ pub fn run(config: Config) {
         // Sibling calls in this assistant turn use the phase advertised in
         // this request, even if one call changes the durable phase mid-turn.
         let closeout_at_request = transcript.is_closeout_requested() && !transcript.is_finalizing();
+        let lifecycle_targets = research.closeout_targets();
+        let blocked_frontiers = crate::agent::lifecycle::blocked_frontier_targets(
+            &transcript.frontiers(),
+            transcript.observations(),
+            &lifecycle_targets,
+        );
+        let research_schemas =
+            crate::agent::lifecycle::research_schemas(&schemas, &blocked_frontiers);
         let finalizing_schemas = if transcript.is_finalizing() {
-            schemas
-                .iter()
-                .filter(|schema| {
-                    crate::agent::lifecycle::advertise_in_finalizing(tool_name(schema))
-                })
-                .cloned()
-                .collect::<Vec<_>>()
+            crate::agent::lifecycle::finalizing_schemas(&schemas, &blocked_frontiers)
         } else {
             Vec::new()
         };
         let closeout_schemas = if closeout_at_request {
-            crate::agent::lifecycle::closeout_schemas(&schemas, &research.closeout_targets())
+            crate::agent::lifecycle::closeout_schemas(
+                &schemas,
+                &lifecycle_targets,
+                &blocked_frontiers,
+            )
         } else {
             Vec::new()
         };
@@ -2566,7 +2687,7 @@ pub fn run(config: Config) {
         } else if closeout_at_request {
             &closeout_schemas
         } else {
-            &schemas
+            &research_schemas
         };
         let dynamic = lifecycle_tail(
             &state,
@@ -2788,6 +2909,7 @@ pub fn run(config: Config) {
             &config.endpoint,
             &payload,
             &config.run_id,
+            turn + 1,
             &config.cancelled,
             !continuation_pending,
             false,
@@ -3091,18 +3213,33 @@ pub fn run(config: Config) {
         while call_index < calls.len() {
             if !transcript.is_finalizing()
                 && !closeout_at_request
+                && can_parallelize_safe_read(
+                    &calls[call_index],
+                    &[],
+                    &transcript,
+                    config.root.as_deref().map(std::path::Path::new),
+                )
                 && safe_read_only_tool(&calls[call_index].name)
                 && schemas
                     .iter()
                     .any(|schema| tool_name(schema) == calls[call_index].name)
             {
                 let start = call_index;
-                while call_index < calls.len()
-                    && safe_read_only_tool(&calls[call_index].name)
-                    && schemas
-                        .iter()
-                        .any(|schema| tool_name(schema) == calls[call_index].name)
-                {
+                while call_index < calls.len() {
+                    let candidate = &calls[call_index];
+                    if !safe_read_only_tool(&candidate.name)
+                        || !schemas
+                            .iter()
+                            .any(|schema| tool_name(schema) == candidate.name)
+                        || !can_parallelize_safe_read(
+                            candidate,
+                            &calls[start..call_index],
+                            &transcript,
+                            config.root.as_deref().map(std::path::Path::new),
+                        )
+                    {
+                        break;
+                    }
                     call_index += 1;
                 }
                 let batch = &calls[start..call_index];
@@ -3208,7 +3345,10 @@ pub fn run(config: Config) {
                 );
                 continue;
             }
-            if !schemas.iter().any(|schema| tool_name(schema) == tool.name) {
+            if !request_schemas
+                .iter()
+                .any(|schema| tool_name(schema) == tool.name)
+            {
                 let message = format!("tool '{}' is unavailable", tool.name);
                 emit(
                     &config.run_id,
@@ -3220,6 +3360,33 @@ pub fn run(config: Config) {
                 );
                 transcript.tool_result(&tool.id, &tool.name, concise_tool_error(&message));
                 continue;
+            }
+            if !closeout_at_request && !transcript.is_finalizing() {
+                if let Err(message) = crate::agent::lifecycle::repeated_file_read_decision(
+                    tool,
+                    &transcript,
+                    config.root.as_deref().map(std::path::Path::new),
+                ) {
+                    trace_forensics(
+                        &config.run_id,
+                        "repeated_read_decision",
+                        json!({"decision":"redirected","tool":tool.name,"reason":message}),
+                    );
+                    emit(
+                        &config.run_id,
+                        Event::ToolError {
+                            id: tool.id.clone(),
+                            name: tool.name.clone(),
+                            message: message.clone(),
+                        },
+                    );
+                    transcript.inline_tool_result(
+                        &tool.id,
+                        &tool.name,
+                        concise_tool_error(&message),
+                    );
+                    continue;
+                }
             }
             if closeout_at_request && !transcript.is_finalizing() {
                 if let Err(message) = crate::agent::lifecycle::closeout_decision(
@@ -3517,9 +3684,19 @@ pub fn run(config: Config) {
                         Event::ToolError {
                             id: tool.id.clone(),
                             name: tool.name.clone(),
-                            message: message.clone(),
+                            message: concise_tool_error(&message),
                         },
                     );
+                    let stored_error = if tool.name == "run_terminal" {
+                        serde_json::from_str::<Value>(&message)
+                            .map(|execution| {
+                                json!({"error":"terminal execution failed","execution":execution})
+                                    .to_string()
+                            })
+                            .unwrap_or_else(|_| concise_tool_error(&message))
+                    } else {
+                        concise_tool_error(&message)
+                    };
                     if matches!(
                         tool.name.as_str(),
                         "observation_read"
@@ -3527,13 +3704,9 @@ pub fn run(config: Config) {
                             | "evidence_record"
                             | "begin_finalization"
                     ) {
-                        transcript.inline_tool_result(
-                            &tool.id,
-                            &tool.name,
-                            concise_tool_error(&message),
-                        );
+                        transcript.inline_tool_result(&tool.id, &tool.name, stored_error);
                     } else {
-                        transcript.tool_result(&tool.id, &tool.name, concise_tool_error(&message));
+                        transcript.tool_result(&tool.id, &tool.name, stored_error);
                     }
                     record_read_evidence(&config, &transcript, tool);
                 }
@@ -3576,6 +3749,145 @@ fn is_context_overflow(error: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parallel_reads_route_repeated_successes_and_missing_paths_through_the_guard() {
+        let base = std::env::temp_dir().join(format!(
+            "parallel-read-guard-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let root = base.join("project");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let existing = "src/current.ts";
+        let missing = "src/missing.ts";
+        let novel = "src/novel.ts";
+        std::fs::write(root.join(existing), "export const current = true;").unwrap();
+        std::fs::write(root.join(novel), "export const novel = true;").unwrap();
+
+        let mut transcript =
+            Transcript::durable(&base.join("store"), "run", &[], root.to_str()).unwrap();
+        transcript.push_run_user(json!({"role":"user","content":"audit source"}));
+        let first_calls = [
+            ValidatedCall {
+                id: "first-existing".into(),
+                name: "read_file".into(),
+                arguments: json!({"path":existing}),
+            },
+            ValidatedCall {
+                id: "first-missing".into(),
+                name: "read_file".into(),
+                arguments: json!({"path":missing}),
+            },
+        ];
+        transcript.assistant_tool_turn(String::new(), &first_calls);
+        transcript.tool_result(
+            "first-existing",
+            "read_file",
+            json!({"path":existing,"content":"export const current = true;"}).to_string(),
+        );
+        transcript.tool_result(
+            "first-missing",
+            "read_file",
+            json!({"path":missing,"error":"file not found"}).to_string(),
+        );
+
+        let repeated_existing = ValidatedCall {
+            id: "repeat-existing".into(),
+            name: "read_file".into(),
+            arguments: json!({"path":existing}),
+        };
+        let repeated_missing = ValidatedCall {
+            id: "repeat-missing".into(),
+            name: "read_file".into(),
+            arguments: json!({"path":missing}),
+        };
+        let new_source = ValidatedCall {
+            id: "new-source".into(),
+            name: "read_file".into(),
+            arguments: json!({"path":novel}),
+        };
+        assert!(!can_parallelize_safe_read(
+            &repeated_existing,
+            &[],
+            &transcript,
+            Some(&root)
+        ));
+        assert!(!can_parallelize_safe_read(
+            &repeated_missing,
+            &[],
+            &transcript,
+            Some(&root)
+        ));
+        assert!(can_parallelize_safe_read(
+            &new_source,
+            &[],
+            &transcript,
+            Some(&root)
+        ));
+        assert!(!can_parallelize_safe_read(
+            &new_source,
+            std::slice::from_ref(&new_source),
+            &transcript,
+            Some(&root)
+        ));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn native_ollama_tool_ids_are_unique_across_provider_turns() {
+        let frame = || {
+            format!(
+                "{}\n",
+                json!({
+                    "message":{
+                        "tool_calls":[{
+                            "function":{
+                                "name":"read_file",
+                                "arguments":{"path":"src/App.tsx"}
+                            }
+                        }]
+                    }
+                })
+            )
+        };
+        let mut first = StreamedTurn::default();
+        let mut first_frame = frame();
+        consume_ollama_ndjson(&mut first_frame, &mut first, "run", 1, false, false).unwrap();
+        let first_id = first.calls[&0]["id"].as_str().unwrap();
+
+        let mut second = StreamedTurn::default();
+        let mut second_frame = frame();
+        consume_ollama_ndjson(&mut second_frame, &mut second, "run", 2, false, false).unwrap();
+        let second_id = second.calls[&0]["id"].as_str().unwrap();
+
+        assert_ne!(first_id, second_id);
+        assert_eq!(first_id, "ollama-run-1-0");
+        assert_eq!(second_id, "ollama-run-2-0");
+    }
+
+    #[test]
+    fn terminal_outcome_accepts_only_success_and_recognized_partial_search() {
+        assert!(!terminal_execution_failed(
+            &json!({"status":"completed","exit_code":0})
+        ));
+        assert!(!terminal_execution_failed(&json!({
+            "status":"partial_success",
+            "exit_code":141,
+            "pipeline_statuses":[141,0],
+            "stdout":"matching source line\n"
+        })));
+        for failure in [
+            json!({"status":"error","exit_code":7,"stdout":"useful stdout"}),
+            json!({"status":"error","exit_code":1,"stdout":""}),
+            json!({"status":"error","error":"spawn failed"}),
+            json!({"status":"timed_out","exit_code":null,"timed_out":true}),
+            json!({"status":"partial_success","exit_code":141,"pipeline_statuses":[141,0],"stdout":""}),
+            json!({"status":"partial_success","exit_code":141,"pipeline_statuses":[141,0,0],"stdout":"data"}),
+        ] {
+            assert!(terminal_execution_failed(&failure), "{failure}");
+        }
+    }
 
     #[test]
     fn historical_seo_markup_and_structured_calls_remain_distinct() {
@@ -3966,7 +4278,7 @@ mod tests {
         transcript.tool_result(
             "read",
             "read_file",
-            json!({"content":"source-backed result"}).to_string(),
+            json!({"content":"backend endpoint accepts requests"}).to_string(),
         );
         let id = transcript.observations()[0].id.clone();
         transcript
@@ -4059,6 +4371,9 @@ mod tests {
             "task_memory",
             "observation_index",
             "observation_read",
+            "evidence_record",
+            "evidence_frontier",
+            "begin_finalization",
             "read_file",
             "list_directory",
             "run_terminal",
@@ -4068,6 +4383,26 @@ mod tests {
         ] {
             assert!(names.contains(&name), "{name}");
         }
+        let frontier = schemas
+            .iter()
+            .find(|tool| tool_name(tool) == "evidence_frontier")
+            .unwrap();
+        let required = frontier
+            .pointer("/function/parameters/required")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert!(required
+            .iter()
+            .any(|field| field.as_str() == Some("observation_id")));
+        assert!(frontier
+            .pointer("/function/description")
+            .and_then(Value::as_str)
+            .unwrap()
+            .contains("target read failed or required approval"));
+        assert_eq!(
+            frontier.pointer("/function/parameters/properties/outcome/enum"),
+            Some(&json!(["blocked"]))
+        );
         let memory = schemas
             .iter()
             .find(|tool| tool_name(tool) == "task_memory")
@@ -4076,6 +4411,92 @@ mod tests {
         assert!(memory
             .pointer("/function/parameters/properties/task")
             .is_none());
+    }
+
+    #[test]
+    fn explicit_read_only_request_removes_project_mutations_from_toolset() {
+        for prompt in ["Не изменяй файлы.", "Do not modify files."] {
+            let schemas = tool_schemas_for_request(true, RunPolicy::Auto, prompt);
+            let names = schemas.iter().map(tool_name).collect::<Vec<_>>();
+            for name in [
+                "apply_patch",
+                "create_file",
+                "delete_file",
+                "project_knowledge_index",
+                "project_knowledge_read",
+                "project_knowledge_update",
+                "write_file",
+            ] {
+                assert!(!names.contains(&name), "{prompt}: {name}");
+            }
+            for name in [
+                "read_file",
+                "list_directory",
+                "run_terminal",
+                "evidence_record",
+            ] {
+                assert!(names.contains(&name), "{prompt}: {name}");
+            }
+        }
+
+        let writable = tool_schemas_for_request(true, RunPolicy::Auto, "Update the project files.");
+        assert!(writable.iter().any(|tool| tool_name(tool) == "write_file"));
+    }
+
+    #[test]
+    fn explicit_read_only_source_inspection_does_not_write_project_knowledge() {
+        let root = std::env::temp_dir().join(format!(
+            "local-ai-read-only-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join(".ai-framework")).unwrap();
+        std::fs::write(root.join("src/App.tsx"), "export const app = true;\n").unwrap();
+        let manifest = root.join(".ai-framework/manifest.json");
+        std::fs::write(&manifest, "preserve invalid metadata verbatim").unwrap();
+
+        let mut config = test_config(65_536);
+        config.root = Some(root.to_string_lossy().into_owned());
+        config.user = "Не изменяй файлы.".into();
+        config.policy = RunPolicy::Auto;
+        let mut state = AgentState::default();
+        let tail = dynamic_tail(
+            &state,
+            config.root.as_deref(),
+            &config.user,
+            &Transcript::default(),
+            config.context_limit,
+        );
+        assert!(!tail.contains("<project_knowledge_catalog>"));
+        for (id, name, arguments) in [
+            ("read-source", "read_file", json!({"path":"src/App.tsx"})),
+            ("list-source", "list_directory", json!({"path":"src"})),
+        ] {
+            let call = ValidatedCall {
+                id: id.into(),
+                name: name.into(),
+                arguments,
+            };
+            let (value, _) = run_tool(&config, &mut state, &call).unwrap();
+            record_safe_read_effect(&config, &mut state, &call, &value);
+        }
+        emit_knowledge_diagnostics(&config, &state);
+
+        assert_eq!(
+            std::fs::read_to_string(&manifest).unwrap(),
+            "preserve invalid metadata verbatim"
+        );
+        assert_eq!(
+            std::fs::read_dir(root.join(".ai-framework"))
+                .unwrap()
+                .count(),
+            1
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -4109,6 +4530,11 @@ mod tests {
         assert!(prompt.contains("Keep code, paths, identifiers, commands"));
         assert!(prompt.contains("multiline Mermaid flowchart"));
         assert!(prompt.contains("Do not compress a diagram into one long arrow chain"));
+        assert!(prompt.contains("at least two meaningful terms visible in the observation content"));
+        assert!(
+            prompt.contains("complete list_directory observation of the exact parent directory")
+        );
+        assert!(prompt.contains("cite its observation ID in a Task Memory finding"));
         assert!(!prompt.contains("if model =="));
     }
 
@@ -4339,7 +4765,11 @@ mod tests {
         transcript.tool_result(
             "read",
             "read_file",
-            format!("exact API source {}", "x".repeat(90_000)),
+            format!(
+                "{} {}",
+                "api.php forwards orders to WorldFilia",
+                "x".repeat(90_000)
+            ),
         );
         let id = transcript.observations()[0].id.clone();
         transcript

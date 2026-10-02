@@ -245,7 +245,7 @@ export interface TerminalExecution {
   exitCode?: number | null;
   timedOut?: boolean;
   cancelled?: boolean;
-  status?: 'running' | 'completed' | 'error' | 'cancelled' | 'timed_out';
+  status?: 'running' | 'completed' | 'partial_success' | 'error' | 'cancelled' | 'timed_out';
   stdout?: string;
   stderr?: string;
 }

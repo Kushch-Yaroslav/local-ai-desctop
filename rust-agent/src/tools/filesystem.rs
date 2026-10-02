@@ -92,17 +92,20 @@ pub fn execute(root: &Path, name: &str, args: &Value) -> Result<(Value, Option<S
                     "internal runtime/cache files are excluded from project discovery".to_owned(),
                 );
             }
-            let mut items = fs::read_dir(target)
-                .map_err(|e| e.to_string())?
-                .filter_map(Result::ok)
-                .filter(|entry| {
-                    !is_runtime_temporary(root, &entry.path())
-                        && !is_knowledge_cache(root, &entry.path())
-                })
-                .map(|x| x.file_name().to_string_lossy().to_string())
-                .collect::<Vec<_>>();
+            let mut items = Vec::new();
+            let mut complete = true;
+            for entry in fs::read_dir(target).map_err(|e| e.to_string())? {
+                let entry = entry.map_err(|e| e.to_string())?;
+                if is_runtime_temporary(root, &entry.path())
+                    || is_knowledge_cache(root, &entry.path())
+                {
+                    complete = false;
+                    continue;
+                }
+                items.push(entry.file_name().to_string_lossy().to_string());
+            }
             items.sort();
-            Ok((json!({"entries":items}), None))
+            Ok((json!({"entries":items,"complete":complete}), None))
         }
         "read_file" => {
             let target = scoped(root, path)?;
@@ -479,11 +482,13 @@ mod tests {
             .expect("entries")
             .iter()
             .any(|item| item == ".tmp"));
+        assert_eq!(root_listing["complete"], true);
         assert!(!runtime_listing["entries"]
             .as_array()
             .expect("entries")
             .iter()
             .any(|item| item == ".tmp"));
+        assert_eq!(runtime_listing["complete"], false);
         assert!(execute(
             &root,
             "read_file",

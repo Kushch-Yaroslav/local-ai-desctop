@@ -230,4 +230,4 @@ function terminalResult(raw: string | undefined): TerminalExecution | undefined 
 const text = (value: unknown) => typeof value === 'string' ? value : undefined;
 const number = (value: unknown) => typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 const bool = (value: unknown) => typeof value === 'boolean' ? value : undefined;
-const terminalStatus = (value: unknown): TerminalExecution['status'] | undefined => ['running', 'completed', 'error', 'cancelled', 'timed_out'].includes(String(value)) ? String(value) as TerminalExecution['status'] : undefined;
+const terminalStatus = (value: unknown): TerminalExecution['status'] | undefined => ['running', 'completed', 'partial_success', 'error', 'cancelled', 'timed_out'].includes(String(value)) ? String(value) as TerminalExecution['status'] : undefined;

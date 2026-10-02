@@ -33,6 +33,8 @@ export function runRustAgentRuntimeRegression(): void {
   const knowledgeActivity = { id: 'knowledge', label: 'Project knowledge', detail: 'project_knowledge_read', kind: 'file_read' as const, state: 'completed' as const, output: JSON.stringify({ entries: [{ status: 'ok', path: 'sources/App.tsx', content: 'large cached body' }, { status: 'missing', path: 'tasks/audit.md', message: 'not materialized' }] }) };
   assert.equal(displayToolResult(knowledgeActivity), 'sources/App.tsx\ntasks/audit.md · missing · not materialized', 'structured knowledge entries must not render as object coercions or cached bodies');
   assert.match(toolResultSummary(knowledgeActivity) ?? '', /^2 knowledge entries/);
+  const partialTerminal = { ...knowledgeActivity, kind: 'terminal' as const, output: JSON.stringify({ command: 'rg api src | head -n 1', exit_code: 141, status: 'partial_success', stdout: 'src/App.tsx:1: api' }) };
+  assert.match(displayToolResult(partialTerminal) ?? '', /partial search result/);
   const legacy = taskPlan({ steps: [{ id: 'legacy-task', label: 'Old item', status: 'completed' }] });
   assert.equal(legacy.milestones?.[0]?.workPlan.tasks[0]?.id, 'legacy-task');
 

@@ -5,6 +5,319 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
+fn evidence_content(value: &Value, output: &mut Vec<String>) {
+    match value {
+        Value::String(text) => output.push(text.clone()),
+        Value::Array(items) => {
+            for item in items {
+                evidence_content(item, output);
+            }
+        }
+        Value::Object(object) => {
+            for key in ["content", "stdout"] {
+                if let Some(text) = object.get(key).and_then(Value::as_str) {
+                    output.push(text.to_owned());
+                }
+            }
+            if let Some(entries) = object.get("entries") {
+                evidence_content(entries, output);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn short_code_terms(text: &str) -> std::collections::BTreeSet<String> {
+    fn add_term(
+        text: &str,
+        start: usize,
+        end: usize,
+        terms: &mut std::collections::BTreeSet<String>,
+    ) {
+        let term = &text[start..end];
+        if term.chars().count() != 2 {
+            return;
+        }
+        let before = text[..start].chars().next_back();
+        let after = text[end..].chars().next();
+        let quoted = before == after && matches!(before, Some('"') | Some('\'') | Some('`'));
+        let slash_delimited = before == Some('/') || after == Some('/');
+        let uppercase_acronym = term.chars().all(char::is_uppercase);
+        if quoted || slash_delimited || uppercase_acronym {
+            terms.insert(term.to_lowercase());
+        }
+    }
+
+    let mut terms = std::collections::BTreeSet::new();
+    let mut start = None;
+    for (index, character) in text.char_indices() {
+        if character.is_alphanumeric() {
+            start.get_or_insert(index);
+        } else if let Some(start) = start.take() {
+            add_term(text, start, index, &mut terms);
+        }
+    }
+    if let Some(start) = start {
+        add_term(text, start, text.len(), &mut terms);
+    }
+    terms
+}
+
+fn claim_terms(text: &str) -> std::collections::BTreeSet<String> {
+    const STOP_WORDS: &[&str] = &[
+        "the", "and", "for", "from", "with", "that", "this", "into", "does", "has", "have", "are",
+        "was", "were", "been", "being", "its", "their", "there", "here", "then", "than", "not",
+        "no", "none", "without", "не", "нет", "для", "это", "его", "она", "они", "как", "что",
+        "при", "или", "есть",
+    ];
+    let mut terms = text
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|term| term.chars().count() >= 3)
+        .map(str::to_lowercase)
+        .filter(|term| !STOP_WORDS.contains(&term.as_str()))
+        .collect::<std::collections::BTreeSet<_>>();
+    terms.extend(
+        short_code_terms(text)
+            .into_iter()
+            .filter(|term| !STOP_WORDS.contains(&term.as_str())),
+    );
+    terms
+}
+
+fn claim_clauses(text: &str) -> Vec<&str> {
+    let mut clauses = Vec::new();
+    let mut start = 0;
+    for (index, character) in text.char_indices() {
+        let end = index + character.len_utf8();
+        let sentence_end = matches!(character, '.' | '!' | '?')
+            && text[end..].chars().next().is_none_or(char::is_whitespace);
+        if matches!(character, ';' | '\n') || sentence_end {
+            let clause = &text[start..index];
+            if !clause.trim().is_empty() {
+                clauses.push(clause);
+            }
+            start = end;
+        }
+    }
+    let trailing = &text[start..];
+    if !trailing.trim().is_empty() {
+        clauses.push(trailing);
+    }
+    clauses
+}
+
+fn clause_anchor_counts(
+    clause: &str,
+    body_terms: &std::collections::BTreeSet<String>,
+) -> (usize, usize) {
+    let terms = claim_terms(clause);
+    (terms.intersection(body_terms).count(), terms.len())
+}
+
+fn source_negation_anchors_claim(clause: &str, body: &str) -> bool {
+    let claimed_terms = claim_terms(clause);
+    if claimed_terms.is_empty() {
+        return false;
+    }
+    claim_clauses(body).iter().any(|source_clause| {
+        if !contains_explicit_negation(source_clause) {
+            return false;
+        }
+        let source_terms = claim_terms(source_clause);
+        let matched = claimed_terms.intersection(&source_terms).count();
+        matched >= 2 && matched.saturating_mul(4) >= claimed_terms.len()
+    })
+}
+
+fn contains_explicit_negation(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    [
+        "no ",
+        "none ",
+        "never ",
+        " no ",
+        " not ",
+        " none ",
+        " never ",
+        " without ",
+        " absent ",
+        " missing ",
+        "нет",
+        "не ",
+        "отсутств",
+        "без ",
+        "doesn't",
+        "isn't",
+        "cannot",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn direct_claim_supported(claim: &str, body: &str) -> bool {
+    let body_terms = claim_terms(body);
+    let clauses = claim_clauses(claim);
+    !clauses.is_empty()
+        && clauses.iter().all(|clause| {
+            let (matched, total) = clause_anchor_counts(clause, &body_terms);
+            total > 0 && matched >= 2 && matched.saturating_mul(4) >= total
+        })
+        && clauses.iter().all(|clause| {
+            !contains_explicit_negation(clause) || source_negation_anchors_claim(clause, body)
+        })
+}
+
+fn direct_claim_anchor_feedback(claim: &str, body: &str) -> String {
+    if claim_clauses(claim).iter().any(|clause| {
+        contains_explicit_negation(clause) && !source_negation_anchors_claim(clause, body)
+    }) {
+        return "direct negative evidence is unsupported: source-level negation must be anchored to at least two meaningful terms from the same claim in one source sentence or line. For absence, use a complete read_file observation while naming that exact file (project-relative path or file name) or a complete list_directory observation of the exact parent of a named absent child. A narrow source cannot establish repository-wide absence; otherwise record a bounded inference/blocker".into();
+    }
+    let body_terms = claim_terms(body);
+    let (matched, total) = claim_clauses(claim)
+        .iter()
+        .map(|clause| clause_anchor_counts(clause, &body_terms))
+        .find(|(matched, total)| *total == 0 || *matched < 2 || matched.saturating_mul(4) < *total)
+        .unwrap_or((0, 0));
+    format!(
+        "direct evidence claim is not sufficiently anchored: a sentence matches {matched}/{total} meaningful terms in the observation; require at least 2 terms and 25%. Split compound claims and cite the raw observation that supports each fact; inference=true does not count toward direct coverage"
+    )
+}
+
+fn direct_source_observation(observation: &Observation) -> bool {
+    !matches!(
+        observation.tool.as_str(),
+        "project_knowledge_index" | "project_knowledge_read" | "task_memory" | "observation_index"
+    )
+}
+
+fn normalized_claim(claim: &str) -> String {
+    claim
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn directory_inventory_supports_absence(
+    claim: &str,
+    observation: &Observation,
+    body: &Value,
+) -> bool {
+    if observation.error
+        || observation.tool != "list_directory"
+        || !contains_explicit_negation(claim)
+        || body.get("complete").and_then(Value::as_bool) != Some(true)
+    {
+        return false;
+    }
+    let Some(source) = observation.source.as_deref() else {
+        return false;
+    };
+    let source = source.trim_start_matches("./").trim_end_matches('/');
+    if source.is_empty() || source == "." {
+        return false;
+    }
+    let Some(entries) = body.get("entries").and_then(Value::as_array) else {
+        return false;
+    };
+    let Some(relative_target) = claim.split(&format!("{source}/")).nth(1) else {
+        return false;
+    };
+    let target = relative_target
+        .split(|character: char| {
+            character.is_whitespace()
+                || matches!(character, '"' | '\'' | '`' | ')' | ']' | '}' | ',' | ';')
+        })
+        .next()
+        .unwrap_or("")
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(['.', ':']);
+    !target.is_empty()
+        && entries
+            .iter()
+            .all(|entry| entry.as_str().is_some_and(|entry| entry != target))
+}
+
+/// Observation sources are absolute, while a claim naturally names the file by
+/// a project-relative path or bare file name. Returns the longest trailing path
+/// of `source` that the claim names on a path boundary.
+fn claim_named_source_path(normalized_claim: &str, source: &str) -> Option<String> {
+    let source = source.to_lowercase().replace('\\', "/");
+    let components = source
+        .split('/')
+        .filter(|c| !c.is_empty())
+        .collect::<Vec<_>>();
+    (0..components.len()).find_map(|start| {
+        let suffix = components[start..].join("/");
+        normalized_claim
+            .match_indices(&suffix)
+            .any(|(index, _)| {
+                let before = normalized_claim[..index].chars().next_back();
+                let after = normalized_claim[index + suffix.len()..].chars().next();
+                let name_char = |c: char| c.is_alphanumeric() || matches!(c, '_' | '-' | '/' | '.');
+                !before.is_some_and(name_char)
+                    && !after.is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '/'))
+            })
+            .then_some(suffix)
+    })
+}
+
+fn complete_file_supports_bounded_absence(
+    claim: &str,
+    observation: &Observation,
+    body: &Value,
+) -> bool {
+    if observation.error
+        || observation.tool != "read_file"
+        || !contains_explicit_negation(claim)
+        || observation.requested_range.as_deref() != Some("all offset_chars=0")
+        || body.get("truncated").and_then(Value::as_bool) != Some(false)
+        || body.get("next_offset_chars").is_some()
+    {
+        return false;
+    }
+    let Some(source) = observation.source.as_deref() else {
+        return false;
+    };
+    let source = source.trim_start_matches("./").trim_end_matches('/');
+    let body_path = body
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim_start_matches("./")
+        .trim_end_matches('/');
+    let normalized_claim = claim.to_lowercase().replace('\\', "/");
+    let named_source = claim_named_source_path(&normalized_claim, source);
+    let claim_mentions_source = named_source.is_some();
+    let claim_without_path = named_source
+        .map(|named| normalized_claim.replace(&named, " "))
+        .unwrap_or_else(|| normalized_claim.clone());
+    let scope_terms = claim_terms(&claim_without_path);
+    if source.is_empty()
+        || body_path != source
+        || !claim_mentions_source
+        || ["project", "repository", "repo"]
+            .iter()
+            .any(|scope| scope_terms.contains(*scope))
+        || scope_terms
+            .iter()
+            .any(|term| term.starts_with("проект") || term.starts_with("репозитор"))
+    {
+        return false;
+    }
+    let Some(content) = body.get("content").and_then(Value::as_str) else {
+        return false;
+    };
+    let terms = claim_terms(&format!("{source}\n{content}"));
+    claim_clauses(claim).iter().all(|clause| {
+        let (matched, total) = clause_anchor_counts(clause, &terms);
+        total > 0 && matched >= 2 && matched.saturating_mul(4) >= total
+    })
+}
+
 /// Append-only canonical agent conversation. Compaction records a projection
 /// boundary; covered raw messages remain available to the runtime and UI.
 pub struct Transcript {
@@ -58,6 +371,10 @@ pub enum Entry {
     RunComplete,
     LanguagePreference(String),
     Evidence(EstablishedEvidence),
+    EvidenceRejection {
+        claim: String,
+        observation_id: String,
+    },
     Frontier(EvidenceFrontier),
     FrontierDisposition(FrontierDisposition),
     /// Volatile guidance becomes durable only after the provider accepted the
@@ -247,7 +564,7 @@ impl Transcript {
                 })
             })
         {
-            return Err("blocked requires an error/approval observation for the resolved target; an abandoned attempt is still open".into());
+            return Err("blocked requires observation_id of an error/approval observation for the resolved target; an abandoned attempt is still open".into());
         }
         if outcome == "irrelevant" {
             let grounded = observation_id.is_some_and(|id| {
@@ -264,7 +581,7 @@ impl Transcript {
                 })
             });
             if !grounded {
-                return Err("irrelevant requires a direct finding from a read of the actual local target; a source-side assertion that it is external is insufficient".into());
+                return Err("irrelevant requires observation_id of a successful read of the actual local target with an accepted direct finding from that same observation; a source-side assertion that it is external is insufficient".into());
             }
         }
         self.record(Entry::FrontierDisposition(FrontierDisposition {
@@ -388,14 +705,102 @@ impl Transcript {
         inference: bool,
     ) -> Result<EstablishedEvidence, String> {
         let claim = claim.split_whitespace().collect::<Vec<_>>().join(" ");
-        if claim.is_empty() || claim.chars().count() > 800 {
-            return Err("evidence claim must contain 1-800 characters".into());
-        }
         let observation = self
             .observation(id)
-            .ok_or_else(|| format!("unknown observation id: {id}; use observation_index"))?;
+            .cloned()
+            .ok_or_else(|| self.observation_id_error(id))?;
+        let prior_rejections = self.rejected_evidence_attempt_count(&claim, &observation.id);
+        if claim.is_empty() {
+            return Err(self.record_evidence_rejection(
+                &claim,
+                &observation.id,
+                prior_rejections,
+                "evidence claim is empty; provide one concise, source-backed factual statement"
+                    .into(),
+            ));
+        }
+        let claim_length = claim.chars().count();
+        if claim_length > 800 {
+            return Err(self.record_evidence_rejection(
+                &claim,
+                &observation.id,
+                prior_rejections,
+                format!(
+                    "evidence claim is {claim_length} characters; maximum is 800. Split it into separate, concise, source-backed factual claims, one fact per evidence_record; do not resubmit this oversized claim unchanged"
+                ),
+            ));
+        }
         if observation.error && !inference {
-            return Err("an error observation cannot establish a direct success claim".into());
+            return Err(self.record_evidence_rejection(
+                &claim,
+                &observation.id,
+                prior_rejections,
+                format!(
+                    "an error observation cannot establish a direct success claim. For a grounded blocker, record a Task Memory finding whose evidence cites {id}; for a direct absence claim, use a successful complete list_directory observation of the exact parent directory"
+                ),
+            ));
+        }
+        let mut unverified_absence = false;
+        if !inference {
+            if !direct_source_observation(&observation) {
+                return Err(self.record_evidence_rejection(
+                    &claim,
+                    &observation.id,
+                    prior_rejections,
+                    format!(
+                        "{} is a knowledge/memory/index result, not a raw source observation; it cannot establish direct evidence. Read the underlying source and cite that observation, or set inference=true (inference does not close direct coverage)",
+                        observation.tool
+                    ),
+                ));
+            }
+            let result = self.read_observation(&observation.id, 0, 16_000)?;
+            let mut content = Vec::new();
+            let mut parsed_body = None;
+            if let Some(text) = result.get("content").and_then(Value::as_str) {
+                if let Ok(parsed) = serde_json::from_str::<Value>(text) {
+                    evidence_content(&parsed, &mut content);
+                    parsed_body = Some(parsed);
+                } else {
+                    content.push(text.to_owned());
+                }
+            }
+            let text_supported = direct_claim_supported(&claim, &content.join("\n"));
+            let inventory_supported = parsed_body.as_ref().is_some_and(|body| {
+                directory_inventory_supports_absence(&claim, &observation, body)
+            });
+            let bounded_file_absence_supported = parsed_body.as_ref().is_some_and(|body| {
+                complete_file_supports_bounded_absence(&claim, &observation, body)
+            });
+            if !text_supported && !inventory_supported && !bounded_file_absence_supported {
+                return Err(self.record_evidence_rejection(
+                    &claim,
+                    &observation.id,
+                    prior_rejections,
+                    direct_claim_anchor_feedback(&claim, &content.join("\n")),
+                ));
+            }
+        }
+        if inference
+            && !observation.error
+            && claim_clauses(&claim)
+                .iter()
+                .any(|clause| contains_explicit_negation(clause))
+        {
+            // An absence claim the direct gate cannot ground is a lead, not
+            // evidence that a requested area was investigated.
+            let body = self
+                .read_observation(&observation.id, 0, 16_000)
+                .ok()
+                .and_then(|result| {
+                    result
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                });
+            unverified_absence = !body.as_ref().is_some_and(|body| {
+                directory_inventory_supports_absence(&claim, &observation, body)
+                    || complete_file_supports_bounded_absence(&claim, &observation, body)
+            });
         }
         if let Some(existing) = self.entries.iter().find_map(|entry| match entry {
             Entry::Evidence(fact)
@@ -411,7 +816,9 @@ impl Transcript {
         let fact = EstablishedEvidence {
             id: format!("ev-{:08}", self.entries.len() + 1),
             claim,
-            origin: if inference {
+            origin: if unverified_absence {
+                "agent inference; unverified absence"
+            } else if inference {
                 "agent inference"
             } else {
                 "agent-reported direct"
@@ -424,6 +831,66 @@ impl Transcript {
         self.record(Entry::Evidence(fact.clone()));
         Ok(fact)
     }
+    fn rejected_evidence_attempt_count(&self, claim: &str, observation_id: &str) -> usize {
+        let claim = normalized_claim(claim);
+        let run_start = self
+            .entries
+            .iter()
+            .rposition(|entry| matches!(entry, Entry::RunUser(_)))
+            .unwrap_or(0);
+        self.entries
+            .iter()
+            .skip(run_start)
+            .filter(|entry| {
+                matches!(
+                    entry,
+                    Entry::EvidenceRejection {
+                        claim: prior_claim,
+                        observation_id: prior_id
+                    } if normalized_claim(prior_claim) == claim && prior_id == observation_id
+                )
+            })
+            .count()
+    }
+    fn record_evidence_rejection(
+        &mut self,
+        claim: &str,
+        observation_id: &str,
+        prior_rejections: usize,
+        reason: String,
+    ) -> String {
+        self.record(Entry::EvidenceRejection {
+            claim: normalized_claim(claim),
+            observation_id: observation_id.to_owned(),
+        });
+        if prior_rejections > 0 {
+            let excerpt = claim.chars().take(160).collect::<String>();
+            let marker = format!(
+                "[observation {observation_id}; claim_chars={}] {excerpt}",
+                claim.chars().count()
+            );
+            let has_active_reminder = self
+                .entries
+                .iter()
+                .rev()
+                .take_while(|entry| !matches!(entry, Entry::ClearReminders))
+                .any(|entry| {
+                    matches!(entry, Entry::Reminder(reminder) if reminder.contains(&marker))
+                });
+            if !has_active_reminder {
+                self.remind(format!(
+                    "Runtime evidence gate: {marker} was rejected {prior_rejections} time(s) and added no coverage. Do not repeat this pair unchanged. Use one concise claim supported by the raw source, inspect a different source, or record an inference/blocker when direct proof is unavailable."
+                ));
+            }
+        }
+        if prior_rejections == 0 {
+            reason
+        } else {
+            format!(
+                "{reason}. This exact claim/observation pair was already rejected {prior_rejections} time(s) in this run and added no coverage. Do not retry it unchanged; narrow the claim to one fact supported by the source or inspect a different raw source."
+            )
+        }
+    }
     pub fn observation(&self, id: &str) -> Option<&Observation> {
         let canonical = id
             .strip_prefix("obs-")
@@ -435,6 +902,29 @@ impl Transcript {
         self.observations()
             .iter()
             .find(|o| o.id == id || canonical.as_deref() == Some(o.id.as_str()))
+    }
+    fn observation_id_error(&self, id: &str) -> String {
+        if let Some((evidence_id, observation_id)) = self.entries.iter().rev().find_map(|entry| {
+            if let Entry::Evidence(fact) = entry {
+                (fact.id == id)
+                    .then(|| {
+                        fact.observation_id
+                            .as_deref()
+                            .map(|observation_id| (&fact.id, observation_id))
+                    })
+                    .flatten()
+            } else {
+                None
+            }
+        }) {
+            format!(
+                "unknown observation id: {evidence_id} is an established-evidence record ID, not an observation ID; use observation_id {observation_id}"
+            )
+        } else {
+            format!(
+                "unknown observation id: {id}; observation IDs start with obs- and can be found with observation_index"
+            )
+        }
     }
     pub fn observation_for_call(&self, call_id: &str) -> Option<&Observation> {
         self.observations()
@@ -449,13 +939,17 @@ impl Transcript {
             "requested_range":o.requested_range,"returned_range":o.returned_range,"error":o.error,
             "body_bytes":o.body_bytes,"recoverable":true
         })).collect::<Vec<_>>();
-        json!({"observations":selected,"offset":offset,"total":all.len(),"more":offset+selected.len()<all.len()})
+        let next_offset = (offset + selected.len() < all.len()).then_some(offset + selected.len());
+        json!({"observations":selected,"offset":offset,"total":all.len(),"more":next_offset.is_some(),"next_offset":next_offset})
     }
     pub fn read_observation(&self, id: &str, offset: usize, limit: usize) -> Result<Value, String> {
-        self.store
-            .as_ref()
-            .ok_or("observation store unavailable")?
-            .read(id, offset, limit)
+        let Some(store) = &self.store else {
+            return Err("observation store unavailable".into());
+        };
+        if self.observation(id).is_none() {
+            return Err(self.observation_id_error(id));
+        }
+        store.read(id, offset, limit)
     }
     pub fn finish_durable(
         &self,
@@ -712,6 +1206,7 @@ impl Transcript {
                 | Entry::RunComplete
                 | Entry::LanguagePreference(_)
                 | Entry::Evidence(_)
+                | Entry::EvidenceRejection { .. }
                 | Entry::Frontier(_)
                 | Entry::FrontierDisposition(_)
                 | Entry::PromptTail(_)
@@ -925,6 +1420,666 @@ mod tests {
     }
 
     #[test]
+    fn unrelated_source_negation_cannot_ground_a_direct_negative_claim() {
+        let base = std::env::temp_dir().join(format!(
+            "evidence-negative-anchor-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let mut transcript = Transcript::durable(&base, "run", &[], None).unwrap();
+        transcript.push_run_user(json!({"role":"user","content":"audit checkout flow"}));
+        transcript.assistant_tool_turn(
+            String::new(),
+            &[ValidatedCall {
+                id: "checkout-source".into(),
+                name: "read_file".into(),
+                arguments: json!({"path":"src/CheckoutForm.tsx"}),
+            }],
+        );
+        transcript.tool_result(
+            "checkout-source",
+            "read_file",
+            json!({
+                "path":"src/CheckoutForm.tsx",
+                "content":"await fetch('/api/orders', { method: 'POST' });\n// no retries are configured"
+            })
+            .to_string(),
+        );
+        let observation_id = transcript
+            .observation_for_call("checkout-source")
+            .unwrap()
+            .id
+            .clone();
+
+        assert!(transcript
+            .record_established_evidence(
+                "The form submits orders through POST at /api/orders.",
+                &observation_id,
+                false,
+            )
+            .is_ok());
+        assert!(transcript
+            .record_established_evidence(
+                "The checkout form does not submit orders to /api/orders.",
+                &observation_id,
+                false,
+            )
+            .unwrap_err()
+            .contains("source-level negation must be anchored"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn direct_evidence_requires_content_anchors_and_observed_negative_language() {
+        let base = std::env::temp_dir().join(format!(
+            "evidence-anchor-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let mut transcript = Transcript::durable(&base, "run", &[], None).unwrap();
+        transcript.push_run_user(json!({"role":"user","content":"audit backend order flow"}));
+        transcript.assistant_tool_turn(
+            String::new(),
+            &[ValidatedCall {
+                id: "catalog".into(),
+                name: "read_file".into(),
+                arguments: json!({"path":"base-items.json"}),
+            }],
+        );
+        transcript.tool_result(
+            "catalog",
+            "read_file",
+            json!({"path":"base-items.json","content":"{\"products\":[{\"name\":\"Tea\",\"price\":4}]}"}).to_string(),
+        );
+        let catalog_id = transcript
+            .observation_for_call("catalog")
+            .unwrap()
+            .id
+            .clone();
+        assert!(transcript
+            .record_established_evidence(
+                "base-items.json contains no API backend order flow",
+                &catalog_id,
+                false,
+            )
+            .unwrap_err()
+            .contains("complete read_file observation"));
+
+        transcript.assistant_tool_turn(
+            String::new(),
+            &[ValidatedCall {
+                id: "order-source".into(),
+                name: "read_file".into(),
+                arguments: json!({"path":"src/OrderForm.tsx"}),
+            }],
+        );
+        transcript.tool_result(
+            "order-source",
+            "read_file",
+            json!({"path":"src/OrderForm.tsx","content":"await fetch('/api/orders', { method: 'POST' });"}).to_string(),
+        );
+        let order_id = transcript
+            .observation_for_call("order-source")
+            .unwrap()
+            .id
+            .clone();
+        assert!(transcript
+            .record_established_evidence(
+                "The form submits orders with POST to /api/orders.",
+                &order_id,
+                false,
+            )
+            .is_ok());
+        assert!(transcript
+            .record_established_evidence(
+                "The form does not submit orders with POST to /api/orders.",
+                &order_id,
+                false,
+            )
+            .unwrap_err()
+            .contains("complete read_file observation"));
+
+        transcript.assistant_tool_turn(
+            String::new(),
+            &[ValidatedCall {
+                id: "negative".into(),
+                name: "read_file".into(),
+                arguments: json!({"path":"notes.md"}),
+            }],
+        );
+        transcript.tool_result(
+            "negative",
+            "read_file",
+            json!({"path":"notes.md","content":"The backend does not submit any orders."})
+                .to_string(),
+        );
+        let negative_id = transcript
+            .observation_for_call("negative")
+            .unwrap()
+            .id
+            .clone();
+        assert!(transcript
+            .record_established_evidence(
+                "The backend does not submit any orders",
+                &negative_id,
+                false,
+            )
+            .is_ok());
+
+        transcript.assistant_tool_turn(
+            String::new(),
+            &[ValidatedCall {
+                id: "module-list".into(),
+                name: "list_directory".into(),
+                arguments: json!({"path":"src/Module"}),
+            }],
+        );
+        transcript.tool_result(
+            "module-list",
+            "list_directory",
+            json!({
+                "entries":["Confirm","Home","ProrudctsPage","SpecialOffer"],
+                "complete":true
+            })
+            .to_string(),
+        );
+        let listing_id = transcript
+            .observation_for_call("module-list")
+            .unwrap()
+            .id
+            .clone();
+        assert!(transcript
+            .record_established_evidence(
+                "src/Module/ProductsPage is absent from the complete src/Module listing; it lists ProrudctsPage instead",
+                &listing_id,
+                false,
+            )
+            .is_ok());
+        assert!(transcript
+            .record_established_evidence(
+                "ProductsPage.tsx is absent from the repository",
+                &listing_id,
+                false,
+            )
+            .is_err());
+
+        transcript.assistant_tool_turn(
+            String::new(),
+            &[ValidatedCall {
+                id: "partial-module-list".into(),
+                name: "list_directory".into(),
+                arguments: json!({"path":"src/Module"}),
+            }],
+        );
+        transcript.tool_result(
+            "partial-module-list",
+            "list_directory",
+            json!({"entries":["Home"],"complete":false}).to_string(),
+        );
+        let partial_listing_id = transcript
+            .observation_for_call("partial-module-list")
+            .unwrap()
+            .id
+            .clone();
+        assert!(transcript
+            .record_established_evidence(
+                "src/Module/ProductsPage is absent from the directory listing",
+                &partial_listing_id,
+                false,
+            )
+            .is_err());
+        drop(transcript);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn paraphrased_claims_and_complete_file_scoped_absence_preserve_grounding() {
+        let base = std::env::temp_dir().join(format!(
+            "evidence-paraphrase-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let mut transcript = Transcript::durable(&base, "run", &[], None).unwrap();
+        transcript.push_run_user(json!({"role":"user","content":"inspect architecture and tests"}));
+        transcript.assistant_tool_turn(
+            String::new(),
+            &[ValidatedCall {
+                id: "context-source".into(),
+                name: "read_file".into(),
+                arguments: json!({"path":"src/Context/ProductContext.tsx"}),
+            }],
+        );
+        let context_content = r#"import React, {createContext, useContext} from 'react';
+import type {Product} from "@/Shared/Interfaces/item.ts";
+const Ctx = createContext<Product | null>(null);
+export const ProductProvider = ({product, children}) => <Ctx.Provider value={product}>{children}</Ctx.Provider>;
+export const useProduct = () => useContext(Ctx);
+export const useProductOptional = () => useContext(Ctx);"#;
+        transcript.tool_result(
+            "context-source",
+            "read_file",
+            json!({
+                "path":"src/Context/ProductContext.tsx",
+                "content":context_content,
+                "truncated":false
+            })
+            .to_string(),
+        );
+        let context_id = transcript
+            .observation_for_call("context-source")
+            .unwrap()
+            .id
+            .clone();
+        let paraphrased =
+            "architecture: context layer: src/context/productcontext.tsx (простой react context для товара, useproduct, useproductoptional).";
+        let anchors = claim_terms(context_content);
+        assert_eq!(clause_anchor_counts(paraphrased, &anchors), (3, 11));
+        assert!(transcript
+            .record_established_evidence(paraphrased, &context_id, false)
+            .is_ok());
+
+        transcript.assistant_tool_turn(
+            String::new(),
+            &[ValidatedCall {
+                id: "package-source".into(),
+                name: "read_file".into(),
+                arguments: json!({"path":"package.json"}),
+            }],
+        );
+        transcript.tool_result(
+            "package-source",
+            "read_file",
+            json!({
+                "path":"package.json",
+                "content":r#"{"name":"casino","scripts":{"build":"vite build","lint":"eslint src"}}"#,
+                "truncated":false
+            })
+            .to_string(),
+        );
+        let package_id = transcript
+            .observation_for_call("package-source")
+            .unwrap()
+            .id
+            .clone();
+        let bounded_negative = "package.json does not define test scripts.";
+        let accepted = transcript
+            .record_established_evidence(bounded_negative, &package_id, false)
+            .expect("complete, exact-file observation supports a file-scoped absence");
+        assert_eq!(
+            accepted.observation_id.as_deref(),
+            Some(package_id.as_str())
+        );
+
+        let broad_negative = "The repository does not define test scripts.";
+        assert!(transcript
+            .record_established_evidence(broad_negative, &package_id, false)
+            .unwrap_err()
+            .contains("repository-wide absence"));
+
+        let wrong_id = transcript
+            .record_established_evidence(bounded_negative, &accepted.id, false)
+            .unwrap_err();
+        assert!(wrong_id.contains("established-evidence record ID"));
+        assert!(wrong_id.contains(&package_id));
+        assert!(transcript
+            .read_observation(&accepted.id, 0, 20)
+            .unwrap_err()
+            .contains(&package_id));
+
+        let first_page = transcript.observation_index(0, 1);
+        assert_eq!(
+            first_page["observations"][0]["source"],
+            "src/Context/ProductContext.tsx"
+        );
+        assert_eq!(first_page["next_offset"], 1);
+        let second_page = transcript.observation_index(1, 1);
+        assert_eq!(second_page["observations"][0]["source"], "package.json");
+        assert_eq!(second_page["next_offset"], Value::Null);
+        assert_eq!(second_page["more"], false);
+
+        drop(transcript);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn quoted_and_slash_delimited_short_code_values_anchor_paraphrases() {
+        let base = std::env::temp_dir().join(format!(
+            "evidence-short-code-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let mut transcript = Transcript::durable(&base, "run", &[], None).unwrap();
+        transcript.push_run_user(json!({"role":"user","content":"inspect supported locales"}));
+        transcript.assistant_tool_turn(
+            String::new(),
+            &[ValidatedCall {
+                id: "locale-source".into(),
+                name: "read_file".into(),
+                arguments: json!({"path":"src/language.ts"}),
+            }],
+        );
+        let source = r#"type Lang = "it" | "en";"#;
+        transcript.tool_result(
+            "locale-source",
+            "read_file",
+            json!({
+                "path":"src/language.ts",
+                "content":source,
+                "truncated":false
+            })
+            .to_string(),
+        );
+        let observation_id = transcript
+            .observation_for_call("locale-source")
+            .unwrap()
+            .id
+            .clone();
+        let claim = "Multilingual support (it/en).";
+        let source_terms = claim_terms(source);
+        assert_eq!(clause_anchor_counts(claim, &source_terms), (2, 4));
+        assert!(transcript
+            .record_established_evidence(claim, &observation_id, false)
+            .is_ok());
+        assert!(transcript
+            .record_established_evidence("It is a locale.", &observation_id, false)
+            .is_err());
+
+        drop(transcript);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn compound_claims_need_per_sentence_source_grounding_and_rejections_escalate() {
+        let base = std::env::temp_dir().join(format!(
+            "evidence-compound-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let mut transcript = Transcript::durable(&base, "run", &[], None).unwrap();
+        transcript.push_run_user(json!({"role":"user","content":"inspect order flow"}));
+        transcript.assistant_tool_turn(
+            String::new(),
+            &[ValidatedCall {
+                id: "source".into(),
+                name: "read_file".into(),
+                arguments: json!({"path":"src/OrderForm.tsx"}),
+            }],
+        );
+        transcript.tool_result(
+            "source",
+            "read_file",
+            json!({
+                "path":"src/OrderForm.tsx",
+                "content":"await fetch('/api/orders', { method: 'POST' });"
+            })
+            .to_string(),
+        );
+        let source_id = transcript
+            .observation_for_call("source")
+            .unwrap()
+            .id
+            .clone();
+        let claim = "The OrderForm submits orders with POST to /api/orders. The backend validates inventory and writes each order to a database.";
+        let first = transcript
+            .record_established_evidence(claim, &source_id, false)
+            .unwrap_err();
+        assert!(first.contains("a sentence matches"));
+        assert!(!first.contains("already rejected"));
+        let covered = transcript.entries().len();
+        transcript.compact("checkpoint".into(), covered);
+        drop(transcript);
+        let mut transcript = Transcript::durable(&base, "run", &[], None).unwrap();
+        let second = transcript
+            .record_established_evidence(claim, &source_id, false)
+            .unwrap_err();
+        assert!(second.contains("already rejected 1 time(s)"));
+        assert!(second.contains("Do not retry it unchanged"));
+        assert!(transcript
+            .record_established_evidence(claim, &source_id, true)
+            .is_ok());
+        assert_eq!(
+            transcript
+                .entries
+                .iter()
+                .filter(|entry| {
+                    matches!(entry, Entry::Evidence(fact) if fact.origin == "agent-reported direct")
+                })
+                .count(),
+            0,
+            "inference must not become direct coverage"
+        );
+        transcript.push_run_user(json!({"role":"user","content":"new task"}));
+        let next_run = transcript
+            .record_established_evidence(claim, &source_id, false)
+            .unwrap_err();
+        assert!(!next_run.contains("already rejected"));
+        let oversized_claim = "x".repeat(801);
+        assert_eq!(oversized_claim.chars().count(), 801);
+        let first_oversized = transcript
+            .record_established_evidence(&oversized_claim, &source_id, false)
+            .unwrap_err();
+        assert!(first_oversized.contains("801 characters; maximum is 800"));
+        let second_oversized = transcript
+            .record_established_evidence(&oversized_claim, &source_id, false)
+            .unwrap_err();
+        assert!(second_oversized.contains("already rejected 1 time(s)"));
+        assert!(transcript
+            .pending_tail("")
+            .contains("was rejected 1 time(s) and added no coverage"));
+        let first_empty = transcript
+            .record_established_evidence("", &source_id, false)
+            .unwrap_err();
+        assert!(first_empty.contains("claim is empty"));
+        let second_empty = transcript
+            .record_established_evidence("", &source_id, false)
+            .unwrap_err();
+        assert!(second_empty.contains("already rejected 1 time(s)"));
+        drop(transcript);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn absolute_observation_sources_accept_relative_file_scoped_absence_and_demote_unbounded_inference(
+    ) {
+        let base = std::env::temp_dir().join(format!(
+            "evidence-absolute-absence-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let mut transcript = Transcript::durable(&base, "run", &[], None).unwrap();
+        transcript.push_run_user(json!({"role":"user","content":"audit order flow"}));
+        let source = "/work/shop/src/Module/Confirm/Confirm.tsx";
+        transcript.assistant_tool_turn(
+            String::new(),
+            &[ValidatedCall {
+                id: "confirm".into(),
+                name: "read_file".into(),
+                arguments: json!({"path":source}),
+            }],
+        );
+        transcript.tool_result(
+            "confirm",
+            "read_file",
+            json!({
+                "path":source,
+                "content":"import {useNavigate} from 'react-router-dom';\nexport function Confirm(){ const navigate = useNavigate(); return <button onClick={() => navigate('/')}>Home</button>; }",
+                "truncated":false
+            })
+            .to_string(),
+        );
+        let id = transcript
+            .observation_for_call("confirm")
+            .unwrap()
+            .id
+            .clone();
+        let scoped = transcript
+            .record_established_evidence(
+                "src/Module/Confirm/Confirm.tsx does not call fetch or axios, only useNavigate in Confirm.",
+                &id,
+                false,
+            )
+            .expect("a relative path names the absolute observed file");
+        assert_eq!(scoped.origin, "agent-reported direct");
+        assert!(transcript
+            .record_established_evidence(
+                "Other/Confirm.tsx does not call fetch or axios, only useNavigate in Confirm.",
+                &id,
+                false,
+            )
+            .is_err());
+        let broad = transcript
+            .record_established_evidence(
+                "The project has no backend API: Confirm.tsx has no fetch and orders never leave the browser.",
+                &id,
+                true,
+            )
+            .unwrap();
+        assert_eq!(broad.origin, "agent inference; unverified absence");
+        let positive = transcript
+            .record_established_evidence("Confirm.tsx navigates home with useNavigate.", &id, true)
+            .unwrap();
+        assert_eq!(positive.origin, "agent inference");
+        drop(transcript);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn project_knowledge_cannot_establish_direct_source_evidence() {
+        let base = std::env::temp_dir().join(format!(
+            "evidence-knowledge-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let mut transcript = Transcript::durable(&base, "run", &[], None).unwrap();
+        transcript.push_run_user(json!({"role":"user","content":"inspect architecture"}));
+        transcript.assistant_tool_turn(
+            String::new(),
+            &[ValidatedCall {
+                id: "knowledge".into(),
+                name: "project_knowledge_read".into(),
+                arguments: json!({"query":"application architecture"}),
+            }],
+        );
+        transcript.tool_result(
+            "knowledge",
+            "project_knowledge_read",
+            json!({
+                "content":"The app uses a React interface and PHP backend. Source files include OrderForm.tsx and public/api.php."
+            })
+            .to_string(),
+        );
+        let knowledge_id = transcript
+            .observation_for_call("knowledge")
+            .unwrap()
+            .id
+            .clone();
+        assert!(transcript
+            .record_established_evidence(
+                "The app uses a React interface and PHP backend",
+                &knowledge_id,
+                false,
+            )
+            .unwrap_err()
+            .contains("not a raw source observation"));
+        let inferred = transcript
+            .record_established_evidence(
+                "The app uses a React interface and PHP backend",
+                &knowledge_id,
+                true,
+            )
+            .unwrap();
+        assert_eq!(inferred.origin, "agent inference");
+        drop(transcript);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn terminal_partial_success_is_evidence_but_failed_output_is_diagnostic_only() {
+        let base = std::env::temp_dir().join(format!(
+            "terminal-observation-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let mut transcript = Transcript::durable(&base, "run", &[], None).unwrap();
+        transcript.push_run_user(json!({"role":"user","content":"inspect API source"}));
+        transcript.assistant_tool_turn(
+            String::new(),
+            &[ValidatedCall {
+                id: "partial".into(),
+                name: "run_terminal".into(),
+                arguments: json!({"command":"rg api src | head -n 1"}),
+            }],
+        );
+        transcript.tool_result(
+            "partial",
+            "run_terminal",
+            json!({
+                "command":"rg api src | head -n 1",
+                "exit_code":141,
+                "pipeline_statuses":[141,0],
+                "status":"partial_success",
+                "stdout":"src/OrderForm.tsx: await fetch('/api/orders', { method:'POST' });"
+            })
+            .to_string(),
+        );
+        let partial_id = transcript
+            .observation_for_call("partial")
+            .unwrap()
+            .id
+            .clone();
+        assert!(!transcript.observation(&partial_id).unwrap().error);
+        assert!(transcript
+            .record_established_evidence(
+                "OrderForm submits orders through the API",
+                &partial_id,
+                false,
+            )
+            .is_ok());
+
+        transcript.assistant_tool_turn(
+            String::new(),
+            &[ValidatedCall {
+                id: "failed".into(),
+                name: "run_terminal".into(),
+                arguments: json!({"command":"grep no-match src"}),
+            }],
+        );
+        transcript.tool_result(
+            "failed",
+            "run_terminal",
+            json!({
+                "error":"terminal execution failed",
+                "execution":{
+                    "command":"grep no-match src",
+                    "exit_code":2,
+                    "status":"error",
+                    "stdout":"useful diagnostic stdout"
+                }
+            })
+            .to_string(),
+        );
+        let failed_id = transcript
+            .observation_for_call("failed")
+            .unwrap()
+            .id
+            .clone();
+        assert!(transcript.observation(&failed_id).unwrap().error);
+        assert!(
+            transcript.read_observation(&failed_id, 0, 2_000).unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .contains("useful diagnostic stdout")
+        );
+        assert!(transcript
+            .record_established_evidence("API uses useful diagnostic stdout", &failed_id, false)
+            .unwrap_err()
+            .contains("error observation"));
+        drop(transcript);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn frontier_and_source_observation_survive_compaction_and_restart() {
         let base = std::env::temp_dir().join(format!(
             "frontier-restart-{}-{:?}",
@@ -963,11 +2118,11 @@ mod tests {
             arguments: json!({"path":source}),
         };
         transcript.assistant_tool_turn(String::new(), &[call]);
-        let result = json!({"content":"await fetch('service.php', {method:'POST'})"}).to_string();
+        let detailed_finding = "local service accepts submitted form details ".repeat(12);
+        let result = json!({"content":format!("await fetch('service.php', {{method:'POST'}}); {detailed_finding}")}).to_string();
         transcript.tool_result("call-ui", "read_file", result.clone());
         let edges = transcript.discover_frontiers("call-ui", &result);
         assert_eq!(edges.len(), 1);
-        let detailed_finding = "local service accepts submitted form details ".repeat(12);
         assert!(detailed_finding.chars().count() > 420);
         assert!(
             transcript

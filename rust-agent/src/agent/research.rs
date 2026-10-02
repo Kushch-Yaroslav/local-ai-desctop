@@ -22,6 +22,14 @@ struct Area {
     /// the concrete requested areas are grounded; lack of proof is not a
     /// reason to replay the entire repository.
     requires_direct_evidence: bool,
+    /// Set only when this area has been touched by a statement tied to a
+    /// real, successful observation (direct or honest inference). A raw
+    /// Task Memory note with no matching observation never sets this, even
+    /// though it can still raise `coverage` to `Weak`. This is tracked
+    /// separately from `coverage` strength because "direct vs inference" and
+    /// "cited vs uncited" are different axes: an honest inference claim
+    /// anchored to a real source is still genuinely grounded.
+    cited: bool,
 }
 
 pub struct ResearchController {
@@ -100,6 +108,7 @@ impl ResearchController {
                         coverage: Coverage::None,
                         reasons: BTreeSet::new(),
                         requires_direct_evidence,
+                        cited: false,
                     },
                 );
             }
@@ -113,33 +122,61 @@ impl ResearchController {
         }
     }
     pub fn evidence(&mut self, area: &str, strength: Coverage, reason: &str) {
+        self.evidence_cited(area, strength, reason, true);
+    }
+    /// `cited` must be true only when `reason`/the originating statement is
+    /// tied to a real, successful observation; a bare Task Memory note with
+    /// no matching observation must pass `false`.
+    fn evidence_cited(&mut self, area: &str, strength: Coverage, reason: &str, cited: bool) {
         if let Some(entry) = self.areas.get_mut(area) {
             if strength > entry.coverage
                 || (entry.coverage == Coverage::Blocked && strength == Coverage::Sufficient)
             {
                 entry.coverage = strength;
             }
+            entry.cited |= cited;
             entry.reasons.insert(reason.into());
         }
     }
     pub fn blocked(&mut self, area: &str, reason: &str) {
+        self.blocked_cited(area, reason, true);
+    }
+    fn blocked_cited(&mut self, area: &str, reason: &str, cited: bool) {
         if let Some(e) = self.areas.get_mut(area) {
             if e.coverage != Coverage::Sufficient {
                 e.coverage = Coverage::Blocked;
             }
+            e.cited |= cited;
             e.reasons.insert(reason.into());
         }
     }
     pub fn refresh_from_memory(&mut self, memory: &TaskMemory, observations: &[Observation]) {
         for area in self.areas.values_mut() {
             area.coverage = Coverage::None;
+            area.cited = false;
             area.reasons.clear();
         }
         for entry in memory.entries.iter().filter(|entry| !entry.invalidated) {
-            let cited = observations
+            let cited_observation = observations
                 .iter()
                 .find(|o| cites_observation(&entry.evidence, &o.id));
-            let strength = match cited {
+            // A note only covers an area its cited sources themselves relate
+            // to; prose naming an area (a plan, a question) is not coverage.
+            let cited_sources: Vec<&Observation> = observations
+                .iter()
+                .filter(|o| !o.error && cites_observation(&entry.evidence, &o.id))
+                .collect();
+            let source_scope = (!cited_sources.is_empty()
+                && cited_sources.iter().all(|o| o.source.is_some()))
+            .then(|| {
+                cited_sources
+                    .iter()
+                    .filter_map(|o| o.source.as_deref())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .to_lowercase()
+            });
+            let strength = match cited_observation {
                 Some(o) if o.error => Coverage::Blocked,
                 Some(_) if !self.deep => Coverage::Sufficient,
                 Some(_) => Coverage::Weak,
@@ -150,6 +187,12 @@ impl ResearchController {
                 &format!("{} {}", entry.finding, entry.implication),
                 &entry.id,
                 strength,
+                cited_observation.is_some(),
+                if strength == Coverage::Blocked {
+                    None
+                } else {
+                    source_scope.as_deref()
+                },
             );
         }
     }
@@ -169,6 +212,20 @@ impl ResearchController {
                 .as_deref()
                 .is_some_and(|id| observations.iter().any(|o| o.id == id && !o.error))
             {
+                // An absence assertion the direct gate could not ground is a
+                // lead; it must not make a requested area look investigated.
+                if fact.origin == "agent inference; unverified absence" {
+                    continue;
+                }
+                // A source merely named near an assistant note or an
+                // uncited-memory finding is provenance, not verification:
+                // the runtime never confirmed that source supports the
+                // claim's semantics, so it must not count as a citation
+                // even though it carries an `observation_id`.
+                let source_associated = matches!(
+                    fact.origin.as_str(),
+                    "assistant statement; source-associated" | "task-memory source-associated"
+                );
                 let strength = if matches!(
                     fact.origin.as_str(),
                     "agent-reported direct" | "agent established from observation"
@@ -181,7 +238,7 @@ impl ResearchController {
                     // but cannot by itself prove every clause in that note.
                     Coverage::Weak
                 };
-                self.semantic_text(&fact.claim, &fact.id, strength);
+                self.semantic_text(&fact.claim, &fact.id, strength, !source_associated, None);
             }
         }
     }
@@ -242,6 +299,21 @@ impl ResearchController {
     /// Every explicitly requested area needs an active evidence-bearing Task
     /// Memory entry or a blocker, and at least one entry must cite a concrete
     /// observation. Uncited notes alone never force finalization.
+    ///
+    /// The final clause checks `area.cited` directly rather than requiring
+    /// `Coverage::Sufficient | Coverage::Blocked` on some area. A cited,
+    /// honest `inference=true` judgment about an interpretive area
+    /// (architecture, product direction, implementation quality, ...) only
+    /// ever reaches `Coverage::Weak`, which `missing_areas()` already treats
+    /// as resolved enough to stop demanding more investigation. Requiring a
+    /// strictly higher bar only here, for the overall readiness check,
+    /// created an unreachable state whenever every requested area happened
+    /// to be resolved through grounded inference rather than a literal
+    /// quotation: `closeout_targets()` reported nothing left to address, yet
+    /// `synthesis_ready()` could never become true, and the runtime stayed
+    /// stuck in closeout rejecting every tool call with an empty gap list.
+    /// Checking `cited` instead keeps the original guard intact: a bare,
+    /// uncited Task Memory note still never satisfies it.
     pub fn synthesis_ready(&self) -> bool {
         !self.areas.is_empty()
             && self.open_frontiers.is_empty()
@@ -253,10 +325,7 @@ impl ResearchController {
                         area.coverage != Coverage::None
                     }
             })
-            && self
-                .areas
-                .values()
-                .any(|area| matches!(area.coverage, Coverage::Sufficient | Coverage::Blocked))
+            && self.areas.values().any(|area| area.cited)
     }
     /// A closeout request narrows research to evidence gaps; it does not claim
     /// that finalization is ready. No action count or model identity is used.
@@ -311,7 +380,14 @@ impl ResearchController {
     pub fn has_open_frontiers(&self) -> bool {
         !self.open_frontiers.is_empty()
     }
-    fn semantic_text(&mut self, text: &str, reason: &str, strength: Coverage) {
+    fn semantic_text(
+        &mut self,
+        text: &str,
+        reason: &str,
+        strength: Coverage,
+        cited: bool,
+        source_scope: Option<&str>,
+    ) {
         let l = text.to_lowercase();
         for (area, words) in [
             (
@@ -373,6 +449,10 @@ impl ResearchController {
                     "техдолг",
                     "опечат",
                     "импорт",
+                    "optim",
+                    "оптимиз",
+                    "validat",
+                    "валидац",
                 ][..],
             ),
             (
@@ -403,11 +483,13 @@ impl ResearchController {
                 ][..],
             ),
         ] {
-            if words.iter().any(|w| keyword_matches(&l, w)) {
+            if words.iter().any(|w| keyword_matches(&l, w))
+                && source_scope.is_none_or(|src| words.iter().any(|w| keyword_matches(src, w)))
+            {
                 if strength == Coverage::Blocked {
-                    self.blocked(area, reason);
+                    self.blocked_cited(area, reason, cited);
                 } else {
-                    self.evidence(area, strength, reason);
+                    self.evidence_cited(area, strength, reason, cited);
                 }
             }
         }
@@ -561,6 +643,33 @@ mod tests {
         );
         assert_eq!(c.areas["backend/order flow"].coverage, Coverage::Sufficient);
         assert_eq!(c.areas["history/evolution"].coverage, Coverage::Blocked);
+    }
+    #[test]
+    fn plan_note_citing_unrelated_sources_does_not_cover_areas_it_names() {
+        let mut memory = TaskMemory::default();
+        memory
+            .upsert(
+                Some("plan"),
+                "plan: next read routes, seo, analytics, state, order api, legacy history, product tests, AI signals".into(),
+                "obs-1, obs-2".into(),
+                "".into(),
+                "".into(),
+                None,
+            )
+            .unwrap();
+        let mut a = observed("obs-1", false);
+        a.source = Some("/p/package.json".into());
+        let mut b = observed("obs-2", false);
+        b.source = Some("/p/vite.config.ts".into());
+        let mut controller = ResearchController::new(
+            "product architecture implementation backend history AI-assisted audit",
+        );
+        controller.refresh_from_memory(&memory, &[a.clone(), b]);
+        assert!(!controller.synthesis_ready());
+        assert!(controller.areas.values().all(|area| !area.cited));
+        a.source = Some("/p/public/api.php".into());
+        controller.refresh_from_memory(&memory, &[a]);
+        assert!(controller.areas["backend/order flow"].cited);
     }
     #[test]
     fn lexical_source_name_alone_does_not_mark_coverage() {
@@ -754,6 +863,37 @@ mod tests {
     }
 
     #[test]
+    fn grounded_quality_findings_cover_implementation_quality() {
+        let observations = [observed("obs-1", false)];
+        for (n, claim) in [
+            "The component uses memoization to optimize repeated rendering.",
+            "This implementation validates user input before submission.",
+            "Компонент использует мемоизацию для оптимизации повторных рендеров.",
+            "Поля формы проходят валидацию перед отправкой.",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let fact = EstablishedEvidence {
+                id: format!("ev-{n}"),
+                claim: (*claim).into(),
+                origin: "agent established from observation".into(),
+                observation_id: Some("obs-1".into()),
+                source: Some("ui-component".into()),
+                revision: None,
+            };
+            let mut controller = ResearchController::new("implementation quality audit");
+            controller.refresh_from_evidence(&TaskMemory::default(), &observations, &[fact]);
+            assert_eq!(
+                controller.areas["implementation quality"].coverage,
+                Coverage::Sufficient,
+                "grounded implementation optimization should cover this requested area: {claim}"
+            );
+            assert!(controller.synthesis_ready());
+        }
+    }
+
+    #[test]
     fn inferential_assessment_can_be_reported_as_uncertain_without_reopening_source_discovery() {
         let mut controller = ResearchController::new("audit backend and AI-assisted development");
         let fact = EstablishedEvidence {
@@ -776,6 +916,70 @@ mod tests {
             controller.areas["AI-assisted evidence"].coverage,
             Coverage::None
         );
+    }
+
+    #[test]
+    fn cited_inference_findings_across_every_required_area_reach_synthesis_ready() {
+        // Honest audit judgments about architecture, product direction and
+        // code quality are routinely reported with inference=true because
+        // they are interpretive rather than literal quotations. Every such
+        // claim here is still anchored to a real, successful observation.
+        // missing_areas() already treats this as resolved enough to stop
+        // asking for more investigation, so synthesis_ready() must agree;
+        // otherwise closeout_targets() goes empty while the runtime can
+        // never leave the closeout phase, and every subsequent tool call is
+        // rejected with an empty, unfillable gap list.
+        let observations = [observed("obs-1", false)];
+        let claims = [
+            "магазин натуральных товаров вероятно ориентирован на конверсии",
+            "архитектура маршрутов, по всей видимости, использует SEO-паттерны",
+            "качество реализации выглядит приемлемым судя по структуре кода",
+            "api.php, судя по всему, принимает заказ",
+            "история проекта предположительно включает прежний Casino-Chicken",
+        ];
+        let facts = claims
+            .iter()
+            .enumerate()
+            .map(|(n, claim)| EstablishedEvidence {
+                id: format!("ev-{n}"),
+                claim: (*claim).into(),
+                origin: "agent inference".into(),
+                observation_id: Some("obs-1".into()),
+                source: Some("api.php".into()),
+                revision: None,
+            })
+            .collect::<Vec<_>>();
+        let mut controller =
+            ResearchController::new("Аудит продукта, архитектуры, качества, заказов и истории");
+        controller.refresh_from_evidence(&TaskMemory::default(), &observations, &facts);
+        assert!(
+            controller.missing_areas().is_empty(),
+            "cited inference should stop demanding more investigation"
+        );
+        assert!(
+            controller.synthesis_ready(),
+            "a fully cited, inference-only audit must still be able to reach Finalizing \
+             instead of deadlocking in closeout with an empty gap list"
+        );
+    }
+
+    #[test]
+    fn unverified_absence_inference_does_not_close_a_requested_area() {
+        let mut controller = ResearchController::new("Аудит backend и заказов");
+        let observations = [observed("obs-1", false)];
+        let mut fact = EstablishedEvidence {
+            id: "ev-2".into(),
+            claim: "backend заказов отсутствует, api.php нет, заказ только в браузере".into(),
+            origin: "agent inference; unverified absence".into(),
+            observation_id: Some("obs-1".into()),
+            source: Some("api.php".into()),
+            revision: None,
+        };
+        controller.refresh_from_evidence(&TaskMemory::default(), &observations, &[fact.clone()]);
+        assert!(controller.missing_areas().contains(&"backend/order flow"));
+        fact.origin = "agent inference".into();
+        controller.refresh_from_evidence(&TaskMemory::default(), &observations, &[fact]);
+        assert!(!controller.missing_areas().contains(&"backend/order flow"));
     }
 
     #[test]

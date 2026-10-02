@@ -40,8 +40,8 @@ export function toolResultSummary(activity: ToolActivity): string | undefined {
 export function displayToolResult(activity: ToolActivity): string | undefined {
   if (!activity.output) return undefined;
   try {
-    const result = JSON.parse(activity.output) as { command?: string; stdout?: string; stderr?: string; exit_code?: number; timed_out?: boolean; cancelled?: boolean; content?: string };
-    if (activity.kind === 'terminal') return `${result.command ? `$ ${result.command}\n` : ''}${result.exit_code === 0 ? '✓ exit 0' : result.exit_code !== undefined ? `✗ exit ${result.exit_code}` : ''}${result.timed_out ? ' · timed out' : ''}${result.cancelled ? ' · cancelled' : ''}${result.stdout ? `\n${result.stdout}` : ''}${result.stderr ? `\n${result.stderr}` : ''}`.trim();
+    const result = JSON.parse(activity.output) as { command?: string; stdout?: string; stderr?: string; exit_code?: number; status?: string; timed_out?: boolean; cancelled?: boolean; content?: string };
+    if (activity.kind === 'terminal') return `${result.command ? `$ ${result.command}\n` : ''}${result.status === 'partial_success' ? '✓ partial search result (downstream closed pipe after output)' : result.exit_code === 0 ? '✓ exit 0' : result.exit_code !== undefined ? `✗ exit ${result.exit_code}` : ''}${result.timed_out ? ' · timed out' : ''}${result.cancelled ? ' · cancelled' : ''}${result.stdout ? `\n${result.stdout}` : ''}${result.stderr ? `\n${result.stderr}` : ''}`.trim();
     if (typeof result.content === 'string') return result.content;
     const entries = structuredEntries(result);
     if (entries) return entries.map(entryLine).join('\n');
@@ -52,7 +52,7 @@ export function displayToolResult(activity: ToolActivity): string | undefined {
 
 function TerminalDetails({ terminal, fallback }: { terminal?: TerminalExecution; fallback?: string }) {
   if (!terminal) return fallback ? <><h4>Diagnostics</h4><pre>{fallback}</pre></> : null;
-  const status = terminal.status === 'completed' ? '✓ completed' : terminal.status === 'cancelled' ? 'Cancelled' : terminal.status === 'timed_out' ? 'Timed out' : terminal.status === 'error' ? 'Error' : 'Running';
+  const status = terminal.status === 'completed' ? '✓ completed' : terminal.status === 'partial_success' ? '✓ partial search result (downstream closed pipe after output)' : terminal.status === 'cancelled' ? 'Cancelled' : terminal.status === 'timed_out' ? 'Timed out' : terminal.status === 'error' ? 'Error' : 'Running';
   return <>
     {terminal.command && <><h4>Command</h4><pre>{terminal.command}</pre></>}
     <h4>Diagnostics</h4><pre>{[terminal.cwd && `cwd: ${terminal.cwd}`, terminal.pid && `pid: ${terminal.pid} · pgid: ${terminal.pgid ?? '—'} · session: ${terminal.sessionId ?? '—'}`, terminal.startedAt && `started: ${terminal.startedAt}`, terminal.finishedAt && `finished: ${terminal.finishedAt}`, `status: ${status}`, terminal.exitCode !== null && terminal.exitCode !== undefined && `exit: ${terminal.exitCode}`, terminal.timedOut && 'timed_out: true', terminal.cancelled && 'cancelled: true'].filter(Boolean).join('\n')}</pre>

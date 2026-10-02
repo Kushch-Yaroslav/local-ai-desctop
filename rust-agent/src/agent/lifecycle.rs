@@ -1,6 +1,8 @@
 //! Finalization is a durable transcript state. This module classifies whether
 //! a proposed tool operation is a bounded verification or renewed discovery.
 //! It does not own a plan, evidence, or model-specific policy.
+use crate::agent::evidence::Observation;
+use crate::agent::frontiers::{matches_target_source, EvidenceFrontier};
 use crate::agent::research::ResearchController;
 use crate::agent::transcript::{Transcript, ValidatedCall};
 use serde_json::{json, Value};
@@ -20,11 +22,55 @@ fn closeout_acquisition(name: &str) -> bool {
     )
 }
 
-/// Keep the ordinary read and history tools available, but give each evidence
-/// acquisition a concrete unresolved purpose during Closeout. The runtime
-/// checks the same contract when a provider ignores its advertised schema.
-pub fn closeout_schemas(schemas: &[Value], targets: &[String]) -> Vec<Value> {
-    let mut result = schemas.to_vec();
+fn closeout_tool_available(name: &str) -> bool {
+    closeout_acquisition(name)
+        || matches!(
+            name,
+            "task_memory" | "evidence_record" | "evidence_frontier" | "begin_finalization"
+        )
+}
+
+pub fn blocked_frontier_targets(
+    frontiers: &[EvidenceFrontier],
+    observations: &[Observation],
+    closeout_targets: &[String],
+) -> Vec<String> {
+    frontiers
+        .iter()
+        .filter(|frontier| closeout_targets.iter().any(|target| target == &frontier.id))
+        .filter(|frontier| {
+            observations.iter().any(|observation| {
+                observation.error
+                    && observation
+                        .source
+                        .as_deref()
+                        .is_some_and(|source| matches_target_source(frontier, source))
+            })
+        })
+        .map(|frontier| frontier.id.clone())
+        .collect()
+}
+
+/// Closeout permits targeted reads and evidence-state updates, not project
+/// mutations. The runtime enforces the same set when a provider ignores its
+/// advertised schema.
+pub fn closeout_schemas(
+    schemas: &[Value],
+    targets: &[String],
+    blocked_frontiers: &[String],
+) -> Vec<Value> {
+    let mut result = schemas
+        .iter()
+        .filter(|schema| {
+            let name = schema
+                .pointer("/function/name")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            closeout_tool_available(name) && name != "evidence_frontier"
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    append_blocked_frontier_schema(schemas, &mut result, blocked_frontiers);
     for schema in &mut result {
         let name = schema
             .pointer("/function/name")
@@ -51,7 +97,74 @@ pub fn closeout_schemas(schemas: &[Value], targets: &[String]) -> Vec<Value> {
                 json!(["closeout_gap", "closeout_reason"]);
         }
     }
+    restrict_frontier_dispositions(&mut result, blocked_frontiers);
     result
+}
+
+pub fn research_schemas(schemas: &[Value], blocked_frontiers: &[String]) -> Vec<Value> {
+    let mut result = schemas
+        .iter()
+        .filter(|schema| {
+            schema.pointer("/function/name").and_then(Value::as_str) != Some("evidence_frontier")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    append_blocked_frontier_schema(schemas, &mut result, blocked_frontiers);
+    restrict_frontier_dispositions(&mut result, blocked_frontiers);
+    result
+}
+
+pub fn finalizing_schemas(schemas: &[Value], blocked_frontiers: &[String]) -> Vec<Value> {
+    let mut result = schemas
+        .iter()
+        .filter(|schema| {
+            let name = schema
+                .pointer("/function/name")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            advertise_in_finalizing(name) && name != "evidence_frontier"
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    append_blocked_frontier_schema(schemas, &mut result, blocked_frontiers);
+    restrict_frontier_dispositions(&mut result, blocked_frontiers);
+    result
+}
+
+fn append_blocked_frontier_schema(
+    schemas: &[Value],
+    result: &mut Vec<Value>,
+    blocked_frontiers: &[String],
+) {
+    if blocked_frontiers.is_empty() {
+        return;
+    }
+    if let Some(schema) = schemas.iter().find(|schema| {
+        schema.pointer("/function/name").and_then(Value::as_str) == Some("evidence_frontier")
+    }) {
+        result.push(schema.clone());
+    }
+}
+
+fn restrict_frontier_dispositions(result: &mut [Value], blocked_frontiers: &[String]) {
+    for schema in result {
+        if schema.pointer("/function/name").and_then(Value::as_str) != Some("evidence_frontier") {
+            continue;
+        }
+        let properties = schema
+            .pointer_mut("/function/parameters/properties")
+            .and_then(Value::as_object_mut);
+        if let Some(properties) = properties {
+            properties.insert(
+                "id".into(),
+                json!({"type":"string","enum":blocked_frontiers}),
+            );
+            properties.insert(
+                "outcome".into(),
+                json!({"type":"string","enum":["blocked"]}),
+            );
+        }
+    }
 }
 
 /// A duplicate unchanged read cannot establish a new closeout finding by
@@ -63,6 +176,12 @@ pub fn closeout_decision(
     research: &ResearchController,
     project_root: Option<&Path>,
 ) -> Result<(), String> {
+    if !closeout_tool_available(&call.name) {
+        return Err(format!(
+            "Tool '{}' is unavailable during targeted closeout; use source reads and evidence-state updates until the requested gaps are grounded",
+            call.name
+        ));
+    }
     if !closeout_acquisition(&call.name) {
         return Ok(());
     }
@@ -89,7 +208,7 @@ pub fn closeout_decision(
         ));
     }
     let previous = match call.name.as_str() {
-        "read_file" => unchanged_file_read(call, transcript, project_root),
+        "read_file" => repeated_file_read_observation(call, transcript, project_root),
         "run_terminal" => repeated_terminal_command(call, transcript),
         _ => None,
     };
@@ -105,59 +224,115 @@ pub fn closeout_decision(
                 .and_then(Value::as_str)
                 .is_some_and(|reason| !reason.trim().is_empty());
         if !anchored {
-            return Err(format!("Closeout already has unchanged evidence {id} for this exact operation. Use evidence_record or observation_read for the named gap; to verify a specific contradiction, supply verification_of={id} and verification_reason."));
+            return Err(format!("Closeout already has observation {id} for this exact unchanged operation. Use evidence_record or observation_read for the named gap; to verify a specific contradiction, supply verification_of={id} and verification_reason."));
         }
     }
     Ok(())
 }
 
-fn unchanged_file_read(
+pub fn repeated_file_read_decision(
+    call: &ValidatedCall,
+    transcript: &Transcript,
+    project_root: Option<&Path>,
+) -> Result<(), String> {
+    let Some(id) = repeated_file_read_observation(call, transcript, project_root) else {
+        return Ok(());
+    };
+    let detail = if transcript
+        .observation(&id)
+        .is_some_and(|observation| observation.error)
+    {
+        "the previous read failed and the path is still missing"
+    } else {
+        "the file contents and requested range are unchanged"
+    };
+    Err(format!(
+        "This exact read is already stored as observation {id}; {detail}. No new observation was created. Use observation_read(id=\"{id}\") to recover the stored result, or inspect a different file or range; do not repeat this unchanged read."
+    ))
+}
+
+fn repeated_file_read_observation(
     call: &ValidatedCall,
     transcript: &Transcript,
     root: Option<&Path>,
 ) -> Option<String> {
     let path = call.arguments.get("path")?.as_str()?;
-    let file = root?.join(path).canonicalize().ok()?;
-    let revision = format!("{:x}", Sha256::digest(std::fs::read(&file).ok()?));
-    let lines = call
-        .arguments
-        .get("start_line")
-        .and_then(Value::as_u64)
-        .map(|start| {
-            format!(
-                "lines {}-{}",
-                start,
-                call.arguments
-                    .get("end_line")
-                    .and_then(Value::as_u64)
-                    .map_or("end".into(), |end| end.to_string())
-            )
-        });
+    let root = root?;
+    let canonical_root = root.canonicalize().ok()?;
     let range = format!(
         "{} offset_chars={}",
-        lines.unwrap_or("all".into()),
+        call.arguments
+            .get("start_line")
+            .and_then(Value::as_u64)
+            .map(|start| {
+                format!(
+                    "lines {}-{}",
+                    start,
+                    call.arguments
+                        .get("end_line")
+                        .and_then(Value::as_u64)
+                        .map_or("end".into(), |end| end.to_string())
+                )
+            })
+            .unwrap_or_else(|| "all".into()),
         call.arguments
             .get("offset_chars")
             .and_then(Value::as_u64)
             .unwrap_or(0)
     );
+    if let Ok(file) = canonical_root.join(path).canonicalize() {
+        if !file.starts_with(&canonical_root) {
+            return None;
+        }
+        if let Ok(contents) = std::fs::read(&file) {
+            let revision = format!("{:x}", Sha256::digest(contents));
+            if let Some(observation) = transcript.observations().iter().rev().find(|observation| {
+                observation.tool == "read_file"
+                    && !observation.error
+                    && observation
+                        .source
+                        .as_deref()
+                        .and_then(|source| canonical_source_path(source, &canonical_root))
+                        .as_deref()
+                        == Some(file.as_path())
+                    && observation.source_revision.as_deref() == Some(revision.as_str())
+                    && observation.requested_range.as_deref() == Some(range.as_str())
+            }) {
+                return Some(observation.id.clone());
+            }
+        }
+    }
+
+    let requested_file = canonical_root.join(path);
+    if requested_file.exists() {
+        return None;
+    }
+    let project_path = requested_file.to_string_lossy().into_owned();
     transcript
         .observations()
         .iter()
         .rev()
         .find(|observation| {
             observation.tool == "read_file"
-                && !observation.error
+                && observation.error
+                && observation.requested_range.as_deref() == Some(range.as_str())
                 && observation
                     .source
                     .as_deref()
-                    .and_then(|source| Path::new(source).canonicalize().ok())
-                    .as_deref()
-                    == Some(file.as_path())
-                && observation.source_revision.as_deref() == Some(revision.as_str())
-                && observation.requested_range.as_deref() == Some(range.as_str())
+                    .is_some_and(|source| source == path || source == project_path)
         })
         .map(|observation| observation.id.clone())
+}
+
+fn canonical_source_path(source: &str, root: &Path) -> Option<std::path::PathBuf> {
+    let path = Path::new(source);
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    let canonical = candidate.canonicalize().ok()?;
+    canonical.starts_with(root).then_some(canonical)
 }
 
 fn repeated_terminal_command(call: &ValidatedCall, transcript: &Transcript) -> Option<String> {
@@ -326,6 +501,7 @@ mod tests {
                 json!({"type":"function","function":{"name":"read_file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}),
             ],
             &research.closeout_targets(),
+            &[],
         );
         assert!(schemas[0]["function"]["parameters"]["required"]
             .as_array()
@@ -360,6 +536,246 @@ mod tests {
         assert!(closeout_decision(&new_target, &transcript, &research, Some(&root)).is_ok());
         assert_eq!(transcript.observations().len(), 1);
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn research_rejects_repeated_unchanged_and_missing_file_reads() {
+        let base = std::env::temp_dir().join(format!(
+            "research-repeated-read-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let root = base.join("project");
+        std::fs::create_dir_all(root.join("src/Shared/Interfaces")).unwrap();
+        for name in ["item.ts", "Product.ts", "Category.ts"] {
+            std::fs::write(root.join("src/Shared/Interfaces").join(name), name).unwrap();
+        }
+        let paths = [
+            "item.ts",
+            "Product.ts",
+            "Category.ts",
+            "Items.ts",
+            "Products.ts",
+        ]
+        .map(|name| format!("src/Shared/Interfaces/{name}"));
+        let mut transcript =
+            Transcript::durable(&base.join("store"), "run", &[], root.to_str()).unwrap();
+        transcript.push_run_user(json!({"role":"user","content":"audit project implementation"}));
+        let first_batch = paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| ValidatedCall {
+                id: format!("first-{index}"),
+                name: "read_file".into(),
+                arguments: json!({"path":path}),
+            })
+            .collect::<Vec<_>>();
+        transcript.assistant_tool_turn(String::new(), &first_batch);
+        for (index, path) in paths.iter().enumerate() {
+            let file = root.join(path);
+            let result = if file.exists() {
+                json!({"path":path,"content":std::fs::read_to_string(file).unwrap()})
+            } else {
+                json!({"path":path,"error":"file not found"})
+            };
+            transcript.tool_result(&format!("first-{index}"), "read_file", result.to_string());
+        }
+
+        assert_eq!(transcript.observations().len(), 5);
+        for (index, path) in paths.iter().enumerate() {
+            let observation_id = transcript
+                .observation_for_call(&format!("first-{index}"))
+                .unwrap()
+                .id
+                .clone();
+            let duplicate = ValidatedCall {
+                id: format!("repeat-{index}"),
+                name: "read_file".into(),
+                arguments: json!({"path":path}),
+            };
+            let error =
+                repeated_file_read_decision(&duplicate, &transcript, Some(&root)).unwrap_err();
+            assert!(error.contains(&observation_id), "{error}");
+            assert!(error.contains("observation_read"), "{error}");
+        }
+        assert_eq!(transcript.observations().len(), 5);
+
+        std::fs::write(root.join(&paths[3]), "now present").unwrap();
+        assert!(repeated_file_read_decision(
+            &call("new-version", json!({"path":paths[3]})),
+            &transcript,
+            Some(&root)
+        )
+        .is_ok());
+        std::fs::write(root.join(&paths[0]), "changed").unwrap();
+        assert!(repeated_file_read_decision(
+            &call("changed-version", json!({"path":paths[0]})),
+            &transcript,
+            Some(&root)
+        )
+        .is_ok());
+        assert!(repeated_file_read_decision(
+            &call("new-range", json!({"path":paths[1],"start_line":1})),
+            &transcript,
+            Some(&root)
+        )
+        .is_ok());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn closeout_hides_project_mutations_and_rejects_them_at_execution() {
+        let names = [
+            "read_file",
+            "run_terminal",
+            "task_memory",
+            "evidence_record",
+            "evidence_frontier",
+            "begin_finalization",
+            "write_file",
+            "project_knowledge_update",
+        ];
+        let schemas = names
+            .iter()
+            .map(|name| {
+                json!({"type":"function","function":{"name":name,"parameters":{"type":"object","properties":{},"required":[]}}})
+            })
+            .collect::<Vec<_>>();
+        let research = ResearchController::with_depth("audit backend order flow", true);
+        let closeout = closeout_schemas(&schemas, &research.closeout_targets(), &[]);
+        let available = closeout
+            .iter()
+            .filter_map(|schema| schema.pointer("/function/name").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+
+        assert!(available.contains(&"read_file"));
+        assert!(available.contains(&"run_terminal"));
+        assert!(available.contains(&"task_memory"));
+        assert!(available.contains(&"evidence_record"));
+        assert!(!available.contains(&"evidence_frontier"));
+        assert!(available.contains(&"begin_finalization"));
+        assert!(!available.contains(&"write_file"));
+        assert!(!available.contains(&"project_knowledge_update"));
+
+        for name in ["write_file", "project_knowledge_update"] {
+            assert!(closeout_decision(
+                &call(name, json!({})),
+                &Transcript::default(),
+                &research,
+                None
+            )
+            .unwrap_err()
+            .contains("unavailable during targeted closeout"));
+        }
+    }
+
+    #[test]
+    fn closeout_frontier_disposition_requires_target_specific_error_observation() {
+        let frontier = EvidenceFrontier {
+            id: "frontier-source-00".into(),
+            from_observation: "source".into(),
+            source: "/project/src/Form.tsx".into(),
+            target: "api.php".into(),
+            resolved_path: Some("/project/public/api.php".into()),
+            project_relative_path: Some("public/api.php".into()),
+            resolution: Some("configured public root".into()),
+        };
+        let observation = |id: &str, source: &str, error| Observation {
+            id: id.into(),
+            event_id: format!("event-{id}"),
+            call_id: format!("call-{id}"),
+            tool: "read_file".into(),
+            source: Some(source.into()),
+            source_revision: None,
+            requested_range: None,
+            returned_range: None,
+            error,
+            body_sha256: String::new(),
+            body_bytes: 0,
+        };
+        let targets = vec![frontier.id.clone()];
+        let schemas = vec![
+            json!({"type":"function","function":{"name":"evidence_frontier","parameters":{"type":"object","properties":{"id":{"type":"string"},"outcome":{"type":"string","enum":["blocked","irrelevant"]},"reason":{"type":"string"},"observation_id":{"type":"string"}},"required":["id","outcome","reason","observation_id"]}}}),
+            json!({"type":"function","function":{"name":"evidence_record","parameters":{"type":"object","properties":{},"required":[]}}}),
+        ];
+
+        let successful_target_read = observation("success", "/project/public/api.php", false);
+        let unrelated_error = observation("other-error", "/project/src/Form.tsx", true);
+        let no_disposition = blocked_frontier_targets(
+            std::slice::from_ref(&frontier),
+            &[successful_target_read, unrelated_error],
+            &targets,
+        );
+        assert!(no_disposition.is_empty());
+        let research_hidden = research_schemas(&schemas, &no_disposition);
+        assert!(!research_hidden.iter().any(|schema| schema
+            .pointer("/function/name")
+            .and_then(Value::as_str)
+            == Some("evidence_frontier")));
+        let hidden = closeout_schemas(&schemas, &targets, &no_disposition);
+        assert!(!hidden.iter().any(|schema| schema
+            .pointer("/function/name")
+            .and_then(Value::as_str)
+            == Some("evidence_frontier")));
+        assert!(hidden.iter().any(|schema| schema
+            .pointer("/function/name")
+            .and_then(Value::as_str)
+            == Some("evidence_record")));
+
+        let target_error = observation("target-error", "/project/public/api.php", true);
+        let available =
+            blocked_frontier_targets(std::slice::from_ref(&frontier), &[target_error], &targets);
+        assert_eq!(available, vec![frontier.id]);
+        let research_enabled = research_schemas(&schemas, &available);
+        let research_frontiers = research_enabled
+            .iter()
+            .filter(|schema| {
+                schema.pointer("/function/name").and_then(Value::as_str)
+                    == Some("evidence_frontier")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(research_frontiers.len(), 1);
+        assert_eq!(
+            research_frontiers[0].pointer("/function/parameters/properties/outcome/enum"),
+            Some(&json!(["blocked"]))
+        );
+        let enabled = closeout_schemas(&schemas, &targets, &available);
+        let frontier_schema = enabled
+            .iter()
+            .find(|schema| {
+                schema.pointer("/function/name").and_then(Value::as_str)
+                    == Some("evidence_frontier")
+            })
+            .unwrap();
+        assert_eq!(
+            frontier_schema.pointer("/function/parameters/properties/id/enum"),
+            Some(&json!(["frontier-source-00"]))
+        );
+        assert_eq!(
+            frontier_schema.pointer("/function/parameters/properties/outcome/enum"),
+            Some(&json!(["blocked"]))
+        );
+        assert!(closeout_decision(
+            &call(
+                "evidence_frontier",
+                json!({"id":"frontier-source-00","outcome":"blocked","reason":"target read is unavailable","observation_id":"target-error"}),
+            ),
+            &Transcript::default(),
+            &ResearchController::with_depth("audit backend order flow", true),
+            None,
+        )
+        .is_ok());
+
+        let finalizing_hidden = finalizing_schemas(&schemas, &[]);
+        assert!(!finalizing_hidden.iter().any(|schema| schema
+            .pointer("/function/name")
+            .and_then(Value::as_str)
+            == Some("evidence_frontier")));
+        let finalizing_enabled = finalizing_schemas(&schemas, &available);
+        assert!(finalizing_enabled.iter().any(|schema| schema
+            .pointer("/function/name")
+            .and_then(Value::as_str)
+            == Some("evidence_frontier")));
     }
 
     #[test]

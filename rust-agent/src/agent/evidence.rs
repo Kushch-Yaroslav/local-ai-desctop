@@ -410,6 +410,7 @@ impl EvidenceStore {
                 Entry::RunComplete => "run_complete",
                 Entry::LanguagePreference(_) => "language_preference",
                 Entry::Evidence(_) => "established_evidence",
+                Entry::EvidenceRejection { .. } => "evidence_rejection",
                 Entry::Frontier(_) => "evidence_frontier",
                 Entry::FrontierDisposition(_) => "frontier_disposition",
             };
