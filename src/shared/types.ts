@@ -1,8 +1,9 @@
-import type { RuntimeContextEstimate } from './context-estimator';
+import type { ContextDiscoveryResult, RuntimeContextEstimate } from './context-estimator';
 
 export type ChatMode = 'chat' | 'agent';
 export type WebMode = 'off' | 'auto';
 export type BackendId = 'ollama' | 'llama-cpp';
+export type LlamaKvCacheType = 'f16' | 'q8_0';
 /** A backend-native reasoning control. It never changes the output token budget. */
 export type ReasoningMode = 'auto' | 'fast' | 'deep';
 export type FinishReason = 'stop' | 'length' | 'cancelled' | 'error';
@@ -133,6 +134,8 @@ export interface Conversation {
   secondaryWorkingDirectory: string | null;
   secondaryProjectId: string | null;
   contextWindow: number;
+  llamaKvCacheType?: LlamaKvCacheType;
+  llamaKvOffload?: boolean;
   reasoningMode: ReasoningMode;
   contextTokens: number | null;
   contextModelId: string | null;
@@ -195,7 +198,7 @@ export interface AppSettings {
   llamaServerPath: string | null;
   llamaRuntimeModelId?: string;
   /** Live state of the launcher-managed llama-server; the authority on what is running. */
-  llamaRuntime?: { status: 'starting' | 'ready' | 'switching' | 'offline' | 'stopped'; modelId: string | null; contextWindow: number | null; error?: string; rolledBack?: boolean };
+  llamaRuntime?: { status: 'starting' | 'ready' | 'switching' | 'offline' | 'stopped'; modelId: string | null; contextWindow: number | null; kvCacheType?: LlamaKvCacheType; kvOffload?: boolean; error?: string; rolledBack?: boolean };
   modelsPath: string;
 }
 
@@ -329,7 +332,7 @@ export interface LocalAiApi {
   conversations: {
     list(): Promise<Conversation[]>;
     create(modelId?: string): Promise<Conversation>;
-    update(id: string, patch: Partial<Pick<Conversation, 'title' | 'modelId' | 'mode' | 'workingDirectory' | 'secondaryWorkingDirectory' | 'contextWindow' | 'reasoningMode' | 'webMode'>>): Promise<Conversation>;
+    update(id: string, patch: Partial<Pick<Conversation, 'title' | 'modelId' | 'mode' | 'workingDirectory' | 'secondaryWorkingDirectory' | 'contextWindow' | 'llamaKvCacheType' | 'llamaKvOffload' | 'reasoningMode' | 'webMode'>>): Promise<Conversation>;
     delete(id: string): Promise<void>;
   };
   messages: { list(conversationId: string): Promise<ChatMessage[]>; edit(id: string, content: string, fallback?: Pick<ChatMessage, 'conversationId' | 'content'>): Promise<ChatMessage[]>; regenerate(id: string): Promise<ChatMessage[]> };
@@ -345,6 +348,7 @@ export interface LocalAiApi {
   settings: { get(): Promise<AppSettings> };
   hardware: { get(): Promise<HardwareStats> };
   contextEstimate(modelId: string): Promise<RuntimeContextEstimate>;
+  contextDiscover(modelId: string): Promise<ContextDiscoveryResult>;
   dialog: { chooseDirectory(initialDirectory?: string | null): Promise<string | null> };
   chat: {
     send(request: ChatRequest): Promise<void>;

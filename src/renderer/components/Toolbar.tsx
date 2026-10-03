@@ -3,11 +3,14 @@ import { FolderOpen, X } from 'lucide-react';
 import { useAppStore } from '../store/app-store';
 import { Hardware } from './Hardware';
 import { projectDirectoryName } from '../../shared/project-references';
-import type { RuntimeContextEstimate } from '../../shared/context-estimator';
+import type { ContextDiscoveryResult, RuntimeContextEstimate } from '../../shared/context-estimator';
 
 export function Toolbar() {
-  const { conversations, activeId, models, hardware, settings, activeContextWindow, updateConversation, refreshRuntime } = useAppStore();
+  const { conversations, activeId, models, hardware, settings, activeContextWindow, isGenerating, updateConversation, refreshRuntime } = useAppStore();
   const [estimateResponse, setEstimateResponse] = useState<{ modelId: string; value?: RuntimeContextEstimate; error?: string } | null>(null);
+  const [discovery, setDiscovery] = useState<ContextDiscoveryResult | null>(null);
+  const [discoveryLoading, setDiscoveryLoading] = useState(false);
+  const [discoveryError, setDiscoveryError] = useState<string | null>(null);
   const pollsRuntime = settings?.selectedBackend === 'llama-cpp';
   useEffect(() => {
     if (!pollsRuntime) return undefined;
@@ -20,12 +23,14 @@ export function Toolbar() {
   useEffect(() => {
     if (!selectedModelId) { setEstimateResponse(null); return undefined; }
     let current = true;
-    setEstimateResponse({ modelId: selectedModelId });
+    setEstimateResponse((prior) => prior?.modelId === selectedModelId ? prior : { modelId: selectedModelId });
+    setDiscovery(null);
+    setDiscoveryError(null);
     void window.localAi.contextEstimate(selectedModelId)
       .then((value) => { if (current) setEstimateResponse({ modelId: selectedModelId, value }); })
       .catch((error: unknown) => { if (current) setEstimateResponse({ modelId: selectedModelId, error: error instanceof Error ? error.message : String(error) }); });
     return () => { current = false; };
-  }, [selectedModelId, settings?.selectedBackend, settings?.llamaRuntime?.status, settings?.llamaRuntime?.modelId, settings?.llamaRuntime?.contextWindow, hardware?.ramUsedBytes, hardware?.vramUsedBytes, chat?.contextWindow]);
+  }, [selectedModelId, settings?.selectedBackend, settings?.llamaRuntime?.status, settings?.llamaRuntime?.modelId, settings?.llamaRuntime?.contextWindow, settings?.llamaRuntime?.kvCacheType, settings?.llamaRuntime?.kvOffload]);
   if (!chat) return null;
   const chooseDirectory = async (slot: 1 | 2, currentDirectory: string | null) => { const directory = await window.localAi.dialog.chooseDirectory(currentDirectory); if (directory) await updateConversation(chat.id, slot === 1 ? { workingDirectory: directory } : { secondaryWorkingDirectory: directory }); };
   const contextLabel = `${Math.round((activeContextWindow ?? chat.contextWindow) / 1024)}K`;
@@ -38,43 +43,70 @@ export function Toolbar() {
         : 'llama.cpp · не запущен';
   const missingEstimate = contextEstimate?.unknownReasons.join(', ') ?? '';
   const estimateLoading = Boolean(selectedModelId && (estimateResponse?.modelId !== selectedModelId || (!estimateResponse.value && !estimateResponse.error)));
-  const contextBackend = selectedModel?.backend ?? settings?.selectedBackend;
-  const safeEstimateLabel = contextEstimate?.status === 'estimated' && contextEstimate.hardwareSafeTokens !== null
-    ? contextEstimate.hardwareSafeTokens === 0 ? 'нет подходящего размера' : `${Math.round(contextEstimate.hardwareSafeTokens / 1024)}K (оценка)`
-    : estimateResponse?.error
-      ? 'недоступен'
-      : contextEstimate?.observedContextTokens
-        ? `оценка неизвестна · загружено ${Math.round(contextEstimate.observedContextTokens / 1024)}K`
-        : contextEstimate?.hardwareSafeTokens === 0
-      ? 'нет подходящего размера'
-      : 'неизвестен';
+  const discoveryForModel = discovery?.modelId === selectedModelId ? discovery : undefined;
+  const maxContextLabel = discoveryLoading ? 'измеряется…' : discoveryForModel?.options.length
+    ? discoveryForModel.options.map((option) => `${option.kvCacheType.toUpperCase()} ${option.contextWindow / 1024}K`).join(' · ')
+    : 'не измерен';
   const actualRuntimeContext = contextEstimate?.observedContextTokens
     ?? (llama?.status === 'ready' && llama.modelId === chat.modelId ? llama.contextWindow : null);
+  const contextOptions = (() => {
+    const cacheType = chat.llamaKvCacheType ?? 'f16';
+    const kvOffload = chat.llamaKvOffload ?? true;
+    const modeMaximum = discoveryForModel?.options.find((option) => option.kvCacheType === cacheType && option.kvOffload === kvOffload)?.contextWindow ?? 32_768;
+    const options = (selectedModel?.supportedContextPresets ?? []).filter((contextWindow) => contextWindow <= modeMaximum).map((contextWindow) => ({
+      contextWindow, kvCacheType: cacheType, kvOffload,
+      label: `${Math.round(contextWindow / 1024)}K`,
+    }));
+    for (const option of discoveryForModel?.options ?? []) {
+      const found = options.find((candidate) => candidate.contextWindow === option.contextWindow
+        && candidate.kvCacheType === option.kvCacheType && candidate.kvOffload === option.kvOffload);
+      const label = `${option.contextWindow / 1024}K · Max Context (${option.kvCacheType.toUpperCase()})`;
+      if (found) found.label = label;
+      else options.push({ ...option, label });
+    }
+    if (!options.some((option) => option.contextWindow === chat.contextWindow
+      && option.kvCacheType === cacheType && option.kvOffload === kvOffload)) {
+      options.push({ contextWindow: chat.contextWindow, kvCacheType: cacheType, kvOffload, label: `${Math.round(chat.contextWindow / 1024)}K · текущий` });
+    }
+    return options;
+  })();
+  const selectedContextOption = contextOptions.find((option) => option.contextWindow === chat.contextWindow
+    && option.kvCacheType === (chat.llamaKvCacheType ?? 'f16') && option.kvOffload === (chat.llamaKvOffload ?? true));
+  const discoverMaximum = async () => {
+    if (!selectedModelId) return;
+    setDiscoveryLoading(true);
+    setDiscoveryError(null);
+    try { setDiscovery(await window.localAi.contextDiscover(selectedModelId)); }
+    catch (error) { setDiscoveryError(error instanceof Error ? error.message : String(error)); }
+    finally { setDiscoveryLoading(false); }
+  };
   return (
     <header className="toolbar">
       <div className="monitoring-row" aria-label="Мониторинг runtime">
         <Hardware value={hardware} />
         <span className="backend-indicator">{runtimeLabel}</span>
+        {settings?.selectedBackend === 'llama-cpp' && <button className="context-discover" disabled={discoveryLoading || !selectedModelId || isGenerating} onClick={() => void discoverMaximum()}>{discoveryLoading ? 'Идёт проверка…' : 'Найти Max Context'}</button>}
         <details className="context-estimate">
-          <summary>Безопасный контекст: {estimateLoading ? 'получение данных…' : safeEstimateLabel}</summary>
+          <summary>Max Context: {settings?.selectedBackend === 'llama-cpp' ? maxContextLabel : 'runtime не измеряет KV'}</summary>
           <div className="context-estimate-details">
-            <p>Оценка ограничена уже загруженным окном и его текущими KV, offload и draft/MTP настройками. Больший контекст требует нового измерения; это не доказательство абсолютного максимума оборудования.</p>
-            <p><span>Предел модели/backend</span><b>{contextEstimate?.configuredMaxTokens ? `${Math.round(contextEstimate.configuredMaxTokens / 1024)}K` : selectedModel ? `${Math.round(selectedModel.maxContext / 1024)}K` : 'неизвестен'}</b></p>
-            {contextEstimate?.modelTrainContextTokens !== null && contextEstimate?.modelTrainContextTokens !== undefined && <p><span>Модель обучена до (metadata, не runtime limit)</span><b>{Math.round(contextEstimate.modelTrainContextTokens / 1024)}K</b></p>}
-            <p><span>Выбранное окно</span><b>{Math.round(chat.contextWindow / 1024)}K</b></p>
-            {actualRuntimeContext !== null && <p><span>{contextBackend === 'ollama' ? 'Загруженный Ollama context_length (наблюдение)' : 'Загруженный llama-server n_ctx (наблюдение)'}</span><b>{Math.round(actualRuntimeContext / 1024)}K</b></p>}
-            {contextEstimate?.modelFileSizeBytes !== null && contextEstimate?.modelFileSizeBytes !== undefined && <p><span>Размер модели по runtime metadata (не VRAM)</span><b>{(contextEstimate.modelFileSizeBytes / 1024 ** 3).toFixed(1)} GB</b></p>}
-            {contextEstimate?.observedResidentBytes !== null && contextEstimate?.observedResidentBytes !== undefined && <p><span>Загрузка Ollama (reported)</span><b>{(contextEstimate.observedResidentBytes / 1024 ** 3).toFixed(1)} GB</b></p>}
-            {contextEstimate?.observedDeviceResidentBytes !== null && contextEstimate?.observedDeviceResidentBytes !== undefined && <p><span>Из неё VRAM (reported)</span><b>{(contextEstimate.observedDeviceResidentBytes / 1024 ** 3).toFixed(1)} GB</b></p>}
-            <p><span>Безопасный максимум памяти</span><b>{safeEstimateLabel}</b></p>
-            <p>{contextBackend === 'ollama' ? 'Ollama получает выбранный num_ctx в каждом запросе; это не измерение фактической KV-cache или загрузки модели.' : 'llama.cpp сообщает загруженный серверный n_ctx; успешный запуск не гарантирует запас памяти для других нагрузок.'}</p>
-            <small>{estimateLoading ? 'Получаем сведения активного runtime…' : estimateResponse?.error ? `Не удалось получить метаданные: ${estimateResponse.error}.` : missingEstimate ? `Нет надёжной оценки: ${missingEstimate}.` : contextEstimate?.status === 'estimated' ? 'Оценка масштабирует наблюдаемые allocation sizes и учитывает явно заданные резервы.' : 'Максимум модели/runtime не является гарантией аппаратной безопасности.'}</small>
+            <p>Max Context — наибольшее кратное 4K окно, которое discovery консервативно рассчитало, затем реально запустило с выбранным KV и проверило через health check и inference. В расчёте учтены веса/KV allocations, MTP/draft, слоты, свободные VRAM/RAM и резервы. Выберите найденный вариант как обычный пункт «Контекст».</p>
+            <p><span>Найдено</span><b>{maxContextLabel}</b></p>
+            <p><span>Активное окно</span><b>{actualRuntimeContext ? `${Math.round(actualRuntimeContext / 1024)}K` : 'runtime не загружен'}</b></p>
+            {discoveryForModel?.options.map((option) => <p key={`${option.kvCacheType}-${option.contextWindow}`}><span>{option.kvCacheType.toUpperCase()} · запас после inference</span><b>RAM {Math.round(option.measuredHeadroom.hostBytes / 1024 ** 3 * 10) / 10} GiB · VRAM {Math.round(option.measuredHeadroom.deviceBytes / 1024 ** 3 * 10) / 10} GiB</b></p>)}
+            {discoveryError && <small>Discovery не завершён: {discoveryError}</small>}
+            {discoveryForModel?.unsupported.map((item) => <small key={item.kvCacheType}>{item.kvCacheType.toUpperCase()} не предложен: {item.reason}</small>)}
+            <details><summary>Диагностика</summary>
+              <p><span>Предел модели/runtime</span><b>{contextEstimate?.configuredMaxTokens ? `${Math.round(contextEstimate.configuredMaxTokens / 1024)}K` : selectedModel ? `${Math.round(selectedModel.maxContext / 1024)}K` : 'неизвестен'}</b></p>
+              {contextEstimate?.modelTrainContextTokens !== null && contextEstimate?.modelTrainContextTokens !== undefined && <p><span>Metadata train limit</span><b>{Math.round(contextEstimate.modelTrainContextTokens / 1024)}K</b></p>}
+              {contextEstimate?.allocationEvidence && <p><span>Фактический KV</span><b>{contextEstimate.allocationEvidence.kvTypeK ?? 'unknown'} / {contextEstimate.allocationEvidence.kvTypeV ?? 'unknown'}; слоты {contextEstimate.allocationEvidence.sequenceSlots ?? '?'}, draft {contextEstimate.allocationEvidence.speculativeSlots ?? '?'}</b></p>}
+              <small>{estimateLoading ? 'Обновление runtime данных…' : estimateResponse?.error ? `Не удалось получить метаданные: ${estimateResponse.error}.` : missingEstimate ? `Нет полной активной allocation evidence: ${missingEstimate}.` : discoveryForModel?.restored ? `Измерено при ${discoveryForModel.probeContextTokens / 1024}K; runtime восстановлен.` : 'Максимум не рассчитан до явного discovery.'}</small>
+            </details>
           </div>
         </details>
       </div>
       <div className="toolbar-controls">
         <label className="control"><span>Модель</span><select value={chat.modelId ?? ''} onChange={(event) => void updateConversation(chat.id, { modelId: event.target.value || null }).catch(() => undefined)}><option value="">Выберите модель</option>{models.map((model) => <option value={model.id} key={model.id} disabled={!model.installed}>{model.name}{model.installed ? '' : ' · не установлена'}</option>)}</select></label>
-        <label className="control"><span>Контекст · {contextLabel}</span><select value={chat.contextWindow} onChange={(event) => void updateConversation(chat.id, { contextWindow: Number(event.target.value) }).catch(() => undefined)}>{(selectedModel?.supportedContextPresets ?? []).map((preset) => <option value={preset} key={preset}>{Math.round(preset / 1024)}K</option>)}</select></label>
+        <label className="control"><span>Контекст · {contextLabel}</span><select value={selectedContextOption ? `${selectedContextOption.contextWindow}:${selectedContextOption.kvCacheType}:${selectedContextOption.kvOffload ? 'gpu' : 'ram'}` : ''} onChange={(event) => { const [contextWindow, kvCacheType, placement] = event.target.value.split(':'); if (contextWindow) void updateConversation(chat.id, { contextWindow: Number(contextWindow), ...(settings?.selectedBackend === 'llama-cpp' ? { llamaKvCacheType: kvCacheType as 'f16' | 'q8_0', llamaKvOffload: placement === 'gpu' } : {}) }).catch(() => undefined); }}>{contextOptions.map((option) => <option value={`${option.contextWindow}:${option.kvCacheType}:${option.kvOffload ? 'gpu' : 'ram'}`} key={`${option.contextWindow}:${option.kvCacheType}:${option.kvOffload ? 'gpu' : 'ram'}`}>{option.label}</option>)}</select></label>
         {selectedModel?.supportsReasoning && <label className="control"><span>Рассуждение</span><select value={chat.reasoningMode === 'deep' ? 'deep' : 'fast'} onChange={(event) => void updateConversation(chat.id, { reasoningMode: event.target.value as 'fast' | 'deep' })}><option value="fast">Быстро</option><option value="deep">Глубоко</option></select></label>}
         <label className="control"><span>Web</span><select value={chat.webMode} onChange={(event) => void updateConversation(chat.id, { webMode: event.target.value as 'off' | 'auto' })}><option value="off">Off</option><option value="auto">Auto</option></select></label>
         <label className="control"><span>Режим</span><select value={chat.mode} onChange={(event) => void updateConversation(chat.id, { mode: event.target.value as 'chat' | 'agent' })}><option value="chat">Чат</option><option value="agent">Агент</option></select></label>

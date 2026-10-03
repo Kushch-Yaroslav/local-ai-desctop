@@ -53,13 +53,15 @@ const runtime: RuntimeContextEvidence = {
   modelPath: '/models/target.gguf',
   activeContextTokens: 32_768,
   modelFileSizeBytes: 17_000_000_000,
+  kvCacheType: 'f16',
+  kvOffload: true,
 };
 
 export async function runContextEstimateRegression(): Promise<void> {
-  assert.deepEqual(resolveContextReserve(undefined, 'HOST_RESERVE', defaultContextHostReserveBytes), { bytes: 8 * 1024 ** 3 });
-  assert.deepEqual(resolveContextReserve(undefined, 'DEVICE_RESERVE', defaultContextDeviceReserveBytes), { bytes: 2 * 1024 ** 3 });
+  assert.deepEqual(resolveContextReserve(undefined, 'HOST_RESERVE', defaultContextHostReserveBytes), { bytes: 10 * 1024 ** 3 });
+  assert.deepEqual(resolveContextReserve(undefined, 'DEVICE_RESERVE', defaultContextDeviceReserveBytes), { bytes: 3 * 1024 ** 3 });
   assert.deepEqual(resolveContextReserve(String(12 * 1024 ** 3), 'HOST_RESERVE', defaultContextHostReserveBytes), { bytes: 12 * 1024 ** 3 });
-  assert.match(resolveContextReserve(String(4 * 1024 ** 3), 'HOST_RESERVE', defaultContextHostReserveBytes).error ?? '', /at least/);
+  assert.match(resolveContextReserve(String(8 * 1024 ** 3), 'HOST_RESERVE', defaultContextHostReserveBytes).error ?? '', /at least/);
   assert.match(resolveContextReserve('invalid', 'DEVICE_RESERVE', defaultContextDeviceReserveBytes).error ?? '', /integer byte count/);
   assert.match(resolveContextReserve(String(Number.MAX_SAFE_INTEGER + 1), 'DEVICE_RESERVE', defaultContextDeviceReserveBytes).error ?? '', /safe integer/);
 
@@ -86,6 +88,19 @@ export async function runContextEstimateRegression(): Promise<void> {
   assert.equal(parsed.visionPresent, true);
   assert.equal(parsed.unknownReasons.length, 0, 'complete allocation log should not be marked incomplete');
 
+  const q8AllocationLog = allocationLog
+    .replaceAll('K (f16): 1024 MiB, V (f16): 1024 MiB', 'K (q8_0): 512 MiB, V (q8_0): 512 MiB')
+    .replaceAll('K (f16): 64 MiB, V (f16): 64 MiB', 'K (q8_0): 32 MiB, V (q8_0): 32 MiB')
+    .replace('CUDA0 KV buffer size = 2048.00 MiB', 'CUDA0 KV buffer size = 1024.00 MiB')
+    .replace('size = 2048.00 MiB (32768 cells', 'size = 1024.00 MiB (32768 cells')
+    .replace('CUDA0 KV buffer size = 128.00 MiB', 'CUDA0 KV buffer size = 64.00 MiB')
+    .replace('size = 128.00 MiB (32768 cells', 'size = 64.00 MiB (32768 cells');
+  const q8Parsed = parseLlamaAllocationLog(q8AllocationLog);
+  assert.equal(q8Parsed.kvTypeK, 'q8_0');
+  assert.equal(q8Parsed.speculativeKvTypeK, 'q8_0');
+  assert.equal(q8Parsed.allocations.kv.device, 1024 * 1024 ** 2);
+  assert.equal(q8Parsed.unknownReasons.length, 0, 'complete Q8 allocation evidence was not accepted');
+
   const response = await collectRuntimeContextEstimate({
     backend: 'llama-cpp',
     modelId: runtime.modelId,
@@ -93,12 +108,63 @@ export async function runContextEstimateRegression(): Promise<void> {
     contextPresets: [16_384, 32_768, 65_536, 131_072],
     hardware,
     runtime,
-    hostReserveBytes: 8 * 1024 ** 3,
-    deviceReserveBytes: 4 * 1024 ** 3,
+    hostReserveBytes: defaultContextHostReserveBytes,
+    deviceReserveBytes: defaultContextDeviceReserveBytes,
   }, async () => ({ text: allocationLog }));
   assert.equal(response.status, 'estimated');
   assert.equal(response.observedContextTokens, 32_768);
-  assert.equal(response.hardwareSafeTokens, 32_768, 'safe result must be bounded to the successfully loaded context');
+  assert(response.hardwareSafeTokens !== null && response.hardwareSafeTokens > 32_768, 'measured allocation evidence should discover beyond the loaded context');
+  assert.equal(response.hardwareSafeTokens! % 4_096, 0, 'discovered context must be a valid runtime bucket');
+  assert.deepEqual(response.memoryHeadroom, {
+    hostBytes: hardware.ramTotalBytes - hardware.ramUsedBytes,
+    deviceBytes: hardware.vramTotalBytes! - hardware.vramUsedBytes!,
+  }, 'discovery diagnostics must report live post-load memory headroom');
+  const q8Response = await collectRuntimeContextEstimate({
+    backend: 'llama-cpp',
+    modelId: runtime.modelId,
+    configuredMaxTokens: 131_072,
+    contextPresets: [16_384, 32_768, 65_536, 131_072],
+    hardware,
+    runtime: { ...runtime, kvCacheType: 'q8_0' },
+    hostReserveBytes: defaultContextHostReserveBytes,
+    deviceReserveBytes: defaultContextDeviceReserveBytes,
+  }, async () => ({ text: q8AllocationLog }));
+  assert.equal(q8Response.status, 'estimated');
+  assert(q8Response.hardwareSafeTokens !== null && q8Response.hardwareSafeTokens > response.hardwareSafeTokens!, 'measured Q8 KV cost should yield a materially larger safe option');
+  const mismatchedPrecision = await collectRuntimeContextEstimate({
+    backend: 'llama-cpp',
+    modelId: runtime.modelId,
+    configuredMaxTokens: 131_072,
+    contextPresets: [16_384, 32_768, 65_536, 131_072],
+    hardware,
+    runtime: { ...runtime, kvCacheType: 'q8_0' },
+    hostReserveBytes: defaultContextHostReserveBytes,
+    deviceReserveBytes: 4 * 1024 ** 3,
+  }, async () => ({ text: allocationLog }));
+  assert.equal(mismatchedPrecision.hardwareSafeTokens, null, 'a cache estimate must not borrow another precision mode allocation log');
+  const mismatchedPlacement = await collectRuntimeContextEstimate({
+    backend: 'llama-cpp',
+    modelId: runtime.modelId,
+    configuredMaxTokens: 131_072,
+    contextPresets: [16_384, 32_768, 65_536, 131_072],
+    hardware,
+    runtime: { ...runtime, kvOffload: false },
+    hostReserveBytes: defaultContextHostReserveBytes,
+    deviceReserveBytes: 4 * 1024 ** 3,
+  }, async () => ({ text: allocationLog }));
+  assert.equal(mismatchedPlacement.hardwareSafeTokens, null, 'a GPU KV allocation log must not support a RAM-placement option');
+  const trainLimit = await collectRuntimeContextEstimate({
+    backend: 'llama-cpp',
+    modelId: runtime.modelId,
+    configuredMaxTokens: 131_072,
+    contextPresets: [16_384, 32_768, 65_536, 131_072],
+    hardware,
+    runtime: { ...runtime, modelTrainContextTokens: 24_576 },
+    hostReserveBytes: defaultContextHostReserveBytes,
+    deviceReserveBytes: 4 * 1024 ** 3,
+  }, async () => ({ text: allocationLog }));
+  assert.equal(trainLimit.configuredMaxTokens, 24_576, 'discovery must honor model train metadata below the configured ceiling');
+  assert(trainLimit.hardwareSafeTokens === null || trainLimit.hardwareSafeTokens <= 24_576);
 
   const minimalRuntimeLog = `
 I srv load_model: loading model '/models/target.gguf'
@@ -112,7 +178,7 @@ I common_speculative_init_result: creating MTP draft context
     contextPresets: [16_384, 32_768, 65_536, 131_072],
     hardware,
     runtime,
-    hostReserveBytes: 8 * 1024 ** 3,
+    hostReserveBytes: defaultContextHostReserveBytes,
     deviceReserveBytes: 4 * 1024 ** 3,
   }, async () => ({ text: minimalRuntimeLog }));
   assert.equal(observedOnly.status, 'observed', 'a working runtime is useful evidence even when projection data is missing');
@@ -127,7 +193,7 @@ I common_speculative_init_result: creating MTP draft context
     contextPresets: [16_384, 32_768, 65_536, 131_072],
     hardware,
     runtime: { ...runtime, activeContextTokens: 65_536 },
-    hostReserveBytes: 8 * 1024 ** 3,
+    hostReserveBytes: defaultContextHostReserveBytes,
     deviceReserveBytes: 4 * 1024 ** 3,
   }, async () => ({ text: allocationLog }));
   assert.equal(oldLogForOtherContext.hardwareSafeTokens, null, '32K allocation evidence was extrapolated to a different loaded context');
@@ -138,7 +204,7 @@ I common_speculative_init_result: creating MTP draft context
     contextPresets: [16_384, 32_768, 65_536, 131_072],
     hardware,
     runtime: { ...runtime, modelPath: '/models/another-model.gguf' },
-    hostReserveBytes: 8 * 1024 ** 3,
+    hostReserveBytes: defaultContextHostReserveBytes,
     deviceReserveBytes: 4 * 1024 ** 3,
   }, async () => ({ text: allocationLog }));
   assert.equal(otherModelWithSameContext.hardwareSafeTokens, null, 'same-context allocation evidence for another model was accepted');

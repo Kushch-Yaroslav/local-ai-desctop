@@ -78,6 +78,14 @@ export async function runDatabaseMigrationRegression(): Promise<void> {
 
     const fresh = new Database(freshPath);
     const freshChat = fresh.createConversation('qwen3.8:27b-q4_K_M');
+    assert.equal(freshChat.llamaKvCacheType, 'f16');
+    assert.equal(freshChat.llamaKvOffload, true);
+    const configuredChat = fresh.updateConversation(freshChat.id, { contextWindow: 73_728, llamaKvCacheType: 'q8_0', llamaKvOffload: false });
+    assert.equal(configuredChat.contextWindow, 73_728, 'custom 4K context selection was not persisted');
+    assert.equal(configuredChat.llamaKvCacheType, 'q8_0', 'KV cache type was not persisted');
+    assert.equal(configuredChat.llamaKvOffload, false, 'KV placement was not persisted');
+    const persistedSelection = fresh.getConversation(freshChat.id)!;
+    assert.deepEqual({ contextWindow: persistedSelection.contextWindow, llamaKvCacheType: persistedSelection.llamaKvCacheType, llamaKvOffload: persistedSelection.llamaKvOffload }, { contextWindow: 73_728, llamaKvCacheType: 'q8_0', llamaKvOffload: false });
     fresh.addMessage(freshChat.id, 'user', 'Поправка, напиши ещё плюсы и минусы.', 'steering-message');
     assert.equal(freshChat.reasoningMode, 'fast', 'new conversations must default to Fast reasoning');
     const response = fresh.addMessage(freshChat.id, 'assistant', 'Measured answer', undefined, [], {

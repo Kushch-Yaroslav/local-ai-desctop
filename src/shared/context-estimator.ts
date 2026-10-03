@@ -38,6 +38,10 @@ export interface RuntimeContextEstimate {
   observedResidentBytes: number | null;
   observedDeviceResidentBytes: number | null;
   hardwareSafeTokens: number | null;
+  activeKvCacheType: string | null;
+  activeKvOffload: boolean | null;
+  memoryBaseline: { hostAvailableBytes: number; deviceAvailableBytes: number } | null;
+  memoryHeadroom: { hostBytes: number; deviceBytes: number } | null;
   status: 'estimated' | 'observed' | 'unknown';
   source: 'live-runtime' | 'startup-log' | 'none';
   unknownReasons: string[];
@@ -54,6 +58,54 @@ export interface RuntimeContextEstimate {
     allocations: Record<'weights' | 'compute' | 'output' | 'kv' | 'speculativeWeights' | 'speculativeCompute' | 'speculativeKv' | 'ssm', Partial<Record<'host' | 'device', number>>>;
     unknownReasons: string[];
   };
+}
+
+export interface ContextDiscoveryOption {
+  modelId: string;
+  contextWindow: number;
+  kvCacheType: 'f16' | 'q8_0';
+  kvOffload: boolean;
+  discoveredAt: string;
+  memoryBaseline: { hostAvailableBytes: number; deviceAvailableBytes: number };
+  measuredHeadroom: { hostBytes: number; deviceBytes: number };
+}
+
+export interface ContextDiscoveryResult {
+  modelId: string;
+  probeContextTokens: number;
+  options: ContextDiscoveryOption[];
+  unsupported: Array<{ kvCacheType: 'f16' | 'q8_0'; reason: string }>;
+  restored: boolean;
+}
+
+export function findFreshContextDiscoveryOption(
+  options: readonly ContextDiscoveryOption[],
+  requested: { modelId: string; contextWindow: number; kvCacheType: 'f16' | 'q8_0'; kvOffload: boolean },
+  now = Date.now(),
+  maxAgeMs = 5 * 60_000,
+): ContextDiscoveryOption | null {
+  return options
+    .filter((option) => {
+      const age = now - Date.parse(option.discoveredAt);
+      return option.modelId === requested.modelId
+        && option.contextWindow >= requested.contextWindow
+        && option.kvCacheType === requested.kvCacheType
+        && option.kvOffload === requested.kvOffload
+        && Number.isFinite(age) && age >= 0 && age <= maxAgeMs;
+    })
+    .sort((left, right) => left.contextWindow - right.contextWindow)[0] ?? null;
+}
+
+export function memoryBaselineWithinTolerance(
+  left: { hostAvailableBytes: number; deviceAvailableBytes: number },
+  right: { hostAvailableBytes: number; deviceAvailableBytes: number },
+  hostToleranceBytes: number,
+  deviceToleranceBytes: number,
+): boolean {
+  return [left.hostAvailableBytes, left.deviceAvailableBytes, right.hostAvailableBytes, right.deviceAvailableBytes, hostToleranceBytes, deviceToleranceBytes]
+    .every((value) => Number.isFinite(value) && value >= 0)
+    && Math.abs(left.hostAvailableBytes - right.hostAvailableBytes) <= hostToleranceBytes
+    && Math.abs(left.deviceAvailableBytes - right.deviceAvailableBytes) <= deviceToleranceBytes;
 }
 
 const requiredByteFields = [

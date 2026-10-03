@@ -5,6 +5,7 @@ import { getModelProfile, maxOutputTokens, modelInfo, outputBudget, outputSafety
 import { llamaContextPresets, llamaRuntimeInstalled, llamaRuntimeProfile, llamaRuntimeProfiles } from '../models/llama-runtime-policy';
 import type { ContextWindow } from './ollama-backend';
 import { log } from '../services/logger';
+import type { LlamaKvCacheType } from '../../shared/types';
 
 type NativeToolCall = { index?: number; id?: string; type?: string; function?: { name?: string; arguments?: string } };
 type Choice = { finish_reason?: string | null; message?: { content?: string | null; reasoning_content?: string | null; tool_calls?: NativeToolCall[] }; delta?: { content?: string | null; reasoning_content?: string | null; tool_calls?: NativeToolCall[] } };
@@ -108,6 +109,8 @@ export class LlamaCppBackend implements LlmBackend, ToolCallingBackend {
   private contextLimit: number;
   private visionEnabled: boolean;
   private runtimeModelId: string;
+  private kvCacheType: LlamaKvCacheType = 'f16';
+  private kvOffload = true;
   /** Avoid a second input_tokens request after context management just counted it. */
   private readonly preparedInputTokens = new WeakMap<object, { tools: unknown[] | undefined; reasoningMode: ReasoningMode; tokens: number }>();
   constructor(private readonly baseUrl = 'http://127.0.0.1:8081', contextLimit = 32_768, visionEnabled = true, runtimeModelId = qwenModel) {
@@ -117,11 +120,14 @@ export class LlamaCppBackend implements LlmBackend, ToolCallingBackend {
   }
   private url(path: string): string { return `${this.baseUrl.replace(/\/$/, '')}${path}`; }
   supportsReasoning(model: string): boolean { return model === qwenModel || model === glmFlashModel; }
-  updateRuntimeSelection(model: string, contextLimit: number): void {
+  updateRuntimeSelection(model: string, contextLimit: number, kvCacheType: LlamaKvCacheType = 'f16', kvOffload = true): void {
     const runtime = llamaRuntimeProfiles.find((candidate) => candidate.id === model);
-    if (!runtime || !llamaContextPresets(model).includes(contextLimit)) throw new Error('llama.cpp runtime selection is unsupported');
+    if (!runtime || !Number.isSafeInteger(contextLimit) || contextLimit < 4_096 || contextLimit > runtime.maxContext || contextLimit % 4_096 !== 0) throw new Error('llama.cpp runtime selection is unsupported');
+    if (kvCacheType !== 'f16' && kvCacheType !== 'q8_0') throw new Error('llama.cpp KV cache type is unsupported');
     this.runtimeModelId = model;
     this.contextLimit = contextLimit;
+    this.kvCacheType = kvCacheType;
+    this.kvOffload = kvOffload;
     this.visionEnabled = runtime.vision;
   }
 
@@ -169,6 +175,8 @@ export class LlamaCppBackend implements LlmBackend, ToolCallingBackend {
       ...(modelPath ? { modelPath } : {}),
       ...(typeof modelTrainContextTokens === 'number' && Number.isSafeInteger(modelTrainContextTokens) && modelTrainContextTokens > 0 ? { modelTrainContextTokens } : {}),
       ...(typeof modelFileSizeBytes === 'number' && Number.isFinite(modelFileSizeBytes) && modelFileSizeBytes >= 0 ? { modelFileSizeBytes } : {}),
+      kvCacheType: this.kvCacheType,
+      kvOffload: this.kvOffload,
     };
   }
   async supportsVision(model: string): Promise<boolean> { return model === qwenModel && this.runtimeModelId === qwenModel && this.visionEnabled; }
