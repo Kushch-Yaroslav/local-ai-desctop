@@ -268,7 +268,7 @@ I common_speculative_init_result: creating MTP draft context
   assert.deepEqual(invalidReserve.unknownReasons, ['LOCAL_AI_CONTEXT_HOST_RESERVE_BYTES is invalid']);
 
   const noRuntime = await collectRuntimeContextEstimate({
-    backend: 'ollama',
+    backend: 'llama-cpp',
     modelId: 'not-loaded',
     configuredMaxTokens: 131_072,
     contextPresets: [16_384, 32_768],
@@ -277,7 +277,7 @@ I common_speculative_init_result: creating MTP draft context
   });
   assert.equal(noRuntime.status, 'unknown');
   assert.equal(noRuntime.observedContextTokens, null);
-  assert(noRuntime.unknownReasons.some((reason) => reason.includes('Ollama')));
+  assert(noRuntime.unknownReasons.some((reason) => reason.includes('active runtime context is not reported')));
 }
 
 if (require.main === module) void runContextEstimateRegression();

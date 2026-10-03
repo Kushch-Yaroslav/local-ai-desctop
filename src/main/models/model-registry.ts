@@ -1,7 +1,6 @@
-import type { ModelInfo, ReasoningMode } from '../../shared/types';
+import type { ModelInfo } from '../../shared/types';
 
 export const contextPresets = [16_384, 32_768, 65_536, 131_072, 262_144] as const;
-export const ollamaModelsPath = '/media/yaroslav/DATA/ollama';
 
 export type ModelProfile = {
   id: string;
@@ -35,7 +34,7 @@ export function modelInfo(profile: ModelProfile, installed: boolean, size?: numb
     id: profile.id,
     name: profile.displayName,
     size,
-    backend: 'ollama',
+    backend: 'llama-cpp',
     installed,
     quantization: profile.quantization,
     maxContext: supportedMaxContext,
@@ -52,15 +51,4 @@ export const outputSafetyReserveTokens = 512;
 
 export function outputBudget(contextWindow: number, inputTokens: number): number {
   return Math.min(maxOutputTokens, Math.max(0, contextWindow - inputTokens - outputSafetyReserveTokens));
-}
-
-/** Ollama advertises native reasoning support in `/api/tags` capabilities. */
-export function supportsOllamaReasoning(capabilities: readonly string[] | undefined): boolean {
-  return capabilities?.includes('thinking') === true;
-}
-
-/** Maps the UI control to Ollama's documented native `think` parameter. */
-export function ollamaReasoning(mode: ReasoningMode, capabilities: readonly string[] | undefined): boolean | string | undefined {
-  if (!supportsOllamaReasoning(capabilities) || mode === 'auto') return undefined;
-  return mode === 'fast' ? 'low' : 'high';
 }

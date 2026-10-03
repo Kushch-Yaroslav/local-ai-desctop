@@ -121,7 +121,7 @@ export async function runDatabaseMigrationRegression(): Promise<void> {
       activeMilestoneId: 'milestone-1',
       revision: 3,
       modelTodo: { phases: [{ name: 'Work', items: [{ id: 'todo-1', content: 'Investigate GLM context bug', status: 'completed' as const, memoryId: 'tm-001' }, { id: 'todo-2', content: 'Implement GLM context fix', status: 'in_progress' as const }, { id: 'todo-3', content: 'Verify GLM fix', status: 'pending' as const }] }] },
-      taskMemory: { entries: [{ id: 'tm-001', finding: 'summarize_span Ollama request omitted num_ctx', evidence: 'rust-agent/src/agent/loop_runtime.rs / summarize_span', implication: 'Ollama can reload the runner using model-native context', next: 'patch the request and add regression coverage' }] },
+      taskMemory: { entries: [{ id: 'tm-001', finding: 'summary requests omitted the configured context', evidence: 'rust-agent/src/agent/loop_runtime.rs / summary_payload', implication: 'the summary request could use a smaller server default window', next: 'preserve the selected context in every request phase' }] },
     };
     fresh.addAnalysisAction(persistedRun.id, { id: 'plan-update', label: 'Планирование', kind: 'planning', state: 'completed', plan: finalPlan, metadata: { steps: 2, completed_steps: 1 } });
     const actionCountedRun = fresh.addAnalysisAction(persistedRun.id, { id: 'context-1', label: 'Контекст оптимизирован', detail: '26 151 → 18 028 токенов', kind: 'context', state: 'completed', metadata: { context_window: 32_768, input_tokens_before: 26_151, input_tokens_after: 18_028, compacted_messages: 13, compacted_tool_results: 6, compaction_count: 1 } });

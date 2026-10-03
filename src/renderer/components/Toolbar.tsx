@@ -14,12 +14,10 @@ export function Toolbar() {
   const [discoveryError, setDiscoveryError] = useState<string | null>(null);
   const [discoveryStage, setDiscoveryStage] = useState('');
   const [currentVramBudget, setCurrentVramBudget] = useState<import('../../shared/vram-budget').VramBudget | undefined>();
-  const pollsRuntime = settings?.selectedBackend === 'llama-cpp';
   useEffect(() => {
-    if (!pollsRuntime) return undefined;
     const timer = window.setInterval(() => void refreshRuntime(), 4_000);
     return () => window.clearInterval(timer);
-  }, [pollsRuntime, refreshRuntime]);
+  }, [refreshRuntime]);
   const chat = conversations.find((item) => item.id === activeId);
   const selectedModel = models.find((model) => model.id === chat?.modelId) ?? models[0];
   const selectedModelId = chat ? chat.modelId ?? selectedModel?.id ?? null : null;
@@ -31,14 +29,13 @@ export function Toolbar() {
       .then((value) => { if (current) setEstimateResponse({ modelId: selectedModelId, value }); })
       .catch((error: unknown) => { if (current) setEstimateResponse({ modelId: selectedModelId, error: error instanceof Error ? error.message : String(error) }); });
     return () => { current = false; };
-  }, [selectedModelId, settings?.selectedBackend, settings?.llamaRuntime?.status, settings?.llamaRuntime?.modelId, settings?.llamaRuntime?.contextWindow, settings?.llamaRuntime?.kvCacheType, settings?.llamaRuntime?.kvOffload]);
+  }, [selectedModelId, settings?.llamaRuntime?.status, settings?.llamaRuntime?.modelId, settings?.llamaRuntime?.contextWindow, settings?.llamaRuntime?.kvCacheType, settings?.llamaRuntime?.kvOffload]);
   useEffect(() => {
     setDiscovery(null);
     setDiscoveryError(null);
     setCurrentVramBudget(undefined);
-  }, [selectedModelId, settings?.selectedBackend]);
+  }, [selectedModelId]);
   useEffect(() => {
-    if (!pollsRuntime) return undefined;
     let current = true;
     const poll = async () => {
       try {
@@ -58,15 +55,14 @@ export function Toolbar() {
     void poll();
     const timer = window.setInterval(() => void poll(), 2_000);
     return () => { current = false; window.clearInterval(timer); };
-  }, [pollsRuntime, selectedModelId]);
+  }, [selectedModelId]);
   if (!chat) return null;
   const chooseDirectory = async (slot: 1 | 2, currentDirectory: string | null) => { const directory = await window.localAi.dialog.chooseDirectory(currentDirectory); if (directory) await updateConversation(chat.id, slot === 1 ? { workingDirectory: directory } : { secondaryWorkingDirectory: directory }); };
   const contextLabel = `${Math.round((activeContextWindow ?? chat.contextWindow) / 1024)}K`;
   const contextEstimate = estimateResponse?.modelId === selectedModelId ? estimateResponse.value : undefined;
   const projectSelector = (slot: 1 | 2, directory: string | null) => <div className={`directory project-selector project-${slot}`}><FolderOpen size={16} /><button title={directory ?? undefined} onClick={() => void chooseDirectory(slot, directory)}>{directory ? projectDirectoryName(directory) : `Project ${slot}: не выбран`}</button>{directory && <button className="icon-button" aria-label={`Убрать Project ${slot}`} onClick={() => void updateConversation(chat.id, slot === 1 ? { workingDirectory: null } : { secondaryWorkingDirectory: null })}><X size={14} /></button>}</div>;
   const llama = settings?.llamaRuntime;
-  const runtimeLabel = settings?.selectedBackend !== 'llama-cpp' ? 'Ollama'
-    : !llama || llama.status === 'ready' ? settings.llamaRuntimeModelId === 'gpt-oss:20b' ? 'llama.cpp · EAGLE-3' : settings.llamaRuntimeModelId === 'qwen3.8:27b-q4_K_M' ? 'llama.cpp · MTP' : 'llama.cpp'
+  const runtimeLabel = !llama || llama.status === 'ready' ? 'llama.cpp'
       : llama.status === 'switching' || llama.status === 'starting' ? 'llama.cpp · запуск модели…'
         : 'llama.cpp · не запущен';
   const missingEstimate = contextEstimate?.unknownReasons.join(', ') ?? '';
@@ -104,10 +100,10 @@ export function Toolbar() {
       <div className="monitoring-row" aria-label="Мониторинг runtime">
         <Hardware value={hardware} />
         <span className="backend-indicator">{runtimeLabel}</span>
-        {settings?.selectedBackend === 'llama-cpp' && <button className="context-discover" disabled={discoveryLoading || !selectedModelId || isGenerating} onClick={() => void discoverMaximum()}>{discoveryLoading ? 'Идёт проверка…' : 'Найти Max Context'}</button>}
+        <button className="context-discover" disabled={discoveryLoading || !selectedModelId || isGenerating} onClick={() => void discoverMaximum()}>{discoveryLoading ? 'Идёт проверка…' : 'Найти Max Context'}</button>
         {discoveryLoading && <span role="status">{discoveryStage || 'llama.cpp будет перезапущен несколько раз…'}</span>}
         <details className="context-estimate">
-          <summary>Max Context: {settings?.selectedBackend === 'llama-cpp' ? maxContextLabel : 'runtime не измеряет KV'}</summary>
+          <summary>Max Context: {maxContextLabel}</summary>
           <div className="context-estimate-details">
             <p>Обычные варианты контекста — возможности модели/backend, не гарантия наличия памяти. Max Context добавляет варианты FP16/Q8: ограниченный поиск по реальным запускам, health check и inference, с запасом RAM/VRAM. llama.cpp перезапускается несколько раз; исходный runtime восстанавливается. Это граница безопасного поиска, а не абсолютный OOM-предел.</p>
             <p><span>Найдено</span><b>{maxContextLabel}</b></p>
@@ -132,7 +128,7 @@ export function Toolbar() {
       </div>
       <div className="toolbar-controls">
         <label className="control"><span>Модель</span><select disabled={discoveryLoading} value={chat.modelId ?? ''} onChange={(event) => void updateConversation(chat.id, { modelId: event.target.value || null }).catch(() => undefined)}><option value="">Выберите модель</option>{models.map((model) => <option value={model.id} key={model.id} disabled={!model.installed}>{model.name}{model.installed ? '' : ' · не установлена'}</option>)}</select></label>
-        <label className="control"><span>Контекст · {contextLabel}</span><select disabled={discoveryLoading} value={selectedContextOption ? contextChoiceId(selectedContextOption) : ''} onChange={(event) => { const option = contextOptions.find((candidate) => contextChoiceId(candidate) === event.target.value); if (option) void updateConversation(chat.id, { contextWindow: option.contextWindow, ...(settings?.selectedBackend === 'llama-cpp' ? { llamaKvCacheType: option.kvCacheType, llamaKvOffload: option.kvOffload } : {}) }).catch(() => undefined); }}>{contextOptions.map((option) => <option value={contextChoiceId(option)} key={contextChoiceId(option)}>{option.label}</option>)}</select></label>
+        <label className="control"><span>Контекст · {contextLabel}</span><select disabled={discoveryLoading} value={selectedContextOption ? contextChoiceId(selectedContextOption) : ''} onChange={(event) => { const option = contextOptions.find((candidate) => contextChoiceId(candidate) === event.target.value); if (option) void updateConversation(chat.id, { contextWindow: option.contextWindow, llamaKvCacheType: option.kvCacheType, llamaKvOffload: option.kvOffload }).catch(() => undefined); }}>{contextOptions.map((option) => <option value={contextChoiceId(option)} key={contextChoiceId(option)}>{option.label}</option>)}</select></label>
         {selectedModel?.supportsReasoning && <label className="control"><span>Рассуждение</span><select value={chat.reasoningMode === 'deep' ? 'deep' : 'fast'} onChange={(event) => void updateConversation(chat.id, { reasoningMode: event.target.value as 'fast' | 'deep' })}><option value="fast">Быстро</option><option value="deep">Глубоко</option></select></label>}
         <label className="control"><span>Web</span><select value={chat.webMode} onChange={(event) => void updateConversation(chat.id, { webMode: event.target.value as 'off' | 'auto' })}><option value="off">Off</option><option value="auto">Auto</option></select></label>
         <label className="control"><span>Режим</span><select value={chat.mode} onChange={(event) => void updateConversation(chat.id, { mode: event.target.value as 'chat' | 'agent' })}><option value="chat">Чат</option><option value="agent">Агент</option></select></label>

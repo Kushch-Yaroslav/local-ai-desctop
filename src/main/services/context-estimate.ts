@@ -24,7 +24,7 @@ export interface LlamaAllocationLog {
 }
 
 export interface ContextEstimateRequest {
-  backend: 'ollama' | 'llama-cpp';
+  backend: 'llama-cpp';
   modelId: string;
   configuredMaxTokens: number;
   contextPresets: number[];
@@ -392,9 +392,6 @@ export async function collectRuntimeContextEstimate(
   };
   if (request.reserveErrors?.length) {
     return { ...base, unknownReasons: [...request.reserveErrors] };
-  }
-  if (request.backend !== 'llama-cpp') {
-    return { ...base, unknownReasons: ['Ollama does not expose KV allocation, KV precision, slot allocation, or memory reserves needed for context extrapolation'] };
   }
   if (!observed) {
     return { ...base, unknownReasons: ['active runtime context is not reported for this model; startup log alone does not prove it is currently loaded'] };

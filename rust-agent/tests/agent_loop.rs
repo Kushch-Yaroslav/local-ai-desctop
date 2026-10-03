@@ -295,6 +295,7 @@ impl Workspace {
             context_limit: 65_536,
             reasoning_mode: "fast".into(),
             supports_reasoning: true,
+            reasoning_options: None,
             policy: RunPolicy::Auto,
             history: Vec::new(),
             evidence_dir: Some(self.base.join("evidence").to_string_lossy().into_owned()),

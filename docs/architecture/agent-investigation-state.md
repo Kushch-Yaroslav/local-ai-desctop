@@ -105,9 +105,8 @@ state what remained unexamined.
   are recoverable by observation ID), clamped in the middle if still too long.
   It previously stopped at the first message that exceeded the budget, so after
   a burst of large results the summary never saw most of the span.
-- **The summary request uses the run's protocol options** (context size,
-  reasoning off). On Ollama a request without `num_ctx` is truncated to the
-  server default and reloads the model.
+- **The summary request uses the run's protocol options** (context size and
+  model-specific finalization controls).
 
 ## Provider contract (what the model is shown, and what comes back)
 
@@ -115,9 +114,9 @@ state what remained unexamined.
   own reasoning (`reasoning_content`) next to its content and tool calls, as the
   provider streamed it. A turn that produced only reasoning is recorded too, so
   a retry continues from it instead of regenerating it. Whether the field is
-  sent is a projection decision: OpenAI-compatible endpoints receive
-  `reasoning_content`, native Ollama receives `thinking`, and a provider
-  without reasoning receives neither. Thinking chat templates (GLM-4.7, Qwen3.x)
+  sent is   a projection decision: the OpenAI-compatible llama.cpp endpoint receives
+  `reasoning_content`, and a model without reasoning support receives neither.
+  Thinking chat templates (GLM-4.7, Qwen3.x)
   render prior reasoning back into the prompt; a history without it is rendered
   with empty or bare-`</think>` assistant turns and the model re-derives its plan
   on every step. This matches Jan (`send_reasoning`, default on) and Qwen-Agent

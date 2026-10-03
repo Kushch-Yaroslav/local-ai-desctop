@@ -81,6 +81,24 @@ export async function runLlamaCppBackendRegression(): Promise<void> {
       const models = await backend.getModels();
       assert.deepEqual(models.find((item) => item.id === model)?.supportedContextPresets, [16384, 32768, 65536, 131072, 262144], 'loaded 16K must not redefine model capability');
       assert.deepEqual(models.find((item) => item.id === 'glm-4.7-flash:q4_k')?.supportedContextPresets, [16384, 32768, 65536, 131072], 'GLM normal options were truncated by an active runtime or another model');
+      const gptOss = models.find((item) => item.id === 'gpt-oss:20b');
+      assert(gptOss, 'GPT-OSS was not included in the llama.cpp model registry');
+      assert.equal(gptOss.backend, 'llama-cpp');
+      assert.equal(gptOss.supportsTools, true);
+      assert.equal(gptOss.supportsReasoning, true);
+      assert.deepEqual(gptOss.supportedContextPresets, [16384, 32768, 65536, 131072]);
+    } finally { await stop(server); }
+  }
+  {
+    const scenario: Scenario = { requestBodies: [], countBodies: [] }; const { server, url } = await startServer(scenario);
+    try {
+      const backend = new LlamaCppBackend(url, 32_768, false, 'gpt-oss:20b');
+      assert.equal(backend.supportsReasoning('gpt-oss:20b'), true);
+      assert.equal(await backend.supportsVision('gpt-oss:20b'), false);
+      await backend.chatWithTools('gpt-oss:20b', baseMessages(), toolSchema, new AbortController().signal, 32_768, 'deep');
+      assert.equal(scenario.requestBodies[0]?.reasoning_effort, 'high', 'GPT-OSS Deep request did not use its profile reasoning capability');
+      assert.equal(scenario.requestBodies[0]?.tools instanceof Array, true, 'GPT-OSS request did not retain the tool schema');
+      assert.equal(scenario.requestBodies[0]?.chat_template_kwargs, undefined, 'GPT-OSS request received unrelated template-specific parameters');
     } finally { await stop(server); }
   }
   {

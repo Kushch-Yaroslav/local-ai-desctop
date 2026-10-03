@@ -30,7 +30,7 @@ export interface ContextEstimatorResult {
 
 export interface RuntimeContextEstimate {
   vramBudget?: import('./vram-budget').VramBudget;
-  backend: 'ollama' | 'llama-cpp';
+  backend: 'llama-cpp';
   modelId: string;
   configuredMaxTokens: number | null;
   modelTrainContextTokens: number | null;

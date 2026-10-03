@@ -1,6 +1,6 @@
 # Local AI Desktop
 
-Локальный AI-клиент для Linux. Русскоязычный интерфейс чата и локального агента для моделей Ollama и llama.cpp; облачное API не требуется, весь инференс выполняется на собственной машине.
+Локальный AI-клиент для Linux. Русскоязычный интерфейс чата и локального агента на launcher-managed llama.cpp; облачное API не требуется, весь инференс выполняется на собственной машине.
 
 ## Запуск
 
@@ -16,18 +16,17 @@ env NPM_CONFIG_CACHE="$PWD/local-cache/npm" npm run build
 env NPM_CONFIG_CACHE="$PWD/local-cache/npm" npm start
 ```
 
-На рабочем столе доступны три ярлыка; их запускные скрипты не используют системные каталоги для кэша приложения:
+На рабочем столе доступен стандартный ярлык, который запускает управляемый приложением `llama-server`. Запускной скрипт также доступен напрямую:
 
-- **Local AI Desktop** — стандартный запуск, использует сервис Ollama. Скрипт: `run-local-ai-desktop.sh`.
-- **Local AI Desktop — llama.cpp** — один launcher-managed `llama-server`; Qwen использует MTP, а модель выбирается внутри приложения.
+- **Local AI Desktop** — один launcher-managed `llama-server`; Qwen использует MTP, а модель выбирается внутри приложения. Скрипт: `run-local-ai-desktop.sh`.
 
-Перед началом диалога через Ollama запустите сервис Ollama. Ollama хранит веса через `OLLAMA_MODELS=/media/yaroslav/DATA/ollama`, GGUF для llama.cpp лежат в `/media/yaroslav/DATA/llama-models`; модель и backend выбираются внутри приложения. Qwen обрабатывает изображения нативно; выбранная модель без vision capability возвращает контролируемую ошибку без скрытой fallback-модели.
+GGUF для llama.cpp располагаются в `/media/yaroslav/DATA/llama-models`; установленная модель и контекст выбираются внутри приложения. Qwen обрабатывает изображения нативно; выбранная модель без vision capability возвращает контролируемую ошибку без скрытой fallback-модели.
 
 ## Что реализовано
 
 - Тёмный интерфейс на русском: список чатов сгруппирован по дате создания, у каждого диалога показана выбранная модель; доступны создание, переименование и удаление.
 - История чатов в SQLite, Markdown, подсветка синтаксиса и копирование блоков кода. Для каждого диалога сохраняются дата создания, модель и последнее фактическое использование контекста.
-- Реестр трёх локальных моделей: Qwen3.8-27B и gpt-oss-20b (Ollama), GLM-4.7-Flash (llama.cpp) — с человекочитаемыми именами, проверкой установки, точными квантованиями и динамическими пресетами контекста (от 16K до 256K в зависимости от модели).
+- Реестр локальных GGUF-моделей для llama.cpp: Qwen3.8-27B, gpt-oss-20b и GLM-4.7-Flash — с человекочитаемыми именами, проверкой установки, точными квантованиями и динамическими пресетами контекста (от 16K до 256K в зависимости от модели). GPT-OSS Agent+Deep пока не прошёл проверку надёжности; см. [статус валидации](docs/validation/llama-only-gpt-oss-status.md).
 - Потоковая выдача, отмена генерации, выгрузка предыдущей модели при переключении, запоминание модели, режима и рабочей папки для каждого чата.
 - Один inference run принадлежит main process, а не открытому чату. Переход в другой чат или создание нового не останавливает Agent; sidebar отмечает выполняющийся чат, а возврат восстанавливает текущие reasoning/tool/answer события. Второй запуск блокируется до завершения первого; настройки runtime, Edit/Regenerate и удаление активного чата также защищены.
 - Во время Agent run текстовое «Уточнить» принимается без отмены inference и передаётся на следующей границе model turn. UI различает принятие и передачу модели; SQLite сохраняет пользовательское уточнение, а canonical Rust journal — его точное место среди tools/model turns. В Chat уточнения, вложения и @-ссылки во время генерации не принимаются: дождитесь ответа или остановите его.
@@ -44,7 +43,7 @@ env NPM_CONFIG_CACHE="$PWD/local-cache/npm" npm start
 - Переключатель `Web: Off / Auto` настраивается для каждого диалога. В Auto локальная модель получает read-only web-инструменты: поиск, открытие и чтение страниц, переход по ссылкам и возврат назад.
 - Каждая генерация имеет собственный ID и AbortController. Stop отменяет inference, web-session, agent loop и terminal process group; запоздалые события старой генерации игнорируются. Пользовательские сообщения можно редактировать: downstream история удаляется и ответ создаётся заново.
 - Обновление RAM и показателей NVIDIA через лёгкий опрос `nvidia-smi` каждые две секунды. Когда драйвер или `nvidia-smi` недоступны, остаётся мониторинг RAM и понятный статус GPU.
-- Верхняя панель разделяет вторичный runtime monitoring (RAM, VRAM, GPU и скорость generation) и основные controls. Скорость ответа после завершения берётся из `eval_count / eval_duration` Ollama; tooltip показывает доступные prompt/eval counters и TTFT. Во время streaming приложение не оценивает tokens по символам и ждёт authoritative runtime metric.
+- Верхняя панель разделяет вторичный runtime monitoring (RAM, VRAM, GPU и скорость generation) и основные controls. Скорость ответа после завершения берётся из метрик llama.cpp; tooltip показывает доступные prompt/eval counters и TTFT. Во время streaming приложение не оценивает tokens по символам и ждёт authoritative runtime metric.
 - Изолированный Electron renderer: `contextIsolation`, отключённый `nodeIntegration`, типизированный preload IPC. Доступ к SQLite, выбору папки, процессам и мониторингу остаётся в main process.
 
 ## Версии и этапы развития
@@ -67,13 +66,13 @@ Long-term Experience / Memory рассматривается позже как �
 
 | Интерфейс | Бэкенд | Идентификатор | Точность | Контексты в UI |
 | --- | --- | --- | --- | --- |
-| Qwen3.8-27B | Ollama | `qwen3.8:27b-q4_K_M` | Q4_K_M | 16K, 32K, 64K, 128K, 256K |
-| gpt-oss-20b | Ollama | `gpt-oss:20b` | нативные MXFP4 MoE-веса и BF16-тензоры | 16K, 32K, 64K, 128K |
-| GLM-4.7-Flash | llama.cpp | `glm-4.7-flash:q4_k` | Q4_K | 16K, 32K, 64K |
+| Qwen3.8-27B | llama.cpp | `qwen3.8:27b-q4_K_M` | Q4_K_M | 16K, 32K, 64K, 128K, 256K |
+| gpt-oss-20b (experimental) | llama.cpp | `gpt-oss:20b` | MXFP4 MoE | 16K, 32K, 64K, 128K |
+| GLM-4.7-Flash | llama.cpp | `glm-4.7-flash:q4_k` | Q4_K | 16K, 32K, 64K, 128K |
 
-Все три модели поддерживают инструменты и рассуждения. GLM-4.7-Flash работает на `llama-server` с нативным chat template, reasoning и OpenAI-совместимым tool calling.
+Для Qwen и GLM ранее проверялись llama.cpp сценарии; полный cross-model регрессионный набор на этом feature snapshot ещё не запускался. Для gpt-oss-20b подтверждены прямые Chat, streaming и tool roundtrip, но Agent+Deep выдал неподтверждённые ссылки на исходный код; модель остаётся экспериментальной и не считается надёжно проверенной для Agent. Она использует официальный `ggml-org/gpt-oss-20b-GGUF` файл `gpt-oss-20b-MXFP4.gguf`; launcher проверяет его наличие по пути `/media/yaroslav/DATA/llama-models/gpt-oss-20b-MXFP4.gguf` и не требует отдельной speculative-модели. Все профили работают через `llama-server` с нативными chat templates и OpenAI-совместимым tool calling. Статус, точные результаты и оставшиеся проверки: [GPT-OSS / llama-only validation status](docs/validation/llama-only-gpt-oss-status.md).
 
-Контекст передаётся Ollama на каждый запрос как `num_ctx`, а для llama.cpp приложение сверяет его с `n_ctx`, которые отдал `llama-server`. Output budget не зависит от Reasoning: для каждого запроса он составляет до 32K токенов и ограничивается фактически оставшимся местом context window с запасом 512 токенов. Перед каждым inference приложение делает однотокенный preflight через Ollama и получает фактический `prompt_eval_count`; для llama.cpp output budget резервируется до старта генерации. Если backend поддерживает независимый reasoning control, UI показывает `Fast` и `Deep`: Qwen3.8 и gpt-oss используют Ollama `think`, GLM-4.7-Flash через llama.cpp — `reasoning_effort` и `enable_thinking`. Для каждой генерации SQLite сохраняет reasoning mode, запрошенный и effective output, context/input tokens, число agent steps и finish reason.
+Контекст приложения сверяется с `n_ctx`, который сообщает активный `llama-server`. Output budget не зависит от Reasoning: для каждого запроса он составляет до 32K токенов и ограничивается фактически оставшимся местом context window с запасом 512 токенов; llama.cpp tokenizer preflight и backend usage метрики учитываются до и после генерации. Если модель поддерживает независимое управление reasoning, UI показывает `Fast` и `Deep`; профили передают соответствующие reasoning/template параметры и параметры итогового ответа, включая при Agent synthesis. Для каждой генерации SQLite сохраняет reasoning mode, запрошенный и effective output, context/input tokens, число agent steps и finish reason.
 
 Agent action budget — это soft budget на один generationId: базовый лимит 100 действий. Если задача продолжает продвигаться и не упирается в застой, бюджет расширяется шагами по 50, до абсолютного потолка 250 действий. При завершении плана или отсутствии прогресса у границы лимита агент не расширяет бюджет, а переходит к завершению работы.
 
@@ -89,7 +88,7 @@ Web работает через `playwright-core` и установленный 
 
 ![Схема приложения и roadmap](assets/content/1.png)
 
-**1 — Схема приложения и roadmap.** Стек от UI к инференсу: Request/Context Builder → Working Memory/Context Manager → Agent Orchestrator (Planning, Task Notes, Control Logic) → Tools (Files, Terminal, Web, Safety) → Multimodal → Ollama / llama.cpp, плюс SQLite и planned-компоненты (MCP, Long-term Memory).
+**1 — Схема приложения и roadmap.** Стек от UI к инференсу: Request/Context Builder → Working Memory/Context Manager → Agent Orchestrator (Planning, Task Notes, Control Logic) → Tools (Files, Terminal, Web, Safety) → Multimodal → llama.cpp, плюс SQLite и planned-компоненты (MCP, Long-term Memory).
 
 ![Пустой чат, общий интерфейс](assets/content/2.png)
 
@@ -138,9 +137,9 @@ Web работает через `playwright-core` и установленный 
 
 Для изолированных проверок `LOCAL_AI_RUNTIME_ROOT=/absolute/test/runtime` переопределяет SQLite, attachments, logs и Electron user data, не затрагивая runtime основного checkout. Rust executable по умолчанию выбирается относительно текущего worktree; `LOCAL_AI_AGENT_RUNTIME` позволяет указать его явно. Навигация не является Stop; закрытие приложения по-прежнему отменяет активный run.
 
-Интерфейс `LlmBackend` поддерживает Ollama и launcher-managed `llama-server`. Ярлык **Local AI Desktop — llama.cpp MTP** запускает собственный Qwen server с `draft-mtp`, ждёт его health check и завершает только PID, который создал сам. Он использует символические имена на существующие Ollama GGUF blobs, не создавая вторую копию модели.
+Интерфейс `LlmBackend` подключён к единственному inference runtime — launcher-managed `llama-server`. Ярлык запускает выбранную модель, ждёт health check и завершает только собственный PID. Qwen использует `draft-mtp`; GLM и GPT-OSS запускаются без speculative-моделей.
 
-Ярлык **Local AI Desktop — GLM-4.7-Flash** запускает официальный `ggml-org/GLM-4.7-Flash-GGUF` в квантизации `Q4_K` (18,244,193,920 байт) на `llama.cpp` с контекстом 65,536 токенов. Для GLM включаются его нативный Jinja chat template, reasoning и OpenAI-compatible native tool calling; Qwen MTP и Ollama-модели используют прежние параметры.
+GPT-OSS использует официальный MXFP4 GGUF с embedded Jinja chat template, llama.cpp reasoning parsing и OpenAI-compatible tool calling. Qwen сохраняет vision и MTP; GLM сохраняет свой нативный Jinja template и reasoning controls.
 
 SQLite хранит полную историю, а не KV-кэш модели. Поэтому сессии не создают отдельных постоянных контекстов в VRAM: при переключении чата для запроса передаётся сохранённая история активного чата. Это позволяет в дальнейшем держать загруженным только один inference context/model одновременно.
 

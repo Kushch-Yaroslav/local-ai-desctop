@@ -185,7 +185,7 @@ export const useAppStore = create<State>((rawSet, rawGet) => {
     const { activeId, conversations, messages, models } = get();
     if (!activeId || (!content.trim() && files.length === 0)) return;
     const chat = conversations.find((item) => item.id === activeId); const model = chat?.modelId ?? models[0]?.id;
-    if (!model) { set({ error: 'Нет доступных моделей. Запустите Ollama и загрузите модель.' }); return; }
+    if (!model) { set({ error: 'Нет доступных моделей. Установите GGUF и запустите llama.cpp runtime.' }); return; }
     const userId = crypto.randomUUID();
     let imageIndex = 0;
     const attached: Attachment[] = files.map((file, index) => { const isImage = isImageFile(file); return { id: crypto.randomUUID(), messageId: userId, index, kind: isImage ? 'image' : file.name.endsWith('.pdf') ? 'pdf' : /\.(xlsx|xls)$/i.test(file.name) ? 'spreadsheet' : file.name.endsWith('.docx') ? 'document' : 'text', mimeType: file.type || 'application/octet-stream', filename: file.name, size: file.size, storageRef: '', status: 'pending', metadata: isImage ? { imageNumber: ++imageIndex } : undefined, createdAt: now(), updatedAt: now() }; });
