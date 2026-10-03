@@ -6,5 +6,6 @@ pub mod policy;
 pub mod presentation;
 pub mod reads;
 pub mod state;
+pub mod strategy;
 pub mod task_memory;
 pub mod transcript;

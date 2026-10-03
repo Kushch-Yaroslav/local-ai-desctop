@@ -12,6 +12,7 @@ use crate::agent::{
     policy::{self, Reasoning, RunPolicy},
     reads::repeated_file_read_decision,
     state::AgentState,
+    strategy::{self, Strategy},
     transcript::{validate_calls, CompactionPlan, ToolResultPolicy, Transcript, ValidatedCall},
 };
 use crate::context::evidence_projection::{
@@ -514,6 +515,12 @@ fn budget_error(
 
 fn stable_prefix(config: &Config) -> String {
     let mut prefix = format!("{}\n{}", config.system.trim(), AGENT_GUIDANCE.trim());
+    prefix.push('\n');
+    prefix.push_str(
+        Strategy::from_mode(&config.reasoning_mode)
+            .guidance()
+            .trim(),
+    );
     prefix.push_str(&format!(
         "\nPreferred visible prose language for this run: {}.",
         crate::agent::transcript::preferred_visible_language(&config.user)
@@ -558,6 +565,15 @@ fn dynamic_tail(
     }
     if !investigation.is_empty() {
         tail.push(investigation.to_owned());
+    }
+    if state.strategy.is_deep() && !transcript.is_finalizing() {
+        let unknowns = strategy::open_unknowns_text(&state.task_memory);
+        if !unknowns.is_empty() {
+            tail.push(unknowns);
+        }
+        if strategy::checkpoint_due(state.strategy, state.calls_since_memory) {
+            tail.push(strategy::checkpoint_text(state.calls_since_memory));
+        }
     }
     if !transcript.is_finalizing() && !user_requests_read_only(objective) {
         let knowledge = crate::tools::knowledge::prompt_catalog(root);
@@ -609,7 +625,7 @@ fn emit_knowledge_diagnostics(config: &Config, state: &AgentState) {
 
 fn tool_schemas(has_project_root: bool) -> Vec<Value> {
     let mut tools = vec![
-        json!({"type":"function","function":{"name":"task_memory","description":"Durable semantic memory for the current task across compaction. Record/update meaningful findings, decisions, blockers, or unresolved questions; view reads it; invalidate needs id. Record/update requires finding and may include evidence, implication, next, id, supersedes. Trust precise unchanged-file memory; reread only for a concrete missing, ambiguous, changed, exact-detail, or verification need.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["record","update","invalidate","view"]},"id":{"type":"string"},"finding":{"type":"string"},"evidence":{"type":"string"},"implication":{"type":"string"},"next":{"type":"string"},"supersedes":{"type":"string"}},"required":["action"]}}}),
+        json!({"type":"function","function":{"name":"task_memory","description":"Durable semantic memory for the current task across compaction. Record/update meaningful findings, decisions, blockers, or unresolved questions; view reads it; invalidate needs id. Record/update requires finding and may include evidence, implication, next, id, supersedes, status. Trust precise unchanged-file memory; reread only for a concrete missing, ambiguous, changed, exact-detail, or verification need.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["record","update","invalidate","view"]},"id":{"type":"string"},"finding":{"type":"string"},"evidence":{"type":"string"},"implication":{"type":"string"},"next":{"type":"string"},"supersedes":{"type":"string"},"status":{"type":"string","enum":["confirmed","inferred","unknown","contradicted"],"description":"How well established the finding is: confirmed (observed, cited), inferred (reasoned, not observed), unknown (open; put the resolving step in next), contradicted (evidence disagrees)."}},"required":["action"]}}}),
         json!({"type":"function","function":{"name":"observation_index","description":"List historical tool observations by stable ID, with source path and outcome metadata. Use source to select the raw observation for the needed file. If more=true, continue at the returned next_offset. Observation IDs start with obs-.","parameters":{"type":"object","properties":{"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":50}}}}}),
         json!({"type":"function","function":{"name":"observation_read","description":"Recover a bounded exact slice of a stored historical tool result by observation ID. The response distinguishes historical evidence from current source and reports whether the source changed.","parameters":{"type":"object","properties":{"id":{"type":"string"},"offset_chars":{"type":"integer","minimum":0},"max_chars":{"type":"integer","minimum":1,"maximum":16000}},"required":["id"]}}}),
     ];
@@ -739,7 +755,13 @@ fn write_task_memory(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
-    memory.upsert(
+    let status = value
+        .get("status")
+        .and_then(Value::as_str)
+        .filter(|status| !status.trim().is_empty())
+        .map(crate::agent::task_memory::Status::parse)
+        .transpose()?;
+    memory.upsert_with_status(
         value.get("id").and_then(Value::as_str),
         finding,
         evidence,
@@ -749,6 +771,7 @@ fn write_task_memory(
             .get("supersedes")
             .and_then(Value::as_str)
             .map(str::to_owned),
+        status,
     )
 }
 
@@ -800,7 +823,11 @@ fn apply_task_memory(state: &mut AgentState, arguments: &Value) -> Result<(Value
             .task_memory
             .invalidate(required_text(arguments, "id")?.as_str())?;
     } else if action == "record" || action == "update" {
+        if state.memory_writes_this_turn >= strategy::MAX_MEMORY_WRITES_PER_TURN {
+            return Err(format!("Task Memory accepts at most {} writes per turn. Merge the remaining findings into one entry (update an existing id) instead of one entry per fact.", strategy::MAX_MEMORY_WRITES_PER_TURN));
+        }
         write_task_memory(&mut state.task_memory, arguments)?;
+        state.memory_writes_this_turn += 1;
     } else {
         return Err("unsupported task_memory action".into());
     }
@@ -2407,6 +2434,7 @@ fn run_tool(
     state: &mut AgentState,
     tool: &ValidatedCall,
 ) -> Result<(Value, Option<String>), String> {
+    state.record_tool_call(&tool.name);
     run_scoped_tool(config, state, tool).map(|result| project_result(config, tool, result))
 }
 
@@ -2823,6 +2851,8 @@ enum FinalCandidateReview {
     /// One bounded reminder naming concrete, mechanically known local files
     /// that sources actually request but that were never opened.
     UnopenedRequests(String),
+    /// Deep only: one bounded reminder naming unresolved Task Memory items.
+    OpenUnknowns(String),
 }
 
 /// A tool-free response completes the run. The only deviations are the
@@ -2857,6 +2887,12 @@ fn review_tool_free_final(
             .collect::<Vec<_>>()
             .join("; ");
         return FinalCandidateReview::UnopenedRequests(format!("Before finishing: sources you read request or submit to local files you have not opened: {listed}. If what you are about to claim depends on one of them (for example what it does, or whether the service behind a call exists), inspect it now. Otherwise finish, and state plainly that you did not inspect it instead of describing its behavior."));
+    }
+    if !state.convergence_review_given {
+        if let Some(review) = strategy::convergence_review(state.strategy, &state.task_memory) {
+            state.convergence_review_given = true;
+            return FinalCandidateReview::OpenUnknowns(review);
+        }
     }
     FinalCandidateReview::Accept
 }
@@ -2893,6 +2929,7 @@ pub fn run(config: Config) {
         transcript.push_run_user(json!({"role":"user", "content":config.user}));
     }
     let mut state = AgentState::default();
+    state.strategy = Strategy::from_mode(&config.reasoning_mode);
     state.task_memory = config
         .task_memory
         .as_ref()
@@ -3158,6 +3195,7 @@ pub fn run(config: Config) {
             .cloned()
             .unwrap_or_default();
         emit(&config.run_id, Event::TurnStarted { index: turn + 1 });
+        state.memory_writes_this_turn = 0;
         emit(
             &config.run_id,
             Event::RunState {
@@ -3532,6 +3570,17 @@ pub fn run(config: Config) {
                     transcript.remind(nudge);
                     continue;
                 }
+                FinalCandidateReview::OpenUnknowns(nudge) => {
+                    trace_forensics(
+                        &config.run_id,
+                        "completion_review",
+                        json!({"decision":"open_unknowns","turn":turn+1,"unknowns":strategy::open_unknowns(&state.task_memory)}),
+                    );
+                    transcript
+                        .assistant_withheld_draft(streamed.content, "unresolved task memory items");
+                    transcript.remind(nudge);
+                    continue;
+                }
                 FinalCandidateReview::Accept => {}
             }
             {
@@ -3696,6 +3745,7 @@ pub fn run(config: Config) {
                         );
                         continue;
                     }
+                    state.record_tool_call(&tool.name);
                     match result {
                         Ok((value, diff)) => {
                             record_safe_read_effect(&config, &mut state, tool, &value);
@@ -4832,6 +4882,134 @@ mod tests {
             "synthesis requests carry no tools"
         );
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn stable_prefix_carries_the_selected_strategy() {
+        let mut config = test_config(65_536);
+        let fast = stable_prefix(&config);
+        config.reasoning_mode = "deep".into();
+        let deep = stable_prefix(&config);
+        assert!(fast.contains("Investigation strategy: Fast"));
+        assert!(!fast.contains("Investigation strategy: Deep"));
+        assert!(deep.contains("Investigation strategy: Deep"));
+        assert!(!deep.contains("Investigation strategy: Fast"));
+    }
+
+    #[test]
+    fn deep_checkpoint_and_unknowns_reach_the_tail_only_for_deep() {
+        let mut state = AgentState::default();
+        state
+            .task_memory
+            .upsert_with_status(
+                None,
+                "what the handler forwards to".into(),
+                String::new(),
+                String::new(),
+                "open the handler".into(),
+                None,
+                Some(crate::agent::task_memory::Status::Unknown),
+            )
+            .unwrap();
+        state.calls_since_memory = strategy::CHECKPOINT_INTERVAL;
+        let transcript = Transcript::default();
+        let fast = dynamic_tail(&state, None, "", &transcript, "");
+        assert!(!fast.contains("investigation_checkpoint"));
+        assert!(!fast.contains("open_unknowns"));
+        state.strategy = Strategy::Deep;
+        let deep = dynamic_tail(&state, None, "", &transcript, "");
+        assert!(deep.contains("investigation_checkpoint"));
+        assert!(deep.contains("open_unknowns"));
+        assert!(deep.contains("what the handler forwards to"));
+        state.record_tool_call("task_memory");
+        assert!(
+            !dynamic_tail(&state, None, "", &transcript, "").contains("investigation_checkpoint")
+        );
+    }
+
+    #[test]
+    fn convergence_review_is_deep_only_and_never_repeats() {
+        let mut state = AgentState::default();
+        state
+            .task_memory
+            .upsert_with_status(
+                None,
+                "unverified hop".into(),
+                String::new(),
+                String::new(),
+                String::new(),
+                None,
+                Some(crate::agent::task_memory::Status::Unknown),
+            )
+            .unwrap();
+        let mut transcript = Transcript::default();
+        let ledger = Ledger::default();
+        assert!(matches!(
+            review_tool_free_final(&mut state, &mut transcript, &ledger),
+            FinalCandidateReview::Accept
+        ));
+        state.strategy = Strategy::Deep;
+        assert!(matches!(
+            review_tool_free_final(&mut state, &mut transcript, &ledger),
+            FinalCandidateReview::OpenUnknowns(text) if text.contains("unverified hop")
+        ));
+        assert!(matches!(
+            review_tool_free_final(&mut state, &mut transcript, &ledger),
+            FinalCandidateReview::Accept
+        ));
+    }
+
+    #[test]
+    fn task_memory_writes_are_bounded_per_turn() {
+        let mut state = AgentState::default();
+        for n in 0..strategy::MAX_MEMORY_WRITES_PER_TURN {
+            apply_task_memory(
+                &mut state,
+                &json!({"action":"record","finding":format!("f{n}")}),
+            )
+            .unwrap();
+        }
+        let refused = apply_task_memory(&mut state, &json!({"action":"record","finding":"extra"}));
+        assert!(refused.unwrap_err().contains("at most"));
+        assert_eq!(
+            state.task_memory.entries.len(),
+            strategy::MAX_MEMORY_WRITES_PER_TURN
+        );
+        assert!(apply_task_memory(&mut state, &json!({"action":"view"})).is_ok());
+        state.memory_writes_this_turn = 0;
+        apply_task_memory(
+            &mut state,
+            &json!({"action":"record","finding":"next turn"}),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn task_memory_status_is_validated_and_kept_on_update() {
+        let mut state = AgentState::default();
+        apply_task_memory(
+            &mut state,
+            &json!({"action":"record","id":"a","finding":"x","status":"inferred"}),
+        )
+        .unwrap();
+        assert_eq!(
+            state.task_memory.entries[0].status,
+            Some(crate::agent::task_memory::Status::Inferred)
+        );
+        apply_task_memory(
+            &mut state,
+            &json!({"action":"update","id":"a","finding":"y"}),
+        )
+        .unwrap();
+        assert_eq!(
+            state.task_memory.entries[0].status,
+            Some(crate::agent::task_memory::Status::Inferred)
+        );
+        assert!(apply_task_memory(
+            &mut state,
+            &json!({"action":"record","finding":"z","status":"maybe"})
+        )
+        .is_err());
     }
 
     #[test]
