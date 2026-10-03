@@ -44,11 +44,11 @@ if [[ ! -x "$ELECTRON_BIN" || ! -f dist/main/index.js || ! -f dist/preload/index
   exit 1
 fi
 
-if [[ ! -u "$SANDBOX_HELPER" || ! -x "$SANDBOX_HELPER" ]]; then
+source "$APP_DIR/scripts/electron-sandbox.sh"
+if ! prepare_electron_sandbox "$ELECTRON_BIN" "$SANDBOX_HELPER"; then
   echo "launcher.error: valid system Chrome sandbox helper is missing" >> "$LOG_FILE"
   exit 1
 fi
-export CHROME_DEVEL_SANDBOX="$SANDBOX_HELPER"
 
 export ELECTRON_ENABLE_LOGGING=1
 
@@ -77,8 +77,8 @@ trap cleanup EXIT
 trap 'CLEANUP_REASON="SIGINT"; exit 130' INT
 trap 'CLEANUP_REASON="SIGTERM"; exit 143' TERM
 
-# The bundled helper is kept as chrome-sandbox.disabled because DATA is nosuid.
-# This root-owned system helper preserves Chromium's SUID sandbox.
+# The bundled helper is retired on every launch, including after npm reinstalls.
+# The root-owned system helper preserves Chromium's SUID sandbox.
 echo "launcher.sandbox_helper: $SANDBOX_HELPER" >> "$LOG_FILE"
 echo "launcher.electron: $ELECTRON_BIN" >> "$LOG_FILE"
 "$ELECTRON_BIN" "$APP_DIR" >> "$LOG_FILE" 2>&1 &

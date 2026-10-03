@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root="$(cd "$(dirname "$0")/.." && pwd)"
+fixture="$(mktemp -d)"
+trap 'rm -f "$fixture/launcher.sh" "$fixture/llama-cpp-runtime-state.json" "$fixture/logs/llama-cpp-mtp-launcher.log" "$fixture/stderr"; rmdir "$fixture/logs" "$fixture"' EXIT
+
+# Exercise the actual launcher's preflight and EXIT trap without loading a model.
+sed "s|SANDBOX_HELPER=\"/opt/google/chrome/chrome-sandbox\"|SANDBOX_HELPER=\"$fixture/missing-sandbox\"|" \
+  "$root/run-local-ai-desktop-llama-cpp-mtp.sh" > "$fixture/launcher.sh"
+set +e
+LOCAL_AI_RUNTIME_ROOT="$fixture" LOCAL_AI_LAUNCHER_HEADLESS=1 \
+  LOCAL_AI_LLAMA_CONTEXT=32768 bash "$fixture/launcher.sh" 2>"$fixture/stderr"
+status=$?
+set -e
+[[ "$status" == 1 ]]
+grep -q 'Invalid system Chrome sandbox helper' "$fixture/stderr"
+! grep -q 'llama-server.start ' "$fixture/logs/llama-cpp-mtp-launcher.log"
+node - "$fixture/llama-cpp-runtime-state.json" <<'NODE'
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const state = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+assert.equal(state.status, 'offline', 'EXIT cleanup must not hide startup failure as stopped');
+assert.equal(state.modelId, '');
+assert.equal(state.contextWindow, 0);
+assert.equal(state.serverPid, 0);
+assert.match(state.error, /startup failure:.*system Chrome sandbox helper/);
+NODE
+[[ ! -e "$fixture/llama-cpp-mtp-server.pid" && ! -e "$fixture/llama-cpp-mtp-launcher.pid" ]]
+echo 'llama launcher failure/offline regression passed'

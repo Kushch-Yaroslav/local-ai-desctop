@@ -18,10 +18,10 @@ LLAMA_BIN="/media/yaroslav/DATA/llama.cpp/build-cuda/bin/llama-server"
 ELECTRON_BIN="$APP_DIR/node_modules/electron/dist/electron"
 PORT="8081"
 URL="http://127.0.0.1:${PORT}"
-LOG_DIR="$APP_DIR/runtime/logs"
+STATE_DIR="${LOCAL_AI_RUNTIME_ROOT:-$APP_DIR/runtime}"
+LOG_DIR="$STATE_DIR/logs"
 LOG_FILE="$LOG_DIR/llama-cpp-mtp-launcher.log"
 SERVER_LOG="$LOG_DIR/llama-cpp-mtp-server.log"
-STATE_DIR="$APP_DIR/runtime"
 SERVER_PID_FILE="$STATE_DIR/llama-cpp-mtp-server.pid"
 LAUNCHER_PID_FILE="$STATE_DIR/llama-cpp-mtp-launcher.pid"
 REQUEST_FILE="$STATE_DIR/llama-cpp-runtime-request.env"
@@ -45,7 +45,7 @@ timestamp() { date --iso-8601=seconds; }
 log() { printf '%s %s\n' "$(timestamp)" "$*" >> "$LOG_FILE"; }
 
 saved_llama_selection() {
-  local database="$APP_DIR/runtime/sqlite/local-ai-desktop.db"
+  local database="$STATE_DIR/sqlite/local-ai-desktop.db"
   [[ -r "$database" && -x "$ELECTRON_BIN" ]] || return 0
   ELECTRON_RUN_AS_NODE=1 "$ELECTRON_BIN" -e "const { DatabaseSync } = require('node:sqlite'); const db = new DatabaseSync(process.argv[1], { readOnly: true }); const row = db.prepare(\"SELECT model_id, context_window FROM conversations WHERE model_id IN ('qwen3.8:27b-q4_K_M', 'glm-4.7-flash:q4_k', 'gpt-oss:20b') ORDER BY updated_at DESC LIMIT 1\").get(); if (row) process.stdout.write(row.model_id + '\\t' + row.context_window); db.close();" "$database" 2>/dev/null || true
 }
@@ -213,7 +213,11 @@ cleanup() {
   stop_llama_server "$SERVER_PID"
   rm -f "$SERVER_PID_FILE" "$LAUNCHER_PID_FILE" "$REQUEST_FILE"
   ACTIVE_MODEL=""; ACTIVE_CONTEXT=0; SERVER_PID=""
-  write_state stopped "" "$CLEANUP_REASON" || true
+  if (( status == 0 || status == 130 || status == 143 )); then
+    write_state stopped "" "$CLEANUP_REASON" || true
+  else
+    write_state offline "" "$CLEANUP_REASON" || true
+  fi
   log "launcher.exit status=$status"
 }
 trap cleanup EXIT
@@ -283,7 +287,9 @@ log "context.resolve source=$CONTEXT_SOURCE value=$LLAMA_CONTEXT"
 log "electron=$ELECTRON_BIN llama_server=$LLAMA_BIN variant=$VARIANT runtime_model_id=$RUNTIME_MODEL_ID model=$MODEL mmproj=${MMPROJ:-none} port=$PORT context=$LLAMA_CONTEXT"
 
 [[ -x "$ELECTRON_BIN" && -f "$APP_DIR/dist/main/index.js" && -f "$APP_DIR/dist/preload/index.js" && -f "$APP_DIR/dist/renderer/index.html" ]] || fail "Не найден production build или Electron: $ELECTRON_BIN"
-[[ -u "$SANDBOX_HELPER" && -x "$SANDBOX_HELPER" ]] || fail "Не найден system Chrome sandbox helper: $SANDBOX_HELPER"
+source "$APP_DIR/scripts/electron-sandbox.sh"
+prepare_electron_sandbox "$ELECTRON_BIN" "$SANDBOX_HELPER" || fail "Не удалось настроить system Chrome sandbox helper: $SANDBOX_HELPER"
+log "electron.sandbox helper=$CHROME_DEVEL_SANDBOX bundled=retired"
 rm -f "$REQUEST_FILE"
 
 if curl --silent --fail "$URL/health" >/dev/null 2>&1; then
@@ -297,9 +303,8 @@ if curl --silent --fail "$URL/health" >/dev/null 2>&1; then
 fi
 
 export NPM_CONFIG_CACHE="$APP_DIR/local-cache/npm"
-export XDG_CACHE_HOME="$APP_DIR/runtime/cache"
-export XDG_CONFIG_HOME="$APP_DIR/runtime/app-data"
-export CHROME_DEVEL_SANDBOX="$SANDBOX_HELPER"
+export XDG_CACHE_HOME="$STATE_DIR/cache"
+export XDG_CONFIG_HOME="$STATE_DIR/app-data"
 export ELECTRON_ENABLE_LOGGING=1
 export LOCAL_AI_BACKEND="llama-cpp"
 export LOCAL_AI_LLAMA_CPP_URL="$URL"
@@ -341,4 +346,8 @@ while kill -0 "$ELECTRON_PID" 2>/dev/null; do
 done
 CLEANUP_REASON="electron exited status=$electron_status"
 log "electron.exit status=$electron_status"
+if (( electron_status != 0 )); then
+  log "launcher.error=$CLEANUP_REASON"
+  show_failure "Окно Local AI Desktop не удалось запустить: Electron завершился с кодом $electron_status. См. $LOG_FILE"
+fi
 exit "$electron_status"
