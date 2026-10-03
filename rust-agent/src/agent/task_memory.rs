@@ -1,6 +1,44 @@
 //! Small per-run working memory. This is a handoff list, not project knowledge.
 use serde::{Deserialize, Serialize};
 
+/// How well an entry is established. Optional: entries without a status keep
+/// their historical meaning (a plain finding).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Status {
+    Confirmed,
+    Inferred,
+    Unknown,
+    Contradicted,
+}
+
+impl Status {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_lowercase().as_str() {
+            "confirmed" => Ok(Status::Confirmed),
+            "inferred" => Ok(Status::Inferred),
+            "unknown" => Ok(Status::Unknown),
+            "contradicted" => Ok(Status::Contradicted),
+            other => Err(format!(
+                "unsupported task memory status '{other}': use confirmed, inferred, unknown or contradicted"
+            )),
+        }
+    }
+
+    pub fn is_unresolved(self) -> bool {
+        matches!(self, Status::Unknown | Status::Contradicted)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Status::Confirmed => "confirmed",
+            Status::Inferred => "inferred",
+            Status::Unknown => "unknown",
+            Status::Contradicted => "contradicted",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskMemoryEntry {
     pub id: String,
@@ -15,6 +53,8 @@ pub struct TaskMemoryEntry {
     pub supersedes: Option<String>,
     #[serde(default)]
     pub invalidated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<Status>,
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskMemory {
@@ -33,6 +73,21 @@ impl TaskMemory {
         next: String,
         supersedes: Option<String>,
     ) -> Result<String, String> {
+        self.upsert_with_status(id, finding, evidence, implication, next, supersedes, None)
+    }
+
+    /// An update that omits `status` keeps the entry's previous one.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_with_status(
+        &mut self,
+        id: Option<&str>,
+        finding: String,
+        evidence: String,
+        implication: String,
+        next: String,
+        supersedes: Option<String>,
+        status: Option<Status>,
+    ) -> Result<String, String> {
         let finding = clean(&finding, true)?;
         let id = id
             .filter(|v| !v.trim().is_empty())
@@ -45,6 +100,9 @@ impl TaskMemory {
             entry.next = clean(&next, false)?;
             entry.supersedes = supersedes;
             entry.invalidated = false;
+            if status.is_some() {
+                entry.status = status;
+            }
         } else {
             if let Some(old) = supersedes
                 .as_deref()
@@ -60,6 +118,7 @@ impl TaskMemory {
                 next: clean(&next, false)?,
                 supersedes,
                 invalidated: false,
+                status,
             });
         }
         self.revision = self.revision.saturating_add(1);
@@ -112,7 +171,8 @@ impl TaskMemory {
                 let score = relevance * 4
                     + usize::from(include_next && !e.next.is_empty()) * 2
                     + usize::from(e.evidence.contains("obs-")) * 3
-                    + usize::from(text.contains("block") || text.contains("contradict")) * 2;
+                    + usize::from(text.contains("block") || text.contains("contradict")) * 2
+                    + usize::from(e.status.is_some_and(Status::is_unresolved)) * 3;
                 (score, i, e)
             })
             .collect::<Vec<_>>();
@@ -125,7 +185,10 @@ impl TaskMemory {
         entries
             .into_iter()
             .map(|e| {
-                let mut v = vec![format!("{}: {}", e.id, e.finding)];
+                let mut v = vec![match e.status {
+                    Some(status) => format!("{} [{}]: {}", e.id, status.label(), e.finding),
+                    None => format!("{}: {}", e.id, e.finding),
+                }];
                 if !e.evidence.is_empty() {
                     v.push(format!("  evidence: {}", e.evidence));
                 }
