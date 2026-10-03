@@ -1,6 +1,7 @@
 import { BrowserWindow, dialog, ipcMain } from 'electron';
 import { randomUUID } from 'node:crypto';
 import type { AnalysisRun, ApprovalDecision, ApprovalStatus, ChatRequest, Conversation, ProjectReference, ProjectSuggestion, RiskCategory, ThinkingTimelineEvent } from '../../shared/types';
+import type { RuntimeContextEstimate } from '../../shared/context-estimator';
 import { Database } from '../services/database';
 import { getHardwareStats } from '../services/hardware';
 import { OllamaBackend } from '../backends/ollama-backend';
@@ -24,6 +25,8 @@ import { saveGenerationDiagnosticsBestEffort } from '../services/generation-diag
 import { projectDirectoryName } from '../../shared/project-references';
 import { executionMode } from '../../shared/generation-mode';
 import { existingProjectDirectory } from '../services/project-picker';
+import { collectRuntimeContextEstimate, defaultContextDeviceReserveBytes, defaultContextHostReserveBytes, resolveContextReserve } from '../services/context-estimate';
+import { join } from 'node:path';
 
 const database = new Database();
 const selectedBackend = process.env.LOCAL_AI_BACKEND === 'llama-cpp' ? 'llama-cpp' : 'ollama';
@@ -40,7 +43,7 @@ const rustAgent = new RustAgentRuntime(process.env.LOCAL_AI_AGENT_ENDPOINT ?? (s
 const webChat = new WebChatService(backend, web);
 const attachments = new AttachmentService(database);
 const attachmentPipeline = new AttachmentPipeline(database, attachments);
-type ActiveGeneration = { id: string; abort: AbortController; settled: Promise<void>; finish: () => void };
+type ActiveGeneration = { id: string; abort: AbortController; settled: Promise<void>; finish: () => void; mode?: 'chat' | 'agent'; followups?: import('../../shared/types').ChatMessage[] };
 const activeGenerations = new Map<string, ActiveGeneration>();
 type PendingApproval = { approvalId: string; conversationId: string; generation: ActiveGeneration; actionId: string; category: RiskCategory; root: string; resolve: (result: ApprovalResult) => void; settled: boolean; abort: () => void; emit: (payload: Record<string, unknown>) => void };
 const pendingApprovals = new Map<string, PendingApproval>();
@@ -135,6 +138,7 @@ export function registerIpc(): void {
     return database.createConversation(modelId);
   });
   ipcMain.handle('conversations:update', async (_event, id: string, patch: Partial<Pick<Conversation, 'title' | 'modelId' | 'mode' | 'workingDirectory' | 'secondaryWorkingDirectory' | 'contextWindow' | 'reasoningMode' | 'webMode'>>) => {
+    if (activeGenerations.size && Object.keys(patch).some((key) => key !== 'title')) throw new Error('Дождитесь завершения активной генерации перед изменением настроек.');
     const current = database.getConversation(id);
     if (!current) throw new Error('Чат не найден');
     const nextModelId = patch.modelId ?? current.modelId;
@@ -164,10 +168,14 @@ export function registerIpc(): void {
     if (selectedBackend === 'ollama' && patch.modelId !== undefined && patch.modelId !== current.modelId && current.modelId) void ollama.unloadModel(current.modelId);
     return database.getConversation(id) ?? updated;
   });
-  ipcMain.handle('conversations:delete', async (_event, id: string) => { sessionApprovals.delete(id); await attachments.removeManagedFiles(database.deleteConversation(id)); });
+  ipcMain.handle('conversations:delete', async (_event, id: string) => {
+    if (activeGenerations.has(id)) throw new Error('Нельзя удалить чат с активной генерацией.');
+    sessionApprovals.delete(id); await attachments.removeManagedFiles(database.deleteConversation(id));
+  });
   ipcMain.handle('messages:list', (_event, conversationId: string) => database.listMessages(conversationId));
   ipcMain.handle('agent-plan:get', (_event, conversationId: string) => database.getAgentPlan(conversationId));
   ipcMain.handle('messages:edit', async (_event, messageId: string, content: string, fallback?: { conversationId: string; content: string }) => {
+    if (activeGenerations.size) throw new Error('Дождитесь завершения активной генерации перед редактированием.');
     const message = database.getMessage(messageId) ?? (fallback ? database.findUserMessage(fallback.conversationId, fallback.content) : null); if (!message) throw new Error('Сообщение не найдено');
     const before = database.listAttachmentsForConversation(message.conversationId);
     await cancelGeneration(message.conversationId); const edited = database.editUserMessageAndTruncate(message.id, content);
@@ -176,6 +184,7 @@ export function registerIpc(): void {
     return edited;
   });
   ipcMain.handle('messages:regenerate', async (_event, messageId: string) => {
+    if (activeGenerations.size) throw new Error('Дождитесь завершения активной генерации перед повторной генерацией.');
     const message = database.getMessage(messageId); if (!message) throw new Error('Сообщение не найдено');
     const before = database.listAttachmentsForConversation(message.conversationId);
     await cancelGeneration(message.conversationId);
@@ -210,6 +219,37 @@ export function registerIpc(): void {
     return { selectedBackend, ollamaUrl: 'http://127.0.0.1:11434', llamaServerPath: selectedBackend === 'llama-cpp' ? process.env.LOCAL_AI_LLAMA_SERVER_PATH ?? null : null, ...(llama ? { llamaRuntimeModelId: llama.modelId ?? undefined, llamaRuntime: llama } : {}), modelsPath: paths.models };
   });
   ipcMain.handle('hardware:get', getHardwareStats);
+  ipcMain.handle('context:estimate', async (_event, modelId: string): Promise<RuntimeContextEstimate> => {
+    if (typeof modelId !== 'string' || !modelId) throw new Error('Не указана модель для оценки контекста');
+    const profile = getModelProfile(modelId);
+    const llamaProfile = selectedBackend === 'llama-cpp' ? llamaRuntimeProfile(modelId) : undefined;
+    const configuredMaxTokens = selectedBackend === 'llama-cpp' ? llamaProfile?.maxContext : profile?.maxContext;
+    const contextPresets = selectedBackend === 'llama-cpp' ? llamaContextPresets(modelId) : profile ? contextPresetsFor(profile.maxContext) : [];
+    const hardware = await getHardwareStats();
+    let runtime = null;
+    if (configuredMaxTokens) {
+      if (selectedBackend === 'llama-cpp' && llamaProfile) {
+        const current = await syncLlamaBackend();
+        if (current.status === 'ready' && current.modelId === modelId) runtime = await llamaCpp.getRuntimeContextEvidence(modelId);
+      } else if (selectedBackend === 'ollama' && profile) {
+        runtime = await ollama.getRuntimeContextEvidence(modelId);
+      }
+    }
+    const hostReserve = resolveContextReserve(process.env.LOCAL_AI_CONTEXT_HOST_RESERVE_BYTES, 'LOCAL_AI_CONTEXT_HOST_RESERVE_BYTES', defaultContextHostReserveBytes);
+    const deviceReserve = resolveContextReserve(process.env.LOCAL_AI_CONTEXT_DEVICE_RESERVE_BYTES, 'LOCAL_AI_CONTEXT_DEVICE_RESERVE_BYTES', defaultContextDeviceReserveBytes);
+    return collectRuntimeContextEstimate({
+      backend: selectedBackend,
+      modelId,
+      configuredMaxTokens: configuredMaxTokens ?? 0,
+      contextPresets,
+      hardware,
+      runtime,
+      startupLogPath: selectedBackend === 'llama-cpp' ? process.env.LOCAL_AI_LLAMA_SERVER_LOG ?? join(paths.logs, 'llama-cpp-mtp-server.log') : null,
+      hostReserveBytes: hostReserve.bytes,
+      deviceReserveBytes: deviceReserve.bytes,
+      reserveErrors: [hostReserve.error, deviceReserve.error].filter((error): error is string => Boolean(error)),
+    });
+  });
   ipcMain.handle('dialog:chooseDirectory', async (_event, initialDirectory?: string | null) => {
     const window = BrowserWindow.getFocusedWindow();
     const defaultPath = await existingProjectDirectory(initialDirectory);
@@ -217,6 +257,17 @@ export function registerIpc(): void {
     return result.canceled ? null : result.filePaths[0] ?? null;
   });
   ipcMain.handle('chat:stop', async (_event, conversationId: string, generationId?: string) => { await cancelGeneration(conversationId, generationId, 'user_stop'); });
+  ipcMain.handle('chat:steer', async (event, conversationId: string, generationId: string, content: string) => {
+    const generation = activeGenerations.get(conversationId);
+    if (!generation || generation.id !== generationId || generation.abort.signal.aborted || generation.mode !== 'agent') throw new Error('Уточнения доступны только во время активного Agent run.');
+    if (typeof content !== 'string' || !content.trim() || content.length > 16_000) throw new Error('Уточнение должно содержать от 1 до 16000 символов.');
+    await rustAgent.steer(generation.id, content.trim());
+    const message = database.addMessage(conversationId, 'user', content.trim());
+    (generation.followups ??= []).push(message);
+    log('generation.steering.accepted', { conversationId, generationId, messageId: message.id });
+    event.sender.send('chat:stream', { type: 'steering', conversationId, generationId, userMessage: message, status: 'accepted' });
+    return message;
+  });
   ipcMain.handle('chat:approve', (_event, request: { conversationId: string; generationId: string; approvalId: string; decision: ApprovalDecision }) => {
     const pending = pendingApprovals.get(request.approvalId);
     if (!['reject', 'once', 'session'].includes(request.decision) || !pending || pending.conversationId !== request.conversationId || pending.generation.id !== request.generationId || activeGenerations.get(request.conversationId) !== pending.generation || pending.generation.abort.signal.aborted) return false;
@@ -231,7 +282,8 @@ export function registerIpc(): void {
     return true;
   });
   ipcMain.handle('chat:send', async (event, request: ChatRequest) => {
-    await cancelGeneration(request.conversationId, undefined, 'superseded');
+    // Claim the process-wide inference slot synchronously, before any await.
+    if (activeGenerations.size) throw new Error('Уже выполняется генерация в другом чате. Дождитесь завершения или остановите её.');
     const abort = new AbortController(); let finish!: () => void;
     const generation: ActiveGeneration = { id: request.generationId, abort, settled: new Promise<void>((resolve) => { finish = resolve; }), finish };
     activeGenerations.set(request.conversationId, generation);
@@ -243,6 +295,7 @@ export function registerIpc(): void {
     const conversation = database.getConversation(request.conversationId);
     if (!conversation) throw new Error('Чат не найден');
     const mode = executionMode(conversation.mode, request.mode);
+    generation.mode = mode;
     if (conversation.modelId && conversation.modelId !== request.model) throw new Error('Выбранная модель была изменена. Повторите отправку сообщения.');
     const primaryProject = conversation.workingDirectory && conversation.primaryProjectId ? { id: conversation.primaryProjectId, slot: 1 as const, root: conversation.workingDirectory, label: `Project 1 — ${projectDirectoryName(conversation.workingDirectory)}` } : null;
     const selectedProjects: AgentProject[] = primaryProject ? [primaryProject, ...(conversation.secondaryWorkingDirectory && conversation.secondaryProjectId ? [{ id: conversation.secondaryProjectId, slot: 2 as const, root: conversation.secondaryWorkingDirectory, label: `Project 2 — ${projectDirectoryName(conversation.secondaryWorkingDirectory)}` }] : [])] : [];
@@ -312,6 +365,15 @@ export function registerIpc(): void {
           : backend.streamChat(request.model, chatMessagesWithSystemPrefix(history, [chatSystemContext({ webAvailable: false }, conversation.reasoningMode === 'deep' ? 'deep' : 'fast')], request.conversationId, `capability-${request.conversationId}`), abort.signal, context.active, conversation.reasoningMode);
       for await (let chunk of stream) {
         if (!current()) break;
+        if (chunk.type === 'steering') {
+          const content = chunk.userMessage.content;
+          const message = generation.followups?.find((entry) => entry.content === content);
+          if (message) {
+            event.sender.send('chat:stream', { ...chunk, userMessage: message, conversationId: request.conversationId, generationId: generation.id });
+            log('generation.steering.applied', { conversationId: request.conversationId, generationId: generation.id, messageId: message.id });
+          }
+          continue;
+        }
         if (chunk.type === 'token') output += chunk.content;
         if (chunk.type === 'thinking') {
           thinking += chunk.content;

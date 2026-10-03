@@ -120,11 +120,27 @@ export function taskPlan(value: unknown): AgentPlan {
 /** Electron bridge for the Rust runtime. It passes each content delta through
  * immediately; `final` is metadata, not a delayed text transport. */
 export class RustAgentRuntime {
+  private readonly steering = new Map<string, (content: string) => Promise<void>>();
   constructor(private readonly endpoint: string, private readonly binary = process.env.LOCAL_AI_AGENT_RUNTIME ?? resolve(process.cwd(), 'rust-agent', 'target', 'debug', 'local-ai-agent-runtime')) {}
+
+  steer(runId: string, content: string): Promise<void> {
+    const send = this.steering.get(runId);
+    if (!send) return Promise.reject(new Error('Agent ещё не готов к уточнению или уже завершён.'));
+    return send(content);
+  }
 
   async *stream(model: string, history: ChatMessage[], projects: AgentProject[], signal: AbortSignal, contextLimit: number, reasoningMode: ReasoningMode, webMode: WebMode, runId: string, persistedTaskMemory?: AgentPlan['taskMemory'], conversationId?: string, supportsReasoning = true): AsyncIterable<StreamEvent> {
     if (!existsSync(this.binary)) throw new Error(`Rust Agent Runtime V2 не собран: ${this.binary}. Выполните cargo build в rust-agent.`);
     const child = spawn(this.binary, [], { stdio: 'pipe' });
+    const pending: Array<{ content: string; resolve: () => void; reject: (error: Error) => void }> = [];
+    this.steering.set(runId, (content) => {
+      if (!child.stdin.writable || signal.aborted) return Promise.reject(new Error('Agent уже завершён.'));
+      if (pending.length >= 4) return Promise.reject(new Error('Слишком много ожидающих уточнений.'));
+      return new Promise<void>((resolve, reject) => {
+        pending.push({ content, resolve, reject });
+        child.stdin.write(`${JSON.stringify({ type: 'steer', run_id: runId, content })}\n`);
+      });
+    });
     let stopped = false;
     const stop = () => {
       if (stopped || !child.stdin.writable) return;
@@ -136,7 +152,7 @@ export class RustAgentRuntime {
     const current = splitAgentRunHistory(history);
     const request: RuntimeRequest = {
       type: 'run', run_id: runId, endpoint: this.endpoint, model,
-      system: 'You are Local AI Desktop Agent. Work autonomously inside the selected project scope. Use tools only with complete valid JSON arguments.',
+      system: `You are Local AI Desktop Agent. Work autonomously inside the selected project scope. Use tools only with complete valid JSON arguments.\n${projects.map((project) => `Project ${project.slot}: ${project.label}; identity=${project.id}; root=${project.root}`).join('\n')}`,
       user: current.user, project_root: projects[0]?.root, secondary_project_root: projects[1]?.root,
       context_limit: contextLimit, reasoning_mode: reasoningMode, supports_reasoning: supportsReasoning, web_mode: webMode, policy: 'auto',
       history: current.prior.filter((message) => !message.agentError && !message.agentCancelled).map((message) => ({ role: message.role, content: message.content })),
@@ -157,7 +173,15 @@ export class RustAgentRuntime {
       for await (const line of lines) {
         let event: RuntimeEvent;
         try { event = JSON.parse(line) as RuntimeEvent; } catch { continue; }
-        if (event.type === 'thinking_delta') yield { type: 'thinking', content: event.content ?? '' };
+        if (event.type === 'steering_accepted' || event.type === 'steering_rejected') {
+          const next = pending.shift();
+          if (event.type === 'steering_accepted') next?.resolve();
+          else next?.reject(new Error(event.message ?? 'Agent уже завершён.'));
+        }
+        else if (event.type === 'steering_applied') {
+          yield { type: 'steering', userMessage: { id: '', conversationId: conversationId ?? '', role: 'user', content: event.content ?? '', createdAt: new Date().toISOString() }, status: 'applied' };
+        }
+        else if (event.type === 'thinking_delta') yield { type: 'thinking', content: event.content ?? '' };
         else if (event.type === 'turn_started') yield { type: 'agent-telemetry', telemetry: { turn: event.index ?? 0 } };
         else if (event.type === 'content_delta' || event.type === 'final_delta' || event.type === 'agent_status') {
           if (event.type === 'agent_status') statusCount += 1;
@@ -215,6 +239,8 @@ export class RustAgentRuntime {
       if (!signal.aborted && terminalFinal) yield { type: 'done', finishReason: terminalFinishReason };
       else if (!signal.aborted && !terminalFailure) yield { type: 'error', message: 'Rust Agent Runtime V2 ended without a terminal final response', details: 'The runtime closed before emitting a final event.' };
     } finally {
+      this.steering.delete(runId);
+      for (const next of pending) next.reject(new Error('Agent завершён до принятия уточнения.'));
       signal.removeEventListener('abort', stop);
       if (child.stdin.writable) child.stdin.end();
       if (!child.killed && child.exitCode === null) child.kill('SIGTERM');

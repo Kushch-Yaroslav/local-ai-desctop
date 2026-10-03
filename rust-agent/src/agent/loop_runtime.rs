@@ -30,6 +30,7 @@ use std::sync::{
     Arc, Mutex,
 };
 
+#[derive(Clone)]
 pub struct Config {
     pub run_id: String,
     pub endpoint: String,
@@ -37,6 +38,7 @@ pub struct Config {
     pub system: String,
     pub user: String,
     pub root: Option<String>,
+    pub secondary_root: Option<String>,
     pub context_limit: usize,
     pub reasoning_mode: String,
     pub supports_reasoning: bool,
@@ -47,6 +49,7 @@ pub struct Config {
     pub provider_max_output: Option<usize>,
     pub cancelled: Arc<AtomicBool>,
     pub steering: Arc<Mutex<Vec<String>>>,
+    pub steering_closed: Arc<AtomicBool>,
 }
 
 /// Initial values follow Jan's shape but are deliberately configurable at the
@@ -519,6 +522,12 @@ fn stable_prefix(config: &Config) -> String {
         prefix.push_str("\n<working_directory>");
         prefix.push_str(root);
         prefix.push_str("</working_directory>");
+        prefix.push_str(&format!(
+            "\nProject 1 root: {root}. Project tools accept project=1 (default)."
+        ));
+    }
+    if let Some(root) = &config.secondary_root {
+        prefix.push_str(&format!("\nProject 2 root: {root}. Use project=2 for its tools. Roots are distinct identities; attribute findings to the selected project and do not infer one project's content from the other."));
     }
     prefix
 }
@@ -861,6 +870,47 @@ fn emit_accepted_final_content(run_id: &str, content: &str) {
             },
         );
     }
+}
+
+fn present_answer(
+    content: &str,
+    prefix: &str,
+    transcript: &Transcript,
+    state: &AgentState,
+) -> String {
+    let mut references = BTreeMap::new();
+    for observation in transcript.observations() {
+        let source = observation
+            .source
+            .clone()
+            .unwrap_or_else(|| format!("{} result", observation.tool));
+        references.insert(observation.id.clone(), source.clone());
+        if let Some(number) = observation
+            .id
+            .strip_prefix("obs-")
+            .and_then(|id| id.parse::<u64>().ok())
+        {
+            references.insert(format!("obs-{number}"), source);
+        }
+    }
+    for entry in &state.task_memory.entries {
+        let source = entry
+            .evidence
+            .split(|character: char| {
+                !character.is_ascii_alphanumeric() && !matches!(character, '-' | '_')
+            })
+            .find_map(|reference| references.get(reference).cloned());
+        references.insert(
+            entry.id.clone(),
+            source.unwrap_or_else(|| {
+                crate::agent::presentation::project_answer(
+                    &entry.finding.chars().take(120).collect::<String>(),
+                    &references,
+                )
+            }),
+        );
+    }
+    crate::agent::presentation::project_answer_with_prefix(content, prefix, &references)
 }
 
 fn emit_status(run_id: &str, content: &str) {
@@ -2308,11 +2358,65 @@ fn request_shape(messages: &[Value]) -> Vec<String> {
         .collect()
 }
 
+fn scoped_tool_config(config: &Config, tool: &ValidatedCall) -> Result<Config, String> {
+    let slot = match tool.arguments.get("project") {
+        None => 1,
+        Some(value) => value
+            .as_u64()
+            .filter(|slot| *slot == 1 || *slot == 2)
+            .ok_or("project must be 1 or 2")?,
+    };
+    let mut scoped = config.clone();
+    if slot == 2 {
+        scoped.root = Some(
+            config
+                .secondary_root
+                .clone()
+                .ok_or("Project 2 is not selected")?,
+        );
+    }
+    Ok(scoped)
+}
+
+fn project_result(
+    config: &Config,
+    tool: &ValidatedCall,
+    mut result: (Value, Option<String>),
+) -> (Value, Option<String>) {
+    if config.secondary_root.is_some() && result.0.is_object() {
+        let slot = tool
+            .arguments
+            .get("project")
+            .and_then(Value::as_u64)
+            .unwrap_or(1);
+        result.0["project"] = json!(slot);
+        if slot == 2 {
+            if let (Some(root), Some(path)) = (
+                config.secondary_root.as_deref(),
+                result.0.get("path").and_then(Value::as_str),
+            ) {
+                result.0["path"] = json!(Path::new(root).join(path).to_string_lossy());
+            }
+        }
+    }
+    result
+}
+
 fn run_tool(
     config: &Config,
     state: &mut AgentState,
     tool: &ValidatedCall,
 ) -> Result<(Value, Option<String>), String> {
+    run_scoped_tool(config, state, tool).map(|result| project_result(config, tool, result))
+}
+
+fn run_scoped_tool(
+    config: &Config,
+    state: &mut AgentState,
+    tool: &ValidatedCall,
+) -> Result<(Value, Option<String>), String> {
+    let scoped = scoped_tool_config(config, tool)?;
+    let config = &scoped;
     match tool.name.as_str() {
         "project_knowledge_index" => {
             let root = config
@@ -2612,6 +2716,15 @@ fn run_safe_read_tool(
     config: &Config,
     tool: &ValidatedCall,
 ) -> Result<(Value, Option<String>), String> {
+    run_scoped_read_tool(config, tool).map(|result| project_result(config, tool, result))
+}
+
+fn run_scoped_read_tool(
+    config: &Config,
+    tool: &ValidatedCall,
+) -> Result<(Value, Option<String>), String> {
+    let scoped = scoped_tool_config(config, tool)?;
+    let config = &scoped;
     let root = config
         .root
         .as_ref()
@@ -2637,6 +2750,10 @@ fn record_safe_read_effect(
     tool: &ValidatedCall,
     value: &Value,
 ) {
+    let Ok(scoped) = scoped_tool_config(config, tool) else {
+        return;
+    };
+    let config = &scoped;
     match tool.name.as_str() {
         "project_knowledge_index" | "project_knowledge_read" => {
             if tool.name == "project_knowledge_read" {
@@ -2792,8 +2909,20 @@ pub fn run(config: Config) {
         reserve_tokens: None,
     };
     let stable = stable_prefix(&config);
-    let schemas = tool_schemas_for_request(config.root.is_some(), config.policy, &config.user);
+    transcript.set_secondary_project_root(config.secondary_root.as_deref().map(Path::new));
+    let mut schemas = tool_schemas_for_request(config.root.is_some(), config.policy, &config.user);
+    if config.secondary_root.is_some() {
+        for schema in &mut schemas {
+            if !matches!(
+                tool_name(schema),
+                "task_memory" | "observation_read" | "observation_index"
+            ) {
+                schema["function"]["parameters"]["properties"]["project"] = json!({"type":"integer","enum":[1,2],"description":"Selected project slot. 1 is the primary root; 2 is the secondary root. Defaults to 1."});
+            }
+        }
+    }
     let mut final_content = String::new();
+    let mut visible_final_content = String::new();
     let mut continuation_count = 0_usize;
     let mut continuation_pending = false;
     let mut overflow_attempts = 0_usize;
@@ -2845,7 +2974,8 @@ pub fn run(config: Config) {
         }
         if let Ok(mut steering) = config.steering.lock() {
             for content in steering.drain(..) {
-                transcript.push_steering(content);
+                transcript.push_steering(content.clone());
+                emit(&config.run_id, Event::SteeringApplied { content });
             }
         }
         if turn >= MAX_INVESTIGATION_TURNS && !transcript.is_finalizing() {
@@ -3294,6 +3424,17 @@ pub fn run(config: Config) {
             continue;
         }
         if calls.is_empty() {
+            {
+                let queue = config.steering.lock().expect("steering lock");
+                if !queue.is_empty() {
+                    transcript.assistant_message_with_reasoning(
+                        streamed.content.clone(),
+                        streamed.reasoning.clone(),
+                    );
+                    emit_status(&config.run_id, &streamed.content);
+                    continue;
+                }
+            }
             if unstructured_tool_call_content(&streamed.content) {
                 transcript.assistant_withheld_draft(
                     streamed.content,
@@ -3315,9 +3456,12 @@ pub fn run(config: Config) {
                 continue;
             }
             if was_continuation {
+                let prefix = final_content.clone();
                 let accepted = append_continuation_text(&mut final_content, &streamed.content);
                 streamed.content = accepted.clone();
-                emit_accepted_final_content(&config.run_id, &accepted);
+                let visible = present_answer(&accepted, &prefix, &transcript, &state);
+                visible_final_content.push_str(&visible);
+                emit_accepted_final_content(&config.run_id, &visible);
                 continuation_pending = false;
             }
             trace_forensics(
@@ -3327,7 +3471,9 @@ pub fn run(config: Config) {
             );
             if streamed.finish_reason == "length" {
                 if !was_continuation {
-                    emit_accepted_final_content(&config.run_id, &streamed.content);
+                    let visible = present_answer(&streamed.content, "", &transcript, &state);
+                    visible_final_content.push_str(&visible);
+                    emit_accepted_final_content(&config.run_id, &visible);
                 }
                 if !was_continuation {
                     append_final_text(&mut final_content, &streamed.content);
@@ -3388,8 +3534,22 @@ pub fn run(config: Config) {
                 }
                 FinalCandidateReview::Accept => {}
             }
+            {
+                let queue = config.steering.lock().expect("steering lock");
+                if !queue.is_empty() {
+                    transcript.assistant_message_with_reasoning(
+                        streamed.content.clone(),
+                        streamed.reasoning.clone(),
+                    );
+                    emit_status(&config.run_id, &streamed.content);
+                    continue;
+                }
+                config.steering_closed.store(true, Ordering::Relaxed);
+            }
             if !was_continuation {
-                emit_accepted_final_content(&config.run_id, &streamed.content);
+                let visible = present_answer(&streamed.content, "", &transcript, &state);
+                visible_final_content.push_str(&visible);
+                emit_accepted_final_content(&config.run_id, &visible);
             }
             if !was_continuation {
                 append_final_text(&mut final_content, &streamed.content);
@@ -3412,7 +3572,7 @@ pub fn run(config: Config) {
                 return;
             }
             if let Err(error) =
-                transcript.finish_durable(&config.history, &config.user, &final_content)
+                transcript.finish_durable(&config.history, &config.user, &visible_final_content)
             {
                 emit(
                     &config.run_id,
@@ -4174,6 +4334,7 @@ mod tests {
             system: "system".into(),
             user: "audit".into(),
             root: None,
+            secondary_root: None,
             context_limit: window,
             reasoning_mode: "fast".into(),
             supports_reasoning: true,
@@ -4184,7 +4345,52 @@ mod tests {
             provider_max_output: None,
             cancelled: Arc::new(AtomicBool::new(false)),
             steering: Arc::new(Mutex::new(Vec::new())),
+            steering_closed: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    #[test]
+    fn project_slots_route_reads_and_reject_missing_or_invalid_scope() {
+        let base = std::env::temp_dir().join(format!("project-slots-{}", std::process::id()));
+        let first = base.join("first");
+        let second = base.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(first.join("identity.txt"), "first").unwrap();
+        std::fs::write(second.join("identity.txt"), "second").unwrap();
+        let mut config = test_config(16384);
+        config.root = Some(first.to_string_lossy().into_owned());
+        config.secondary_root = Some(second.to_string_lossy().into_owned());
+        for (slot, expected) in [(1, "first"), (2, "second")] {
+            let call = ValidatedCall {
+                id: slot.to_string(),
+                name: "read_file".into(),
+                arguments: json!({"path":"identity.txt","project":slot}),
+            };
+            let (value, _) = run_safe_read_tool(&config, &call).unwrap();
+            assert!(value.to_string().contains(expected));
+            assert_eq!(value["project"], slot);
+        }
+        let invalid = ValidatedCall {
+            id: "invalid".into(),
+            name: "read_file".into(),
+            arguments: json!({"path":"identity.txt","project":3}),
+        };
+        assert!(run_safe_read_tool(&config, &invalid).is_err());
+        let escape = ValidatedCall {
+            id: "escape".into(),
+            name: "read_file".into(),
+            arguments: json!({"path":"../first/identity.txt","project":2}),
+        };
+        assert!(run_safe_read_tool(&config, &escape).is_err());
+        config.secondary_root = None;
+        let absent = ValidatedCall {
+            id: "absent".into(),
+            name: "read_file".into(),
+            arguments: json!({"path":"identity.txt","project":2}),
+        };
+        assert!(run_safe_read_tool(&config, &absent).is_err());
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     /// Failure shape: entering synthesis because the investigation budget ended

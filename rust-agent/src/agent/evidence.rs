@@ -97,6 +97,7 @@ pub struct EvidenceStore {
     dir: PathBuf,
     run_id: String,
     root: Option<PathBuf>,
+    secondary_root: Option<PathBuf>,
     journal: File,
     next_event: usize,
     next_observation: usize,
@@ -250,6 +251,7 @@ impl EvidenceStore {
                 dir,
                 run_id: run_id.into(),
                 root: canonical_root,
+                secondary_root: None,
                 journal,
                 next_event,
                 next_observation,
@@ -297,15 +299,19 @@ impl EvidenceStore {
                         .and_then(Value::as_str)
                         .map(str::to_owned);
                     let source_revision = source.as_ref().and_then(|p| {
-                        self.root.as_ref().and_then(|root| {
-                            let file = fs::canonicalize(root.join(p)).ok()?;
-                            if !file.starts_with(root) {
-                                return None;
-                            }
-                            fs::read(file)
-                                .ok()
-                                .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
-                        })
+                        self.secondary_root
+                            .as_ref()
+                            .filter(|root| Path::new(p).starts_with(root))
+                            .or(self.root.as_ref())
+                            .and_then(|root| {
+                                let file = fs::canonicalize(root.join(p)).ok()?;
+                                if !file.starts_with(root) {
+                                    return None;
+                                }
+                                fs::read(file)
+                                    .ok()
+                                    .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+                            })
                     });
                     let requested_range = call_args.map(|a| {
                         let lines = a.get("start_line").and_then(Value::as_u64).map(|start| {
@@ -435,10 +441,14 @@ impl EvidenceStore {
         base: &Path,
         history: &[Value],
         user: &str,
+        steering: &[String],
         final_text: &str,
     ) -> Result<(), String> {
         let mut next = history.to_vec();
         next.push(json!({"role":"user","content":user}));
+        for content in steering {
+            next.push(json!({"role":"user","content":content}));
+        }
         next.push(json!({"role":"assistant","content":final_text}));
         let active = Active {
             run_dir: self.dir.file_name().unwrap().to_string_lossy().into_owned(),
@@ -454,14 +464,30 @@ impl EvidenceStore {
     }
 
     pub fn read(&self, id: &str, offset: usize, limit: usize) -> Result<Value, String> {
-        read_stored_observation(
-            &self.dir,
-            self.root.as_deref(),
-            &self.observations,
-            id,
-            offset,
-            limit,
-        )
+        let root = self
+            .observations
+            .iter()
+            .find(|observation| {
+                observation.id == id
+                    || observation
+                        .id
+                        .trim_start_matches("obs-")
+                        .parse::<usize>()
+                        .ok()
+                        == id.trim_start_matches("obs-").parse::<usize>().ok()
+            })
+            .and_then(|observation| observation.source.as_deref())
+            .and_then(|source| {
+                self.secondary_root
+                    .as_deref()
+                    .filter(|root| Path::new(source).starts_with(root))
+            })
+            .or(self.root.as_deref());
+        read_stored_observation(&self.dir, root, &self.observations, id, offset, limit)
+    }
+
+    pub fn set_secondary_root(&mut self, root: Option<&Path>) {
+        self.secondary_root = root.and_then(|root| root.canonicalize().ok());
     }
 }
 

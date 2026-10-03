@@ -20,9 +20,11 @@ const api: LocalAiApi = {
   models: { list: () => ipcRenderer.invoke('models:list') },
   settings: { get: () => ipcRenderer.invoke('settings:get') },
   hardware: { get: () => ipcRenderer.invoke('hardware:get') },
+  contextEstimate: (modelId) => ipcRenderer.invoke('context:estimate', modelId),
   dialog: { chooseDirectory: (initialDirectory) => ipcRenderer.invoke('dialog:chooseDirectory', initialDirectory) },
   chat: {
     send: (request) => ipcRenderer.invoke('chat:send', request),
+    steer: (conversationId, generationId, content) => ipcRenderer.invoke('chat:steer', conversationId, generationId, content),
     stop: (conversationId, generationId) => ipcRenderer.invoke('chat:stop', conversationId, generationId),
     approve: (request) => ipcRenderer.invoke('chat:approve', request),
     onStream: (listener) => { const callback = (_: unknown, event: Parameters<typeof listener>[0]) => listener(event); ipcRenderer.on('chat:stream', callback); return () => ipcRenderer.removeListener('chat:stream', callback); },

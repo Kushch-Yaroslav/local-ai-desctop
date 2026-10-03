@@ -11,6 +11,7 @@ type State = {
   settings: AppSettings | null;
   isGenerating: boolean;
   generationId: string | null;
+  generationConversationId: string | null;
   generationState: 'idle' | 'thinking' | 'using-tool' | 'running-terminal' | 'waiting-for-approval' | 'generating' | 'stopping' | 'cancelled' | 'error';
   error: string | null;
   toolActivities: ToolActivity[];
@@ -31,11 +32,13 @@ type State = {
   deleteConversation: (id: string) => Promise<void>;
   refreshHardware: () => Promise<void>;
   sendMessage: (content: string, files?: File[], projectReferences?: ProjectReference[]) => Promise<void>;
+  steer: (content: string) => Promise<boolean>;
+  steeringStatus: 'accepted' | 'applied' | null;
   approveAction: (decision: ApprovalDecision) => Promise<void>;
   editMessage: (message: ChatMessage, content: string) => Promise<boolean>;
   regenerateMessage: (message: ChatMessage) => Promise<boolean>;
   stop: () => Promise<void>;
-  handleStream: (event: { type: string; content?: string; message?: string; details?: string; activity?: ToolActivity; run?: AnalysisRun; progress?: AnalysisProgress; requested?: number; active?: number; supported?: number; used?: number; maximum?: number; timelinePosition?: number; telemetry?: Partial<AgentTelemetry>; conversationId: string; generationId: string; modelId?: string; assistant?: ChatMessage | null; finishReason?: FinishReason; diagnostics?: Omit<GenerationDiagnostics, 'generationId' | 'conversationId' | 'createdAt'>; actionId?: string; approval?: ActionApproval; approvalId?: string; status?: Exclude<ApprovalStatus, 'pending'> | AttachmentStatus }) => void;
+  handleStream: (event: { type: string; content?: string; message?: string; userMessage?: ChatMessage; details?: string; activity?: ToolActivity; run?: AnalysisRun; progress?: AnalysisProgress; requested?: number; active?: number; supported?: number; used?: number; maximum?: number; timelinePosition?: number; telemetry?: Partial<AgentTelemetry>; conversationId: string; generationId: string; modelId?: string; assistant?: ChatMessage | null; finishReason?: FinishReason; diagnostics?: Omit<GenerationDiagnostics, 'generationId' | 'conversationId' | 'createdAt'>; actionId?: string; approval?: ActionApproval; approvalId?: string; status?: Exclude<ApprovalStatus, 'pending'> | AttachmentStatus | 'accepted' | 'applied' }) => void;
 };
 
 const assistantId = (generationId: string) => `stream-${generationId}`;
@@ -58,7 +61,30 @@ const mergeToolActivity = (prior: ToolActivity | undefined, next: ToolActivity):
   return { ...prior, ...next, ...(terminal ? { terminal } : {}) };
 };
 
-export const useAppStore = create<State>((set, get) => {
+const viewKeys = ['messages', 'isGenerating', 'generationId', 'generationState', 'error', 'toolActivities', 'toolActivityCount', 'activeContextWindow', 'analysisProgress', 'analysisRuns', 'lastFinishReason', 'performance', 'pendingApproval', 'approvalSubmitting', 'agentTelemetry', 'steeringStatus'] as const;
+type ConversationView = Pick<State, typeof viewKeys[number]>;
+const viewOf = (state: State): ConversationView => Object.fromEntries(viewKeys.map((key) => [key, state[key]])) as ConversationView;
+
+export const useAppStore = create<State>((rawSet, rawGet) => {
+  const views = new Map<string, ConversationView>();
+  let routedId: string | null = null;
+  let selection = 0;
+  const get = (): State => {
+    const state = rawGet();
+    return routedId && routedId !== state.activeId ? { ...state, ...views.get(routedId), activeId: routedId } : state;
+  };
+  const set = (update: Partial<State> | ((state: State) => Partial<State>)) => {
+    const patch = typeof update === 'function' ? update(get()) : update;
+    if (!routedId || routedId === rawGet().activeId) { rawSet(patch); return; }
+    const viewPatch = Object.fromEntries(Object.entries(patch).filter(([key]) => viewKeys.some((viewKey) => viewKey === key)));
+    views.set(routedId, { ...views.get(routedId)!, ...viewPatch });
+    rawSet(Object.fromEntries(Object.entries(patch).filter(([key]) => !viewKeys.some((viewKey) => viewKey === key))));
+  };
+  const withView = (id: string | null, action: () => void) => {
+    const previous = routedId;
+    routedId = id;
+    try { action(); } finally { routedId = previous; }
+  };
   const pendingTokens = new Map<string, string>();
   const pendingThinking = new Map<string, Array<{ content: string; timelinePosition?: number }>>();
   let animationFrame: number | null = null;
@@ -74,7 +100,7 @@ export const useAppStore = create<State>((set, get) => {
     const tokens = new Map<string, string>(); const thinking = new Map<string, Array<{ content: string; timelinePosition?: number }>>();
     for (const [id, value] of pendingTokens) { const visible = take(value); tokens.set(id, visible); const rest = value.slice(visible.length); if (rest) pendingTokens.set(id, rest); else pendingTokens.delete(id); }
     for (const [id, value] of pendingThinking) { thinking.set(id, value); pendingThinking.delete(id); }
-    set((state) => ({ messages: state.messages.map((message) => {
+    withView(rawGet().generationConversationId, () => set((state) => ({ messages: state.messages.map((message) => {
       const token = tokens.get(get().generationId ?? '');
       const reasoning = thinking.get(get().generationId ?? '');
       const timeline = reasoning?.reduce<ThinkingTimelineEvent[]>((entries, fragment) => {
@@ -84,23 +110,24 @@ export const useAppStore = create<State>((set, get) => {
         return [...entries, { id: `reasoning-${fragment.timelinePosition}`, kind: 'reasoning', content: fragment.content, position: fragment.timelinePosition }];
       }, message.thinkingTimeline ?? []);
       return (token || reasoning?.length) && message.id === assistantId(get().generationId ?? '') ? { ...message, ...(token ? { content: message.content + token } : {}), ...(reasoning?.length ? { thinking: (message.thinking ?? '') + reasoning.map((fragment) => fragment.content).join(''), ...(timeline?.length ? { thinkingTimeline: timeline } : {}) } : {}) } : message;
-    }) }));
+    }) })));
     if (!immediate && (pendingTokens.size || pendingThinking.size)) animationFrame = window.requestAnimationFrame(() => drainStream());
   };
   const finishAgentStream = (messages: ChatMessage[], generationId: string, terminal: { error?: string; cancelled?: boolean }) => messages.map((message) => message.id === assistantId(generationId)
     ? { ...message, ...(terminal.error ? { agentError: terminal.error } : {}), ...(terminal.cancelled ? { agentCancelled: true } : {}), agentFinishedAt: now() }
     : message);
-  const regenerateSavedBranch = async (saved: ChatMessage[], errorMessage: string): Promise<boolean> => {
-    const activeId = get().activeId; const chat = get().conversations.find((item) => item.id === activeId); const model = chat?.modelId ?? get().models[0]?.id;
+  const regenerateSavedBranch = async (saved: ChatMessage[], errorMessage: string, activeId: string): Promise<boolean> => {
+    const chat = get().conversations.find((item) => item.id === activeId); const model = chat?.modelId ?? get().models[0]?.id;
     if (!activeId || !chat || !model) return false;
     const generationId = crypto.randomUUID(); const streaming: ChatMessage = { id: assistantId(generationId), conversationId: activeId, role: 'assistant', content: '', createdAt: now() };
-    set({ messages: [...saved, streaming], isGenerating: true, generationId, generationState: 'thinking', error: null, toolActivities: [], toolActivityCount: 0, analysisProgress: [], lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false, agentTelemetry: { turn: 0, inputTokens: 0, outputTokens: 0, actions: 0, startedAt: now() } });
+    withView(activeId, () => set({ messages: [...saved, streaming], isGenerating: true, generationId, generationConversationId: activeId, generationState: 'thinking', error: null, toolActivities: [], toolActivityCount: 0, analysisProgress: [], lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false, steeringStatus: null, agentTelemetry: { turn: 0, inputTokens: 0, outputTokens: 0, actions: 0, startedAt: now() } }));
     try { await window.localAi.chat.send({ conversationId: activeId, model, mode: chat.mode, messages: saved, generationId, persistUserMessage: false }); }
-    catch (error) { set((state) => state.generationId === generationId ? { isGenerating: false, generationId: null, generationState: 'error', error: error instanceof Error ? error.message : errorMessage, messages: finishAgentStream(state.messages, generationId, { error: error instanceof Error ? error.message : errorMessage }) } : {}); }
+    catch (error) { withView(activeId, () => set((state) => state.generationId === generationId ? { isGenerating: false, generationId: null, generationState: 'error', error: error instanceof Error ? error.message : errorMessage, messages: finishAgentStream(state.messages, generationId, { error: error instanceof Error ? error.message : errorMessage }) } : {})); }
+    finally { set({ generationConversationId: null }); }
     return true;
   };
   return {
-  conversations: [], activeId: null, messages: [], models: [], hardware: null, settings: null, isGenerating: false, generationId: null, generationState: 'idle', error: null, toolActivities: [], toolActivityCount: 0, activeContextWindow: null, analysisProgress: [], analysisRuns: [], lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false, agentTelemetry: null,
+  conversations: [], activeId: null, messages: [], models: [], hardware: null, settings: null, isGenerating: false, generationId: null, generationConversationId: null, generationState: 'idle', error: null, toolActivities: [], toolActivityCount: 0, activeContextWindow: null, analysisProgress: [], analysisRuns: [], lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false, agentTelemetry: null, steeringStatus: null,
   initialize: async () => {
     const [conversations, models, settings] = await Promise.all([window.localAi.conversations.list(), window.localAi.models.list(), window.localAi.settings.get()]);
     set({ conversations, models, settings });
@@ -109,10 +136,13 @@ export const useAppStore = create<State>((set, get) => {
     await get().refreshHardware();
   },
   selectConversation: async (id) => {
-    if (get().activeId !== id && get().generationId) await get().stop();
+    const request = ++selection;
     const [messages, analysisRuns] = await Promise.all([window.localAi.messages.list(id), window.localAi.analysis.list(id)]);
+    if (request !== selection) return;
+    if (get().activeId) views.set(get().activeId!, viewOf(get()));
     const conversation = get().conversations.find((item) => item.id === id);
-    set({ activeId: id, messages, analysisRuns, isGenerating: false, generationId: null, generationState: 'idle', error: null, toolActivities: [], toolActivityCount: 0, activeContextWindow: conversation?.contextWindow ?? null, analysisProgress: [], lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false });
+    const cached = views.get(id);
+    set({ activeId: id, messages, analysisRuns, isGenerating: false, generationId: null, generationState: 'idle', error: null, toolActivities: [], toolActivityCount: 0, activeContextWindow: conversation?.contextWindow ?? null, analysisProgress: [], lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false, agentTelemetry: null, steeringStatus: null, ...(cached && (cached.isGenerating || cached.generationState === 'error' || cached.generationState === 'cancelled') ? cached : {}) });
   },
   createConversation: async () => {
     const activeChat = get().conversations.find((chat) => chat.id === get().activeId);
@@ -142,13 +172,16 @@ export const useAppStore = create<State>((set, get) => {
   },
   deleteConversation: async (id) => {
     await window.localAi.conversations.delete(id);
+    views.delete(id);
     const remaining = get().conversations.filter((item) => item.id !== id);
-    set({ conversations: remaining, activeId: null, messages: [] });
+    set({ conversations: remaining });
+    if (get().activeId !== id) return;
+    set({ activeId: null, messages: [] });
     if (remaining[0]) await get().selectConversation(remaining[0].id); else await get().createConversation();
   },
   refreshHardware: async () => set({ hardware: await window.localAi.hardware.get() }),
   sendMessage: async (content, files = [], projectReferences = []) => {
-    if (get().generationId) await get().stop();
+    if (get().generationConversationId || branchRegenerationPending) { set({ error: 'Уже выполняется генерация или подготовка повтора. Дождитесь завершения или остановите её в активном чате.' }); return; }
     const { activeId, conversations, messages, models } = get();
     if (!activeId || (!content.trim() && files.length === 0)) return;
     const chat = conversations.find((item) => item.id === activeId); const model = chat?.modelId ?? models[0]?.id;
@@ -158,28 +191,39 @@ export const useAppStore = create<State>((set, get) => {
     const attached: Attachment[] = files.map((file, index) => { const isImage = isImageFile(file); return { id: crypto.randomUUID(), messageId: userId, index, kind: isImage ? 'image' : file.name.endsWith('.pdf') ? 'pdf' : /\.(xlsx|xls)$/i.test(file.name) ? 'spreadsheet' : file.name.endsWith('.docx') ? 'document' : 'text', mimeType: file.type || 'application/octet-stream', filename: file.name, size: file.size, storageRef: '', status: 'pending', metadata: isImage ? { imageNumber: ++imageIndex } : undefined, createdAt: now(), updatedAt: now() }; });
     const user: ChatMessage = { id: userId, conversationId: activeId, role: 'user', content: content.trim() || 'Вложения', createdAt: now(), attachments: attached, projectReferences };
     const generationId = crypto.randomUUID(); const streaming: ChatMessage = { id: assistantId(generationId), conversationId: activeId, role: 'assistant', content: '', createdAt: now() };
-    set({ messages: [...messages, user, streaming], isGenerating: true, generationId, generationState: 'thinking', error: null, toolActivities: [], toolActivityCount: 0, analysisProgress: [], lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false, agentTelemetry: chat?.mode === 'agent' ? { turn: 0, inputTokens: 0, outputTokens: 0, actions: 0, startedAt: now() } : null });
-    if (!chat?.modelId) await get().updateConversation(activeId, { modelId: model });
-    if (chat?.title === 'Новый чат') await get().updateConversation(activeId, { title: content.trim().slice(0, 56) });
+    set({ messages: [...messages, user, streaming], isGenerating: true, generationId, generationConversationId: activeId, generationState: 'thinking', error: null, toolActivities: [], toolActivityCount: 0, analysisProgress: [], lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false, agentTelemetry: chat?.mode === 'agent' ? { turn: 0, inputTokens: 0, outputTokens: 0, actions: 0, startedAt: now() } : null });
     try {
+      set({ steeringStatus: null });
+      if (!chat?.modelId) await get().updateConversation(activeId, { modelId: model });
+      if (chat?.title === 'Новый чат') await get().updateConversation(activeId, { title: content.trim().slice(0, 56) });
       const attachmentInputs = await Promise.all(files.map(async (file, index) => ({ id: attached[index].id, messageId: user.id, index: attached[index].index, filename: file.name, mimeType: file.type, data: new Uint8Array(await file.arrayBuffer()) })));
       await window.localAi.chat.send({ conversationId: activeId, model, mode: chat?.mode, messages: [...messages, user], generationId, persistUserMessage: true, attachments: attachmentInputs });
     }
-    catch (error) { set((state) => state.generationId === generationId ? { isGenerating: false, generationId: null, generationState: 'error', error: error instanceof Error ? error.message : 'Не удалось отправить сообщение', messages: state.messages.filter((message) => message.id !== assistantId(generationId)) } : {}); }
+    catch (error) { withView(activeId, () => set((state) => state.generationId === generationId ? { isGenerating: false, generationId: null, generationState: 'error', error: error instanceof Error ? error.message : 'Не удалось отправить сообщение', messages: state.messages.filter((message) => message.id !== assistantId(generationId)) } : {})); }
+    finally { set({ generationConversationId: null }); }
   },
   editMessage: async (message, content) => {
-    if (get().generationId) await get().stop();
-    let saved: ChatMessage[];
-    try { saved = await window.localAi.messages.edit(message.id, content, { conversationId: message.conversationId, content: message.content }); }
+    if (get().generationConversationId || branchRegenerationPending) { set({ error: 'Дождитесь завершения генерации перед редактированием.' }); return false; }
+    branchRegenerationPending = true;
+    try {
+      const saved = await window.localAi.messages.edit(message.id, content, { conversationId: message.conversationId, content: message.content });
+      return await regenerateSavedBranch(saved, 'Не удалось перегенерировать ответ', message.conversationId);
+    }
     catch (error) { set({ error: error instanceof Error ? error.message : 'Не удалось сохранить изменение' }); return false; }
-    return regenerateSavedBranch(saved, 'Не удалось перегенерировать ответ');
+    finally { branchRegenerationPending = false; }
+  },
+  steer: async (content) => {
+    const { activeId, generationId } = get();
+    if (!activeId || !generationId) return false;
+    try { await window.localAi.chat.steer(activeId, generationId, content); return true; }
+    catch (error) { withView(activeId, () => set({ error: error instanceof Error ? error.message : String(error) })); return false; }
   },
   regenerateMessage: async (message) => {
-    if (branchRegenerationPending || get().generationId || get().activeId !== message.conversationId) return false;
+    if (branchRegenerationPending || get().generationConversationId || get().activeId !== message.conversationId) return false;
     branchRegenerationPending = true;
     try {
       const saved = await window.localAi.messages.regenerate(message.id);
-      return await regenerateSavedBranch(saved, 'Не удалось перегенерировать ответ');
+      return await regenerateSavedBranch(saved, 'Не удалось перегенерировать ответ', message.conversationId);
     } catch (error) { set({ error: error instanceof Error ? error.message : 'Не удалось перегенерировать ответ' }); return false; }
     finally { branchRegenerationPending = false; }
   },
@@ -192,11 +236,17 @@ export const useAppStore = create<State>((set, get) => {
   },
   stop: async () => { const { activeId, generationId } = get(); if (!activeId || !generationId) return; set({ generationState: 'stopping', pendingApproval: null, approvalSubmitting: false }); await window.localAi.chat.stop(activeId, generationId); pendingTokens.delete(generationId); pendingThinking.delete(generationId); if (animationFrame !== null) { window.cancelAnimationFrame(animationFrame); animationFrame = null; } set((state) => state.generationId === generationId ? { isGenerating: false, generationId: null, generationState: 'cancelled', messages: finishAgentStream(state.messages, generationId, { cancelled: true }), performance: null, pendingApproval: null, approvalSubmitting: false } : {}); },
   handleStream: (event) => {
+    if (event.conversationId !== rawGet().activeId && !views.has(event.conversationId)) return;
+    withView(event.conversationId, () => {
     if (event.type === 'context-usage' && typeof event.used === 'number') {
       const used = event.used;
       set((state) => ({ conversations: state.conversations.map((chat) => chat.id === event.conversationId ? { ...chat, contextTokens: used, contextModelId: event.modelId ?? chat.modelId } : chat) }));
     }
     if (!isCurrentGenerationEvent(event.conversationId, event.generationId, get().activeId, get().generationId)) return;
+    if (event.type === 'steering' && event.userMessage) {
+      const message = event.userMessage;
+      set((state) => ({ steeringStatus: event.status === 'applied' ? 'applied' : 'accepted', messages: state.messages.some((entry) => entry.id === message.id) ? state.messages : [...state.messages.filter((entry) => entry.id !== assistantId(event.generationId)), message, ...state.messages.filter((entry) => entry.id === assistantId(event.generationId))] }));
+    }
     if (event.type === 'token') {
       pendingTokens.set(event.generationId, (pendingTokens.get(event.generationId) ?? '') + (event.content ?? ''));
       if (animationFrame === null) animationFrame = window.requestAnimationFrame(() => drainStream());
@@ -245,6 +295,7 @@ export const useAppStore = create<State>((set, get) => {
     if (event.type === 'error') { drainStream(true); pendingTokens.delete(event.generationId); pendingThinking.delete(event.generationId); const message = event.details ? `${event.message}: ${event.details}` : event.message ?? 'Ошибка генерации'; set((state) => ({ isGenerating: false, generationId: null, generationState: 'error', error: message, messages: finishAgentStream(state.messages, event.generationId, { error: message }), lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false, agentTelemetry: state.agentTelemetry ? { ...state.agentTelemetry, finishedAt: now() } : null })); }
     if (event.type === 'cancelled') { drainStream(true); pendingTokens.delete(event.generationId); pendingThinking.delete(event.generationId); set((state) => ({ isGenerating: false, generationId: null, generationState: 'cancelled', messages: finishAgentStream(state.messages, event.generationId, { cancelled: true }), lastFinishReason: 'cancelled', performance: null, pendingApproval: null, approvalSubmitting: false, agentTelemetry: state.agentTelemetry ? { ...state.agentTelemetry, finishedAt: now() } : null })); }
     if (event.type === 'done') { drainStream(true); set((state) => ({ isGenerating: false, generationId: null, generationState: 'idle', messages: state.messages.flatMap((message) => message.id === assistantId(event.generationId) ? (event.assistant ? [event.assistant] : []) : [message]), lastFinishReason: event.finishReason ?? 'stop', agentTelemetry: state.agentTelemetry ? { ...state.agentTelemetry, finishedAt: now() } : null })); }
+    });
   },
 };
 });

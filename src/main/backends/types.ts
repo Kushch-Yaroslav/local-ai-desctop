@@ -46,3 +46,16 @@ export interface LlmBackend {
   streamChat(model: string, messages: ChatMessage[], signal: AbortSignal, contextWindow?: number, reasoningMode?: ReasoningMode): AsyncIterable<StreamEvent>;
   getStatus(): Promise<{ available: boolean; message?: string }>;
 }
+
+/** Directly reported state for a model currently resident in a backend runtime.
+ * Resident byte counts are observations, not model-weight-only measurements. */
+export interface RuntimeContextEvidence {
+  backend: 'ollama' | 'llama-cpp';
+  modelId: string;
+  activeContextTokens: number;
+  modelPath?: string;
+  modelTrainContextTokens?: number;
+  modelFileSizeBytes?: number;
+  residentBytes?: number;
+  deviceResidentBytes?: number;
+}

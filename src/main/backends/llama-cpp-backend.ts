@@ -1,15 +1,15 @@
 import type { ChatMessage, FinishReason, ModelInfo, ReasoningMode, StreamEvent } from '../../shared/types';
 import { createHash } from 'node:crypto';
-import { wholeNanoseconds, type InferenceDiagnostics, type LlmBackend, type ToolCallingBackend, type ToolInferenceRequestContext, type ToolInferenceStreamEvent, type ToolMessage } from './types';
+import { wholeNanoseconds, type InferenceDiagnostics, type LlmBackend, type RuntimeContextEvidence, type ToolCallingBackend, type ToolInferenceRequestContext, type ToolInferenceStreamEvent, type ToolMessage } from './types';
 import { getModelProfile, maxOutputTokens, modelInfo, outputBudget, outputSafetyReserveTokens } from '../models/model-registry';
-import { llamaContextPresets, llamaRuntimeInstalled, llamaRuntimeProfiles } from '../models/llama-runtime-policy';
+import { llamaContextPresets, llamaRuntimeInstalled, llamaRuntimeProfile, llamaRuntimeProfiles } from '../models/llama-runtime-policy';
 import type { ContextWindow } from './ollama-backend';
 import { log } from '../services/logger';
 
 type NativeToolCall = { index?: number; id?: string; type?: string; function?: { name?: string; arguments?: string } };
 type Choice = { finish_reason?: string | null; message?: { content?: string | null; reasoning_content?: string | null; tool_calls?: NativeToolCall[] }; delta?: { content?: string | null; reasoning_content?: string | null; tool_calls?: NativeToolCall[] } };
 type ChatResponse = { choices?: Choice[]; usage?: { prompt_tokens?: number; completion_tokens?: number }; timings?: { prompt_ms?: number; predicted_ms?: number; prompt_per_second?: number; predicted_per_second?: number } };
-type ModelsResponse = { data?: Array<{ meta?: { n_ctx?: number; size?: number } }> };
+type ModelsResponse = { data?: Array<{ meta?: { n_ctx?: number; n_ctx_train?: number; size?: number } }> };
 type InputTokenResponse = { input_tokens?: unknown };
 const qwenModel = 'qwen3.8:27b-q4_K_M';
 const glmFlashModel = 'glm-4.7-flash:q4_k';
@@ -150,6 +150,26 @@ export class LlamaCppBackend implements LlmBackend, ToolCallingBackend {
   async getStatus(): Promise<{ available: boolean; message?: string }> {
     try { const response = await fetch(this.url('/health'), { signal: AbortSignal.timeout(2_000) }); return response.ok ? { available: true } : { available: false, message: `llama.cpp вернул HTTP ${response.status}` }; }
     catch (error) { return { available: false, message: error instanceof Error ? error.message : String(error) }; }
+  }
+  /** Reports the loaded server context, not a memory-safe prediction. */
+  async getRuntimeContextEvidence(modelId = this.runtimeModelId, signal?: AbortSignal): Promise<RuntimeContextEvidence | null> {
+    if (modelId !== this.runtimeModelId) return null;
+    const response = await fetch(this.url('/v1/models'), { signal });
+    if (!response.ok) throw new Error(`llama.cpp вернул HTTP ${response.status} при чтении загруженной модели`);
+    const data = await response.json() as ModelsResponse;
+    const activeContextTokens = data.data?.[0]?.meta?.n_ctx;
+    if (typeof activeContextTokens !== 'number' || !Number.isSafeInteger(activeContextTokens) || activeContextTokens <= 0) return null;
+    const modelTrainContextTokens = data.data?.[0]?.meta?.n_ctx_train;
+    const modelFileSizeBytes = data.data?.[0]?.meta?.size;
+    const modelPath = llamaRuntimeProfile(modelId)?.modelPath;
+    return {
+      backend: 'llama-cpp',
+      modelId,
+      activeContextTokens,
+      ...(modelPath ? { modelPath } : {}),
+      ...(typeof modelTrainContextTokens === 'number' && Number.isSafeInteger(modelTrainContextTokens) && modelTrainContextTokens > 0 ? { modelTrainContextTokens } : {}),
+      ...(typeof modelFileSizeBytes === 'number' && Number.isFinite(modelFileSizeBytes) && modelFileSizeBytes >= 0 ? { modelFileSizeBytes } : {}),
+    };
   }
   async supportsVision(model: string): Promise<boolean> { return model === qwenModel && this.runtimeModelId === qwenModel && this.visionEnabled; }
   async resolveContextWindow(model: string, requested: number, signal?: AbortSignal): Promise<ContextWindow> {

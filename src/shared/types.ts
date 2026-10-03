@@ -1,3 +1,5 @@
+import type { RuntimeContextEstimate } from './context-estimator';
+
 export type ChatMode = 'chat' | 'agent';
 export type WebMode = 'off' | 'auto';
 export type BackendId = 'ollama' | 'llama-cpp';
@@ -307,6 +309,7 @@ export type StreamEvent =
   | { type: 'token'; content: string }
   | { type: 'thinking'; content: string; timelinePosition?: number }
   | { type: 'task-memory'; memory: NonNullable<AgentPlan['taskMemory']> }
+  | { type: 'steering'; userMessage: ChatMessage; status: 'accepted' | 'applied' }
   | { type: 'tool'; activity: ToolActivity; runId?: string }
   | { type: 'attachment'; activity: ToolActivity }
   | { type: 'approval-request'; actionId: string; approval: ActionApproval }
@@ -340,9 +343,11 @@ export interface LocalAiApi {
   models: { list(): Promise<ModelInfo[]> };
   settings: { get(): Promise<AppSettings> };
   hardware: { get(): Promise<HardwareStats> };
+  contextEstimate(modelId: string): Promise<RuntimeContextEstimate>;
   dialog: { chooseDirectory(initialDirectory?: string | null): Promise<string | null> };
   chat: {
     send(request: ChatRequest): Promise<void>;
+    steer(conversationId: string, generationId: string, content: string): Promise<ChatMessage>;
     stop(conversationId: string, generationId?: string): Promise<void>;
     approve(request: { conversationId: string; generationId: string; approvalId: string; decision: ApprovalDecision }): Promise<boolean>;
     onStream(listener: (event: StreamEvent & { conversationId: string; generationId: string; modelId?: string }) => void): () => void;

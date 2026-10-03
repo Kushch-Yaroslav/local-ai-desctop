@@ -18,6 +18,7 @@ struct Control {
     cancelled: Arc<AtomicBool>,
     steering: Arc<Mutex<Vec<String>>>,
     finished: Arc<AtomicBool>,
+    steering_closed: Arc<AtomicBool>,
 }
 
 fn main() {
@@ -54,7 +55,7 @@ fn main() {
                 system,
                 user,
                 project_root,
-                secondary_project_root: _,
+                secondary_project_root,
                 context_limit,
                 reasoning_mode,
                 supports_reasoning,
@@ -65,13 +66,21 @@ fn main() {
                 task_memory,
                 provider_max_output,
             } => {
-                if controls.contains_key(&run_id) {
+                if !controls.is_empty() {
+                    local_ai_agent_runtime::protocol::emit(
+                        &run_id,
+                        local_ai_agent_runtime::agent::events::Event::AgentError {
+                            code: "generation_busy".into(),
+                            message: "Only one Agent generation may run at a time".into(),
+                        },
+                    );
                     continue;
                 }
                 let control = Control {
                     cancelled: Arc::new(AtomicBool::new(false)),
                     steering: Arc::new(Mutex::new(Vec::new())),
                     finished: Arc::new(AtomicBool::new(false)),
+                    steering_closed: Arc::new(AtomicBool::new(false)),
                 };
                 controls.insert(run_id.clone(), control.clone());
                 std::thread::spawn(move || {
@@ -82,6 +91,7 @@ fn main() {
                         system,
                         user,
                         root: project_root,
+                        secondary_root: secondary_project_root,
                         context_limit,
                         reasoning_mode,
                         supports_reasoning,
@@ -96,6 +106,7 @@ fn main() {
                         provider_max_output,
                         cancelled: control.cancelled,
                         steering: control.steering,
+                        steering_closed: control.steering_closed,
                     });
                     control.finished.store(true, Ordering::Relaxed);
                 });
@@ -107,11 +118,37 @@ fn main() {
             }
             Request::Steer { run_id, content } => {
                 if let Some(control) = controls.get(&run_id) {
-                    control
-                        .steering
-                        .lock()
-                        .expect("steering lock")
-                        .push(content);
+                    let mut queue = control.steering.lock().expect("steering lock");
+                    if control.steering_closed.load(Ordering::Relaxed)
+                        || control.finished.load(Ordering::Relaxed)
+                        || control.cancelled.load(Ordering::Relaxed)
+                        || content.trim().is_empty()
+                        || content.len() > 64_000
+                        || queue.len() >= 4
+                    {
+                        local_ai_agent_runtime::protocol::emit(
+                            &run_id,
+                            local_ai_agent_runtime::agent::events::Event::SteeringRejected {
+                                message: "Agent is closed or steering queue/input limit exceeded"
+                                    .into(),
+                            },
+                        );
+                    } else {
+                        queue.push(content.clone());
+                        local_ai_agent_runtime::protocol::emit(
+                            &run_id,
+                            local_ai_agent_runtime::agent::events::Event::SteeringAccepted {
+                                content,
+                            },
+                        );
+                    }
+                } else {
+                    local_ai_agent_runtime::protocol::emit(
+                        &run_id,
+                        local_ai_agent_runtime::agent::events::Event::SteeringRejected {
+                            message: "Agent run has ended".into(),
+                        },
+                    );
                 }
             }
             Request::Shutdown => {

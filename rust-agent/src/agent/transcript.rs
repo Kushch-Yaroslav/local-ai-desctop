@@ -124,6 +124,12 @@ impl Transcript {
     pub fn set_project_root(&mut self, root: Option<&Path>) {
         self.project_root = root.and_then(|path| path.canonicalize().ok());
     }
+
+    pub fn set_secondary_project_root(&mut self, root: Option<&Path>) {
+        if let Some(store) = &mut self.store {
+            store.set_secondary_root(root);
+        }
+    }
     pub fn durable(
         base: &Path,
         run_id: &str,
@@ -279,7 +285,19 @@ impl Transcript {
         final_text: &str,
     ) -> Result<(), String> {
         if let (Some(store), Some(base)) = (&self.store, &self.evidence_base) {
-            store.finish(base, history, user, final_text)
+            let current = self
+                .entries
+                .iter()
+                .rposition(|entry| matches!(entry, Entry::RunUser(_)))
+                .unwrap_or(0);
+            let steering = self.entries[current..]
+                .iter()
+                .filter_map(|entry| match entry {
+                    Entry::Steering(content) => Some(content.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            store.finish(base, history, user, &steering, final_text)
         } else {
             Ok(())
         }

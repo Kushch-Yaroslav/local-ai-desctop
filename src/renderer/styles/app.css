@@ -12,6 +12,10 @@
 .mermaid-controls button, .mermaid-source-actions button { min-height: 30px; padding: 4px 9px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface-raised); color: var(--text); font-size: 12px; }
 .mermaid-controls button:hover:not(:disabled), .mermaid-source-actions button:hover { background: var(--surface-hover); }
 .mermaid-controls button:disabled { opacity: .45; cursor: default; }
+.steering-button { min-height: 32px; padding: 5px 10px; border: 1px solid var(--border-strong); border-radius: 7px; background: var(--surface-raised); color: var(--text); font-size: 12px; }
+.steering-button:hover:not(:disabled) { background: var(--surface-hover); }
+.steering-button:disabled { opacity: .45; cursor: default; }
+.composer-wrap .steering-status { margin: 0 4px 8px; text-align: left; color: var(--accent); font-size: 12px; }
 .mermaid-controls output { min-width: 44px; text-align: center; color: var(--text-muted); font-variant-numeric: tabular-nums; }
 .mermaid-viewport { max-height: 520px; min-height: 160px; overflow: auto; padding: clamp(16px, 3vw, 28px); cursor: grab; overscroll-behavior: contain; }
 .mermaid-viewport:active { cursor: grabbing; }

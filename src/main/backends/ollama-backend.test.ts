@@ -9,6 +9,28 @@ const showResponse = (capabilities: string[]) => new Response(JSON.stringify({ c
 
 export async function runOllamaBackendRegression(): Promise<void> {
   const originalFetch = globalThis.fetch;
+  {
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      assert(String(input).endsWith('/api/ps'), 'Ollama runtime evidence did not use live runner metadata');
+      return new Response(JSON.stringify({ models: [
+        { name: model, model, context_length: 65_536, size: 9_000, size_vram: 7_000 },
+        { name: 'other-model', context_length: 131_072, size: 20_000, size_vram: 0 },
+      ] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }) as typeof fetch;
+    try {
+      const backend = new OllamaBackend('http://unit.test');
+      assert.deepEqual(await backend.getRuntimeContextEvidence(model), {
+        backend: 'ollama',
+        modelId: model,
+        activeContextTokens: 65_536,
+        residentBytes: 9_000,
+        deviceResidentBytes: 7_000,
+      }, 'Ollama live context/residency evidence was not returned as reported');
+      assert.equal(await backend.getRuntimeContextEvidence('not-loaded'), null, 'an unloaded Ollama model was reported as live evidence');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  }
   const requests: Array<Record<string, unknown>> = [];
   globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
     if (String(input).endsWith('/api/tags')) return new Response(JSON.stringify({ models: [{ name: model, size: 1, capabilities: ['completion', 'tools', 'thinking'] }] }), { status: 200, headers: { 'content-type': 'application/json' } });

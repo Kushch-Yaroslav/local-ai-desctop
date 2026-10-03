@@ -1,5 +1,5 @@
 import type { ChatMessage, FinishReason, ModelInfo, ReasoningMode, StreamEvent } from '../../shared/types';
-import { wholeNanoseconds, type InferenceDiagnostics, type LlmBackend, type ToolCallingBackend, type ToolInferenceRequestContext, type ToolMessage } from './types';
+import { wholeNanoseconds, type InferenceDiagnostics, type LlmBackend, type RuntimeContextEvidence, type ToolCallingBackend, type ToolInferenceRequestContext, type ToolMessage } from './types';
 import { getModelProfile, maxOutputTokens, modelInfo, modelRegistry, ollamaReasoning, outputBudget, supportsOllamaReasoning } from '../models/model-registry';
 import { log } from '../services/logger';
 import { OllamaRequestError, classifyOllamaError, ollamaErrorDiagnostics } from './ollama-errors';
@@ -10,7 +10,7 @@ type OllamaChunk = { message?: { content?: string; thinking?: string }; done?: b
 
 type OllamaToolResponse = { message?: ToolMessage; error?: string; done_reason?: string } & OllamaMetrics;
 type OllamaShowResponse = { model_info?: Record<string, unknown>; parameters?: string; capabilities?: string[] };
-type OllamaRunningModels = { models?: Array<{ name: string; model?: string; context_length?: number; details?: { context_length?: number } }> };
+type OllamaRunningModels = { models?: Array<{ name: string; model?: string; context_length?: number; size?: number; size_vram?: number; details?: { context_length?: number } }> };
 
 export type ContextWindow = { requested: number; active: number; supported?: number };
 
@@ -106,6 +106,24 @@ export class OllamaBackend implements LlmBackend, ToolCallingBackend {
   async getStatus(): Promise<{ available: boolean; message?: string }> {
     try { await this.getModels(); return { available: true }; }
     catch (error) { return { available: false, message: error instanceof Error ? error.message : String(error) }; }
+  }
+
+  /** Returns only values reported for this model by the live Ollama runner. */
+  async getRuntimeContextEvidence(modelId: string, signal?: AbortSignal): Promise<RuntimeContextEvidence | null> {
+    const response = await fetch(`${this.baseUrl}/api/ps`, { signal });
+    if (!response.ok) throw new Error(`Ollama вернул HTTP ${response.status} при чтении загруженной модели`);
+    const data = await response.json() as OllamaRunningModels;
+    const loaded = data.models?.find((candidate) => candidate.name === modelId || candidate.model === modelId);
+    if (!loaded) return null;
+    const activeContextTokens = loaded.context_length ?? loaded.details?.context_length;
+    if (typeof activeContextTokens !== 'number' || !Number.isSafeInteger(activeContextTokens) || activeContextTokens <= 0) return null;
+    return {
+      backend: 'ollama',
+      modelId,
+      activeContextTokens,
+      ...(Number.isFinite(loaded.size) && (loaded.size ?? 0) >= 0 ? { residentBytes: loaded.size } : {}),
+      ...(Number.isFinite(loaded.size_vram) && (loaded.size_vram ?? 0) >= 0 ? { deviceResidentBytes: loaded.size_vram } : {}),
+    };
   }
 
   /** Uses the runtime's advertised capability, never a model-name heuristic. */

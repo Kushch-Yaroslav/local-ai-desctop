@@ -17,6 +17,122 @@ use std::sync::{Arc, Mutex};
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
+#[test]
+fn two_project_reads_have_distinct_evidence_and_model_visible_scope() {
+    let fixture = Workspace::new(&[("first-only.txt", "primary identity")]);
+    let secondary = fixture.base.join("secondary");
+    std::fs::create_dir_all(&secondary).unwrap();
+    std::fs::write(secondary.join("second-only.txt"), "secondary identity").unwrap();
+    let secondary_name = secondary.to_string_lossy().into_owned();
+    let expected = secondary_name.clone();
+    let provider = Provider::start(move |request, turn| {
+        assert!(request["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains(&expected));
+        if turn == 0 {
+            assert!(request["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["function"]["name"] == "read_file"
+                    && tool["function"]["parameters"]["properties"]["project"]["enum"]
+                        == json!([1, 2])));
+            Reply::Tools(vec![
+                ("read_file", json!({"path":"first-only.txt","project":1})),
+                ("read_file", json!({"path":"second-only.txt","project":2})),
+            ])
+        } else {
+            let tools = request["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry["role"] == "tool")
+                .map(|entry| entry["content"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert!(tools.iter().any(|body| body.contains("primary identity")));
+            assert!(tools.iter().any(|body| body.contains("secondary identity")));
+            Reply::Text("Project 1: obs-00000001. Project 2: obs-00000002.".into())
+        }
+    });
+    let mut config = fixture.config(&provider.endpoint, "read-only compare two projects");
+    config.secondary_root = Some(secondary_name.clone());
+    run(config);
+    let evidence = fixture.base.join("evidence");
+    let active: Value =
+        serde_json::from_slice(&std::fs::read(evidence.join("active.json")).unwrap()).unwrap();
+    let journal = std::fs::read_to_string(
+        evidence
+            .join(active["run_dir"].as_str().unwrap())
+            .join("events.jsonl"),
+    )
+    .unwrap();
+    let observations = journal
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter_map(|entry| {
+            entry
+                .get("observation")
+                .filter(|observation| !observation.is_null())
+                .cloned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(observations.len(), 2);
+    assert_eq!(observations[0]["source"], "first-only.txt");
+    assert_eq!(
+        observations[1]["source"],
+        format!("{secondary_name}/second-only.txt")
+    );
+    assert!(observations
+        .iter()
+        .all(|observation| observation["source_revision"].as_str().is_some()));
+}
+
+#[test]
+fn steering_at_completion_is_applied_before_final_and_replays() {
+    let fixture = Workspace::new(&[("identity.txt", "steering evidence")]);
+    let queue = Arc::new(Mutex::new(Vec::new()));
+    let incoming = queue.clone();
+    let provider = Provider::start(move |request, turn| {
+        if turn == 0 {
+            incoming
+                .lock()
+                .unwrap()
+                .push("Read identity.txt before answering; include STEER_OK.".into());
+            Reply::Text("Premature answer".into())
+        } else if turn == 1 {
+            assert!(request["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["role"] == "user"
+                    && entry["content"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("STEER_OK"))));
+            Reply::Tools(vec![("read_file", json!({"path":"identity.txt"}))])
+        } else {
+            Reply::Text("STEER_OK".into())
+        }
+    });
+    let mut config = fixture.config(&provider.endpoint, "inspect");
+    config.steering = queue;
+    run(config);
+    let history = vec![
+        json!({"role":"user","content":"inspect"}),
+        json!({"role":"user","content":"Read identity.txt before answering; include STEER_OK."}),
+        json!({"role":"assistant","content":"STEER_OK"}),
+    ];
+    let restored = local_ai_agent_runtime::agent::transcript::Transcript::durable(
+        &fixture.base.join("evidence"),
+        "next-run",
+        &history,
+        fixture.root.to_str(),
+    )
+    .unwrap();
+    assert!(restored.entries().iter().any(|entry| matches!(entry, local_ai_agent_runtime::agent::transcript::Entry::Steering(content) if content.contains("STEER_OK"))));
+    assert_eq!(restored.observations().len(), 1);
+}
+
 enum Reply {
     Text(String),
     /// Only reasoning, no content and no structured call.
@@ -175,6 +291,7 @@ impl Workspace {
             system: "system".into(),
             user: user.into(),
             root: Some(self.root.to_string_lossy().into_owned()),
+            secondary_root: None,
             context_limit: 65_536,
             reasoning_mode: "fast".into(),
             supports_reasoning: true,
@@ -185,6 +302,7 @@ impl Workspace {
             provider_max_output: None,
             cancelled: Arc::new(AtomicBool::new(false)),
             steering: Arc::new(Mutex::new(Vec::new())),
+            steering_closed: Arc::new(AtomicBool::new(false)),
         }
     }
 
