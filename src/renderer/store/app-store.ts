@@ -27,6 +27,7 @@ type State = {
   selectConversation: (id: string) => Promise<void>;
   createConversation: () => Promise<void>;
   updateConversation: (id: string, patch: Partial<Conversation>) => Promise<void>;
+  refreshRuntime: () => Promise<void>;
   deleteConversation: (id: string) => Promise<void>;
   refreshHardware: () => Promise<void>;
   sendMessage: (content: string, files?: File[], projectReferences?: ProjectReference[]) => Promise<void>;
@@ -124,10 +125,20 @@ export const useAppStore = create<State>((set, get) => {
     try {
       const updated = await window.localAi.conversations.update(id, patch);
       set((state) => ({ conversations: state.conversations.map((chat) => chat.id === id ? updated : chat), activeContextWindow: state.activeId === id ? updated.contextWindow : state.activeContextWindow, performance: state.activeId === id && patch.modelId !== undefined ? null : state.performance }));
+      if (patch.modelId !== undefined || patch.contextWindow !== undefined) void get().refreshRuntime();
     } catch (error) {
-      if (before) set((state) => ({ conversations: state.conversations.map((chat) => chat.id === id && Object.entries(patch).every(([key, value]) => chat[key as keyof Conversation] === value) ? before : chat) }));
+      if (before) set((state) => ({ conversations: state.conversations.map((chat) => chat.id === id && Object.entries(patch).every(([key, value]) => chat[key as keyof Conversation] === value) ? before : chat), activeContextWindow: state.activeId === id ? before.contextWindow : state.activeContextWindow }));
+      // A refused runtime switch leaves the stored conversation unchanged; show the real reason and the real runtime.
+      set({ error: (error instanceof Error ? error.message : String(error)).replace(/^Error invoking remote method '[^']+': (Error: )?/, '') });
+      await get().refreshRuntime();
       throw error;
     }
+  },
+  refreshRuntime: async () => {
+    try {
+      const [settings, models] = await Promise.all([window.localAi.settings.get(), window.localAi.models.list()]);
+      set({ settings, models });
+    } catch { /* the next poll retries */ }
   },
   deleteConversation: async (id) => {
     await window.localAi.conversations.delete(id);

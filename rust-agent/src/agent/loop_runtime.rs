@@ -14,7 +14,9 @@ use crate::agent::{
     state::AgentState,
     transcript::{validate_calls, CompactionPlan, ToolResultPolicy, Transcript, ValidatedCall},
 };
-use crate::context::evidence_projection::{attach_historical_index, fold_to_budget};
+use crate::context::evidence_projection::{
+    apply_folds, attach_historical_index, fold_to_budget, folded_ids,
+};
 use crate::context::projection::project;
 use crate::protocol::emit;
 use serde_json::{json, Value};
@@ -37,6 +39,7 @@ pub struct Config {
     pub root: Option<String>,
     pub context_limit: usize,
     pub reasoning_mode: String,
+    pub supports_reasoning: bool,
     pub policy: RunPolicy,
     pub history: Vec<Value>,
     pub evidence_dir: Option<String>,
@@ -72,7 +75,7 @@ pub const MAX_SYNTHESIS_TURNS: usize = MAX_CONTINUATION_TURNS + 8;
 pub const MAX_CONTINUATION_TURNS: usize = 32;
 pub const MAX_LOGICAL_FINAL_CHARS: usize = 1_000_000;
 pub const SUMMARY_INPUT_CHARS: usize = 48_000;
-pub const SUMMARY_MAX_OUTPUT_TOKENS: usize = 1_024;
+pub const SUMMARY_MAX_OUTPUT_TOKENS: usize = 2_048;
 pub const MIN_SUMMARY_OUTPUT_TOKENS: usize = 64;
 const MIN_CONTINUATION_OVERLAP_CHARS: usize = 32;
 const MIN_FULL_RESTART_PREFIX_CHARS: usize = 96;
@@ -135,12 +138,26 @@ pub fn dynamic_output_limit(
         .min(app_max_output)
 }
 
-fn request_reasoning(config: &Config) -> Value {
-    match policy::reasoning(&config.reasoning_mode, "agent") {
-        Reasoning::Off => json!({"chat_template_kwargs":{"enable_thinking":false}}),
-        Reasoning::Low => json!({"reasoning_effort":"low"}),
-        Reasoning::Deep => json!({"reasoning_effort":"xhigh"}),
+/// SAFETY FALLBACK, not the fix for any loop: once the runtime has withdrawn
+/// tools and asked for a final answer, hidden reasoning is switched off so that
+/// answer is written as visible content rather than into the thinking channel.
+/// The primary contract (reasoning is recorded and replayed with the turn that
+/// produced it) is in `Transcript::assistant_*_with_reasoning`.
+fn request_reasoning(config: &Config, finalizing: bool) -> Option<Value> {
+    if !config.supports_reasoning {
+        return None;
     }
+    Some(
+        match if finalizing {
+            Reasoning::Off
+        } else {
+            policy::reasoning(&config.reasoning_mode, "agent")
+        } {
+            Reasoning::Off => json!({"chat_template_kwargs":{"enable_thinking":false}}),
+            Reasoning::Low => json!({"reasoning_effort":"low"}),
+            Reasoning::Deep => json!({"reasoning_effort":"xhigh"}),
+        },
+    )
 }
 
 fn is_ollama_native_endpoint(endpoint: &str) -> bool {
@@ -162,6 +179,10 @@ fn ollama_native_messages(messages: &[Value]) -> Vec<Value> {
             object.remove("_observation_id");
             object.remove("_result_policy");
             object.remove("_rehydration");
+            // Ollama's native spelling of a prior assistant turn's reasoning.
+            if let Some(reasoning) = object.remove("reasoning_content") {
+                object.insert("thinking".into(), reasoning);
+            }
             if object.get("role").and_then(Value::as_str) == Some("tool") {
                 object.remove("name");
             }
@@ -192,12 +213,21 @@ fn ollama_native_messages(messages: &[Value]) -> Vec<Value> {
         .collect()
 }
 
-fn ollama_native_think(config: &Config) -> Value {
-    match policy::reasoning(&config.reasoning_mode, "agent") {
-        Reasoning::Off => json!(false),
-        Reasoning::Low => json!("low"),
-        Reasoning::Deep => json!("high"),
+fn ollama_native_think(config: &Config, finalizing: bool) -> Option<Value> {
+    if !config.supports_reasoning {
+        return None;
     }
+    Some(
+        match if finalizing {
+            Reasoning::Off
+        } else {
+            policy::reasoning(&config.reasoning_mode, "agent")
+        } {
+            Reasoning::Off => json!(false),
+            Reasoning::Low => json!("low"),
+            Reasoning::Deep => json!("high"),
+        },
+    )
 }
 
 fn wire_messages(messages: &[Value]) -> Vec<Value> {
@@ -221,15 +251,51 @@ fn request_payload(
     schemas: &[Value],
     max_tokens: usize,
 ) -> Value {
+    request_payload_for_phase(config, messages, schemas, max_tokens, false)
+}
+
+/// A provider that does not reason has no use for replayed reasoning, and a
+/// strict one may reject the field. This is a projection decision: the record
+/// keeps the reasoning.
+fn without_replayed_reasoning(messages: &[Value]) -> Vec<Value> {
+    messages
+        .iter()
+        .cloned()
+        .map(|mut message| {
+            if let Some(object) = message.as_object_mut() {
+                object.remove("reasoning_content");
+            }
+            message
+        })
+        .collect()
+}
+
+fn request_payload_for_phase(
+    config: &Config,
+    messages: &[Value],
+    schemas: &[Value],
+    max_tokens: usize,
+    finalizing: bool,
+) -> Value {
+    let stripped;
+    let messages = if config.supports_reasoning {
+        messages
+    } else {
+        stripped = without_replayed_reasoning(messages);
+        stripped.as_slice()
+    };
     if is_ollama_native_endpoint(&config.endpoint) {
-        return json!({
+        let mut payload = json!({
             "model": config.model,
             "messages": ollama_native_messages(messages),
             "stream": true,
             "tools": schemas,
-            "think": ollama_native_think(config),
             "options": {"num_ctx": config.context_limit, "num_predict": max_tokens},
         });
+        if let Some(think) = ollama_native_think(config, finalizing) {
+            payload["think"] = think;
+        }
+        return payload;
     }
     let wire_messages = wire_messages(messages);
     let mut payload = json!({
@@ -243,13 +309,41 @@ fn request_payload(
         payload["tools"] = json!(schemas);
         payload["tool_choice"] = json!("auto");
     }
-    payload.as_object_mut().expect("request payload").extend(
-        request_reasoning(config)
-            .as_object()
-            .expect("reasoning payload")
-            .clone(),
-    );
+    if let Some(reasoning) = request_reasoning(config, finalizing) {
+        payload
+            .as_object_mut()
+            .expect("request payload")
+            .extend(reasoning.as_object().expect("reasoning payload").clone());
+    }
     payload
+}
+
+thread_local! {
+    /// Actual-over-estimated prompt size, learned from the provider's own
+    /// usage report for this run's previous request. The character-based
+    /// estimate is deliberately pessimistic for JSON-escaped tool output; left
+    /// uncorrected it makes a 64K window behave like a 40K one, so evidence is
+    /// folded away early, the cached prefix is rewritten, and the model rereads.
+    static TOKEN_CALIBRATION: std::cell::Cell<f64> = const { std::cell::Cell::new(1.0) };
+}
+
+const CALIBRATION_MIN: f64 = 0.4;
+const CALIBRATION_MAX: f64 = 1.6;
+
+fn calibrate_estimate(estimated: usize) -> usize {
+    ((estimated as f64) * TOKEN_CALIBRATION.with(std::cell::Cell::get)).ceil() as usize
+}
+
+/// `estimated` is the (already calibrated) projection of the request the
+/// provider just answered; `actual` is the prompt size it reported for it.
+fn learn_token_calibration(estimated: usize, actual: usize) {
+    if estimated == 0 || actual == 0 {
+        return;
+    }
+    let observed = TOKEN_CALIBRATION.with(std::cell::Cell::get) * actual as f64 / estimated as f64;
+    let learned = (0.5 * TOKEN_CALIBRATION.with(std::cell::Cell::get) + 0.5 * observed)
+        .clamp(CALIBRATION_MIN, CALIBRATION_MAX);
+    TOKEN_CALIBRATION.with(|cell| cell.set(learned));
 }
 
 fn estimate_tokens(value: &Value) -> usize {
@@ -291,14 +385,16 @@ fn request_budget(config: &Config, messages: &[Value], schemas: &[Value]) -> Req
         }
     }
     RequestBudget {
-        projected_input_tokens: estimate_tokens(&payload),
-        stable_prefix_tokens: messages
-            .first()
-            .map_or(0, |message| estimate_tokens(&json!([message]))),
-        tool_schemas_tokens: estimate_tokens(&Value::Array(schemas.to_vec())),
-        transcript_history_tokens: estimate_tokens(&Value::Array(transcript)),
-        summary_tokens: estimate_tokens(&Value::Array(summaries)),
-        dynamic_tail_tokens: estimate_tokens(&Value::Array(dynamic)),
+        projected_input_tokens: calibrate_estimate(estimate_tokens(&payload)),
+        stable_prefix_tokens: calibrate_estimate(
+            messages
+                .first()
+                .map_or(0, |message| estimate_tokens(&json!([message]))),
+        ),
+        tool_schemas_tokens: calibrate_estimate(estimate_tokens(&Value::Array(schemas.to_vec()))),
+        transcript_history_tokens: calibrate_estimate(estimate_tokens(&Value::Array(transcript))),
+        summary_tokens: calibrate_estimate(estimate_tokens(&Value::Array(summaries))),
+        dynamic_tail_tokens: calibrate_estimate(estimate_tokens(&Value::Array(dynamic))),
     }
 }
 
@@ -935,10 +1031,79 @@ fn retry_keep_recent(attempt: usize) -> usize {
     (DEFAULT_KEEP_RECENT >> attempt).max(2)
 }
 
+const REASONING_TOOL_OPEN: &str = "<tool_call>";
+const REASONING_TOOL_CLOSE: &str = "</tool_call>";
+
+#[derive(Default)]
+struct ReasoningMarkupFilter {
+    pending: String,
+    inside_tool_call: bool,
+    hid_markup: bool,
+}
+
+impl ReasoningMarkupFilter {
+    // Retain possible marker prefixes between deltas so split tags cannot leak.
+    fn push(&mut self, input: &str, flush: bool) -> String {
+        self.pending.push_str(input);
+        let mut visible = String::new();
+        loop {
+            let lower = self.pending.to_ascii_lowercase();
+            if self.inside_tool_call {
+                if let Some(end) = lower.find(REASONING_TOOL_CLOSE) {
+                    self.pending.drain(..end + REASONING_TOOL_CLOSE.len());
+                    self.inside_tool_call = false;
+                    continue;
+                }
+                let keep = suffix_prefix_length(&lower, REASONING_TOOL_CLOSE);
+                self.pending = if keep == 0 {
+                    String::new()
+                } else {
+                    self.pending[self.pending.len() - keep..].to_owned()
+                };
+                break;
+            }
+            if let Some(start) = lower.find(REASONING_TOOL_OPEN) {
+                visible.push_str(&self.pending[..start]);
+                self.pending.drain(..start + REASONING_TOOL_OPEN.len());
+                self.inside_tool_call = true;
+                self.hid_markup = true;
+                continue;
+            }
+            let keep = suffix_prefix_length(&lower, REASONING_TOOL_OPEN);
+            let safe = self.pending.len() - keep;
+            visible.push_str(&self.pending[..safe]);
+            self.pending = self.pending[safe..].to_owned();
+            break;
+        }
+        if flush {
+            // A held-back fragment that never became a tag is ordinary text; an
+            // unterminated call body stays hidden.
+            if !self.inside_tool_call {
+                visible.push_str(&self.pending);
+            }
+            self.pending.clear();
+            self.inside_tool_call = false;
+        }
+        visible
+    }
+}
+
+fn suffix_prefix_length(value: &str, marker: &str) -> usize {
+    (1..marker.len())
+        .rev()
+        .find(|length| value.as_bytes().ends_with(&marker.as_bytes()[..*length]))
+        .unwrap_or(0)
+}
+
 #[derive(Default)]
 struct StreamedTurn {
     content: String,
+    /// What the UI shows: reasoning with provider tool-call markup removed.
     reasoning: String,
+    /// Exactly what the provider streamed as reasoning. This, not the display
+    /// text, is the canonical record that is replayed on the next request.
+    reasoning_raw: String,
+    reasoning_markup_filter: ReasoningMarkupFilter,
     thinking_started: bool,
     reasoning_delta_count: usize,
     calls: BTreeMap<usize, Value>,
@@ -951,6 +1116,43 @@ struct StreamedTurn {
     prompt_ms: Option<f64>,
     predicted_ms: Option<f64>,
     predicted_per_second: Option<f64>,
+}
+
+fn append_reasoning(turn: &mut StreamedTurn, run_id: &str, reasoning: &str, emit_visible: bool) {
+    turn.reasoning_raw.push_str(reasoning);
+    let visible = turn.reasoning_markup_filter.push(reasoning, false);
+    if visible.is_empty() {
+        return;
+    }
+    if !turn.thinking_started {
+        turn.thinking_started = true;
+        if emit_visible {
+            emit(run_id, Event::ThinkingStarted);
+        }
+    }
+    turn.reasoning.push_str(&visible);
+    turn.reasoning_delta_count += 1;
+    if emit_visible {
+        emit(run_id, Event::ThinkingDelta { content: visible });
+    }
+}
+
+fn flush_reasoning(turn: &mut StreamedTurn, run_id: &str, emit_visible: bool) {
+    let visible = turn.reasoning_markup_filter.push("", true);
+    if visible.is_empty() {
+        return;
+    }
+    if !turn.thinking_started {
+        turn.thinking_started = true;
+        if emit_visible {
+            emit(run_id, Event::ThinkingStarted);
+        }
+    }
+    turn.reasoning.push_str(&visible);
+    turn.reasoning_delta_count += 1;
+    if emit_visible {
+        emit(run_id, Event::ThinkingDelta { content: visible });
+    }
 }
 
 /// Opt-in forensic trace for a real provider run. It stays outside the
@@ -1252,14 +1454,20 @@ fn stream_call(
             native_ollama,
         )?;
     }
+    flush_reasoning(&mut turn, run_id, emit_visible);
     trace_forensics(
         run_id,
         "assembled_turn",
         json!({
+            "turn":turn_index,
             "reasoning_chars":turn.reasoning.chars().count(),
             "content_chars":turn.content.chars().count(),
+            "reasoning":turn.reasoning,
+            "content":turn.content,
             "calls":turn.calls.values().cloned().collect::<Vec<_>>(),
             "finish_reason":turn.finish_reason,
+            "prompt_tokens":turn.prompt_tokens,
+            "completion_tokens":turn.completion_tokens,
         }),
     );
     Ok(turn)
@@ -1308,23 +1516,26 @@ fn consume_ollama_ndjson(
             .get("eval_count")
             .and_then(Value::as_u64)
             .or(turn.completion_tokens);
+        turn.prompt_ms = value
+            .get("prompt_eval_duration")
+            .and_then(Value::as_f64)
+            .map(|duration| duration / 1_000_000.0)
+            .or(turn.prompt_ms);
+        turn.predicted_ms = value
+            .get("eval_duration")
+            .and_then(Value::as_f64)
+            .map(|duration| duration / 1_000_000.0)
+            .or(turn.predicted_ms);
+        if let (Some(tokens), Some(duration)) = (
+            value.get("eval_count").and_then(Value::as_f64),
+            value.get("eval_duration").and_then(Value::as_f64),
+        ) {
+            if duration > 0.0 {
+                turn.predicted_per_second = Some(tokens * 1_000_000_000.0 / duration);
+            }
+        }
         if let Some(reasoning) = value.pointer("/message/thinking").and_then(Value::as_str) {
-            if !turn.thinking_started {
-                turn.thinking_started = true;
-                if emit_visible {
-                    emit(run_id, Event::ThinkingStarted);
-                }
-            }
-            turn.reasoning.push_str(reasoning);
-            turn.reasoning_delta_count += 1;
-            if emit_visible {
-                emit(
-                    run_id,
-                    Event::ThinkingDelta {
-                        content: reasoning.to_owned(),
-                    },
-                );
-            }
+            append_reasoning(turn, run_id, reasoning, emit_visible);
         }
         if let Some(content) = value.pointer("/message/content").and_then(Value::as_str) {
             turn.content.push_str(content);
@@ -1367,6 +1578,7 @@ fn consume_ollama_ndjson(
                 .and_then(Value::as_str)
                 .unwrap_or("stop")
                 .to_owned();
+            flush_reasoning(turn, run_id, emit_visible);
         }
     }
     Ok(())
@@ -1424,10 +1636,17 @@ fn consume_sse(
                     .or(turn.cache_write_tokens);
             }
             if let Some(timings) = value.get("timings") {
-                turn.prompt_tokens = timings
-                    .get("prompt_n")
-                    .and_then(Value::as_u64)
-                    .or(turn.prompt_tokens);
+                // `prompt_n` counts only the tokens evaluated for this request;
+                // the reused prefix is `cache_n`. Their sum is the real input
+                // size when the usage block did not report it.
+                let evaluated = timings.get("prompt_n").and_then(Value::as_u64);
+                let reused = timings.get("cache_n").and_then(Value::as_u64);
+                if turn.prompt_tokens.is_none() {
+                    turn.prompt_tokens = evaluated.map(|n| n + reused.unwrap_or(0));
+                }
+                if turn.cached_tokens.is_none() {
+                    turn.cached_tokens = reused;
+                }
                 turn.completion_tokens = timings
                     .get("predicted_n")
                     .and_then(Value::as_u64)
@@ -1457,22 +1676,7 @@ fn consume_sse(
                     "parsed_reasoning_delta",
                     json!({"chars":reasoning.chars().count()}),
                 );
-                if !turn.thinking_started {
-                    turn.thinking_started = true;
-                    if emit_visible {
-                        emit(run_id, Event::ThinkingStarted);
-                    }
-                }
-                turn.reasoning.push_str(reasoning);
-                turn.reasoning_delta_count += 1;
-                if emit_visible {
-                    emit(
-                        run_id,
-                        Event::ThinkingDelta {
-                            content: reasoning.to_owned(),
-                        },
-                    );
-                }
+                append_reasoning(turn, run_id, reasoning, emit_visible);
             }
             if let Some(content) = delta
                 .and_then(|delta| delta.get("content"))
@@ -1531,6 +1735,7 @@ fn consume_sse(
                 .and_then(Value::as_str)
             {
                 turn.finish_reason = reason.to_owned();
+                flush_reasoning(turn, run_id, emit_visible);
             }
         }
     }
@@ -1593,7 +1798,7 @@ fn summarize_span(config: &Config, plan: &CompactionPlan) -> SummaryResult {
         false,
     ) {
         Ok(turn) if !turn.content.trim().is_empty() => {
-            let text = turn.content.trim().to_owned();
+            let text = mark_if_cut_at_output_limit(turn.content.trim(), &turn.finish_reason);
             SummaryResult {
                 output_tokens: turn
                     .completion_tokens
@@ -1607,6 +1812,17 @@ fn summarize_span(config: &Config, plan: &CompactionPlan) -> SummaryResult {
             input_tokens,
             output_tokens: 0,
         },
+    }
+}
+
+/// A checkpoint that stopped at the output limit is incomplete, and its last
+/// headings ("Not yet inspected", "Next useful intent") are the ones lost. The
+/// provider said so with `finish_reason: length`; the model must be told too.
+fn mark_if_cut_at_output_limit(text: &str, finish_reason: &str) -> String {
+    if finish_reason == "length" {
+        format!("{text}\n[This checkpoint was cut at its output limit; later sections are missing. Recover exact details with observation_read.]")
+    } else {
+        text.to_owned()
     }
 }
 
@@ -2584,6 +2800,8 @@ pub fn run(config: Config) {
     let mut compaction_index = 0_usize;
     let mut last_compaction: Option<(usize, usize)> = None;
     let mut tool_result_tokens_since_compaction = 0_usize;
+    // Observations already shown as receipts stay receipts (see `apply_folds`).
+    let mut sticky_folds: std::collections::HashSet<String> = std::collections::HashSet::new();
     // An emergency tool-result reduction belongs only to the next provider
     // projection. The append-only transcript remains verbatim.
     let mut pending_fitted_projection: Option<Vec<Value>> = None;
@@ -2678,12 +2896,14 @@ pub fn run(config: Config) {
         let mut messages = pending_fitted_projection
             .take()
             .unwrap_or_else(|| project_evidence(&config, &transcript, &stable, &sent_tail));
+        apply_folds(&transcript, &mut messages, &sticky_folds);
         let before_budget = request_budget(&config, &messages, request_schemas);
         let folded = if needs_compaction(budget, before_budget.projected_input_tokens) {
             fold_evidence_to_target(&config, &transcript, request_schemas, &mut messages)
         } else {
             Vec::new()
         };
+        sticky_folds.extend(folded_ids(&transcript, &messages));
         if !folded.is_empty() {
             trace_forensics(
                 &config.run_id,
@@ -2782,7 +3002,13 @@ pub fn run(config: Config) {
         }
         let projected = current_budget.projected_input_tokens;
         trace_projection(&config.run_id, &transcript, &messages, projected);
-        let payload = request_payload(&config, &messages, request_schemas, output_limit);
+        let payload = request_payload_for_phase(
+            &config,
+            &messages,
+            request_schemas,
+            output_limit,
+            transcript.is_finalizing(),
+        );
         trace_forensics(
             &config.run_id,
             "agent_request_state",
@@ -2880,6 +3106,14 @@ pub fn run(config: Config) {
         ) {
             Ok(streamed) => {
                 overflow_attempts = 0;
+                // Native Ollama reports only the tokens it evaluated for this
+                // request (the cached prefix is excluded), so its count is not
+                // the prompt size and must not teach the estimate.
+                if !is_ollama_native_endpoint(&config.endpoint) {
+                    if let Some(actual) = streamed.prompt_tokens {
+                        learn_token_calibration(projected, actual as usize);
+                    }
+                }
                 if !sent_tail.is_empty() {
                     transcript.record_prompt_tail(&sent_tail);
                 }
@@ -2998,8 +3232,9 @@ pub fn run(config: Config) {
         let calls = match validate_calls(&raw_calls, Some(&streamed.finish_reason)) {
             Ok(calls) => calls,
             Err(error) => {
-                if !streamed.content.is_empty() {
-                    transcript.assistant_message(streamed.content);
+                if !streamed.content.is_empty() || !streamed.reasoning_raw.trim().is_empty() {
+                    transcript
+                        .assistant_message_with_reasoning(streamed.content, streamed.reasoning_raw);
                 }
                 emit(
                     &config.run_id,
@@ -3028,8 +3263,23 @@ pub fn run(config: Config) {
             trace_forensics(
                 &config.run_id,
                 "empty_response",
-                json!({"turn":turn+1,"finish_reason":streamed.finish_reason,"consecutive":consecutive_empty_turns,"reasoning_chars":streamed.reasoning.chars().count()}),
+                json!({"turn":turn+1,"finish_reason":streamed.finish_reason,"consecutive":consecutive_empty_turns,"reasoning_chars":streamed.reasoning_raw.chars().count()}),
             );
+            if streamed.reasoning_markup_filter.hid_markup {
+                emit(
+                    &config.run_id,
+                    Event::ToolError {
+                        id: "protocol".into(),
+                        name: "tool_protocol".into(),
+                        message: "The provider emitted a tool call inside its reasoning stream; no structured tool call was executed".into(),
+                    },
+                );
+            }
+            // The turn happened. Recording what the model reasoned lets the
+            // retry continue from it instead of regenerating it from nothing.
+            if !streamed.reasoning_raw.trim().is_empty() {
+                transcript.assistant_message_with_reasoning(String::new(), streamed.reasoning_raw);
+            }
             if consecutive_empty_turns >= MAX_CONSECUTIVE_EMPTY_TURNS && !transcript.is_finalizing()
             {
                 transcript.mark_finalizing();
@@ -3082,7 +3332,8 @@ pub fn run(config: Config) {
                 if !was_continuation {
                     append_final_text(&mut final_content, &streamed.content);
                 }
-                transcript.assistant_message(streamed.content);
+                transcript
+                    .assistant_message_with_reasoning(streamed.content, streamed.reasoning_raw);
                 if continuation_count >= MAX_CONTINUATION_TURNS
                     || final_content.chars().count() >= MAX_LOGICAL_FINAL_CHARS
                 {
@@ -3143,7 +3394,7 @@ pub fn run(config: Config) {
             if !was_continuation {
                 append_final_text(&mut final_content, &streamed.content);
             }
-            transcript.assistant_message(streamed.content);
+            transcript.assistant_message_with_reasoning(streamed.content, streamed.reasoning_raw);
             transcript.mark_run_complete();
             trace_forensics(
                 &config.run_id,
@@ -3185,7 +3436,11 @@ pub fn run(config: Config) {
         }
         emit_status(&config.run_id, &streamed.content);
         let canonical_content = streamed.content.clone();
-        transcript.assistant_tool_turn(streamed.content, &calls);
+        transcript.assistant_tool_turn_with_reasoning(
+            streamed.content,
+            streamed.reasoning_raw,
+            &calls,
+        );
         trace_forensics(
             &config.run_id,
             "canonical_assistant_tool_turn",
@@ -3681,6 +3936,133 @@ mod tests {
     }
 
     #[test]
+    fn provider_usage_calibrates_the_pessimistic_token_estimate() {
+        TOKEN_CALIBRATION.with(|cell| cell.set(1.0));
+        learn_token_calibration(10_000, 7_000);
+        let first = TOKEN_CALIBRATION.with(std::cell::Cell::get);
+        assert!((first - 0.85).abs() < 1e-9, "{first}");
+        assert_eq!(calibrate_estimate(1_000), 850);
+        // The estimate that produced the next request was already calibrated.
+        learn_token_calibration(8_500, 5_950);
+        let second = TOKEN_CALIBRATION.with(std::cell::Cell::get);
+        assert!(second < first && second > 0.6, "{second}");
+        // A provider that reports nonsense cannot drive the estimate outside its bounds.
+        learn_token_calibration(100, 1_000_000);
+        assert!(TOKEN_CALIBRATION.with(std::cell::Cell::get) <= CALIBRATION_MAX);
+        TOKEN_CALIBRATION.with(|cell| cell.set(1.0));
+        learn_token_calibration(1_000_000, 1);
+        assert!(TOKEN_CALIBRATION.with(std::cell::Cell::get) >= CALIBRATION_MIN);
+        learn_token_calibration(0, 500);
+        TOKEN_CALIBRATION.with(|cell| cell.set(1.0));
+    }
+
+    #[test]
+    fn llama_cpp_usage_reports_total_prompt_size_and_the_reused_prefix() {
+        let mut turn = StreamedTurn::default();
+        let mut frames = format!(
+            "data: {}\n\ndata: {}\n\n",
+            json!({"choices":[{"delta":{"content":"x"}}]}),
+            json!({"choices":[],"usage":{"prompt_tokens":33190,"completion_tokens":5,"total_tokens":33195,"prompt_tokens_details":{"cached_tokens":18388}},"timings":{"cache_n":18388,"prompt_n":14802,"predicted_n":5,"predicted_ms":50.0,"predicted_per_second":100.0}})
+        );
+        consume_sse(&mut frames, &mut turn, "fixture", false, false).unwrap();
+        assert_eq!(
+            turn.prompt_tokens,
+            Some(33_190),
+            "evaluated tokens must not replace the input size"
+        );
+        assert_eq!(turn.cached_tokens, Some(18_388));
+        // Without a usage block the input size is the evaluated plus the reused part.
+        let mut bare = StreamedTurn::default();
+        let mut frame = format!(
+            "data: {}\n\n",
+            json!({"choices":[],"timings":{"cache_n":100,"prompt_n":50,"predicted_n":1}})
+        );
+        consume_sse(&mut frame, &mut bare, "fixture", false, false).unwrap();
+        assert_eq!(bare.prompt_tokens, Some(150));
+    }
+
+    #[test]
+    fn finalizing_provider_payload_disables_supported_reasoning() {
+        let mut config = test_config(32_768);
+        config.reasoning_mode = "deep".into();
+        let messages = vec![json!({"role":"user","content":"answer"})];
+        let openai = request_payload_for_phase(&config, &messages, &[], 1_024, false);
+        let final_openai = request_payload_for_phase(&config, &messages, &[], 1_024, true);
+        assert_eq!(openai["reasoning_effort"], "xhigh");
+        assert_eq!(
+            final_openai["chat_template_kwargs"]["enable_thinking"],
+            false
+        );
+        assert!(final_openai.get("reasoning_effort").is_none());
+
+        config.endpoint = "http://localhost/api/chat".into();
+        let native = request_payload_for_phase(&config, &messages, &[], 1_024, false);
+        let final_native = request_payload_for_phase(&config, &messages, &[], 1_024, true);
+        assert_eq!(native["think"], "high");
+        assert_eq!(final_native["think"], false);
+
+        config.supports_reasoning = false;
+        let unsupported = request_payload_for_phase(&config, &messages, &[], 1_024, true);
+        assert!(unsupported.get("think").is_none());
+    }
+
+    #[test]
+    fn reasoning_markup_filter_handles_split_tool_tags_and_keeps_surrounding_text() {
+        let mut filter = ReasoningMarkupFilter::default();
+        let mut visible = String::new();
+        for delta in [
+            "Analysis before <tool_",
+            "call>read_file<arg_key>path</arg_key>",
+            "<arg_value>secret.txt</arg_value></tool_",
+            "call> then continue.",
+        ] {
+            visible.push_str(&filter.push(delta, false));
+        }
+        visible.push_str(&filter.push("", true));
+        assert_eq!(visible, "Analysis before  then continue.");
+    }
+
+    #[test]
+    fn a_checkpoint_cut_at_the_output_limit_says_so() {
+        assert_eq!(mark_if_cut_at_output_limit("complete", "stop"), "complete");
+        let cut = mark_if_cut_at_output_limit("half a sen", "length");
+        assert!(cut.starts_with("half a sen\n[This checkpoint was cut"));
+        assert!(cut.contains("observation_read"));
+    }
+
+    #[test]
+    fn a_fragment_that_never_became_a_tool_tag_is_ordinary_reasoning_text() {
+        let mut filter = ReasoningMarkupFilter::default();
+        let mut visible = filter.push("compare a < b and x <tool", false);
+        visible.push_str(&filter.push("", true));
+        assert_eq!(visible, "compare a < b and x <tool");
+        assert!(!filter.hid_markup);
+        let mut unterminated = ReasoningMarkupFilter::default();
+        let mut text = unterminated.push("plan <tool_call>read_file<arg_key>pa", false);
+        text.push_str(&unterminated.push("", true));
+        assert_eq!(text, "plan ");
+        assert!(unterminated.hid_markup);
+    }
+
+    #[test]
+    fn ollama_usage_durations_produce_generation_speed_only_when_reported() {
+        let mut turn = StreamedTurn::default();
+        let mut frames = format!(
+            "{}\n",
+            json!({"done":true,"prompt_eval_count":20,"prompt_eval_duration":2_000_000_000_u64,"eval_count":8,"eval_duration":4_000_000_000_u64})
+        );
+        consume_ollama_ndjson(&mut frames, &mut turn, "fixture", 1, false, false).unwrap();
+        assert_eq!(turn.prompt_ms, Some(2_000.0));
+        assert_eq!(turn.predicted_ms, Some(4_000.0));
+        assert_eq!(turn.predicted_per_second, Some(2.0));
+
+        let mut unsupported = StreamedTurn::default();
+        let mut frame = format!("{}\n", json!({"done":true,"eval_count":8}));
+        consume_ollama_ndjson(&mut frame, &mut unsupported, "fixture", 1, false, false).unwrap();
+        assert_eq!(unsupported.predicted_per_second, None);
+    }
+
+    #[test]
     fn terminal_outcome_accepts_only_success_and_recognized_partial_search() {
         assert!(!terminal_execution_failed(
             &json!({"status":"completed","exit_code":0})
@@ -3727,7 +4109,10 @@ mod tests {
         ));
         consume_sse(&mut frames, &mut turn, "fixture", false, false).unwrap();
         assert!(frames.is_empty());
-        assert_eq!(turn.reasoning, reasoning);
+        assert_eq!(
+            turn.reasoning,
+            "Продолжаю анализ. Изучаю SEO и analytics.\n"
+        );
         assert_eq!(turn.content, "Продолжаю анализ. Изучаю SEO и analytics.");
         let raw = turn.calls.into_values().collect::<Vec<_>>();
         let calls = validate_calls(&raw, Some(&turn.finish_reason)).unwrap();
@@ -3791,6 +4176,7 @@ mod tests {
             root: None,
             context_limit: window,
             reasoning_mode: "fast".into(),
+            supports_reasoning: true,
             policy: RunPolicy::Safe,
             history: Vec::new(),
             evidence_dir: None,

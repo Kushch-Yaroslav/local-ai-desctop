@@ -57,6 +57,7 @@ fn main() {
                 secondary_project_root: _,
                 context_limit,
                 reasoning_mode,
+                supports_reasoning,
                 web_mode: _,
                 policy,
                 history,
@@ -83,6 +84,7 @@ fn main() {
                         root: project_root,
                         context_limit,
                         reasoning_mode,
+                        supports_reasoning,
                         policy: if policy == "safe" {
                             RunPolicy::Safe
                         } else {

@@ -9,7 +9,7 @@ type OllamaMetrics = { prompt_eval_count?: number; prompt_eval_duration?: number
 type OllamaChunk = { message?: { content?: string; thinking?: string }; done?: boolean; done_reason?: string; error?: string } & OllamaMetrics;
 
 type OllamaToolResponse = { message?: ToolMessage; error?: string; done_reason?: string } & OllamaMetrics;
-type OllamaShowResponse = { model_info?: Record<string, unknown>; parameters?: string };
+type OllamaShowResponse = { model_info?: Record<string, unknown>; parameters?: string; capabilities?: string[] };
 type OllamaRunningModels = { models?: Array<{ name: string; model?: string; context_length?: number; details?: { context_length?: number } }> };
 
 export type ContextWindow = { requested: number; active: number; supported?: number };
@@ -21,9 +21,40 @@ const toolSchemaTokenAllowance = (tools: unknown[] | undefined): number => tools
 export class OllamaBackend implements LlmBackend, ToolCallingBackend {
   /** Models requested by this Desktop process, released explicitly on exit. */
   private readonly usedModels = new Set<string>();
+  private readonly modelCapabilities = new Map<string, string[]>();
   /** A context-manager probe is immediately reused by the matching request. */
   private readonly preparedInputTokens = new WeakMap<object, { tools: unknown[] | undefined; contextWindow: number; tokens: number }>();
   constructor(private readonly baseUrl = 'http://127.0.0.1:11434') {}
+
+  /**
+   * `/api/show` is the authoritative per-model capability list. `/api/tags`
+   * can omit capabilities that `/api/show` reports (GLM-4.7-Flash is listed
+   * as completion-only there while `show` advertises tools and thinking).
+   */
+  private async showCapabilities(model: string, signal?: AbortSignal): Promise<string[] | undefined> {
+    try {
+      const response = await fetch(`${this.baseUrl}/api/show`, { method: 'POST', signal, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model }) });
+      if (!response.ok) return undefined;
+      const data = await response.json() as OllamaShowResponse;
+      if (!Array.isArray(data.capabilities)) return undefined;
+      this.modelCapabilities.set(model, data.capabilities);
+      return data.capabilities;
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      return undefined;
+    }
+  }
+
+  private async listTags(signal?: AbortSignal): Promise<OllamaTags> {
+    const response = await fetch(`${this.baseUrl}/api/tags`, { signal });
+    if (!response.ok) throw new Error(`Ollama вернул HTTP ${response.status}`);
+    return await response.json() as OllamaTags;
+  }
+
+  async supportsReasoning(model: string, signal?: AbortSignal): Promise<boolean> {
+    const known = this.modelCapabilities.get(model) ?? await this.showCapabilities(model, signal);
+    return supportsOllamaReasoning(known);
+  }
 
   /** Ollama identifies tool results by tool_name. Keep OpenAI call IDs inside
    * the Agent state machine, but do not send an unsupported extra field here. */
@@ -46,14 +77,13 @@ export class OllamaBackend implements LlmBackend, ToolCallingBackend {
   }
 
   async getModels(): Promise<ModelInfo[]> {
-    const response = await fetch(`${this.baseUrl}/api/tags`);
-    if (!response.ok) throw new Error(`Ollama вернул HTTP ${response.status}`);
-    const data = await response.json() as OllamaTags;
+    const data = await this.listTags();
     const installed = new Map((data.models ?? []).map((model) => [model.name, model]));
     return Promise.all(modelRegistry.map(async (profile) => {
       const model = installed.get(profile.id);
       if (!model) return modelInfo(profile, false);
-      return modelInfo(profile, true, model.size, await this.modelContextLimit(profile.id, profile.maxContext), supportsOllamaReasoning(profile));
+      const capabilities = await this.showCapabilities(profile.id) ?? model.capabilities;
+      return modelInfo(profile, true, model.size, await this.modelContextLimit(profile.id, profile.maxContext), supportsOllamaReasoning(capabilities));
     }));
   }
 
@@ -225,7 +255,7 @@ export class OllamaBackend implements LlmBackend, ToolCallingBackend {
       requestedContext,
       effectiveBackendContext: requestedContext,
     });
-    const think = ollamaReasoning(reasoningMode, profile);
+    const think = ollamaReasoning(reasoningMode, this.modelCapabilities.get(model) ?? await this.showCapabilities(model, signal));
     return { ...(think === undefined ? {} : { think }), options: { num_ctx: requestedContext, num_predict: effective }, diagnostics };
   }
 

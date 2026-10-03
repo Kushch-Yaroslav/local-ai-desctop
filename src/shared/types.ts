@@ -192,6 +192,8 @@ export interface AppSettings {
   ollamaUrl: string;
   llamaServerPath: string | null;
   llamaRuntimeModelId?: string;
+  /** Live state of the launcher-managed llama-server; the authority on what is running. */
+  llamaRuntime?: { status: 'starting' | 'ready' | 'switching' | 'offline' | 'stopped'; modelId: string | null; contextWindow: number | null; error?: string; rolledBack?: boolean };
   modelsPath: string;
 }
 

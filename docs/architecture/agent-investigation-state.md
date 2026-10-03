@@ -109,6 +109,32 @@ state what remained unexamined.
   reasoning off). On Ollama a request without `num_ctx` is truncated to the
   server default and reloads the model.
 
+## Provider contract (what the model is shown, and what comes back)
+
+- **Reasoning is part of the record.** The assistant entry stores the model's
+  own reasoning (`reasoning_content`) next to its content and tool calls, as the
+  provider streamed it. A turn that produced only reasoning is recorded too, so
+  a retry continues from it instead of regenerating it. Whether the field is
+  sent is a projection decision: OpenAI-compatible endpoints receive
+  `reasoning_content`, native Ollama receives `thinking`, and a provider
+  without reasoning receives neither. Thinking chat templates (GLM-4.7, Qwen3.x)
+  render prior reasoning back into the prompt; a history without it is rendered
+  with empty or bare-`</think>` assistant turns and the model re-derives its plan
+  on every step. This matches Jan (`send_reasoning`, default on) and Qwen-Agent
+  (assistant outputs, reasoning included, are appended to the message list).
+- **Display and record differ.** Thinking shown to the user hides provider
+  tool-call markup written inside the reasoning stream; the record keeps the
+  exact stream. Such markup is never executed. When a turn consists of nothing
+  else, the run reports a protocol notice and the retry sees the reasoning.
+- **The size estimate is learned from the provider.** The character estimate is
+  pessimistic for JSON-escaped tool output. After every request the runtime
+  compares its projection with the prompt size the provider reported and scales
+  later estimates by that ratio (bounded, smoothed). Folding and compaction
+  triggers are therefore relative to the real window, which keeps the cached
+  prefix stable for long stretches instead of rewriting one old result per turn.
+- **Safety fallback, not a fix:** after the runtime has withdrawn tools and asked
+  for a final answer, hidden reasoning is switched off for that request.
+
 ## Memory
 
 Task Memory remains the model-authored semantic handoff (findings, decisions,

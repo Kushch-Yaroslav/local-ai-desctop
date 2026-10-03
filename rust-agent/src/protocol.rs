@@ -14,6 +14,8 @@ pub enum Request {
         secondary_project_root: Option<String>,
         context_limit: usize,
         reasoning_mode: String,
+        #[serde(default = "default_supports_reasoning")]
+        supports_reasoning: bool,
         web_mode: String,
         policy: String,
         #[serde(default)]
@@ -38,6 +40,11 @@ pub enum Request {
     },
     Shutdown,
 }
+
+fn default_supports_reasoning() -> bool {
+    true
+}
+
 #[derive(Debug, Serialize)]
 pub struct Envelope<T: Serialize> {
     pub run_id: String,

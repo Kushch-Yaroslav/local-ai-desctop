@@ -15,8 +15,8 @@ type RuntimeEvent = {
   type: string; content?: string; id?: string; name?: string; message?: string; detail?: string; status?: string;
   diff?: string | null; is_error?: boolean; plan?: unknown; memory?: unknown; used?: number; limit?: number;
   before?: number; after?: number; stream?: string; state?: string; index?: number;
-  prompt_tokens?: number; completion_tokens?: number; total_tokens?: number; cached_tokens?: number; cache_write_tokens?: number;
-  prompt_ms?: number; predicted_ms?: number; predicted_per_second?: number; finish_reason?: string;
+  prompt_tokens?: number | null; completion_tokens?: number | null; total_tokens?: number | null; cached_tokens?: number | null; cache_write_tokens?: number | null;
+  prompt_ms?: number | null; predicted_ms?: number | null; predicted_per_second?: number | null; finish_reason?: string;
   phase?: string; max_tokens?: number; context_limit?: number; projected_input_tokens?: number;
   reserved_output_tokens?: number; complete?: boolean; continuation_count?: number; chars?: number;
   continuation?: number; prior_chars?: number; next_max_tokens?: number; arguments?: Record<string, unknown>;
@@ -27,6 +27,7 @@ type RuntimeEvent = {
 type RuntimeRequest = {
   type: 'run'; run_id: string; endpoint: string; model: string; system: string; user: string;
   project_root?: string; secondary_project_root?: string; context_limit: number; reasoning_mode: ReasoningMode;
+  supports_reasoning: boolean;
   web_mode: WebMode; policy: 'auto' | 'safe'; history: unknown[]; task_memory?: AgentPlan['taskMemory']; provider_max_output?: number;
   evidence_dir?: string;
 };
@@ -121,7 +122,7 @@ export function taskPlan(value: unknown): AgentPlan {
 export class RustAgentRuntime {
   constructor(private readonly endpoint: string, private readonly binary = process.env.LOCAL_AI_AGENT_RUNTIME ?? resolve(process.cwd(), 'rust-agent', 'target', 'debug', 'local-ai-agent-runtime')) {}
 
-  async *stream(model: string, history: ChatMessage[], projects: AgentProject[], signal: AbortSignal, contextLimit: number, reasoningMode: ReasoningMode, webMode: WebMode, runId: string, persistedTaskMemory?: AgentPlan['taskMemory'], conversationId?: string): AsyncIterable<StreamEvent> {
+  async *stream(model: string, history: ChatMessage[], projects: AgentProject[], signal: AbortSignal, contextLimit: number, reasoningMode: ReasoningMode, webMode: WebMode, runId: string, persistedTaskMemory?: AgentPlan['taskMemory'], conversationId?: string, supportsReasoning = true): AsyncIterable<StreamEvent> {
     if (!existsSync(this.binary)) throw new Error(`Rust Agent Runtime V2 не собран: ${this.binary}. Выполните cargo build в rust-agent.`);
     const child = spawn(this.binary, [], { stdio: 'pipe' });
     let stopped = false;
@@ -137,7 +138,7 @@ export class RustAgentRuntime {
       type: 'run', run_id: runId, endpoint: this.endpoint, model,
       system: 'You are Local AI Desktop Agent. Work autonomously inside the selected project scope. Use tools only with complete valid JSON arguments.',
       user: current.user, project_root: projects[0]?.root, secondary_project_root: projects[1]?.root,
-      context_limit: contextLimit, reasoning_mode: reasoningMode, web_mode: webMode, policy: 'auto',
+      context_limit: contextLimit, reasoning_mode: reasoningMode, supports_reasoning: supportsReasoning, web_mode: webMode, policy: 'auto',
       history: current.prior.filter((message) => !message.agentError && !message.agentCancelled).map((message) => ({ role: message.role, content: message.content })),
       ...(conversationId ? { evidence_dir: join(paths.userData, 'agent-evidence', createHash('sha256').update(conversationId).digest('hex')) } : {}),
       ...(persistedTaskMemory ? { task_memory: persistedTaskMemory } : {}),
@@ -185,7 +186,16 @@ export class RustAgentRuntime {
           yield { type: 'context-usage', used: event.used ?? 0, maximum: event.limit ?? contextLimit };
           yield { type: 'agent-telemetry', telemetry: { contextUsed: event.used, contextLimit: event.limit ?? contextLimit } };
         } else if (event.type === 'turn_usage') {
-          yield { type: 'agent-telemetry', telemetry: { inputTokens: event.prompt_tokens, outputTokens: event.completion_tokens, tokensPerSecond: event.predicted_per_second, cachedTokens: event.cached_tokens, cacheWriteTokens: event.cache_write_tokens } };
+          const tokensPerSecond = finiteMetric(event.predicted_per_second);
+          const cachedTokens = finiteMetric(event.cached_tokens);
+          const cacheWriteTokens = finiteMetric(event.cache_write_tokens);
+          yield { type: 'agent-telemetry', telemetry: {
+            inputTokens: finiteMetric(event.prompt_tokens) ?? 0,
+            outputTokens: finiteMetric(event.completion_tokens) ?? 0,
+            ...(tokensPerSecond === undefined ? {} : { tokensPerSecond }),
+            ...(cachedTokens === undefined ? {} : { cachedTokens }),
+            ...(cacheWriteTokens === undefined ? {} : { cacheWriteTokens }),
+          } };
         } else if (event.type === 'agent_stopped') {
           child.stdin.end();
           yield { type: 'cancelled' };
@@ -231,3 +241,4 @@ const text = (value: unknown) => typeof value === 'string' ? value : undefined;
 const number = (value: unknown) => typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 const bool = (value: unknown) => typeof value === 'boolean' ? value : undefined;
 const terminalStatus = (value: unknown): TerminalExecution['status'] | undefined => ['running', 'completed', 'partial_success', 'error', 'cancelled', 'timed_out'].includes(String(value)) ? String(value) as TerminalExecution['status'] : undefined;
+const finiteMetric = (value: number | null | undefined): number | undefined => typeof value === 'number' && Number.isFinite(value) ? value : undefined;

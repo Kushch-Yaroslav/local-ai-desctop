@@ -14,6 +14,7 @@ local-cache/
 /runtime/acceptance-*/
 /runtime/.tmp/
 /runtime/*.pid
+/runtime/llama-cpp-runtime-*
 *.log
 .idea/
 

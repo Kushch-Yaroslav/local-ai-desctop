@@ -54,13 +54,13 @@ export function outputBudget(contextWindow: number, inputTokens: number): number
   return Math.min(maxOutputTokens, Math.max(0, contextWindow - inputTokens - outputSafetyReserveTokens));
 }
 
-/** Ollama's native `think` values exist only for these model families. */
-export function supportsOllamaReasoning(profile: ModelProfile): boolean {
-  return profile.id.startsWith('qwen3.8:') || profile.id.startsWith('gpt-oss:');
+/** Ollama advertises native reasoning support in `/api/tags` capabilities. */
+export function supportsOllamaReasoning(capabilities: readonly string[] | undefined): boolean {
+  return capabilities?.includes('thinking') === true;
 }
 
 /** Maps the UI control to Ollama's documented native `think` parameter. */
-export function ollamaReasoning(mode: ReasoningMode, profile: ModelProfile): boolean | string | undefined {
-  if (!supportsOllamaReasoning(profile) || mode === 'auto') return undefined;
+export function ollamaReasoning(mode: ReasoningMode, capabilities: readonly string[] | undefined): boolean | string | undefined {
+  if (!supportsOllamaReasoning(capabilities) || mode === 'auto') return undefined;
   return mode === 'fast' ? 'low' : 'high';
 }

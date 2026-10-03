@@ -5,6 +5,7 @@ import { Database } from '../services/database';
 import { getHardwareStats } from '../services/hardware';
 import { OllamaBackend } from '../backends/ollama-backend';
 import { LlamaCppBackend } from '../backends/llama-cpp-backend';
+import { LAUNCHER_ABSENT, LlamaRuntimeController, type LlamaRuntimeState } from '../services/llama-runtime-controller';
 import { RustAgentRuntime, taskPlan, type AgentProject } from '../services/rust-agent-runtime';
 import { paths } from '../services/paths';
 import { log } from '../services/logger';
@@ -43,10 +44,28 @@ type ActiveGeneration = { id: string; abort: AbortController; settled: Promise<v
 const activeGenerations = new Map<string, ActiveGeneration>();
 type PendingApproval = { approvalId: string; conversationId: string; generation: ActiveGeneration; actionId: string; category: RiskCategory; root: string; resolve: (result: ApprovalResult) => void; settled: boolean; abort: () => void; emit: (payload: Record<string, unknown>) => void };
 const pendingApprovals = new Map<string, PendingApproval>();
-async function restartLlamaRuntime(): Promise<void> {
-  if (selectedBackend !== 'llama-cpp') return;
-  try { process.kill(Number((await readFile(`${paths.dataRoot}/llama-cpp-mtp-launcher.pid`, 'utf8')).trim()), 'SIGUSR1'); }
-  catch { /* A manually managed backend has no launcher to restart. */ }
+const llamaRuntime = new LlamaRuntimeController({
+  stateFile: `${paths.dataRoot}/llama-cpp-runtime-state.json`,
+  requestFile: `${paths.dataRoot}/llama-cpp-runtime-request.env`,
+  launcherPidFile: `${paths.dataRoot}/llama-cpp-mtp-launcher.pid`,
+});
+/** The launcher's state file is the authority. A manually managed server has no launcher, so the startup environment stands in. */
+async function currentLlamaRuntime(): Promise<LlamaRuntimeState> {
+  const state = await llamaRuntime.state();
+  if (state.status === 'offline' && state.error === LAUNCHER_ABSENT) return { status: 'ready', modelId: llamaRuntimeModelId, contextWindow: llamaContextLimit };
+  if (state.status === 'ready') {
+    // The state file records the last transition; a server that died since then must not be reported as running.
+    const health = await llamaCpp.getStatus();
+    if (!health.available) return { status: 'offline', modelId: null, contextWindow: null, error: `llama-server не отвечает: ${health.message ?? 'health check failed'}` };
+  }
+  return state;
+}
+async function syncLlamaBackend(): Promise<LlamaRuntimeState> {
+  const state = await currentLlamaRuntime();
+  if (state.status === 'ready' && state.modelId && state.contextWindow) {
+    try { llamaCpp.updateRuntimeSelection(state.modelId, state.contextWindow); } catch { /* an unsupported combination is reported by the launcher state itself */ }
+  }
+  return state;
 }
 const sessionApprovals = new Map<string, { root: string; categories: Set<RiskCategory> }>();
 
@@ -110,8 +129,8 @@ function inlineConfirmation(event: Electron.IpcMainInvokeEvent, conversationId: 
 
 export function registerIpc(): void {
   ipcMain.handle('conversations:list', () => database.listConversations());
-  ipcMain.handle('conversations:create', (_event, requestedModelId?: string) => {
-    const modelId = requestedModelId ?? (selectedBackend === 'llama-cpp' ? llamaRuntimeModelId : modelRegistry[0].id);
+  ipcMain.handle('conversations:create', async (_event, requestedModelId?: string) => {
+    const modelId = requestedModelId ?? (selectedBackend === 'llama-cpp' ? (await currentLlamaRuntime()).modelId ?? llamaRuntimeModelId : modelRegistry[0].id);
     if (!getModelProfile(modelId)) throw new Error('Выбранная модель отсутствует в реестре приложения');
     return database.createConversation(modelId);
   });
@@ -124,8 +143,22 @@ export function registerIpc(): void {
     const allowed = profile ? (selectedBackend === 'llama-cpp' ? llamaContextPresets(nextModelId ?? '') : contextPresetsFor(profile.maxContext)) : [];
     const requestedContext = patch.contextWindow ?? current.contextWindow;
     const contextWindow = allowed.length && !allowed.includes(requestedContext) ? allowed.at(-1)! : requestedContext;
+    if (selectedBackend === 'llama-cpp' && nextModelId && profile) {
+      const runtime = await syncLlamaBackend();
+      const runtimeDiffers = runtime.status !== 'ready' || runtime.modelId !== nextModelId || runtime.contextWindow !== contextWindow;
+      // Re-selecting the stored model is a retry when the server is not running it.
+      if (runtimeDiffers && (patch.modelId !== undefined || patch.contextWindow !== undefined)) {
+        if (activeGenerations.size > 0) throw new Error('Нельзя переключать llama.cpp во время генерации: остановите её или дождитесь завершения.');
+        log('llama.runtime.switch.requested', { conversationId: id, from: runtime, to: { modelId: nextModelId, contextWindow } });
+        const result = await llamaRuntime.switchTo(nextModelId, contextWindow);
+        await syncLlamaBackend();
+        log('llama.runtime.switch.finished', { conversationId: id, ok: result.ok, state: result.state, error: result.ok ? undefined : result.error });
+        // Nothing is persisted for a failed switch: the stored conversation must keep
+        // naming the model that is really running (or none, when the server is down).
+        if (!result.ok) throw new Error(`Не удалось переключить llama.cpp на ${profile.displayName} (${Math.round(contextWindow / 1024)}K): ${result.error}${result.state.rolledBack ? ` Продолжает работать ${result.state.modelId}.` : result.state.status === 'offline' ? ' llama.cpp сейчас не запущен.' : ''}`);
+      }
+    }
     const updated = database.updateConversation(id, { ...patch, contextWindow });
-    if (selectedBackend === 'llama-cpp' && ((patch.contextWindow !== undefined && contextWindow !== current.contextWindow) || (patch.modelId !== undefined && patch.modelId !== current.modelId))) void restartLlamaRuntime();
     if ((patch.workingDirectory !== undefined && patch.workingDirectory !== current.workingDirectory) || (patch.secondaryWorkingDirectory !== undefined && patch.secondaryWorkingDirectory !== current.secondaryWorkingDirectory)) sessionApprovals.delete(id);
     if (patch.modelId !== undefined && patch.modelId !== current.modelId) database.setContextUsage(id, null, null);
     if (selectedBackend === 'ollama' && patch.modelId !== undefined && patch.modelId !== current.modelId && current.modelId) void ollama.unloadModel(current.modelId);
@@ -172,7 +205,10 @@ export function registerIpc(): void {
     try { return await backend.getModels(); }
     catch (error) { log('backend.models.failed', { backend: selectedBackend, message: error instanceof Error ? error.message : String(error) }); return []; }
   });
-  ipcMain.handle('settings:get', () => ({ selectedBackend, ollamaUrl: 'http://127.0.0.1:11434', llamaServerPath: selectedBackend === 'llama-cpp' ? process.env.LOCAL_AI_LLAMA_SERVER_PATH ?? null : null, ...(selectedBackend === 'llama-cpp' ? { llamaRuntimeModelId } : {}), modelsPath: paths.models }));
+  ipcMain.handle('settings:get', async () => {
+    const llama = selectedBackend === 'llama-cpp' ? await syncLlamaBackend() : null;
+    return { selectedBackend, ollamaUrl: 'http://127.0.0.1:11434', llamaServerPath: selectedBackend === 'llama-cpp' ? process.env.LOCAL_AI_LLAMA_SERVER_PATH ?? null : null, ...(llama ? { llamaRuntimeModelId: llama.modelId ?? undefined, llamaRuntime: llama } : {}), modelsPath: paths.models };
+  });
   ipcMain.handle('hardware:get', getHardwareStats);
   ipcMain.handle('dialog:chooseDirectory', async (_event, initialDirectory?: string | null) => {
     const window = BrowserWindow.getFocusedWindow();
@@ -264,8 +300,13 @@ export function registerIpc(): void {
       let history = attachmentPipeline.buildContext(request.messages, !hasImages);
       if (nativeVision) history = await attachmentPipeline.prepareNativeImages(history, abort.signal);
       const persistedTaskMemory = mode === 'agent' ? taskPlan(database.getAgentPlan(request.conversationId) ?? {}).taskMemory : undefined;
+      const agentSupportsReasoning = mode === 'agent'
+        ? selectedBackend === 'ollama'
+          ? await ollama.supportsReasoning(request.model, abort.signal)
+          : llamaCpp.supportsReasoning(request.model)
+        : false;
       const stream = mode === 'agent'
-        ? rustAgent.stream(request.model, history, agentProjects, abort.signal, context.active, conversation.reasoningMode, conversation.webMode, generation.id, persistedTaskMemory, request.conversationId)
+        ? rustAgent.stream(request.model, history, agentProjects, abort.signal, context.active, conversation.reasoningMode, conversation.webMode, generation.id, persistedTaskMemory, request.conversationId, agentSupportsReasoning)
         : conversation.webMode === 'auto'
           ? webChat.stream(request.model, history, abort.signal, context.active, conversation.reasoningMode)
           : backend.streamChat(request.model, chatMessagesWithSystemPrefix(history, [chatSystemContext({ webAvailable: false }, conversation.reasoningMode === 'deep' ? 'deep' : 'fast')], request.conversationId, `capability-${request.conversationId}`), abort.signal, context.active, conversation.reasoningMode);

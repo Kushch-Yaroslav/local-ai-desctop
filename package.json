@@ -25,6 +25,7 @@
     "test:llama-cpp-backend": "npm run build && node dist/main/backends/llama-cpp-backend.test.js",
     "test:ollama-errors": "npm run build && node dist/main/backends/ollama-errors.test.js",
     "test:ollama-backend": "npm run build && node dist/main/backends/ollama-backend.test.js",
+    "test:llama-runtime": "npm run build && node dist/main/services/llama-runtime-controller.test.js",
     "start": "electron ."
   },
   "dependencies": {

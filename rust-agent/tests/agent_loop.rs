@@ -22,6 +22,10 @@ enum Reply {
     /// Only reasoning, no content and no structured call.
     Reasoning(String),
     Tools(Vec<(&'static str, Value)>),
+    /// Reasoning streamed first, then structured calls.
+    ReasonedTools(String, Vec<(&'static str, Value)>),
+    /// Reasoning streamed first, then visible content.
+    ReasonedText(String, String),
 }
 
 struct Provider {
@@ -92,6 +96,21 @@ impl Provider {
                         out.push_str(&frame(json!({"reasoning_content": text}), None));
                         out.push_str(&frame(json!({}), Some("stop")));
                     }
+                    Reply::ReasonedText(reasoning, text) => {
+                        out.push_str(&frame(json!({"reasoning_content": reasoning}), None));
+                        out.push_str(&frame(json!({"content": text}), None));
+                        out.push_str(&frame(json!({}), Some("stop")));
+                    }
+                    Reply::ReasonedTools(reasoning, calls) => {
+                        out.push_str(&frame(json!({"reasoning_content": reasoning}), None));
+                        let calls = calls
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, (name, arguments))| json!({"index":index,"id":format!("call_{served}_{index}"),"type":"function","function":{"name":name,"arguments":arguments.to_string()}}))
+                            .collect::<Vec<_>>();
+                        out.push_str(&frame(json!({"tool_calls": calls}), None));
+                        out.push_str(&frame(json!({}), Some("tool_calls")));
+                    }
                     Reply::Tools(calls) => {
                         let calls = calls
                             .into_iter()
@@ -158,6 +177,7 @@ impl Workspace {
             root: Some(self.root.to_string_lossy().into_owned()),
             context_limit: 65_536,
             reasoning_mode: "fast".into(),
+            supports_reasoning: true,
             policy: RunPolicy::Auto,
             history: Vec::new(),
             evidence_dir: Some(self.base.join("evidence").to_string_lossy().into_owned()),
@@ -480,6 +500,37 @@ fn persistent_empty_responses_force_a_tool_free_answer_turn() {
     assert!(last_user_text(last).contains("MODE: FINALIZING"));
 }
 
+#[test]
+fn reasoning_only_finalizing_turn_retries_without_reasoning_and_accepts_visible_answer() {
+    let workspace = Workspace::new(SHOP);
+    let mut config = workspace.config("unused", READ_ONLY);
+    config.reasoning_mode = "deep".into();
+    let provider = Provider::start(|request, _| {
+        if request.pointer("/chat_template_kwargs/enable_thinking") == Some(&json!(false)) {
+            Reply::Text("Visible final answer.".into())
+        } else {
+            Reply::Reasoning("I will synthesize the answer now.".into())
+        }
+    });
+    config.endpoint = provider.endpoint.clone();
+    run(config);
+    assert!(completed(&workspace.journal()));
+    let requests = provider.requests();
+    assert!(requests.len() >= 2);
+    assert_eq!(
+        requests.last().unwrap()["chat_template_kwargs"]["enable_thinking"],
+        false,
+        "finalizing request must explicitly disable supported reasoning"
+    );
+    assert!(requests.last().unwrap().get("tools").is_none());
+    assert!(workspace.journal().iter().any(|entry| {
+        entry
+            .pointer("/Message/content")
+            .and_then(Value::as_str)
+            .is_some_and(|content| content.contains("Visible final answer"))
+    }));
+}
+
 /// Failure shape: a single turn of parallel reads larger than the whole window
 /// (here 8 files of 60 KB against a 16K window). Results are now bounded by the
 /// window at creation and carry a continuation offset, instead of being
@@ -534,4 +585,99 @@ fn a_burst_of_large_reads_cannot_exceed_a_small_window() {
         .unwrap();
     assert!(first_result.contains("\"truncated\":true"));
     assert!(first_result.contains("next_offset_chars"));
+}
+
+/// Failure shape: reasoning was dropped from the record, so a thinking model's
+/// template rendered every earlier assistant turn with empty thinking and the
+/// model re-derived its plan on each step.
+#[test]
+fn reasoning_is_recorded_and_replayed_with_the_assistant_turn_that_produced_it() {
+    let workspace = Workspace::new(SHOP);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::ReasonedTools(
+            "PLAN-ALPHA: read the form first".into(),
+            vec![("read_file", json!({"path":"src/Form.tsx"}))],
+        ),
+        1 => Reply::ReasonedTools(
+            "PLAN-BETA: then the endpoint".into(),
+            vec![("read_file", json!({"path":"public/api.php"}))],
+        ),
+        _ => Reply::ReasonedText("ALL-DONE".into(), "The form posts to api.php.".into()),
+    });
+    run(workspace.config(&provider.endpoint, READ_ONLY));
+    assert!(completed(&workspace.journal()));
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3);
+    let assistants = |request: &Value| {
+        request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "assistant")
+            .map(|m| {
+                m.get("reasoning_content")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned()
+            })
+            .collect::<Vec<_>>()
+    };
+    assert!(assistants(&requests[0]).is_empty());
+    assert_eq!(
+        assistants(&requests[1]),
+        vec!["PLAN-ALPHA: read the form first"]
+    );
+    assert_eq!(
+        assistants(&requests[2]),
+        vec![
+            "PLAN-ALPHA: read the form first",
+            "PLAN-BETA: then the endpoint"
+        ]
+    );
+    // The durable record keeps it too, so a restart replays the same bytes.
+    let journal = workspace.journal();
+    assert!(journal.iter().any(|entry| entry
+        .pointer("/Message/reasoning_content")
+        .and_then(Value::as_str)
+        == Some("PLAN-BETA: then the endpoint")));
+}
+
+/// Failure shape: a turn with only reasoning left no trace, so the retry
+/// regenerated the same reasoning from nothing, indefinitely.
+#[test]
+fn a_reasoning_only_turn_is_visible_to_the_retry() {
+    let workspace = Workspace::new(SHOP);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Reasoning("DRAFT-IN-THINKING: the report is: form posts to api.php".into()),
+        _ => Reply::Text("The form posts to api.php.".into()),
+    });
+    run(workspace.config(&provider.endpoint, READ_ONLY));
+    assert!(completed(&workspace.journal()));
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let retry = requests[1]["messages"].as_array().unwrap();
+    assert!(
+        retry.iter().any(|m| m["role"] == "assistant"
+            && m["reasoning_content"] == "DRAFT-IN-THINKING: the report is: form posts to api.php"),
+        "the retry did not carry the reasoning-only turn"
+    );
+    assert!(last_user_text(&requests[1]).contains("neither an answer nor a structured tool call"));
+}
+
+#[test]
+fn a_provider_without_reasoning_never_receives_replayed_reasoning() {
+    let workspace = Workspace::new(SHOP);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::ReasonedTools(
+            "hidden".into(),
+            vec![("read_file", json!({"path":"src/Form.tsx"}))],
+        ),
+        _ => Reply::Text("done".into()),
+    });
+    let mut config = workspace.config(&provider.endpoint, READ_ONLY);
+    config.supports_reasoning = false;
+    run(config);
+    assert!(!provider.requests()[1]
+        .to_string()
+        .contains("reasoning_content"));
 }

@@ -105,15 +105,34 @@ export function validateLlamaMessageSequence(messages: ToolMessage[]): string | 
 /** Adapter for the launcher-managed, OpenAI-compatible llama-server. */
 export class LlamaCppBackend implements LlmBackend, ToolCallingBackend {
   private lastActualPromptTokens: number | undefined;
+  private contextLimit: number;
+  private visionEnabled: boolean;
+  private runtimeModelId: string;
   /** Avoid a second input_tokens request after context management just counted it. */
   private readonly preparedInputTokens = new WeakMap<object, { tools: unknown[] | undefined; reasoningMode: ReasoningMode; tokens: number }>();
-  constructor(private readonly baseUrl = 'http://127.0.0.1:8081', private readonly contextLimit = 32_768, private readonly visionEnabled = true, private readonly runtimeModelId = qwenModel) {}
+  constructor(private readonly baseUrl = 'http://127.0.0.1:8081', contextLimit = 32_768, visionEnabled = true, runtimeModelId = qwenModel) {
+    this.contextLimit = contextLimit;
+    this.visionEnabled = visionEnabled;
+    this.runtimeModelId = runtimeModelId;
+  }
   private url(path: string): string { return `${this.baseUrl.replace(/\/$/, '')}${path}`; }
+  supportsReasoning(model: string): boolean { return model === qwenModel || model === glmFlashModel; }
+  updateRuntimeSelection(model: string, contextLimit: number): void {
+    const runtime = llamaRuntimeProfiles.find((candidate) => candidate.id === model);
+    if (!runtime || !llamaContextPresets(model).includes(contextLimit)) throw new Error('llama.cpp runtime selection is unsupported');
+    this.runtimeModelId = model;
+    this.contextLimit = contextLimit;
+    this.visionEnabled = runtime.vision;
+  }
 
   async getModels(): Promise<ModelInfo[]> {
-    const response = await fetch(this.url('/v1/models'));
-    if (!response.ok) throw new Error(`llama.cpp вернул HTTP ${response.status}`);
-    const data = await response.json() as ModelsResponse;
+    // An unreachable server must still list the installable runtimes: choosing
+    // one is how the user restarts llama.cpp after a failed switch.
+    let data: ModelsResponse = {};
+    try {
+      const response = await fetch(this.url('/v1/models'));
+      if (response.ok) data = await response.json() as ModelsResponse;
+    } catch { /* offline: only file availability is known */ }
     const runtimeContext = Math.min(this.contextLimit, data.data?.[0]?.meta?.n_ctx ?? this.contextLimit);
     if (!getModelProfile(this.runtimeModelId)) throw new Error(`llama.cpp запущен с неизвестной моделью: ${this.runtimeModelId}`);
     return llamaRuntimeProfiles.flatMap((runtime) => {
@@ -121,7 +140,7 @@ export class LlamaCppBackend implements LlmBackend, ToolCallingBackend {
       if (!profile) return [];
       const active = runtime.id === this.runtimeModelId;
       return [{
-        ...modelInfo(profile, active ? (data.data ?? []).length > 0 : llamaRuntimeInstalled(runtime), active ? data.data?.[0]?.meta?.size : undefined, active ? Math.min(runtime.maxContext, runtimeContext) : runtime.maxContext, active ? (runtime.id === qwenModel || runtime.id === glmFlashModel) : profile.supportsReasoning),
+        ...modelInfo(profile, active && (data.data ?? []).length > 0 ? true : llamaRuntimeInstalled(runtime), active ? data.data?.[0]?.meta?.size : undefined, active ? Math.min(runtime.maxContext, runtimeContext) : runtime.maxContext, active ? (runtime.id === qwenModel || runtime.id === glmFlashModel) : profile.supportsReasoning),
         backend: 'llama-cpp' as const,
         supportedContextPresets: llamaContextPresets(runtime.id),
       }];
@@ -129,7 +148,7 @@ export class LlamaCppBackend implements LlmBackend, ToolCallingBackend {
   }
 
   async getStatus(): Promise<{ available: boolean; message?: string }> {
-    try { const response = await fetch(this.url('/health')); return response.ok ? { available: true } : { available: false, message: `llama.cpp вернул HTTP ${response.status}` }; }
+    try { const response = await fetch(this.url('/health'), { signal: AbortSignal.timeout(2_000) }); return response.ok ? { available: true } : { available: false, message: `llama.cpp вернул HTTP ${response.status}` }; }
     catch (error) { return { available: false, message: error instanceof Error ? error.message : String(error) }; }
   }
   async supportsVision(model: string): Promise<boolean> { return model === qwenModel && this.runtimeModelId === qwenModel && this.visionEnabled; }
