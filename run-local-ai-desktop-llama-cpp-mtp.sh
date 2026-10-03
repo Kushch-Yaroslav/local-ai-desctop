@@ -162,9 +162,9 @@ launch_server() {
   : > "$SERVER_LOG"
   log "llama-server.start variant=$VARIANT runtime_model_id=$RUNTIME_MODEL_ID ctx_size=$context model=$MODEL mmproj=${MMPROJ:-none}"
   if [[ "$VARIANT" == "glm-4.7-flash" ]]; then
-    "$LLAMA_BIN" -m "$MODEL" --alias "$RUNTIME_MODEL_ID" --host 127.0.0.1 --port "$PORT" --ctx-size "$context" --gpu-layers "$gpu_layers" --flash-attn on "${context_args[@]}" --batch-size 512 --ubatch-size 512 --parallel 1 --jinja --reasoning on --no-warmup >> "$SERVER_LOG" 2>&1 &
+    "$LLAMA_BIN" --log-verbosity 5 -m "$MODEL" --alias "$RUNTIME_MODEL_ID" --host 127.0.0.1 --port "$PORT" --ctx-size "$context" --gpu-layers "$gpu_layers" --flash-attn on "${context_args[@]}" --batch-size 512 --ubatch-size 512 --parallel 1 --jinja --reasoning on --no-warmup >> "$SERVER_LOG" 2>&1 &
   else
-    "$LLAMA_BIN" -m "$MODEL" --alias "$RUNTIME_MODEL_ID" --mmproj "$MMPROJ" --no-mmproj-offload --host 127.0.0.1 --port "$PORT" --ctx-size "$context" --gpu-layers "$gpu_layers" --flash-attn on --parallel 1 --spec-type draft-mtp "${context_args[@]}" >> "$SERVER_LOG" 2>&1 &
+    "$LLAMA_BIN" --log-verbosity 5 -m "$MODEL" --alias "$RUNTIME_MODEL_ID" --mmproj "$MMPROJ" --no-mmproj-offload --host 127.0.0.1 --port "$PORT" --ctx-size "$context" --gpu-layers "$gpu_layers" --flash-attn on --parallel 1 --spec-type draft-mtp "${context_args[@]}" >> "$SERVER_LOG" 2>&1 &
   fi
   SERVER_PID=$!
   printf '%s\n' "$SERVER_PID" > "$SERVER_PID_FILE"
@@ -304,6 +304,7 @@ export ELECTRON_ENABLE_LOGGING=1
 export LOCAL_AI_BACKEND="llama-cpp"
 export LOCAL_AI_LLAMA_CPP_URL="$URL"
 export LOCAL_AI_LLAMA_SERVER_PATH="$LLAMA_BIN"
+export LOCAL_AI_LLAMA_SERVER_LOG="$SERVER_LOG"
 unset LOCAL_AI_DEV_SERVER_URL VITE_DEV_SERVER_URL
 cd "$APP_DIR"
 printf '%s\n' "$$" > "$LAUNCHER_PID_FILE"
