@@ -256,7 +256,8 @@ export interface TerminalExecution {
 
 export type ThinkingTimelineEvent =
   | { id: string; kind: 'reasoning'; content: string; position: number; startedAt?: string; completedAt?: string }
-  | { id: string; kind: 'activity'; activityId: string; position: number };
+  | { id: string; kind: 'activity'; activityId: string; position: number }
+  | { id: string; kind: 'steering'; messageId: string; position: number; status: 'accepted' | 'applied' };
 
 export type AgentPlanStepStatus = 'pending' | 'in_progress' | 'completed' | 'abandoned';
 /** Kept optional for reading messages saved by the pre-milestone renderer. */
@@ -309,7 +310,7 @@ export type StreamEvent =
   | { type: 'token'; content: string }
   | { type: 'thinking'; content: string; timelinePosition?: number }
   | { type: 'task-memory'; memory: NonNullable<AgentPlan['taskMemory']> }
-  | { type: 'steering'; userMessage: ChatMessage; status: 'accepted' | 'applied' }
+  | { type: 'steering'; userMessage: ChatMessage; status: 'accepted' | 'applied'; timelinePosition?: number }
   | { type: 'tool'; activity: ToolActivity; runId?: string }
   | { type: 'attachment'; activity: ToolActivity }
   | { type: 'approval-request'; actionId: string; approval: ActionApproval }

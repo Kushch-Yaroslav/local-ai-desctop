@@ -53,7 +53,7 @@ const mapMessage = (row: MessageRow, attachments?: Attachment[], projectReferenc
   let taskPlan: import('../../shared/types').AgentPlan | undefined;
   try {
     const parsed = row.thinking_timeline ? JSON.parse(row.thinking_timeline) as unknown : undefined;
-    if (Array.isArray(parsed)) thinkingTimeline = parsed.filter((item): item is ThinkingTimelineEvent => Boolean(item) && typeof item === 'object' && typeof item.id === 'string' && typeof item.position === 'number' && ((item.kind === 'reasoning' && typeof item.content === 'string' && (item.startedAt === undefined || typeof item.startedAt === 'string') && (item.completedAt === undefined || typeof item.completedAt === 'string')) || (item.kind === 'activity' && typeof item.activityId === 'string')));
+    if (Array.isArray(parsed)) thinkingTimeline = parsed.filter((item): item is ThinkingTimelineEvent => Boolean(item) && typeof item === 'object' && typeof item.id === 'string' && typeof item.position === 'number' && ((item.kind === 'reasoning' && typeof item.content === 'string' && (item.startedAt === undefined || typeof item.startedAt === 'string') && (item.completedAt === undefined || typeof item.completedAt === 'string')) || (item.kind === 'activity' && typeof item.activityId === 'string') || (item.kind === 'steering' && typeof item.messageId === 'string' && (item.status === 'accepted' || item.status === 'applied'))));
   } catch { /* Old or damaged timeline metadata remains optional. */ }
   try {
     const parsed = row.task_plan ? JSON.parse(row.task_plan) as unknown : undefined;

@@ -2,6 +2,7 @@ import { memo, useEffect, useId, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
+import { mermaidThemeVariables } from '../../shared/mermaid-theme';
 
 // Mermaid configuration is global; serialize themed renders from different messages.
 let mermaidQueue = Promise.resolve();
@@ -12,7 +13,7 @@ function MermaidBlock({ source }: { source: string }) {
   const viewport = useRef<HTMLDivElement>(null);
   const drag = useRef<{ x: number; y: number; left: number; top: number } | null>(null);
   const copyTimer = useRef<number | undefined>(undefined);
-  const [theme, setTheme] = useState<'dark' | 'default'>('dark');
+  const [theme, setTheme] = useState<'dark' | 'light'>('dark');
   const [svg, setSvg] = useState('');
   const [naturalWidth, setNaturalWidth] = useState(0);
   const [error, setError] = useState('');
@@ -30,7 +31,7 @@ function MermaidBlock({ source }: { source: string }) {
         ? [0, 2, 4].map(offset => parseInt(hex.slice(offset, offset + 2), 16))
         : background.match(/[\d.]+/g)?.slice(0, 3).map(Number);
       const dark = rgb?.length === 3 ? rgb[0] * .2126 + rgb[1] * .7152 + rgb[2] * .0722 < 128 : preference.matches;
-      setTheme(dark ? 'dark' : 'default');
+      setTheme(dark ? 'dark' : 'light');
     };
     const observer = new MutationObserver(updateTheme);
     for (const element of [document.documentElement, document.body]) {
@@ -64,9 +65,10 @@ function MermaidBlock({ source }: { source: string }) {
           startOnLoad: false,
           securityLevel: 'strict',
           suppressErrorRendering: true,
-          theme,
+          theme: 'base',
+          themeVariables: mermaidThemeVariables(theme),
           fontFamily: 'Inter, ui-sans-serif, system-ui, sans-serif',
-          flowchart: { htmlLabels: false },
+          flowchart: { htmlLabels: true },
         });
         const result = await mermaid.render(`mermaid-${id}`, source, scratch);
         if (!cancelled) {
@@ -100,7 +102,7 @@ function MermaidBlock({ source }: { source: string }) {
     }
   };
 
-  return <div className={`mermaid-block${expanded ? ' mermaid-expanded' : ''}`} ref={block}>
+  return <div className={`mermaid-block mermaid-${theme}${expanded ? ' mermaid-expanded' : ''}`} ref={block}>
     <div className="mermaid-toolbar">
       <span className="mermaid-title">Диаграмма</span>
       <div className="mermaid-controls" role="group" aria-label="Управление диаграммой">

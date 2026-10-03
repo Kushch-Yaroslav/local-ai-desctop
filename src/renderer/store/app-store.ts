@@ -245,7 +245,20 @@ export const useAppStore = create<State>((rawSet, rawGet) => {
     if (!isCurrentGenerationEvent(event.conversationId, event.generationId, get().activeId, get().generationId)) return;
     if (event.type === 'steering' && event.userMessage) {
       const message = event.userMessage;
-      set((state) => ({ steeringStatus: event.status === 'applied' ? 'applied' : 'accepted', messages: state.messages.some((entry) => entry.id === message.id) ? state.messages : [...state.messages.filter((entry) => entry.id !== assistantId(event.generationId)), message, ...state.messages.filter((entry) => entry.id === assistantId(event.generationId))] }));
+      set((state) => {
+        const assistantMessageId = assistantId(event.generationId);
+        const assistant = state.messages.find((entry) => entry.id === assistantMessageId);
+        const timeline = assistant?.thinkingTimeline ?? [];
+        const existing = timeline.find((entry) => entry.kind === 'steering' && entry.messageId === message.id);
+        const status: 'accepted' | 'applied' = event.status === 'applied' || (existing?.kind === 'steering' && existing.status === 'applied') ? 'applied' : 'accepted';
+        const nextTimeline = existing?.kind === 'steering'
+          ? timeline.map((entry) => entry === existing ? { ...existing, status } : entry)
+          : event.timelinePosition === undefined ? timeline : [...timeline, { id: `steering-${message.id}`, kind: 'steering' as const, messageId: message.id, position: event.timelinePosition, status }];
+        const messages = state.messages.some((entry) => entry.id === message.id)
+          ? state.messages.map((entry) => entry.id === assistantMessageId && nextTimeline !== timeline ? { ...entry, thinkingTimeline: nextTimeline } : entry)
+          : [...state.messages.filter((entry) => entry.id !== assistantMessageId), message, ...state.messages.filter((entry) => entry.id === assistantMessageId).map((entry) => ({ ...entry, ...(nextTimeline !== timeline ? { thinkingTimeline: nextTimeline } : {}) }))];
+        return { steeringStatus: status, messages };
+      });
     }
     if (event.type === 'token') {
       pendingTokens.set(event.generationId, (pendingTokens.get(event.generationId) ?? '') + (event.content ?? ''));

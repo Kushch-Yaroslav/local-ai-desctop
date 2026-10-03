@@ -43,7 +43,18 @@ const rustAgent = new RustAgentRuntime(process.env.LOCAL_AI_AGENT_ENDPOINT ?? (s
 const webChat = new WebChatService(backend, web);
 const attachments = new AttachmentService(database);
 const attachmentPipeline = new AttachmentPipeline(database, attachments);
-type ActiveGeneration = { id: string; abort: AbortController; settled: Promise<void>; finish: () => void; mode?: 'chat' | 'agent'; followups?: import('../../shared/types').ChatMessage[] };
+type ActiveGeneration = {
+  id: string;
+  abort: AbortController;
+  settled: Promise<void>;
+  finish: () => void;
+  mode?: 'chat' | 'agent';
+  followups?: Array<{ message: import('../../shared/types').ChatMessage; timelinePosition: number; applied: boolean }>;
+  thinkingTimeline: ThinkingTimelineEvent[];
+  activityTimelinePositions: Map<string, number>;
+  timelinePosition: number;
+  lastTimelineKind: ThinkingTimelineEvent['kind'] | null;
+};
 const activeGenerations = new Map<string, ActiveGeneration>();
 type PendingApproval = { approvalId: string; conversationId: string; generation: ActiveGeneration; actionId: string; category: RiskCategory; root: string; resolve: (result: ApprovalResult) => void; settled: boolean; abort: () => void; emit: (payload: Record<string, unknown>) => void };
 const pendingApprovals = new Map<string, PendingApproval>();
@@ -263,9 +274,16 @@ export function registerIpc(): void {
     if (typeof content !== 'string' || !content.trim() || content.length > 16_000) throw new Error('Уточнение должно содержать от 1 до 16000 символов.');
     await rustAgent.steer(generation.id, content.trim());
     const message = database.addMessage(conversationId, 'user', content.trim());
-    (generation.followups ??= []).push(message);
+    if (generation.lastTimelineKind === 'reasoning') {
+      const prior = generation.thinkingTimeline.at(-1);
+      if (prior?.kind === 'reasoning') prior.completedAt = new Date().toISOString();
+    }
+    const timelinePosition = ++generation.timelinePosition;
+    generation.thinkingTimeline.push({ id: randomUUID(), kind: 'steering', messageId: message.id, position: timelinePosition, status: 'accepted' });
+    generation.lastTimelineKind = 'steering';
+    (generation.followups ??= []).push({ message, timelinePosition, applied: false });
     log('generation.steering.accepted', { conversationId, generationId, messageId: message.id });
-    event.sender.send('chat:stream', { type: 'steering', conversationId, generationId, userMessage: message, status: 'accepted' });
+    event.sender.send('chat:stream', { type: 'steering', conversationId, generationId, userMessage: message, status: 'accepted', timelinePosition });
     return message;
   });
   ipcMain.handle('chat:approve', (_event, request: { conversationId: string; generationId: string; approvalId: string; decision: ApprovalDecision }) => {
@@ -285,7 +303,7 @@ export function registerIpc(): void {
     // Claim the process-wide inference slot synchronously, before any await.
     if (activeGenerations.size) throw new Error('Уже выполняется генерация в другом чате. Дождитесь завершения или остановите её.');
     const abort = new AbortController(); let finish!: () => void;
-    const generation: ActiveGeneration = { id: request.generationId, abort, settled: new Promise<void>((resolve) => { finish = resolve; }), finish };
+    const generation: ActiveGeneration = { id: request.generationId, abort, settled: new Promise<void>((resolve) => { finish = resolve; }), finish, thinkingTimeline: [], activityTimelinePositions: new Map(), timelinePosition: 0, lastTimelineKind: null };
     activeGenerations.set(request.conversationId, generation);
     const current = () => activeGenerations.get(request.conversationId) === generation && !abort.signal.aborted;
     let run: AnalysisRun | null = null;
@@ -325,7 +343,7 @@ export function registerIpc(): void {
     await backend.ensureModelAvailable(request.model);
     if (!current()) return;
     let output = ''; let thinking = ''; let messageDiagnostics: import('../../shared/types').GenerationDiagnostics | undefined; let completed = false; let failed = false; let finishReason: 'stop' | 'length' = 'stop';
-    const thinkingTimeline: ThinkingTimelineEvent[] = []; const activityTimelinePositions = new Map<string, number>(); let timelinePosition = 0; let lastTimelineKind: ThinkingTimelineEvent['kind'] | null = null;
+    const { thinkingTimeline, activityTimelinePositions } = generation;
     const agentProjects: AgentProject[] = mode === 'agent' ? [...selectedProjects] : [];
     const agentRoot = agentProjects[0]?.root ?? null;
     const enabledTools = mode === 'agent' ? ['apply_patch', 'create_file', 'delete_file', 'list_directory', 'project_knowledge_index', 'project_knowledge_read', 'project_knowledge_update', 'read_file', 'run_terminal', 'task_memory', 'write_file'] : conversation.webMode === 'auto' ? ['web'] : [];
@@ -367,10 +385,13 @@ export function registerIpc(): void {
         if (!current()) break;
         if (chunk.type === 'steering') {
           const content = chunk.userMessage.content;
-          const message = generation.followups?.find((entry) => entry.content === content);
-          if (message) {
-            event.sender.send('chat:stream', { ...chunk, userMessage: message, conversationId: request.conversationId, generationId: generation.id });
-            log('generation.steering.applied', { conversationId: request.conversationId, generationId: generation.id, messageId: message.id });
+          const followup = generation.followups?.find((entry) => !entry.applied && entry.message.content === content);
+          if (followup) {
+            followup.applied = true;
+            const timelineEvent = thinkingTimeline.find((entry) => entry.kind === 'steering' && entry.messageId === followup.message.id);
+            if (timelineEvent?.kind === 'steering') timelineEvent.status = 'applied';
+            event.sender.send('chat:stream', { ...chunk, userMessage: followup.message, timelinePosition: followup.timelinePosition, conversationId: request.conversationId, generationId: generation.id });
+            log('generation.steering.applied', { conversationId: request.conversationId, generationId: generation.id, messageId: followup.message.id });
           }
           continue;
         }
@@ -378,9 +399,9 @@ export function registerIpc(): void {
         if (chunk.type === 'thinking') {
           thinking += chunk.content;
           if (mode === 'agent') {
-            if (lastTimelineKind !== 'reasoning') { timelinePosition += 1; thinkingTimeline.push({ id: randomUUID(), kind: 'reasoning', content: chunk.content, position: timelinePosition, startedAt: new Date().toISOString() }); lastTimelineKind = 'reasoning'; }
+            if (generation.lastTimelineKind !== 'reasoning') { const position = ++generation.timelinePosition; thinkingTimeline.push({ id: randomUUID(), kind: 'reasoning', content: chunk.content, position, startedAt: new Date().toISOString() }); generation.lastTimelineKind = 'reasoning'; }
             else { const entry = thinkingTimeline.at(-1); if (entry?.kind === 'reasoning') entry.content += chunk.content; }
-            chunk = { ...chunk, timelinePosition };
+            chunk = { ...chunk, timelinePosition: generation.timelinePosition };
           }
         }
         if (chunk.type === 'task-memory') {
@@ -403,11 +424,11 @@ export function registerIpc(): void {
         if (chunk.type === 'done') { completed = true; finishReason = chunk.finishReason === 'length' ? 'length' : 'stop'; continue; }
         if (chunk.type === 'error') failed = true;
         if (run && chunk.type === 'tool') {
-          if (lastTimelineKind === 'reasoning') { const prior = thinkingTimeline.at(-1); if (prior?.kind === 'reasoning') prior.completedAt = new Date().toISOString(); }
+          if (generation.lastTimelineKind === 'reasoning') { const prior = thinkingTimeline.at(-1); if (prior?.kind === 'reasoning') prior.completedAt = new Date().toISOString(); }
           const existingPosition = activityTimelinePositions.get(chunk.activity.id);
-          const position = existingPosition ?? (timelinePosition += 1);
+          const position = existingPosition ?? ++generation.timelinePosition;
           if (existingPosition === undefined) { activityTimelinePositions.set(chunk.activity.id, position); thinkingTimeline.push({ id: randomUUID(), kind: 'activity', activityId: chunk.activity.id, position }); }
-          lastTimelineKind = 'activity';
+          generation.lastTimelineKind = 'activity';
           const activity = { ...chunk.activity, timelinePosition: position };
           const updated = database.addAnalysisAction(run.id, activity);
           const visibleActivity = { ...activity };
@@ -418,7 +439,7 @@ export function registerIpc(): void {
       }
       if (!current()) { if (run) database.finishAnalysisRun(run.id, 'cancelled', null); return; }
       if (failed || !completed) { if (run) event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run: database.finishAnalysisRun(run.id, 'error', null) }); return; }
-      if (lastTimelineKind === 'reasoning') { const prior = thinkingTimeline.at(-1); if (prior?.kind === 'reasoning') prior.completedAt = new Date().toISOString(); }
+      if (generation.lastTimelineKind === 'reasoning') { const prior = thinkingTimeline.at(-1); if (prior?.kind === 'reasoning') prior.completedAt = new Date().toISOString(); }
       const inputTokens = messageDiagnostics?.promptEvalCount ?? messageDiagnostics?.inputTokens;
       const generationStats = messageDiagnostics?.evalCount === undefined ? undefined : {
         outputTokens: messageDiagnostics.evalCount,

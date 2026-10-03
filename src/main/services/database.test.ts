@@ -78,10 +78,11 @@ export async function runDatabaseMigrationRegression(): Promise<void> {
 
     const fresh = new Database(freshPath);
     const freshChat = fresh.createConversation('qwen3.8:27b-q4_K_M');
+    fresh.addMessage(freshChat.id, 'user', 'Поправка, напиши ещё плюсы и минусы.', 'steering-message');
     assert.equal(freshChat.reasoningMode, 'fast', 'new conversations must default to Fast reasoning');
     const response = fresh.addMessage(freshChat.id, 'assistant', 'Measured answer', undefined, [], {
       thinking: 'I checked the backend timing fields first.',
-      thinkingTimeline: [{ id: 'reasoning-1', kind: 'reasoning', content: 'I checked the backend timing fields first.', position: 1 }, { id: 'plan-event', kind: 'activity', activityId: 'plan-update', position: 2 }],
+      thinkingTimeline: [{ id: 'reasoning-1', kind: 'reasoning', content: 'I checked the backend timing fields first.', position: 1 }, { id: 'steering-1', kind: 'steering', messageId: 'steering-message', position: 2, status: 'applied' }, { id: 'plan-event', kind: 'activity', activityId: 'plan-update', position: 3 }],
       generationStats: { outputTokens: 4049, tokensPerSecond: 49, generationDurationMs: 82_600, timeToFirstTokenMs: 620, inputTokens: 1_200 },
     });
     const persistedRun = fresh.createAnalysisRun(freshChat.id, 'fast');
@@ -133,7 +134,8 @@ export async function runDatabaseMigrationRegression(): Promise<void> {
     const loaded = reopenedFresh.listAnalysisRuns(freshChat.id)[0];
     const restoredResponse = reopenedFresh.getMessage(response.id);
     assert.equal(restoredResponse?.thinking, 'I checked the backend timing fields first.', 'message Thinking was not preserved after restart');
-    assert.deepEqual(restoredResponse?.thinkingTimeline, [{ id: 'reasoning-1', kind: 'reasoning', content: 'I checked the backend timing fields first.', position: 1 }, { id: 'plan-event', kind: 'activity', activityId: 'plan-update', position: 2 }], 'message Thinking event order was not preserved after restart');
+    assert.deepEqual(restoredResponse?.thinkingTimeline, [{ id: 'reasoning-1', kind: 'reasoning', content: 'I checked the backend timing fields first.', position: 1 }, { id: 'steering-1', kind: 'steering', messageId: 'steering-message', position: 2, status: 'applied' }, { id: 'plan-event', kind: 'activity', activityId: 'plan-update', position: 3 }], 'message Thinking and steering event order was not preserved after restart');
+    assert.equal(reopenedFresh.getMessage('steering-message')?.content, 'Поправка, напиши ещё плюсы и минусы.', 'canonical steering message did not survive database reopen');
     assert.deepEqual(restoredResponse?.generationStats, { outputTokens: 4049, tokensPerSecond: 49, generationDurationMs: 82_600, timeToFirstTokenMs: 620, inputTokens: 1_200 }, 'message generation statistics were not preserved after restart');
     assert.deepEqual(loaded.actions.find((action) => action.id === 'plan-update')?.plan, finalPlan, 'last structured Agent Plan was not preserved after restart');
     assert.deepEqual(reopenedFresh.getAgentPlan(freshChat.id), finalPlan, 'canonical Goal/Work Plan was not preserved after restart');
