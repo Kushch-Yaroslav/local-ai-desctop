@@ -43,9 +43,7 @@ impl AgentState {
     }
 
     pub fn record_tool_call(&mut self, tool: &str) {
-        if tool == "task_memory" {
-            self.calls_since_memory = 0;
-        } else {
+        if tool != "task_memory" {
             self.calls_since_memory = self.calls_since_memory.saturating_add(1);
         }
     }
@@ -69,13 +67,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn memory_cadence_resets_on_task_memory_only() {
+    fn memory_call_alone_does_not_reset_write_cadence() {
         let mut state = AgentState::default();
         state.record_tool_call("read_file");
         state.record_tool_call("list_directory");
         assert_eq!(state.calls_since_memory, 2);
         state.record_tool_call("task_memory");
-        assert_eq!(state.calls_since_memory, 0);
+        assert_eq!(state.calls_since_memory, 2);
     }
 
     #[test]

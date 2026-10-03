@@ -18,6 +18,92 @@ use std::sync::{Arc, Mutex};
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
 #[test]
+fn unsupported_saved_confirmed_memory_never_reaches_provider() {
+    let fixture = Workspace::new(&[("source.txt", "observed source")]);
+    let provider = Provider::start(|_, _| panic!("invalid saved memory reached provider"));
+    let mut config = fixture.config(&provider.endpoint, "Continue investigation");
+    config.task_memory = Some(json!({"entries":[{
+        "id":"saved","finding":"unsupported","status":"confirmed","evidence":"obs-99999999"
+    }],"revision":1}));
+    run(config);
+    assert!(provider.requests().is_empty());
+}
+
+#[test]
+fn confirmed_memory_rejection_is_visible_and_retry_preserves_state() {
+    let fixture = Workspace::new(&[("source.txt", "observed source")]);
+    let provider = Provider::start(move |request, turn| {
+        let parameters = &request["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["function"]["name"] == "task_memory")
+            .unwrap()["function"]["parameters"];
+        assert_eq!(parameters["type"], "object");
+        assert_eq!(parameters["properties"]["finding"]["type"], "string");
+        assert_eq!(parameters["required"], json!(["action"]));
+        assert!(parameters.get("oneOf").is_none());
+        match turn {
+            0 => Reply::Tools(vec![("read_file", json!({"path":"source.txt"}))]),
+            1 => Reply::Tools(vec![("task_memory", json!({"action":"unsupported"}))]),
+            2 => Reply::Tools(vec![("task_memory", json!({"action":"record"}))]),
+            3 => Reply::Tools(vec![("task_memory", json!({}))]),
+            4 => Reply::Tools(vec![(
+                "task_memory",
+                json!({
+                    "action":"record","id":"fact","finding":"invalid candidate","status":"confirmed","evidence":"obs-99999999"
+                }),
+            )]),
+            5 => {
+                let messages = request["messages"].as_array().unwrap();
+                assert!(messages.iter().any(|message| message["role"] == "tool"
+                    && message["content"]
+                        .as_str()
+                        .is_some_and(|body| body.contains("unknown observation")
+                            && body.contains("no memory was changed"))));
+                assert!(!messages.iter().any(|message| message["role"] == "user"
+                    && message["content"]
+                        .as_str()
+                        .is_some_and(|body| body.contains("fact [confirmed]"))));
+                Reply::Tools(vec![(
+                    "task_memory",
+                    json!({
+                        "action":"record","id":"fact","finding":"observed source","status":"confirmed","evidence":"obs-00000001"
+                    }),
+                )])
+            }
+            _ => {
+                let result = request["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .rev()
+                    .find(|message| message["role"] == "tool")
+                    .unwrap();
+                let body = result["content"].as_str().unwrap();
+                let end = body.find("\n[observation").unwrap_or(body.len());
+                let memory: Value = serde_json::from_str(&body[..end]).unwrap();
+                assert_eq!(memory["task_memory"]["revision"], 1);
+                assert_eq!(
+                    memory["task_memory"]["entries"].as_array().unwrap().len(),
+                    1
+                );
+                assert_eq!(
+                    memory["task_memory"]["entries"][0]["finding"],
+                    "observed source"
+                );
+                Reply::Text("Completed after a recoverable invalid evidence write.".into())
+            }
+        }
+    });
+    run(fixture.config(
+        &provider.endpoint,
+        "Read-only source inspection with memory",
+    ));
+    assert_eq!(provider.requests().len(), 7);
+}
+
+#[test]
 fn two_project_reads_have_distinct_evidence_and_model_visible_scope() {
     let fixture = Workspace::new(&[("first-only.txt", "primary identity")]);
     let secondary = fixture.base.join("secondary");

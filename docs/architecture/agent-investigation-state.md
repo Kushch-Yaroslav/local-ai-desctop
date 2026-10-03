@@ -10,6 +10,43 @@ model-facing evidence grading and finalization lifecycle.
 **The runtime owns facts it can verify mechanically. The model owns every
 semantic judgement.**
 
+## Task Memory evidence contract
+
+Task Memory is structured JSON: prose such as "status is confirmed" inside
+`finding` does not set the `status` field. An omitted status on a new entry
+retains legacy, unclassified semantics; on an update it retains the previous
+status. No status is inferred from the finding text.
+
+The advertised schema has an object root with all parameters exposed directly.
+Native tool grammars in the supported llama.cpp runtime enumerate object-root
+properties; a root `oneOf` hides those parameters from its XML tool parser.
+Runtime validation remains authoritative: `action` is required, record/update
+needs a nonempty string `finding`, and invalidate needs a known `id`.
+Malformed calls return recoverable errors without memory mutation.
+
+An effective `confirmed` status requires nonempty `evidence` with a resolvable
+observation ID or an exact source path present in the transcript's observation
+store (including cited paths with spaces or Unicode). Paths must match at
+reference boundaries, not as substrings of other paths. Unknown observation
+references are rejected even when accompanied by a
+valid path. Numeric observation-ID spelling is resolved by the same helper as
+observation recovery; sentence punctuation and `obs-... .. obs-...` references
+are accepted when each cited ID resolves. The check happens against the normalized candidate entry,
+before committing any memory revision, replacement, superseded-entry
+invalidation, write-cap consumption, or checkpoint-cadence reset. Failed writes
+return a recoverable tool error; view calls do not reset the write cadence.
+Observation references remain resolvable after compaction and durable replay.
+Restored active confirmed entries are checked against that durable store before
+any provider request. Invalid saved memory produces an explicit Agent error,
+not a silently discarded or relabeled entry; invalidated historical entries and
+unclassified legacy entries retain their meaning.
+
+This is a structural check, not semantic entailment. A real failed operation
+may support a confirmed blocker, but does not prove file contents. Likewise a
+valid source reference does not prove that it supports a model's sentence.
+Inferred, unknown, contradicted, and unclassified entries are not silently
+promoted or relabeled, and no tool call is forced.
+
 | Runtime owns (mechanical, verifiable) | Model owns (semantic) |
 | --- | --- |
 | Tool-call validity and call/result pairing | What to read, in what order, and why |

@@ -97,6 +97,7 @@ const AGENT_GUIDANCE: &str = r#"
 - Use the latest user's language for all user-visible natural-language text: streamed reasoning/progress, tool preambles, brief status updates, and the final answer. Follow an explicit language request if present. Keep code, paths, identifiers, commands, API/tool syntax, and literal source quotations in their original form. Do not translate protocol fields.
 - For non-trivial architecture relationships, use a compact multiline Mermaid flowchart when it improves readability, or a properly indented multiline tree. Do not compress a diagram into one long arrow chain; avoid decorative box art.
 - Task Memory = durable semantic continuity for this task. Record meaningful findings, decisions, blockers, and next actions, and cite the observation IDs (obs-…) a finding rests on in its evidence field. After compaction, trust a precise Task Memory finding from an unchanged inspected file; reread only for a missing fact, ambiguity, possible change, exact detail, or targeted verification.
+- Set Task Memory status and evidence as JSON fields, not prose inside finding. Confirmed entries require evidence containing an observation ID or exact inspected source path from this transcript. A valid reference does not prove the claim; use inferred or unknown for unverified conclusions.
 - Investigation state = a mechanical inventory the runtime keeps of this run's tool observations: files read with their observation IDs, listed entries and local files referenced by sources you read that were not opened yet, failed operations, and commands run. It is not a task list and nothing in it is required. Use it to avoid rereading and to notice code you have not seen; follow a reference only when what you are about to claim depends on it. Recover an exact stored body with observation_read.
 - Ground claims in what you observed. Keep observed facts, inferences and unknowns apart, and mark inferences as inferences. Something you did not open is unknown, not absent. State that something does not exist only for a scope you actually covered (a complete directory listing, a complete file read, or a search whose scope you can name) and name that scope; otherwise say it was not found in what you inspected. A failed or approval-blocked operation is a blocker, not evidence.
 - When the request lists areas or questions, answer each from something you inspected or report it as not inspected. Do not spend further tool calls only to re-verify what you have already read.
@@ -554,8 +555,10 @@ fn emit_knowledge_diagnostics(config: &Config, state: &AgentState) {
 }
 
 fn tool_schemas(has_project_root: bool) -> Vec<Value> {
+    // Native tool grammars enumerate object-root properties, not union roots.
+    // Action-specific requirements are enforced transactionally at dispatch.
     let mut tools = vec![
-        json!({"type":"function","function":{"name":"task_memory","description":"Durable semantic memory for the current task across compaction. Record/update meaningful findings, decisions, blockers, or unresolved questions; view reads it; invalidate needs id. Record/update requires finding and may include evidence, implication, next, id, supersedes, status. Trust precise unchanged-file memory; reread only for a concrete missing, ambiguous, changed, exact-detail, or verification need.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["record","update","invalidate","view"]},"id":{"type":"string"},"finding":{"type":"string"},"evidence":{"type":"string"},"implication":{"type":"string"},"next":{"type":"string"},"supersedes":{"type":"string"},"status":{"type":"string","enum":["confirmed","inferred","unknown","contradicted"],"description":"How well established the finding is: confirmed (observed, cited), inferred (reasoned, not observed), unknown (open; put the resolving step in next), contradicted (evidence disagrees)."}},"required":["action"],"oneOf":[{"type":"object","properties":{"action":{"const":"view"}},"required":["action"]},{"type":"object","properties":{"action":{"enum":["record","update"]},"finding":{"type":"string"}},"required":["action","finding"]},{"type":"object","properties":{"action":{"const":"invalidate"},"id":{"type":"string"}},"required":["action","id"]}]}}}),
+        json!({"type":"function","function":{"name":"task_memory","description":"Durable semantic memory for the current task across compaction. Record/update meaningful findings, decisions, blockers, or unresolved questions; view reads it; invalidate needs id. Record/update requires finding and may include evidence, implication, next, id, supersedes, status. Trust precise unchanged-file memory; reread only for a concrete missing, ambiguous, changed, exact-detail, or verification need.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["record","update","invalidate","view"]},"id":{"type":"string"},"finding":{"type":"string"},"evidence":{"type":"string"},"implication":{"type":"string"},"next":{"type":"string"},"supersedes":{"type":"string"},"status":{"type":"string","enum":["confirmed","inferred","unknown","contradicted"],"description":"How well established the finding is: confirmed (observed, cited), inferred (reasoned, not observed), unknown (open; put the resolving step in next), contradicted (evidence disagrees)."}},"required":["action"]}}}),
         json!({"type":"function","function":{"name":"observation_index","description":"List historical tool observations by stable ID, with source path and outcome metadata. Use source to select the raw observation for the needed file. If more=true, continue at the returned next_offset. Observation IDs start with obs-.","parameters":{"type":"object","properties":{"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":50}}}}}),
         json!({"type":"function","function":{"name":"observation_read","description":"Recover a bounded exact slice of a stored historical tool result by observation ID. The response distinguishes historical evidence from current source and reports whether the source changed.","parameters":{"type":"object","properties":{"id":{"type":"string"},"offset_chars":{"type":"integer","minimum":0},"max_chars":{"type":"integer","minimum":1,"maximum":16000}},"required":["id"]}}}),
     ];
@@ -727,21 +730,88 @@ fn task_memory_conflict(
         .get("evidence")
         .and_then(Value::as_str)
         .unwrap_or("");
-    if transcript
-        .observations()
-        .iter()
-        .any(|o| o.id != cited.id && new_evidence.contains(&o.id))
-    {
+    if transcript.observations().iter().any(|o| {
+        new_evidence.contains(&o.id)
+            || o.source
+                .as_deref()
+                .is_some_and(|source| new_evidence == source)
+    }) {
         return None;
     }
     Some(format!("Potential evidence conflict: {} cites exact historical observation {}. Retrieve that observation with observation_read and cite a verified observation before replacing this finding.", prior.id, cited.id))
 }
 
-fn apply_task_memory(state: &mut AgentState, arguments: &Value) -> Result<(Value, bool), String> {
-    let action = arguments
-        .get("action")
-        .and_then(Value::as_str)
-        .unwrap_or("record");
+fn validate_confirmed_memory(
+    entry: &crate::agent::task_memory::TaskMemoryEntry,
+    transcript: &Transcript,
+) -> Result<(), String> {
+    use crate::agent::task_memory::Status;
+    if entry.status != Some(Status::Confirmed) {
+        return Ok(());
+    }
+    let reference_character = |character: char| {
+        character.is_alphanumeric() || matches!(character, '-' | '_' | '.' | '/' | '\\')
+    };
+    let tokens = entry
+        .evidence
+        .split(|character| !reference_character(character))
+        .flat_map(|token| token.split(".."))
+        .map(|token| token.trim_matches('.'));
+    let mut found = transcript.observations().iter().any(|observation| {
+        observation.source.as_deref().is_some_and(|source| {
+            !source.is_empty()
+                && entry
+                    .evidence
+                    .match_indices(source)
+                    .any(|(start, matched)| {
+                        let end = start + matched.len();
+                        !entry.evidence[..start]
+                            .chars()
+                            .next_back()
+                            .is_some_and(reference_character)
+                            && !entry.evidence[end..]
+                                .chars()
+                                .next()
+                                .is_some_and(reference_character)
+                    })
+        })
+    });
+    for token in tokens.filter(|token| !token.is_empty()) {
+        if token.starts_with("obs-") {
+            if transcript.observation(token).is_none() {
+                return Err(format!("Confirmed Task Memory cites unknown observation '{token}'. Use observation_index to find a valid reference and retry; no memory was changed."));
+            }
+            found = true;
+        }
+    }
+    if !found {
+        return Err("Confirmed Task Memory requires nonempty evidence referencing an observation ID or exact source path inspected in this transcript. Use observation_index and retry with evidence, or explicitly use inferred/unknown when unverified; no memory was changed.".into());
+    }
+    Ok(())
+}
+
+fn restore_task_memory(
+    value: Option<&Value>,
+    transcript: &Transcript,
+) -> Result<crate::agent::task_memory::TaskMemory, String> {
+    let memory: crate::agent::task_memory::TaskMemory = match value {
+        Some(value) => serde_json::from_value(value.clone())
+            .map_err(|error| format!("Invalid saved Task Memory: {error}"))?,
+        None => return Ok(Default::default()),
+    };
+    for entry in memory.entries.iter().filter(|entry| !entry.invalidated) {
+        validate_confirmed_memory(entry, transcript)
+            .map_err(|error| format!("Invalid saved Task Memory entry '{}': {error}", entry.id))?;
+    }
+    Ok(memory)
+}
+
+fn apply_task_memory(
+    state: &mut AgentState,
+    arguments: &Value,
+    transcript: &Transcript,
+) -> Result<(Value, bool), String> {
+    let action = required_text(arguments, "action")?;
     if action == "view" {
         return Ok((
             json!({"task_memory": state.task_memory, "updated": false}),
@@ -756,11 +826,20 @@ fn apply_task_memory(state: &mut AgentState, arguments: &Value) -> Result<(Value
         if state.memory_writes_this_turn >= strategy::MAX_MEMORY_WRITES_PER_TURN {
             return Err(format!("Task Memory accepts at most {} writes per turn. Merge the remaining findings into one entry (update an existing id) instead of one entry per fact.", strategy::MAX_MEMORY_WRITES_PER_TURN));
         }
-        write_task_memory(&mut state.task_memory, arguments)?;
+        let mut candidate = state.task_memory.clone();
+        let id = write_task_memory(&mut candidate, arguments)?;
+        let entry = candidate
+            .entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .ok_or_else(|| "Task Memory write did not create an entry".to_owned())?;
+        validate_confirmed_memory(entry, transcript)?;
+        state.task_memory = candidate;
         state.memory_writes_this_turn += 1;
     } else {
         return Err("unsupported task_memory action".into());
     }
+    state.calls_since_memory = 0;
     Ok((
         json!({"task_memory": state.task_memory, "updated": true}),
         true,
@@ -2209,15 +2288,18 @@ fn run_tool(
     config: &Config,
     state: &mut AgentState,
     tool: &ValidatedCall,
+    transcript: &Transcript,
 ) -> Result<(Value, Option<String>), String> {
     state.record_tool_call(&tool.name);
-    run_scoped_tool(config, state, tool).map(|result| project_result(config, tool, result))
+    run_scoped_tool(config, state, tool, transcript)
+        .map(|result| project_result(config, tool, result))
 }
 
 fn run_scoped_tool(
     config: &Config,
     state: &mut AgentState,
     tool: &ValidatedCall,
+    transcript: &Transcript,
 ) -> Result<(Value, Option<String>), String> {
     let scoped = scoped_tool_config(config, tool)?;
     let config = &scoped;
@@ -2279,7 +2361,7 @@ fn run_scoped_tool(
             Ok((value, None))
         }
         "task_memory" => {
-            let (value, changed) = apply_task_memory(state, &tool.arguments)?;
+            let (value, changed) = apply_task_memory(state, &tool.arguments, transcript)?;
             if changed {
                 emit(
                     &config.run_id,
@@ -2706,11 +2788,19 @@ pub fn run(config: Config) {
     }
     let mut state = AgentState::default();
     state.strategy = Strategy::from_mode(&config.reasoning_mode);
-    state.task_memory = config
-        .task_memory
-        .as_ref()
-        .and_then(|memory| serde_json::from_value(memory.clone()).ok())
-        .unwrap_or_default();
+    state.task_memory = match restore_task_memory(config.task_memory.as_ref(), &transcript) {
+        Ok(memory) => memory,
+        Err(message) => {
+            emit(
+                &config.run_id,
+                Event::AgentError {
+                    code: "task_memory".into(),
+                    message,
+                },
+            );
+            return;
+        }
+    };
     if !user_requests_read_only(&config.user) {
         if let Some(root) = config.root.as_deref() {
             let _ = crate::tools::knowledge::bootstrap(&PathBuf::from(root));
@@ -3705,10 +3795,10 @@ pub fn run(config: Config) {
                     {
                         Err(conflict)
                     } else {
-                        run_tool(&config, &mut state, tool)
+                        run_tool(&config, &mut state, tool, &transcript)
                     }
                 }
-                _ => run_tool(&config, &mut state, tool),
+                _ => run_tool(&config, &mut state, tool, &transcript),
             };
             match outcome {
                 Ok((value, diff)) => {
@@ -4313,47 +4403,85 @@ mod tests {
     }
 
     #[test]
-    fn task_memory_schema_requires_the_action_specific_fields() {
+    fn task_memory_schema_exposes_parameters_at_object_root() {
         let memory = tool_schemas(true)
             .into_iter()
             .find(|tool| tool_name(tool) == "task_memory")
             .unwrap();
-        let variants = memory
-            .pointer("/function/parameters/oneOf")
-            .and_then(Value::as_array)
-            .unwrap();
-        for (action, required) in [
-            ("view", vec!["action"]),
-            ("record", vec!["action", "finding"]),
-            ("update", vec!["action", "finding"]),
-            ("invalidate", vec!["action", "id"]),
+        let parameters = &memory["function"]["parameters"];
+        assert_eq!(parameters["type"], "object");
+        assert_eq!(parameters["required"], json!(["action"]));
+        assert!(parameters.get("oneOf").is_none());
+        assert!(parameters.get("anyOf").is_none());
+        for field in [
+            "action",
+            "id",
+            "finding",
+            "evidence",
+            "implication",
+            "next",
+            "supersedes",
+            "status",
         ] {
-            let variant = variants
-                .iter()
-                .find(|variant| {
-                    variant
-                        .pointer("/properties/action/const")
-                        .and_then(Value::as_str)
-                        == Some(action)
-                        || variant
-                            .pointer("/properties/action/enum")
-                            .and_then(Value::as_array)
-                            .is_some_and(|actions| {
-                                actions.iter().any(|value| value.as_str() == Some(action))
-                            })
-                })
-                .unwrap_or_else(|| panic!("missing task_memory schema branch for {action}"));
-            assert_eq!(
-                variant
-                    .get("required")
-                    .and_then(Value::as_array)
-                    .unwrap()
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .collect::<Vec<_>>(),
-                required
-            );
+            assert_eq!(parameters["properties"][field]["type"], "string", "{field}");
         }
+    }
+
+    #[test]
+    fn task_memory_rejects_invalid_actions_and_missing_fields_without_mutation() {
+        let mut state = AgentState::default();
+        apply_task_memory(
+            &mut state,
+            &json!({"action":"record","id":"existing","finding":"preserved"}),
+            &Transcript::default(),
+        )
+        .unwrap();
+        state.calls_since_memory = 7;
+        let before = state.task_memory.clone();
+        for arguments in [
+            json!({}),
+            json!({"finding":"missing action"}),
+            json!({"action":"unsupported","finding":"invalid"}),
+            json!({"action":"record"}),
+            json!({"action":"update","id":"existing"}),
+            json!({"action":"record","finding":""}),
+            json!({"action":"record","finding":42}),
+            json!({"action":"invalidate"}),
+            json!({"action":"invalidate","id":"unknown"}),
+        ] {
+            assert!(
+                apply_task_memory(&mut state, &arguments, &Transcript::default()).is_err(),
+                "{arguments}"
+            );
+            assert_eq!(state.task_memory, before);
+            assert_eq!(state.memory_writes_this_turn, 1);
+            assert_eq!(state.calls_since_memory, 7);
+        }
+    }
+
+    #[test]
+    fn saved_memory_is_not_silently_dropped_or_trusted_without_support() {
+        let transcript = Transcript::default();
+        assert!(restore_task_memory(Some(&json!({"entries":"invalid"})), &transcript).is_err());
+        let mut saved = json!({"revision":3,"entries":[{
+            "id":"old","finding":"legacy finding","status":"confirmed","evidence":""
+        }]});
+        assert!(restore_task_memory(Some(&saved), &transcript).is_err());
+        saved["entries"][0]["invalidated"] = json!(true);
+        assert_eq!(
+            restore_task_memory(Some(&saved), &transcript)
+                .unwrap()
+                .revision,
+            3
+        );
+        saved["entries"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("status");
+        saved["entries"][0]["invalidated"] = json!(false);
+        let restored = restore_task_memory(Some(&saved), &transcript).unwrap();
+        assert_eq!(restored.entries[0].status, None);
+        assert_eq!(restored.revision, 3);
     }
 
     #[test]
@@ -4425,7 +4553,7 @@ mod tests {
                 name: name.into(),
                 arguments,
             };
-            let (value, _) = run_tool(&config, &mut state, &call).unwrap();
+            let (value, _) = run_tool(&config, &mut state, &call, &Transcript::default()).unwrap();
             record_safe_read_effect(&config, &mut state, &call, &value);
         }
         emit_knowledge_diagnostics(&config, &state);
@@ -4693,7 +4821,12 @@ mod tests {
         assert!(deep.contains("investigation_checkpoint"));
         assert!(deep.contains("open_unknowns"));
         assert!(deep.contains("what the handler forwards to"));
-        state.record_tool_call("task_memory");
+        apply_task_memory(
+            &mut state,
+            &json!({"action":"record","finding":"checkpoint recorded","status":"inferred"}),
+            &transcript,
+        )
+        .unwrap();
         assert!(
             !dynamic_tail(&state, None, "", &transcript, "").contains("investigation_checkpoint")
         );
@@ -4738,20 +4871,31 @@ mod tests {
             apply_task_memory(
                 &mut state,
                 &json!({"action":"record","finding":format!("f{n}")}),
+                &Transcript::default(),
             )
             .unwrap();
         }
-        let refused = apply_task_memory(&mut state, &json!({"action":"record","finding":"extra"}));
+        let refused = apply_task_memory(
+            &mut state,
+            &json!({"action":"record","finding":"extra"}),
+            &Transcript::default(),
+        );
         assert!(refused.unwrap_err().contains("at most"));
         assert_eq!(
             state.task_memory.entries.len(),
             strategy::MAX_MEMORY_WRITES_PER_TURN
         );
-        assert!(apply_task_memory(&mut state, &json!({"action":"view"})).is_ok());
+        assert!(apply_task_memory(
+            &mut state,
+            &json!({"action":"view"}),
+            &Transcript::default()
+        )
+        .is_ok());
         state.memory_writes_this_turn = 0;
         apply_task_memory(
             &mut state,
             &json!({"action":"record","finding":"next turn"}),
+            &Transcript::default(),
         )
         .unwrap();
     }
@@ -4762,6 +4906,7 @@ mod tests {
         apply_task_memory(
             &mut state,
             &json!({"action":"record","id":"a","finding":"x","status":"inferred"}),
+            &Transcript::default(),
         )
         .unwrap();
         assert_eq!(
@@ -4771,6 +4916,7 @@ mod tests {
         apply_task_memory(
             &mut state,
             &json!({"action":"update","id":"a","finding":"y"}),
+            &Transcript::default(),
         )
         .unwrap();
         assert_eq!(
@@ -4779,9 +4925,188 @@ mod tests {
         );
         assert!(apply_task_memory(
             &mut state,
-            &json!({"action":"record","finding":"z","status":"maybe"})
+            &json!({"action":"record","finding":"z","status":"maybe"}),
+            &Transcript::default(),
         )
         .is_err());
+    }
+
+    #[test]
+    fn confirmed_memory_checks_effective_status_before_mutation() {
+        let base = std::env::temp_dir().join(format!(
+            "confirmed-memory-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(base.join("project")).unwrap();
+        let root = base.join("project");
+        std::fs::write(root.join("source.ts"), "export const value = 1;\n").unwrap();
+        let mut transcript =
+            Transcript::durable(&base.join("store"), "confirmed-test", &[], root.to_str()).unwrap();
+        transcript.push_run_user(json!({"role":"user","content":"inspect source"}));
+        transcript.assistant_tool_turn(
+            String::new(),
+            &[ValidatedCall {
+                id: "read".into(),
+                name: "read_file".into(),
+                arguments: json!({"path":"source.ts"}),
+            }],
+        );
+        transcript.tool_result(
+            "read",
+            "read_file",
+            json!({"path":"source.ts","content":"export const value = 1;"}).to_string(),
+        );
+        let observation = transcript.observations()[0].id.clone();
+        let mut cited = crate::agent::task_memory::TaskMemoryEntry {
+            status: Some(crate::agent::task_memory::Status::Confirmed),
+            evidence: format!("{observation}..{observation}."),
+            ..Default::default()
+        };
+        assert!(validate_confirmed_memory(&cited, &transcript).is_ok());
+        cited.evidence = format!("{observation}..obs-99999999.");
+        assert!(validate_confirmed_memory(&cited, &transcript).is_err());
+        let mut state = AgentState::default();
+        state.calls_since_memory = 7;
+        for evidence in ["", "obs-99999999", "source.ts obs-99999999"] {
+            let before = state.task_memory.clone();
+            assert!(apply_task_memory(&mut state, &json!({
+                "action":"record","id":"fact","finding":"observed","status":"confirmed","evidence":evidence
+            }), &transcript).is_err());
+            assert_eq!(state.task_memory, before);
+            assert_eq!(state.calls_since_memory, 7);
+            assert_eq!(state.memory_writes_this_turn, 0);
+        }
+        apply_task_memory(&mut state, &json!({
+            "action":"record","id":"fact","finding":"observed","status":"confirmed","evidence":format!("source.ts ({observation})")
+        }), &transcript).unwrap();
+        assert_eq!(state.calls_since_memory, 0);
+        let before = state.task_memory.clone();
+        for arguments in [
+            json!({"action":"update","id":"fact","finding":"replacement","evidence":""}),
+            json!({"action":"record","supersedes":"fact","finding":"replacement","status":"confirmed","evidence":"obs-99999999"}),
+        ] {
+            assert!(apply_task_memory(&mut state, &arguments, &transcript).is_err());
+            assert_eq!(state.task_memory, before);
+            assert_eq!(state.memory_writes_this_turn, 1);
+        }
+        apply_task_memory(
+            &mut state,
+            &json!({
+                "action":"update","id":"fact","finding":"revised","evidence":"source.ts"
+            }),
+            &transcript,
+        )
+        .unwrap();
+        assert_eq!(
+            state.task_memory.entries[0].status,
+            Some(crate::agent::task_memory::Status::Confirmed)
+        );
+        state.memory_writes_this_turn = 0;
+        apply_task_memory(
+            &mut state,
+            &json!({
+                "action":"record","id":"hypothesis","finding":"possible","status":"unknown"
+            }),
+            &transcript,
+        )
+        .unwrap();
+        let before = state.task_memory.clone();
+        assert!(apply_task_memory(
+            &mut state,
+            &json!({
+                "action":"update","id":"hypothesis","finding":"promoted","status":"confirmed"
+            }),
+            &transcript
+        )
+        .is_err());
+        assert_eq!(state.task_memory, before);
+        let serialized = serde_json::to_value(&state.task_memory).unwrap();
+        let restored = restore_task_memory(Some(&serialized), &transcript).unwrap();
+        assert_eq!(restored, state.task_memory);
+        state.memory_writes_this_turn = 0;
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let spaced_source = "src/\u{00fc}ber view.ts";
+        std::fs::write(root.join(spaced_source), "source with a spaced path").unwrap();
+        transcript.assistant_tool_turn(
+            String::new(),
+            &[ValidatedCall {
+                id: "spaced".into(),
+                name: "read_file".into(),
+                arguments: json!({"path":spaced_source}),
+            }],
+        );
+        transcript.tool_result(
+            "spaced",
+            "read_file",
+            json!({"path":spaced_source,"content":"source with a spaced path"}).to_string(),
+        );
+        apply_task_memory(
+            &mut state,
+            &json!({
+                "action":"record","finding":"spaced path inspected","status":"confirmed",
+                "evidence":format!("`{spaced_source}:1`")
+            }),
+            &transcript,
+        )
+        .unwrap();
+        let before = state.task_memory.clone();
+        for evidence in [
+            format!("other/{spaced_source}"),
+            format!("{spaced_source}.unread"),
+            format!("{spaced_source} obs-99999999"),
+        ] {
+            assert!(apply_task_memory(
+                &mut state,
+                &json!({
+                    "action":"record","finding":"bad path","status":"confirmed","evidence":evidence
+                }),
+                &transcript
+            )
+            .is_err());
+            assert_eq!(state.task_memory, before);
+            assert_eq!(state.memory_writes_this_turn, 1);
+        }
+        state.memory_writes_this_turn = 0;
+        transcript.assistant_tool_turn(
+            String::new(),
+            &[ValidatedCall {
+                id: "missing".into(),
+                name: "read_file".into(),
+                arguments: json!({"path":"missing.ts"}),
+            }],
+        );
+        transcript.tool_result(
+            "missing",
+            "read_file",
+            json!({"error":"file not found","path":"missing.ts"}).to_string(),
+        );
+        let failed_id = transcript
+            .observation_for_call("missing")
+            .unwrap()
+            .id
+            .clone();
+        apply_task_memory(
+            &mut state,
+            &json!({
+                "action":"record","finding":"read failed","status":"confirmed","evidence":failed_id
+            }),
+            &transcript,
+        )
+        .unwrap();
+        // Existence is structural support for an error/blocker, not proof of source contents.
+        assert!(transcript.observation_for_call("missing").unwrap().error);
+        transcript.compact("findings retained".into(), transcript.entries().len());
+        assert!(validate_confirmed_memory(&restored.entries[0], &transcript).is_ok());
+        drop(transcript);
+        let resumed =
+            Transcript::durable(&base.join("store"), "confirmed-test", &[], root.to_str()).unwrap();
+        assert!(validate_confirmed_memory(&restored.entries[0], &resumed).is_ok());
+        assert_eq!(
+            restore_task_memory(Some(&serde_json::to_value(&restored).unwrap()), &resumed).unwrap(),
+            restored
+        );
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
