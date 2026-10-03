@@ -43,7 +43,8 @@ const hardware: HardwareStats = {
   ramUsedBytes: 8 * 1024 ** 3,
   ramTotalBytes: 32 * 1024 ** 3,
   vramUsedBytes: 19_707 * 1024 ** 2,
-  vramTotalBytes: 24_118 * 1024 ** 2,
+  vramTotalBytes: 24_576 * 1024 ** 2,
+  vramAvailableBytes: 4_411 * 1024 ** 2,
   gpuUtilization: 0,
   available: true,
 };
@@ -58,10 +59,10 @@ const runtime: RuntimeContextEvidence = {
 };
 
 export async function runContextEstimateRegression(): Promise<void> {
-  assert.deepEqual(resolveContextReserve(undefined, 'HOST_RESERVE', defaultContextHostReserveBytes), { bytes: 10 * 1024 ** 3 });
-  assert.deepEqual(resolveContextReserve(undefined, 'DEVICE_RESERVE', defaultContextDeviceReserveBytes), { bytes: 3 * 1024 ** 3 });
+  assert.deepEqual(resolveContextReserve(undefined, 'HOST_RESERVE', defaultContextHostReserveBytes), { bytes: 8 * 1024 ** 3 });
+  assert.deepEqual(resolveContextReserve(undefined, 'DEVICE_RESERVE', defaultContextDeviceReserveBytes), { bytes: 2 * 1024 ** 3 });
   assert.deepEqual(resolveContextReserve(String(12 * 1024 ** 3), 'HOST_RESERVE', defaultContextHostReserveBytes), { bytes: 12 * 1024 ** 3 });
-  assert.match(resolveContextReserve(String(8 * 1024 ** 3), 'HOST_RESERVE', defaultContextHostReserveBytes).error ?? '', /at least/);
+  assert.match(resolveContextReserve(String(7 * 1024 ** 3), 'HOST_RESERVE', defaultContextHostReserveBytes).error ?? '', /at least/);
   assert.match(resolveContextReserve('invalid', 'DEVICE_RESERVE', defaultContextDeviceReserveBytes).error ?? '', /integer byte count/);
   assert.match(resolveContextReserve(String(Number.MAX_SAFE_INTEGER + 1), 'DEVICE_RESERVE', defaultContextDeviceReserveBytes).error ?? '', /safe integer/);
 
@@ -117,8 +118,31 @@ export async function runContextEstimateRegression(): Promise<void> {
   assert.equal(response.hardwareSafeTokens! % 4_096, 0, 'discovered context must be a valid runtime bucket');
   assert.deepEqual(response.memoryHeadroom, {
     hostBytes: hardware.ramTotalBytes - hardware.ramUsedBytes,
-    deviceBytes: hardware.vramTotalBytes! - hardware.vramUsedBytes!,
+    deviceBytes: hardware.vramAvailableBytes!,
   }, 'discovery diagnostics must report live post-load memory headroom');
+  const kvOnlyLog = `
+I srv load_model: loading model '/models/target.gguf'
+I load_tensors: offloaded 47/47 layers to GPU
+I load_tensors: CPU_Mapped model buffer size = 170.16 MiB
+I load_tensors: CUDA0 model buffer size = 17219.86 MiB
+I llama_context: n_seq_max = 1
+I llama_context: n_ctx = 32768
+I llama_context: CUDA_Host output buffer size = 0.59 MiB
+I llama_kv_cache: CUDA0 KV buffer size = 1692.00 MiB
+I llama_kv_cache: size = 1692.00 MiB (32768 cells, 47 layers, 1/1 seqs), K (f16): 1692.00 MiB, V (f16): 0.00 MiB
+I sched_reserve: CUDA0 compute buffer size = 94.01 MiB
+I sched_reserve: CUDA_Host compute buffer size = 24.01 MiB
+I srv load_model: initializing, n_slots = 1, n_ctx_slot = 32768
+I spec common_specu: no implementations specified for speculative decoding
+I srv llama_server: model loaded
+`;
+  const kvOnly = parseLlamaAllocationLog(kvOnlyLog, ['llama-server', '-m', '/models/target.gguf']);
+  assert.equal(kvOnly.speculativeMode, 'none', 'real no-implementation message must establish disabled speculative decoding');
+  assert.equal(kvOnly.visionPresent, false, 'actual no-projector arguments must establish text-only runtime');
+  assert.deepEqual(kvOnly.allocations.ssm, { host: 0, device: 0 });
+  assert.deepEqual(kvOnly.unknownReasons, [], 'complete non-recurrent/non-vision allocation evidence was rejected');
+  const partialKvOnly = parseLlamaAllocationLog(kvOnlyLog.replace('I srv llama_server: model loaded', ''), ['llama-server']);
+  assert(partialKvOnly.unknownReasons.some((reason) => reason.includes('recurrent-state')), 'partial startup must not manufacture an absent recurrent allocation');
   const q8Response = await collectRuntimeContextEstimate({
     backend: 'llama-cpp',
     modelId: runtime.modelId,
@@ -221,6 +245,13 @@ I common_speculative_init_result: creating MTP draft context
   }, async () => ({ text: allocationLog }));
   assert.equal(unavailableHardware.hardwareSafeTokens, null, 'stale hardware snapshot was used for a safe estimate');
   assert(unavailableHardware.unknownReasons.some((reason) => reason.includes('memory snapshot is unavailable')));
+  const missingFreeMemory = await collectRuntimeContextEstimate({
+    backend: 'llama-cpp', modelId: runtime.modelId, configuredMaxTokens: 131072,
+    contextPresets: [32768], hardware: { ...hardware, vramAvailableBytes: null }, runtime,
+    hostReserveBytes: defaultContextHostReserveBytes, deviceReserveBytes: defaultContextDeviceReserveBytes,
+  }, async () => ({ text: allocationLog }));
+  assert.equal(missingFreeMemory.hardwareSafeTokens, null, 'total minus used must not replace missing available VRAM (driver reserves are not free)');
+  assert.equal(missingFreeMemory.memoryHeadroom, null);
 
   const invalidReserve = await collectRuntimeContextEstimate({
     backend: 'llama-cpp',

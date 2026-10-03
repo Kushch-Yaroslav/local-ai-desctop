@@ -74,8 +74,13 @@ export async function runLlamaCppBackendRegression(): Promise<void> {
         modelPath: '/media/yaroslav/DATA/llama-models/qwen3.8-27b-q4_K_M.gguf',
         modelTrainContextTokens: 262_144,
         modelFileSizeBytes: 16_799_719_424,
+        kvCacheType: 'f16',
+        kvOffload: true,
       }, 'live llama-server n_ctx was not exposed as runtime evidence');
       assert.equal(await backend.getRuntimeContextEvidence('other-model'), null, 'llama.cpp reported evidence for a model that is not loaded');
+      const models = await backend.getModels();
+      assert.deepEqual(models.find((item) => item.id === model)?.supportedContextPresets, [16384, 32768, 65536, 131072, 262144], 'loaded 16K must not redefine model capability');
+      assert.deepEqual(models.find((item) => item.id === 'glm-4.7-flash:q4_k')?.supportedContextPresets, [16384, 32768, 65536, 131072], 'GLM normal options were truncated by an active runtime or another model');
     } finally { await stop(server); }
   }
   {

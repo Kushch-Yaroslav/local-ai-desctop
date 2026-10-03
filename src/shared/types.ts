@@ -188,6 +188,7 @@ export interface HardwareStats {
   ramTotalBytes: number;
   vramUsedBytes: number | null;
   vramTotalBytes: number | null;
+  vramAvailableBytes: number | null;
   gpuUtilization: number | null;
   available: boolean;
 }
@@ -349,6 +350,7 @@ export interface LocalAiApi {
   hardware: { get(): Promise<HardwareStats> };
   contextEstimate(modelId: string): Promise<RuntimeContextEstimate>;
   contextDiscover(modelId: string): Promise<ContextDiscoveryResult>;
+  contextDiscoveryStatus(): Promise<import('./context-estimator').ContextDiscoveryProgress>;
   dialog: { chooseDirectory(initialDirectory?: string | null): Promise<string | null> };
   chat: {
     send(request: ChatRequest): Promise<void>;

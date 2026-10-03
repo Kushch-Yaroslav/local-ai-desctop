@@ -33,11 +33,11 @@ export interface ContextEstimateRequest {
   hostReserveBytes?: number | null;
   deviceReserveBytes?: number | null;
   reserveErrors?: string[];
+  runtimeArguments?: string[];
 }
 
-export const defaultContextHostReserveBytes = 10 * 1024 ** 3;
-export const defaultContextDeviceReserveBytes = 3 * 1024 ** 3;
-const kvProjectionSafetyFactor = 1.25;
+export const defaultContextHostReserveBytes = 8 * 1024 ** 3;
+export const defaultContextDeviceReserveBytes = 2 * 1024 ** 3;
 
 export function resolveContextReserve(value: string | undefined, variable: string, defaultBytes: number): { bytes: number | null; error?: string } {
   if (value === undefined) return { bytes: defaultBytes };
@@ -89,7 +89,7 @@ function setTier(allocation: Partial<Record<AllocationLocation, number>>, locati
 }
 
 /** Parses final non-dry-run allocation evidence; repeat reserve summaries are maxima, not additive allocations. */
-export function parseLlamaAllocationLog(text: string): LlamaAllocationLog {
+export function parseLlamaAllocationLog(text: string, runtimeArguments?: readonly string[]): LlamaAllocationLog {
   const lines = text.split(/\r?\n/);
   const offloadIndex = lastMatchingIndex(lines, /load_tensors:.*offloaded\s+\d+\/\d+\s+layers/i);
   const nonZeroWeightsIndex = lastMatchingIndex(lines, /model buffer size\s*=\s*(?!0+(?:\.0+)?\s*(?:MiB|GiB|MB|GB))/i);
@@ -195,6 +195,11 @@ export function parseLlamaAllocationLog(text: string): LlamaAllocationLog {
     measurements.push({ value: totalSize, phase: currentPhase, kind, location });
   }
   contextTokens = latestContextFromServer ?? contextTokens;
+  const loadedIndex = lines.findIndex((line, index) => index >= start && /\bsrv\s+llama_server: model loaded/.test(line));
+  const fullyLoaded = loadedIndex >= start;
+  const startupText = lines.slice(start, fullyLoaded ? loadedIndex + 1 : end).join('\n');
+  if (/\bspec\s+common_specu:\s+no implementations specified for speculative decoding/.test(startupText)) speculativeMode = 'none';
+  if (visionPresent === null && fullyLoaded && runtimeArguments && !runtimeArguments.some((arg) => arg === '--mmproj' || arg === '-mm' || arg === '--mmproj-url' || arg.startsWith('--mmproj=') || arg.startsWith('--mmproj-url='))) visionPresent = false;
 
   for (const measurement of measurements) {
     const target = phaseTotals[measurement.phase][measurement.kind];
@@ -210,6 +215,13 @@ export function parseLlamaAllocationLog(text: string): LlamaAllocationLog {
   allocations.output.host = (allocations.output.host ?? 0) + (phaseTotals.speculative.output.host ?? 0);
   allocations.output.device = (allocations.output.device ?? 0) + (phaseTotals.speculative.output.device ?? 0);
   allocations.speculativeKv = { ...phaseTotals.speculative.speculativeKv };
+  // A completed verbose KV-only startup has no recurrent memory module.
+  // Partial logs cannot establish absence of recurrent allocations.
+  if (fullyLoaded && sawTargetKvSummary && !/llama_memory_recurrent:|ssm_d_(?:conv|inner|state)/.test(startupText)) {
+    allocations.ssm = { host: 0, device: 0 };
+    sawTargetRsSummary = true;
+    targetRsSummaryBytes = 0;
+  }
 
   if (visionWeightsBytes > 0) allocations.weights.host = (allocations.weights.host ?? 0) + visionWeightsBytes;
   if (visionComputeBytes > 0) allocations.compute.host = (allocations.compute.host ?? 0) + visionComputeBytes;
@@ -299,7 +311,8 @@ function createEstimatorInput(request: ContextEstimateRequest, log: LlamaAllocat
   const vramTotalBytes = hardware.vramTotalBytes;
   const vramUsedBytes = hardware.vramUsedBytes;
   if (vramTotalBytes === null || vramUsedBytes === null || vramTotalBytes <= 0 || vramUsedBytes < 0 || vramUsedBytes > vramTotalBytes) return null;
-  const currentDeviceAvailable = Math.max(0, vramTotalBytes - vramUsedBytes);
+  const currentDeviceAvailable = hardware.vramAvailableBytes;
+  if (currentDeviceAvailable === null || !Number.isFinite(currentDeviceAvailable) || currentDeviceAvailable < 0 || currentDeviceAvailable > vramTotalBytes - vramUsedBytes) return null;
 
   return {
     configuredMaxTokens: request.configuredMaxTokens,
@@ -310,10 +323,10 @@ function createEstimatorInput(request: ContextEstimateRequest, log: LlamaAllocat
     deviceReserveBytes: request.deviceReserveBytes,
     hostWeightBytes: totalFor(log.allocations.weights, 'host') + totalFor(log.allocations.compute, 'host') + totalFor(log.allocations.output, 'host') + totalFor(log.allocations.ssm, 'host'),
     deviceWeightBytes: totalFor(log.allocations.weights, 'device') + totalFor(log.allocations.compute, 'device') + totalFor(log.allocations.output, 'device') + totalFor(log.allocations.ssm, 'device'),
-    hostKvBytesPerToken: totalFor(log.allocations.kv, 'host') / (log.contextTokens * log.sequenceSlots) * kvProjectionSafetyFactor,
-    deviceKvBytesPerToken: totalFor(log.allocations.kv, 'device') / (log.contextTokens * log.sequenceSlots) * kvProjectionSafetyFactor,
-    speculativeHostKvBytesPerToken: log.speculativeSlots ? totalFor(log.allocations.speculativeKv, 'host') / (log.contextTokens * log.speculativeSlots) * kvProjectionSafetyFactor : 0,
-    speculativeDeviceKvBytesPerToken: log.speculativeSlots ? totalFor(log.allocations.speculativeKv, 'device') / (log.contextTokens * log.speculativeSlots) * kvProjectionSafetyFactor : 0,
+    hostKvBytesPerToken: totalFor(log.allocations.kv, 'host') / (log.contextTokens * log.sequenceSlots),
+    deviceKvBytesPerToken: totalFor(log.allocations.kv, 'device') / (log.contextTokens * log.sequenceSlots),
+    speculativeHostKvBytesPerToken: log.speculativeSlots ? totalFor(log.allocations.speculativeKv, 'host') / (log.contextTokens * log.speculativeSlots) : 0,
+    speculativeDeviceKvBytesPerToken: log.speculativeSlots ? totalFor(log.allocations.speculativeKv, 'device') / (log.contextTokens * log.speculativeSlots) : 0,
     sequenceSlots: log.sequenceSlots,
     speculativeMode: log.speculativeMode,
     speculativeHostWeightBytes: totalFor(log.allocations.speculativeWeights, 'host'),
@@ -342,6 +355,7 @@ export async function collectRuntimeContextEstimate(
   const observed = request.runtime?.backend === request.backend && request.runtime.modelId === request.modelId ? request.runtime : null;
   const vramTotalBytes = request.hardware.vramTotalBytes;
   const vramUsedBytes = request.hardware.vramUsedBytes;
+  const vramAvailableBytes = request.hardware.vramAvailableBytes;
   const memoryHeadroom = request.hardware.available
     && request.hardware.ramTotalBytes > 0
     && request.hardware.ramUsedBytes >= 0
@@ -351,7 +365,8 @@ export async function collectRuntimeContextEstimate(
     && vramTotalBytes > 0
     && vramUsedBytes >= 0
     && vramUsedBytes <= vramTotalBytes
-    ? { hostBytes: request.hardware.ramTotalBytes - request.hardware.ramUsedBytes, deviceBytes: vramTotalBytes - vramUsedBytes }
+    && vramAvailableBytes !== null && Number.isFinite(vramAvailableBytes) && vramAvailableBytes >= 0 && vramAvailableBytes <= vramTotalBytes - vramUsedBytes
+    ? { hostBytes: request.hardware.ramTotalBytes - request.hardware.ramUsedBytes, deviceBytes: vramAvailableBytes }
     : null;
   const base: RuntimeContextEstimate = {
     backend: request.backend,
@@ -387,7 +402,7 @@ export async function collectRuntimeContextEstimate(
   if (!logResult.text) {
     return { ...base, unknownReasons: [logResult.reason ?? 'llama-server allocation log unavailable'] };
   }
-  const allocationEvidence = parseLlamaAllocationLog(logResult.text);
+  const allocationEvidence = parseLlamaAllocationLog(logResult.text, request.runtimeArguments);
   if (allocationEvidence.contextTokens !== observed.activeContextTokens) {
     return {
       ...base,
@@ -424,7 +439,10 @@ export async function collectRuntimeContextEstimate(
       ...(request.hostReserveBytes == null ? ['explicit system RAM reserve is not configured'] : []),
       ...(request.deviceReserveBytes == null ? ['explicit accelerator-memory reserve is not configured'] : []),
       ...(!request.hardware.available || request.hardware.ramTotalBytes <= 0 || request.hardware.ramUsedBytes < 0 || request.hardware.ramUsedBytes > request.hardware.ramTotalBytes ? ['system memory snapshot is unavailable or invalid'] : []),
-      ...(vramTotalBytes === null || vramUsedBytes === null || vramTotalBytes <= 0 || vramUsedBytes < 0 || vramUsedBytes > vramTotalBytes ? ['accelerator memory availability is unavailable or invalid'] : []),
+      ...(vramTotalBytes === null || vramUsedBytes === null || vramTotalBytes <= 0 || vramUsedBytes < 0 || vramUsedBytes > vramTotalBytes
+        || request.hardware.vramAvailableBytes === null || !Number.isFinite(request.hardware.vramAvailableBytes)
+        || request.hardware.vramAvailableBytes < 0 || request.hardware.vramAvailableBytes > vramTotalBytes - vramUsedBytes
+        ? ['accelerator memory availability is unavailable or invalid (requires reported free memory for one device)'] : []),
       ...(!completeAllocationTier(allocationEvidence, 'host') ? ['startup log does not provide complete host allocation categories'] : []),
       ...(!completeAllocationTier(allocationEvidence, 'device') ? ['startup log does not provide complete accelerator allocation categories'] : []),
     ];
@@ -451,10 +469,6 @@ export async function collectRuntimeContextEstimate(
     unknownReasons: estimator.unknownReasons,
     estimator,
     memoryBaseline: { hostAvailableBytes: estimatorInput.hostAvailableBytes, deviceAvailableBytes: estimatorInput.deviceAvailableBytes },
-    memoryHeadroom: {
-      hostBytes: Math.max(0, request.hardware.ramTotalBytes - request.hardware.ramUsedBytes),
-      deviceBytes: Math.max(0, request.hardware.vramTotalBytes! - request.hardware.vramUsedBytes!),
-    },
     allocationEvidence,
   };
 }

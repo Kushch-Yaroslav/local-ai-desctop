@@ -24,8 +24,7 @@ export const llamaRuntimeProfiles: readonly LlamaRuntimeProfile[] = [
 
 export function llamaRuntimeProfile(id: string): LlamaRuntimeProfile | undefined { return llamaRuntimeProfiles.find((profile) => profile.id === id); }
 export function llamaRuntimeInstalled(profile: LlamaRuntimeProfile): boolean { return Boolean(profile.modelPath && existsSync(profile.modelPath)); }
-export function llamaContextPresets(id: string): number[] {
+export function llamaContextPresets(id: string, trainedContext?: number): number[] {
   const profile = llamaRuntimeProfile(id);
-  // Larger runtime-specific maxima are exposed only after allocation-backed discovery.
-  return profile ? contextPresetsFor(Math.min(profile.maxContext, 65_536)) : [];
+  return profile ? contextPresetsFor(Math.min(profile.maxContext, trainedContext ?? profile.maxContext)) : [];
 }

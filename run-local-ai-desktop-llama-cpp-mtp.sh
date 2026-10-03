@@ -9,14 +9,15 @@
 # restored when possible. Electron is never restarted by a runtime change.
 #
 # Protocol files (runtime/):
-#   llama-cpp-runtime-request.env  written by Electron: REQUEST_ID, MODEL_ID, CONTEXT
+#   llama-cpp-runtime-request.env  written by Electron: REQUEST_ID, MODEL_ID, CONTEXT, KV_TYPE, KV_OFFLOAD
 #   llama-cpp-runtime-state.json   written here: the only authority on what runs
 set -euo pipefail
 
 APP_DIR="/media/yaroslav/DATA/local-ai-desktop"
 LLAMA_BIN="/media/yaroslav/DATA/llama.cpp/build-cuda/bin/llama-server"
 ELECTRON_BIN="$APP_DIR/node_modules/electron/dist/electron"
-PORT="8081"
+PORT="${LOCAL_AI_LLAMA_PORT:-8081}"
+[[ "$PORT" =~ ^[0-9]+$ ]] && (( PORT >= 1 && PORT <= 65535 )) || { printf 'Invalid LOCAL_AI_LLAMA_PORT: %s\n' "$PORT" >&2; exit 2; }
 URL="http://127.0.0.1:${PORT}"
 STATE_DIR="${LOCAL_AI_RUNTIME_ROOT:-$APP_DIR/runtime}"
 LOG_DIR="$STATE_DIR/logs"
@@ -113,7 +114,7 @@ stop_llama_server() {
 }
 
 # A new model must not be loaded while the previous process's VRAM is still
-# being returned to the driver: Qwen with MTP at 64K leaves well under 1 GiB free.
+# being returned to the driver.
 wait_for_gpu_release() {
   command -v nvidia-smi >/dev/null 2>&1 || return 0
   local previous="" current=""
@@ -286,7 +287,7 @@ trap 'switch_runtime' USR1
 
 # ---- initial selection ----
 IFS=$'\t' read -r SELECTED_MODEL SAVED_CONTEXT SAVED_KV_TYPE SAVED_KV_OFFLOAD <<< "$(saved_llama_selection)"
-SELECTED_MODEL="${SELECTED_MODEL:-qwen3.8:27b-q4_K_M}"
+SELECTED_MODEL="${LOCAL_AI_LLAMA_MODEL_ID:-${SELECTED_MODEL:-qwen3.8:27b-q4_K_M}}"
 select_variant "$SELECTED_MODEL" || { printf '%s\n' "$LAUNCH_ERROR" >&2; exit 2; }
 SAVED_KV_TYPE="${SAVED_KV_TYPE:-f16}"
 SAVED_KV_OFFLOAD="${SAVED_KV_OFFLOAD:-1}"

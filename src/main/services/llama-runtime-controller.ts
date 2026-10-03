@@ -3,6 +3,7 @@ import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { llamaRuntimeProfile } from '../models/llama-runtime-policy';
 import type { LlamaKvCacheType } from '../../shared/types';
+import { llamaCapabilityLimit } from './gguf-context';
 
 /**
  * What the launcher says is running. `modelId`/`contextWindow` describe the
@@ -20,6 +21,7 @@ export type LlamaRuntimeState = {
   rolledBack?: boolean;
   /** The launcher that wrote this state; a state whose launcher is gone describes nothing. */
   launcherPid?: number;
+  serverPid?: number;
 };
 
 export type LlamaSwitchResult =
@@ -37,6 +39,7 @@ type Deps = {
   signal: (pid: number) => void;
   sleep: (ms: number) => Promise<void>;
   now: () => number;
+  capabilityLimit: (modelId: string) => Promise<number>;
 };
 
 const defaultDeps: Deps = {
@@ -44,6 +47,7 @@ const defaultDeps: Deps = {
   signal: (pid) => { process.kill(pid, 'SIGUSR1'); },
   sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   now: () => Date.now(),
+  capabilityLimit: llamaCapabilityLimit,
 };
 
 /** Error text of a state with no live launcher; callers fall back to the startup environment. */
@@ -65,6 +69,7 @@ export function parseLlamaRuntimeState(raw: string): LlamaRuntimeState | null {
       ...(typeof value.requestId === 'string' && value.requestId ? { requestId: value.requestId } : {}),
       ...(value.rolledBack === true ? { rolledBack: true } : {}),
       ...(typeof value.launcherPid === 'number' && value.launcherPid > 0 ? { launcherPid: value.launcherPid } : {}),
+      ...(typeof value.serverPid === 'number' && value.serverPid > 0 ? { serverPid: value.serverPid } : {}),
     };
   } catch { return null; }
 }
@@ -104,7 +109,7 @@ export class LlamaRuntimeController {
   private async perform(modelId: string, contextWindow: number, kvCacheType: LlamaKvCacheType, kvOffload: boolean): Promise<LlamaSwitchResult> {
     const profile = llamaRuntimeProfile(modelId);
     if (!profile) return { ok: false, state: await this.state(), error: `Модель ${modelId} не поддерживается llama.cpp runtime` };
-    if (!Number.isSafeInteger(contextWindow) || contextWindow < 4_096 || contextWindow > profile.maxContext || contextWindow % 4_096 !== 0) return { ok: false, state: await this.state(), error: `Контекст ${contextWindow} не поддерживается для ${modelId}` };
+    if (!Number.isSafeInteger(contextWindow) || contextWindow < 4_096 || contextWindow > await this.deps.capabilityLimit(modelId) || contextWindow % 4_096 !== 0) return { ok: false, state: await this.state(), error: `Контекст ${contextWindow} не поддерживается для ${modelId}` };
 
     const launcherPid = Number((await this.deps.readText(this.files.launcherPidFile).catch(() => '')).trim());
     if (!Number.isSafeInteger(launcherPid) || launcherPid <= 0) return { ok: false, state: await this.state(), error: 'Launcher llama.cpp не запущен: перезапуск модели невозможен без него.' };

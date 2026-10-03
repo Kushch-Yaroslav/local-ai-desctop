@@ -1,7 +1,8 @@
 import { BrowserWindow, dialog, ipcMain } from 'electron';
 import { randomUUID } from 'node:crypto';
 import type { AnalysisRun, ApprovalDecision, ApprovalStatus, ChatRequest, Conversation, ProjectReference, ProjectSuggestion, RiskCategory, ThinkingTimelineEvent } from '../../shared/types';
-import { findFreshContextDiscoveryOption, memoryBaselineWithinTolerance, type ContextDiscoveryOption, type ContextDiscoveryResult, type RuntimeContextEstimate } from '../../shared/context-estimator';
+import { discoveryHasReserveHeadroom, findFreshContextDiscoveryOption, memoryBaselineWithinTolerance, type ContextDiscoveryOption, type ContextDiscoveryResult, type ContextDiscoveryProgress, type RuntimeContextEstimate } from '../../shared/context-estimator';
+import { defaultLlamaKv, normalContextForModel, resolveLlamaKvSelection } from '../../shared/context-options';
 import { Database } from '../services/database';
 import { getHardwareStats } from '../services/hardware';
 import { OllamaBackend } from '../backends/ollama-backend';
@@ -27,6 +28,8 @@ import { executionMode } from '../../shared/generation-mode';
 import { existingProjectDirectory } from '../services/project-picker';
 import { collectRuntimeContextEstimate, defaultContextDeviceReserveBytes, defaultContextHostReserveBytes, resolveContextReserve } from '../services/context-estimate';
 import { join } from 'node:path';
+import { llamaCapabilityLimit } from '../services/gguf-context';
+import { discoverContextBoundary, predictContextHeadroom, type DiscoveryProbe } from '../services/context-discovery';
 
 const database = new Database();
 const selectedBackend = process.env.LOCAL_AI_BACKEND === 'llama-cpp' ? 'llama-cpp' : 'ollama';
@@ -67,11 +70,32 @@ const llamaRuntime = new LlamaRuntimeController({
 });
 const discoveredContextOptions = new Map<string, { option: ContextDiscoveryOption; modelIdentity: string }>();
 let contextDiscoveryBusy = false;
-const discoveryCandidateMargin = 0.8;
+let runtimeSelectionBusy = false;
+let contextDiscoveryProgress: ContextDiscoveryProgress = { busy: false, modelId: null, stage: '', probeCount: 0 };
 const discoveryKey = (modelId: string, contextWindow: number, kvCacheType: 'f16' | 'q8_0', kvOffload: boolean) => `${modelId}:${contextWindow}:${kvCacheType}:${kvOffload ? 'gpu' : 'ram'}`;
+function currentDiscoveryHeadroomFits(option: ContextDiscoveryOption, baseline: ContextDiscoveryOption['memoryBaseline']): boolean {
+  const host = resolveContextReserve(process.env.LOCAL_AI_CONTEXT_HOST_RESERVE_BYTES, 'LOCAL_AI_CONTEXT_HOST_RESERVE_BYTES', defaultContextHostReserveBytes);
+  const device = resolveContextReserve(process.env.LOCAL_AI_CONTEXT_DEVICE_RESERVE_BYTES, 'LOCAL_AI_CONTEXT_DEVICE_RESERVE_BYTES', defaultContextDeviceReserveBytes);
+  if (host.bytes === null || device.bytes === null) throw new Error(host.error ?? device.error ?? 'Invalid discovery reserve.');
+  return discoveryHasReserveHeadroom(option, baseline, host.bytes, device.bytes);
+}
 async function modelFileIdentity(path: string): Promise<string> {
   const file = await stat(path);
   return `${file.dev}:${file.ino}:${file.size}:${file.mtimeMs}`;
+}
+async function runtimeConfigurationIdentity(modelId: string): Promise<string> {
+  const profile = llamaRuntimeProfile(modelId);
+  const state = await llamaRuntime.state();
+  if (!profile?.modelPath || state.status !== 'ready' || state.modelId !== modelId || !state.serverPid) throw new Error('Discovery configuration is no longer running.');
+  const args = (await readFile(`/proc/${state.serverPid}/cmdline`, 'utf8')).split('\0').filter(Boolean);
+  const stableArgs: string[] = [];
+  for (let i = 0; i < args.length; i += 1) {
+    if (['--ctx-size', '-c', '--cache-type-k', '--cache-type-v', '--cache-type-k-draft', '--cache-type-v-draft'].includes(args[i])) { i += 1; continue; }
+    stableArgs.push(args[i]);
+  }
+  return JSON.stringify({ args: stableArgs, model: await modelFileIdentity(profile.modelPath),
+    projector: profile.mmprojPath ? await modelFileIdentity(profile.mmprojPath) : null,
+    binary: await modelFileIdentity(args[0]), hardLimit: await llamaCapabilityLimit(modelId), speculative: profile.speculative });
 }
 /** The launcher's state file is the authority. A manually managed server has no launcher, so the startup environment stands in. */
 async function currentLlamaRuntime(): Promise<LlamaRuntimeState> {
@@ -94,16 +118,18 @@ async function syncLlamaBackend(): Promise<LlamaRuntimeState> {
 async function estimateModelContext(modelId: string): Promise<RuntimeContextEstimate> {
   const profile = getModelProfile(modelId);
   const llamaProfile = selectedBackend === 'llama-cpp' ? llamaRuntimeProfile(modelId) : undefined;
-  const configuredMaxTokens = selectedBackend === 'llama-cpp' ? llamaProfile?.maxContext : profile?.maxContext;
+  const configuredMaxTokens = selectedBackend === 'llama-cpp' && llamaProfile ? await llamaCapabilityLimit(modelId) : profile?.maxContext;
   const contextPresets = selectedBackend === 'llama-cpp' ? llamaContextPresets(modelId) : profile ? contextPresetsFor(profile.maxContext) : [];
   const hardware = await getHardwareStats();
   let runtime = null;
+  let runtimeArguments: string[] | undefined;
   if (configuredMaxTokens) {
     if (selectedBackend === 'llama-cpp' && llamaProfile) {
       const current = await llamaRuntime.state();
       if (current.status === 'ready' && current.launcherPid !== undefined && current.modelId === modelId && current.kvCacheType && current.kvOffload !== undefined) {
         await syncLlamaBackend();
         runtime = await llamaCpp.getRuntimeContextEvidence(modelId);
+        if (current.serverPid) runtimeArguments = (await readFile(`/proc/${current.serverPid}/cmdline`, 'utf8')).split('\0').filter(Boolean);
       }
     } else if (selectedBackend === 'ollama' && profile) {
       runtime = await ollama.getRuntimeContextEvidence(modelId);
@@ -122,149 +148,107 @@ async function estimateModelContext(modelId: string): Promise<RuntimeContextEsti
     hostReserveBytes: hostReserve.bytes,
     deviceReserveBytes: deviceReserve.bytes,
     reserveErrors: [hostReserve.error, deviceReserve.error].filter((error): error is string => Boolean(error)),
+    runtimeArguments,
   });
 }
 async function discoverModelContexts(modelId: string): Promise<ContextDiscoveryResult> {
   const profile = llamaRuntimeProfile(modelId);
   if (contextDiscoveryBusy) throw new Error('Max Context discovery is already running.');
-  for (const key of discoveredContextOptions.keys()) if (key.startsWith(`${modelId}:`)) discoveredContextOptions.delete(key);
+  if (runtimeSelectionBusy) throw new Error('Дождитесь завершения переключения runtime.');
+  discoveredContextOptions.clear();
   if (selectedBackend !== 'llama-cpp' || !profile) throw new Error('Max Context discovery requires an installed llama.cpp model.');
   contextDiscoveryBusy = true;
+  contextDiscoveryProgress = { busy: true, modelId, stage: 'Подготовка; llama.cpp будет перезапущен несколько раз…', probeCount: 0 };
   let original: LlamaRuntimeState | null = null;
-  const options: ContextDiscoveryOption[] = [];
-  const unsupported: ContextDiscoveryResult['unsupported'] = [];
-  const probeContextTokens = Math.min(16_384, profile.maxContext);
-  let restored = false;
   try {
     if (activeGenerations.size) throw new Error('Остановите генерацию перед измерением Max Context.');
     original = await llamaRuntime.state();
-    if (original.status !== 'ready' || original.launcherPid === undefined || !original.modelId || original.contextWindow === null || !original.kvCacheType || original.kvOffload === undefined) {
+    if (original.status !== 'ready' || original.launcherPid === undefined || !original.serverPid || !original.modelId || original.contextWindow === null || !original.kvCacheType || original.kvOffload === undefined) {
       throw new Error('Для безопасного discovery требуется работающий launcher-managed llama.cpp runtime с подтверждёнными KV-настройками.');
     }
-    if (probeContextTokens < 4_096 || probeContextTokens % 4_096 !== 0) throw new Error('Модель не поддерживает минимальный ограниченный контекст discovery.');
-    if (!profile.modelPath) throw new Error('У модели нет зарегистрированного файла для cache identity.');
-    const modelIdentity = await modelFileIdentity(profile.modelPath);
-    for (const kvCacheType of ['f16', 'q8_0'] as const) {
-      try {
-        const switched = await llamaRuntime.switchTo(modelId, probeContextTokens, kvCacheType, true);
-        if (!switched.ok) {
-          unsupported.push({ kvCacheType, reason: switched.error });
-          if (switched.state.status !== 'ready') throw new Error(`Не удалось загрузить тестовую конфигурацию ${kvCacheType}: ${switched.error}`);
-          continue;
+    if (original.modelId !== modelId) throw new Error('Выберите и загрузите модель перед Max Context discovery.');
+    const prior = original;
+    const offload = original.kvOffload;
+    const configurationId = await runtimeConfigurationIdentity(modelId);
+    const hardLimit = await llamaCapabilityLimit(modelId);
+    const initialEstimate = await estimateModelContext(modelId);
+    const baseHeadroom = predictContextHeadroom([initialEstimate], Math.min(16_384, hardLimit));
+    if (initialEstimate.status !== 'estimated' || !initialEstimate.memoryBaseline || !baseHeadroom || !initialEstimate.observedContextTokens || !initialEstimate.allocationEvidence) throw new Error('Нет полной allocation evidence для безопасного базового запуска.');
+    const precisionExpansion = initialEstimate.activeKvCacheType === 'q8_0'
+      ? Object.values(initialEstimate.allocationEvidence.allocations.kv).reduce((sum, value) => sum + (value ?? 0), 0)
+        + Object.values(initialEstimate.allocationEvidence.allocations.speculativeKv).reduce((sum, value) => sum + (value ?? 0), 0)
+      : 0;
+    if (baseHeadroom.deviceBytes - (offload ? precisionExpansion : 0) < 1.25 * 1024 ** 3
+      || baseHeadroom.hostBytes - (offload ? 0 : precisionExpansion) < 4.25 * 1024 ** 3) throw new Error('Недостаточно свежей свободной памяти для безопасного базового FP16 probe.');
+    const hostReserve = resolveContextReserve(process.env.LOCAL_AI_CONTEXT_HOST_RESERVE_BYTES, 'LOCAL_AI_CONTEXT_HOST_RESERVE_BYTES', defaultContextHostReserveBytes);
+    const deviceReserve = resolveContextReserve(process.env.LOCAL_AI_CONTEXT_DEVICE_RESERVE_BYTES, 'LOCAL_AI_CONTEXT_DEVICE_RESERVE_BYTES', defaultContextDeviceReserveBytes);
+    if (hostReserve.bytes === null || deviceReserve.bytes === null) throw new Error(hostReserve.error ?? deviceReserve.error);
+    const result = await discoverContextBoundary({
+      modelId, hardLimit, kvOffload: offload, hostReserveBytes: hostReserve.bytes, deviceReserveBytes: deviceReserve.bytes,
+      progress: (stage, probeCount) => { contextDiscoveryProgress = { busy: true, modelId, stage, probeCount }; },
+      probe: async (contextWindow, kvCacheType, phase): Promise<DiscoveryProbe> => {
+        const started = Date.now();
+        const record: DiscoveryProbe['record'] = { contextWindow, kvCacheType, phase, startup: false, health: false, inference: false, fits: false, headroom: null, memoryBaseline: null, elapsedMs: 0 };
+        let estimate: RuntimeContextEstimate | null = null;
+        try {
+          const switched = await llamaRuntime.switchTo(modelId, contextWindow, kvCacheType, offload);
+          if (!switched.ok) {
+            if (switched.state.status !== 'ready') throw new Error(`Discovery rollback failed: ${switched.error}`);
+            record.reason = switched.error;
+            return { record, estimate };
+          }
+          record.startup = true;
+          const state = await syncLlamaBackend();
+          if (state.status !== 'ready' || !state.serverPid) throw new Error('Probe server is not alive/healthy.');
+          process.kill(state.serverPid, 0);
+          record.args = (await readFile(`/proc/${state.serverPid}/cmdline`, 'utf8')).split('\0').filter(Boolean);
+          record.health = (await llamaCpp.getStatus()).available;
+          if (!record.health) throw new Error('Probe health check failed.');
+          await verifyContextProbeInference(modelId);
+          record.inference = true;
+          process.kill(state.serverPid, 0);
+          estimate = await estimateModelContext(modelId);
+          record.headroom = estimate.memoryHeadroom;
+          record.memoryBaseline = estimate.memoryBaseline;
+          record.hardware = await getHardwareStats();
+          if (estimate.status !== 'estimated') record.reason = estimate.unknownReasons.join('; ');
+          return { record, estimate };
+        } catch (error) {
+          record.reason = error instanceof Error ? error.message : String(error);
+          if ((await llamaRuntime.state()).status !== 'ready') throw error;
+          return { record, estimate };
+        } finally {
+          record.elapsedMs = Date.now() - started;
+          log('context.discovery.probe', record);
         }
+      },
+      restore: async () => {
+        const restore = await llamaRuntime.switchTo(prior.modelId!, prior.contextWindow!, prior.kvCacheType!, prior.kvOffload!);
+        if (!restore.ok) throw new Error(`Max Context discovery could not restore the prior runtime: ${restore.error}`);
         await syncLlamaBackend();
-        await verifyContextProbeInference(modelId);
-        if (await modelFileIdentity(profile.modelPath) !== modelIdentity) throw new Error('Model file changed during discovery; no result is safe to cache.');
-        const probeEstimate = await estimateModelContext(modelId);
-        if (probeEstimate.status !== 'estimated' || !probeEstimate.hardwareSafeTokens || probeEstimate.hardwareSafeTokens < probeContextTokens
-          || probeEstimate.observedContextTokens !== probeContextTokens || !probeEstimate.memoryBaseline
-          || probeEstimate.activeKvCacheType !== kvCacheType || probeEstimate.activeKvOffload !== true) {
-          unsupported.push({ kvCacheType, reason: probeEstimate.unknownReasons.join('; ') || `Нет безопасного окна выше ограниченного ${probeContextTokens}-token probe.` });
-          continue;
-        }
-
-        const projectedCandidate = Math.floor((probeEstimate.hardwareSafeTokens * discoveryCandidateMargin) / 4_096) * 4_096;
-        let candidateContext = Math.max(probeContextTokens, projectedCandidate);
-        let validatedEstimate: RuntimeContextEstimate | null = null;
-        let candidateFailure = 'Кандидат не прошёл точную проверку при запуске и inference.';
-        for (let attempt = 0; attempt < 2; attempt += 1) {
-          const candidateSwitch = await llamaRuntime.switchTo(modelId, candidateContext, kvCacheType, true);
-          if (!candidateSwitch.ok) {
-            candidateFailure = candidateSwitch.error;
-            if (attempt === 0 && candidateContext > probeContextTokens) {
-              candidateContext = Math.max(probeContextTokens, candidateContext - 8_192);
-              continue;
-            }
-            break;
-          }
-          await syncLlamaBackend();
-          try {
-            await verifyContextProbeInference(modelId);
-            if (await modelFileIdentity(profile.modelPath) !== modelIdentity) throw new Error('Model file changed during candidate validation.');
-            const candidateEstimate = await estimateModelContext(modelId);
-            if (candidateEstimate.status === 'estimated'
-              && candidateEstimate.observedContextTokens === candidateContext
-              && candidateEstimate.hardwareSafeTokens !== null
-              && candidateEstimate.hardwareSafeTokens >= candidateContext
-              && candidateEstimate.activeKvCacheType === kvCacheType
-              && candidateEstimate.activeKvOffload === true
-              && candidateEstimate.memoryBaseline
-              && candidateEstimate.memoryHeadroom
-              && candidateEstimate.memoryHeadroom.hostBytes >= defaultContextHostReserveBytes
-              && candidateEstimate.memoryHeadroom.deviceBytes >= defaultContextDeviceReserveBytes) {
-              validatedEstimate = candidateEstimate;
-              break;
-            }
-            candidateFailure = candidateEstimate.unknownReasons.join('; ')
-              || `При ${candidateContext} токенах расчёт или фактический запас памяти не подтвердил выбранную конфигурацию.`;
-          } catch (error) {
-            candidateFailure = error instanceof Error ? error.message : String(error);
-          }
-          if (attempt === 0 && candidateContext > probeContextTokens) {
-            candidateContext = Math.max(probeContextTokens, candidateContext - 8_192);
-            continue;
-          }
-          break;
-        }
-        if (!validatedEstimate?.memoryBaseline || !validatedEstimate.memoryHeadroom) {
-          unsupported.push({ kvCacheType, reason: `Точная проверка Max Context не пройдена: ${candidateFailure}` });
-          continue;
-        }
-        const option: ContextDiscoveryOption = {
-          modelId,
-          contextWindow: candidateContext,
-          kvCacheType,
-          kvOffload: true,
-          discoveredAt: new Date().toISOString(),
-          memoryBaseline: validatedEstimate.memoryBaseline,
-          measuredHeadroom: validatedEstimate.memoryHeadroom,
-        };
-        options.push(option);
-        discoveredContextOptions.set(discoveryKey(modelId, option.contextWindow, kvCacheType, true), { option, modelIdentity });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        unsupported.push({ kvCacheType, reason: message });
-        const state = await llamaRuntime.state();
-        if (state.status !== 'ready') throw new Error(`Discovery ${kvCacheType} failed and runtime is not ready: ${message}`);
-      }
-    }
-    const f16 = options.find((option) => option.kvCacheType === 'f16');
-    const q8 = options.find((option) => option.kvCacheType === 'q8_0');
-    if (f16 && q8 && q8.contextWindow < f16.contextWindow + 8_192) {
-      options.splice(options.indexOf(q8), 1);
-      discoveredContextOptions.delete(discoveryKey(modelId, q8.contextWindow, 'q8_0', true));
-      unsupported.push({ kvCacheType: 'q8_0', reason: `Q8_0 did not improve the measured safe window by at least 8K over F16 (${f16.contextWindow / 1024}K vs ${q8.contextWindow / 1024}K).` });
-    }
-    if (await modelFileIdentity(profile.modelPath) !== modelIdentity) throw new Error('Model file changed during discovery; no result is safe to cache.');
+      },
+    });
+    // Identity excludes context/cache mode, so choosing an option does not
+    // invalidate the sibling mode. Model/draft/projector/backend args do.
+    result.configurationId = await runtimeConfigurationIdentity(modelId);
+    if (result.configurationId !== configurationId) throw new Error('Runtime/model/draft configuration changed during discovery.');
+    for (const option of result.options) discoveredContextOptions.set(discoveryKey(modelId, option.contextWindow, option.kvCacheType, option.kvOffload), { option, modelIdentity: result.configurationId });
+    contextDiscoveryProgress = { busy: false, modelId, stage: 'Готово', probeCount: result.probes?.length ?? 0, result };
+    return result;
   } catch (error) {
-    for (const key of discoveredContextOptions.keys()) if (key.startsWith(`${modelId}:`)) discoveredContextOptions.delete(key);
+    discoveredContextOptions.clear();
+    contextDiscoveryProgress = { busy: false, modelId, stage: 'Discovery не завершён', probeCount: contextDiscoveryProgress.probeCount, error: error instanceof Error ? error.message : String(error) };
     throw error;
   } finally {
-    try {
-      if (original?.status === 'ready' && original.modelId && original.contextWindow !== null && original.kvCacheType && original.kvOffload !== undefined) {
-        const restore = await llamaRuntime.switchTo(original.modelId, original.contextWindow, original.kvCacheType, original.kvOffload);
-        if (!restore.ok) {
-          discoveredContextOptions.clear();
-          throw new Error(`Max Context discovery could not restore the prior runtime (${original.modelId}/${original.contextWindow}/${original.kvCacheType}): ${restore.error}`);
-        }
-        await syncLlamaBackend();
-        restored = true;
-      }
-    } catch (error) {
-      discoveredContextOptions.clear();
-      throw error;
-    } finally {
-      contextDiscoveryBusy = false;
-    }
+    contextDiscoveryBusy = false;
   }
-  return { modelId, probeContextTokens, options, unsupported, restored };
 }
 async function verifyContextProbeInference(modelId: string): Promise<void> {
   const url = process.env.LOCAL_AI_LLAMA_CPP_URL ?? 'http://127.0.0.1:8081';
   const response = await fetch(`${url.replace(/\/$/, '')}/v1/chat/completions`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ model: modelId, messages: [{ role: 'user', content: 'What is 1 + 1? Reply with exactly 2 and no explanation.' }], max_tokens: 64, temperature: 0, stream: false }),
+    body: JSON.stringify({ model: modelId, messages: [{ role: 'user', content: 'What is 1 + 1? Reply with exactly 2 and no explanation.' }], max_tokens: 128, temperature: 0, chat_template_kwargs: { enable_thinking: false }, stream: false }),
     signal: AbortSignal.timeout(60_000),
   });
   if (!response.ok) throw new Error(`Discovery inference failed with HTTP ${response.status}.`);
@@ -279,13 +263,31 @@ async function validateDiscoveredOption(modelId: string, contextWindow: number, 
   const option = findFreshContextDiscoveryOption(cachedOptions.map((item) => item.option), { modelId, contextWindow, kvCacheType, kvOffload });
   if (!option) throw new Error('Max Context discovery is missing, stale, or does not validate this KV configuration and context; run Discover again.');
   const cached = cachedOptions.find((item) => item.option === option);
-  const modelPath = llamaRuntimeProfile(modelId)?.modelPath;
-  if (!cached || !modelPath || await modelFileIdentity(modelPath) !== cached.modelIdentity) throw new Error('Model file identity changed since discovery; run Discover again.');
+  if (!cached || await runtimeConfigurationIdentity(modelId) !== cached.modelIdentity) throw new Error('Runtime/model/draft configuration changed since discovery; run Discover again.');
   const current = await estimateModelContext(modelId);
   if (current.status !== 'estimated' || !current.memoryBaseline || current.observedContextTokens === null) throw new Error('Current runtime memory evidence is unavailable; run Discover again.');
-  if (!memoryBaselineWithinTolerance(current.memoryBaseline, option.memoryBaseline, 2 * 1024 ** 3, 512 * 1024 ** 2)) {
+  if (!memoryBaselineWithinTolerance(current.memoryBaseline, option.memoryBaseline, 2 * 1024 ** 3, 512 * 1024 ** 2)
+    || !currentDiscoveryHeadroomFits(option, current.memoryBaseline)) {
     throw new Error('Available memory changed materially since discovery; run Discover again before selecting this context.');
   }
+}
+async function discoveryStatus(): Promise<ContextDiscoveryProgress> {
+  if (contextDiscoveryBusy || runtimeSelectionBusy || activeGenerations.size || !contextDiscoveryProgress.result) return contextDiscoveryProgress;
+  const result = contextDiscoveryProgress.result;
+  try {
+    if (!result.configurationId || await runtimeConfigurationIdentity(result.modelId) !== result.configurationId) throw new Error('Модель/runtime/draft изменились; повторите discovery.');
+    const estimate = await estimateModelContext(result.modelId);
+    if (result.options.length && (!estimate.memoryBaseline || result.options.some((option) => !findFreshContextDiscoveryOption([option], option)
+      || !memoryBaselineWithinTolerance(estimate.memoryBaseline!, option.memoryBaseline, 2 * 1024 ** 3, 512 * 1024 ** 2)
+      || !currentDiscoveryHeadroomFits(option, estimate.memoryBaseline!)))) {
+      throw new Error('Ресурсы существенно изменились или результат устарел; повторите discovery.');
+    }
+  } catch (error) {
+    if (contextDiscoveryProgress.result !== result || contextDiscoveryBusy || runtimeSelectionBusy) return contextDiscoveryProgress;
+    discoveredContextOptions.clear();
+    contextDiscoveryProgress = { busy: false, modelId: result.modelId, stage: 'Результат недействителен', probeCount: 0, error: error instanceof Error ? error.message : String(error) };
+  }
+  return contextDiscoveryProgress;
 }
 const sessionApprovals = new Map<string, { root: string; categories: Set<RiskCategory> }>();
 
@@ -356,27 +358,34 @@ export function registerIpc(): void {
   });
   ipcMain.handle('conversations:update', async (_event, id: string, patch: Partial<Pick<Conversation, 'title' | 'modelId' | 'mode' | 'workingDirectory' | 'secondaryWorkingDirectory' | 'contextWindow' | 'llamaKvCacheType' | 'llamaKvOffload' | 'reasoningMode' | 'webMode'>>) => {
     if (contextDiscoveryBusy) throw new Error('Дождитесь завершения Max Context discovery перед изменением настроек runtime.');
+    if (runtimeSelectionBusy) throw new Error('Дождитесь завершения переключения runtime.');
+    runtimeSelectionBusy = true;
+    try {
     if (activeGenerations.size && Object.keys(patch).some((key) => key !== 'title')) throw new Error('Дождитесь завершения активной генерации перед изменением настроек.');
     const current = database.getConversation(id);
     if (!current) throw new Error('Чат не найден');
     const nextModelId = patch.modelId ?? current.modelId;
     const profile = nextModelId ? getModelProfile(nextModelId) : undefined;
     if (nextModelId && !profile) throw new Error('Выбранная модель отсутствует в реестре приложения');
-    const allowed = profile ? (selectedBackend === 'llama-cpp' ? llamaContextPresets(nextModelId ?? '') : contextPresetsFor(profile.maxContext)) : [];
+    const capability = profile ? selectedBackend === 'llama-cpp' ? await llamaCapabilityLimit(nextModelId ?? '') : profile.maxContext : 0;
+    const allowed = profile ? (selectedBackend === 'llama-cpp' ? llamaContextPresets(nextModelId ?? '', capability) : contextPresetsFor(capability)) : [];
     const requestedContext = patch.contextWindow ?? current.contextWindow;
-    let contextWindow = requestedContext;
-    if (allowed.length && !allowed.includes(requestedContext)) {
-      if (selectedBackend !== 'llama-cpp' || requestedContext % 4_096 !== 0 || requestedContext > (llamaRuntimeProfile(nextModelId ?? '')?.maxContext ?? 0)) {
+    const modelChanged = nextModelId !== current.modelId;
+    let contextWindow = modelChanged && patch.contextWindow === undefined && allowed.length ? normalContextForModel(requestedContext, allowed) : requestedContext;
+    if (allowed.length && !allowed.includes(contextWindow)) {
+      if (selectedBackend === 'llama-cpp' && (contextWindow % 4_096 !== 0 || contextWindow > capability || contextWindow <= 0)) {
+        throw new Error(`Requested context ${contextWindow} is outside the model/backend capability or runtime bucket size.`);
+      }
+      if (selectedBackend !== 'llama-cpp') {
         contextWindow = allowed.at(-1)!;
       }
     }
     if (selectedBackend === 'llama-cpp' && nextModelId && profile) {
-      const kvCacheType = patch.llamaKvCacheType ?? current.llamaKvCacheType ?? 'f16';
-      const kvOffload = patch.llamaKvOffload ?? current.llamaKvOffload ?? true;
-      const requiresDiscovery = !allowed.includes(requestedContext)
-        || kvCacheType !== (current.llamaKvCacheType ?? 'f16')
-        || kvOffload !== (current.llamaKvOffload ?? true);
-      if (requiresDiscovery) await validateDiscoveredOption(nextModelId, contextWindow, kvCacheType, kvOffload);
+      const isRuntimeRequest = patch.modelId !== undefined || patch.contextWindow !== undefined || patch.llamaKvCacheType !== undefined || patch.llamaKvOffload !== undefined;
+      const { llamaKvCacheType: kvCacheType, llamaKvOffload: kvOffload } = resolveLlamaKvSelection(current, patch, modelChanged);
+      const requiresDiscovery = !allowed.includes(contextWindow) || kvCacheType !== defaultLlamaKv.llamaKvCacheType || kvOffload !== defaultLlamaKv.llamaKvOffload;
+      if (isRuntimeRequest && requiresDiscovery) await validateDiscoveredOption(nextModelId, contextWindow, kvCacheType, kvOffload);
+      patch = { ...patch, llamaKvCacheType: kvCacheType, llamaKvOffload: kvOffload };
       const runtime = await syncLlamaBackend();
       const runtimeDiffers = runtime.status !== 'ready' || runtime.modelId !== nextModelId || runtime.contextWindow !== contextWindow || runtime.kvCacheType !== kvCacheType || runtime.kvOffload !== kvOffload;
       // Re-selecting the stored model is a retry when the server is not running it.
@@ -390,12 +399,19 @@ export function registerIpc(): void {
         // naming the model that is really running (or none, when the server is down).
         if (!result.ok) throw new Error(`Не удалось переключить llama.cpp на ${profile.displayName} (${Math.round(contextWindow / 1024)}K, ${kvCacheType}, KV ${kvOffload ? 'GPU' : 'RAM'}): ${result.error}${result.state.rolledBack ? ` Продолжает работать ${result.state.modelId}.` : result.state.status === 'offline' ? ' llama.cpp сейчас не запущен.' : ''}`);
       }
+      if (modelChanged) {
+        discoveredContextOptions.clear();
+        contextDiscoveryProgress = { busy: false, modelId: nextModelId, stage: '', probeCount: 0 };
+      }
     }
     const updated = database.updateConversation(id, { ...patch, contextWindow });
     if ((patch.workingDirectory !== undefined && patch.workingDirectory !== current.workingDirectory) || (patch.secondaryWorkingDirectory !== undefined && patch.secondaryWorkingDirectory !== current.secondaryWorkingDirectory)) sessionApprovals.delete(id);
     if (patch.modelId !== undefined && patch.modelId !== current.modelId) database.setContextUsage(id, null, null);
     if (selectedBackend === 'ollama' && patch.modelId !== undefined && patch.modelId !== current.modelId && current.modelId) void ollama.unloadModel(current.modelId);
     return database.getConversation(id) ?? updated;
+    } finally {
+      runtimeSelectionBusy = false;
+    }
   });
   ipcMain.handle('conversations:delete', async (_event, id: string) => {
     if (activeGenerations.has(id)) throw new Error('Нельзя удалить чат с активной генерацией.');
@@ -456,6 +472,7 @@ export function registerIpc(): void {
     if (typeof modelId !== 'string' || !modelId) throw new Error('Не указана модель для discovery контекста');
     return discoverModelContexts(modelId);
   });
+  ipcMain.handle('context:discovery-status', discoveryStatus);
   ipcMain.handle('dialog:chooseDirectory', async (_event, initialDirectory?: string | null) => {
     const window = BrowserWindow.getFocusedWindow();
     const defaultPath = await existingProjectDirectory(initialDirectory);
@@ -495,6 +512,8 @@ export function registerIpc(): void {
     return true;
   });
   ipcMain.handle('chat:send', async (event, request: ChatRequest) => {
+    if (contextDiscoveryBusy) throw new Error('Дождитесь завершения Max Context discovery перед генерацией.');
+    if (runtimeSelectionBusy) throw new Error('Дождитесь завершения переключения runtime перед генерацией.');
     // Claim the process-wide inference slot synchronously, before any await.
     if (activeGenerations.size) throw new Error('Уже выполняется генерация в другом чате. Дождитесь завершения или остановите её.');
     const abort = new AbortController(); let finish!: () => void;

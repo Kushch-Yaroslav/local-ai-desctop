@@ -21,6 +21,7 @@ async function fixture(timeoutMs = 5_000) {
     },
     sleep: async () => { clock += 500; await new Promise((resolve) => setImmediate(resolve)); },
     now: () => clock,
+    capabilityLimit: async (modelId) => modelId === qwen ? 262144 : 131072,
   }) };
 }
 
@@ -29,7 +30,7 @@ const state = (fields: Record<string, unknown>) => JSON.stringify({ status: 'rea
 export async function runLlamaRuntimeControllerRegression(): Promise<void> {
   assert.equal(parseLlamaRuntimeState('not json'), null);
   assert.equal(parseLlamaRuntimeState(state({ status: 'weird' })), null);
-  assert.deepEqual(parseLlamaRuntimeState(state({ modelId: qwen, contextWindow: 65_536, kvCacheType: 'f16', kvOffload: true })), { status: 'ready', modelId: qwen, contextWindow: 65_536, kvCacheType: 'f16', kvOffload: true, launcherPid: 4242 });
+  assert.deepEqual(parseLlamaRuntimeState(state({ modelId: qwen, contextWindow: 65_536, kvCacheType: 'f16', kvOffload: true })), { status: 'ready', modelId: qwen, contextWindow: 65_536, kvCacheType: 'f16', kvOffload: true, launcherPid: 4242, serverPid: 1 });
 
   {
     const { files, signals, make } = await fixture();

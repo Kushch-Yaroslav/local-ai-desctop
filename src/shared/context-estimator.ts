@@ -68,6 +68,32 @@ export interface ContextDiscoveryOption {
   discoveredAt: string;
   memoryBaseline: { hostAvailableBytes: number; deviceAvailableBytes: number };
   measuredHeadroom: { hostBytes: number; deviceBytes: number };
+  boundaryTokens?: number;
+}
+
+export interface ContextProbeRecord {
+  kvCacheType: 'f16' | 'q8_0';
+  contextWindow: number;
+  phase: 'base' | 'search' | 'final';
+  startup: boolean;
+  health: boolean;
+  inference: boolean;
+  fits: boolean;
+  reason?: string;
+  headroom: { hostBytes: number; deviceBytes: number } | null;
+  memoryBaseline: { hostAvailableBytes: number; deviceAvailableBytes: number } | null;
+  hardware?: { ramTotalBytes: number; ramUsedBytes: number; vramTotalBytes: number | null; vramUsedBytes: number | null; vramAvailableBytes: number | null };
+  args?: string[];
+  elapsedMs: number;
+}
+
+export interface ContextDiscoveryProgress {
+  busy: boolean;
+  modelId: string | null;
+  stage: string;
+  probeCount: number;
+  result?: ContextDiscoveryResult;
+  error?: string;
 }
 
 export interface ContextDiscoveryResult {
@@ -76,13 +102,16 @@ export interface ContextDiscoveryResult {
   options: ContextDiscoveryOption[];
   unsupported: Array<{ kvCacheType: 'f16' | 'q8_0'; reason: string }>;
   restored: boolean;
+  hardLimit?: number;
+  configurationId?: string;
+  probes?: ContextProbeRecord[];
 }
 
 export function findFreshContextDiscoveryOption(
   options: readonly ContextDiscoveryOption[],
   requested: { modelId: string; contextWindow: number; kvCacheType: 'f16' | 'q8_0'; kvOffload: boolean },
   now = Date.now(),
-  maxAgeMs = 5 * 60_000,
+  maxAgeMs = 30 * 60_000,
 ): ContextDiscoveryOption | null {
   return options
     .filter((option) => {
@@ -106,6 +135,18 @@ export function memoryBaselineWithinTolerance(
     .every((value) => Number.isFinite(value) && value >= 0)
     && Math.abs(left.hostAvailableBytes - right.hostAvailableBytes) <= hostToleranceBytes
     && Math.abs(left.deviceAvailableBytes - right.deviceAvailableBytes) <= deviceToleranceBytes;
+}
+
+export function discoveryHasReserveHeadroom(
+  option: ContextDiscoveryOption,
+  current: ContextDiscoveryOption['memoryBaseline'],
+  hostReserveBytes: number,
+  deviceReserveBytes: number,
+): boolean {
+  const host = option.measuredHeadroom.hostBytes + current.hostAvailableBytes - option.memoryBaseline.hostAvailableBytes;
+  const device = option.measuredHeadroom.deviceBytes + current.deviceAvailableBytes - option.memoryBaseline.deviceAvailableBytes;
+  return Number.isFinite(host) && Number.isFinite(device)
+    && host >= hostReserveBytes && device >= deviceReserveBytes;
 }
 
 const requiredByteFields = [

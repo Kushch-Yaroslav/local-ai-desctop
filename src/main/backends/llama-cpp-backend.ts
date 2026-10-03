@@ -6,6 +6,7 @@ import { llamaContextPresets, llamaRuntimeInstalled, llamaRuntimeProfile, llamaR
 import type { ContextWindow } from './ollama-backend';
 import { log } from '../services/logger';
 import type { LlamaKvCacheType } from '../../shared/types';
+import { llamaCapabilityLimit } from '../services/gguf-context';
 
 type NativeToolCall = { index?: number; id?: string; type?: string; function?: { name?: string; arguments?: string } };
 type Choice = { finish_reason?: string | null; message?: { content?: string | null; reasoning_content?: string | null; tool_calls?: NativeToolCall[] }; delta?: { content?: string | null; reasoning_content?: string | null; tool_calls?: NativeToolCall[] } };
@@ -139,18 +140,22 @@ export class LlamaCppBackend implements LlmBackend, ToolCallingBackend {
       const response = await fetch(this.url('/v1/models'));
       if (response.ok) data = await response.json() as ModelsResponse;
     } catch { /* offline: only file availability is known */ }
-    const runtimeContext = Math.min(this.contextLimit, data.data?.[0]?.meta?.n_ctx ?? this.contextLimit);
     if (!getModelProfile(this.runtimeModelId)) throw new Error(`llama.cpp запущен с неизвестной моделью: ${this.runtimeModelId}`);
-    return llamaRuntimeProfiles.flatMap((runtime) => {
+    const result: ModelInfo[] = [];
+    for (const runtime of llamaRuntimeProfiles) {
       const profile = getModelProfile(runtime.id);
-      if (!profile) return [];
+      if (!profile) continue;
       const active = runtime.id === this.runtimeModelId;
-      return [{
-        ...modelInfo(profile, active && (data.data ?? []).length > 0 ? true : llamaRuntimeInstalled(runtime), active ? data.data?.[0]?.meta?.size : undefined, active ? Math.min(runtime.maxContext, runtimeContext) : runtime.maxContext, active ? (runtime.id === qwenModel || runtime.id === glmFlashModel) : profile.supportsReasoning),
+      const installed = llamaRuntimeInstalled(runtime);
+      const trainedLimit = active ? data.data?.[0]?.meta?.n_ctx_train : undefined;
+      const capability = Math.min(installed ? await llamaCapabilityLimit(runtime.id) : runtime.maxContext, trainedLimit ?? runtime.maxContext);
+      result.push({
+        ...modelInfo(profile, active && (data.data ?? []).length > 0 ? true : installed, active ? data.data?.[0]?.meta?.size : undefined, capability, active ? (runtime.id === qwenModel || runtime.id === glmFlashModel) : profile.supportsReasoning),
         backend: 'llama-cpp' as const,
-        supportedContextPresets: llamaContextPresets(runtime.id),
-      }];
-    });
+        supportedContextPresets: llamaContextPresets(runtime.id, capability),
+      });
+    }
+    return result;
   }
 
   async getStatus(): Promise<{ available: boolean; message?: string }> {
