@@ -75,9 +75,26 @@ complete final validation gate. In particular, live Qwen/GLM/GPT-OSS
 cross-model Agent+Deep checks,
 reasoning/final separation, cancellation/cleanup across all models, and final
 Max Context regression on the completed feature snapshot remain unverified.
-No final release build or distributable packaging was produced.
+
+## Automated validation run
+
+On the final source snapshot, `cargo test --manifest-path
+rust-agent/Cargo.toml --quiet` passed (114 unit tests and 16 integration
+tests), `cargo fmt --manifest-path rust-agent/Cargo.toml --check` passed, and
+`git diff --check` passed. The existing `npm run build` completed successfully,
+including the Rust runtime build, TypeScript typecheck, Vite renderer build,
+and Electron TypeScript build. `npm run test:max-context` passed, including
+its build, context/VRAM discovery, llama backend, database, Electron sandbox,
+and launcher-failure checks. The compiled Rust Agent bridge test
+`node dist/main/services/rust-agent-runtime.test.js` also passed.
+
+The Vite build emitted the existing warning about chunks larger than 500 kB.
+These checks do not clear the live GPT-OSS Agent+Deep blocker or substitute for
+the unrun cross-model and end-to-end checks above.
 
 The repository's existing `npm run build` script is its build convention; it
 does not define an installer/AppImage packaging step. A successful build would
 produce the local `dist/` output and use the existing launcher, not imply a
-packaged release.
+packaged release. This validation build produced `dist/renderer/index.html`
+and `dist/main/index.js`; no distributable installer was produced and no
+release is approved.
