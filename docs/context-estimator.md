@@ -1,106 +1,128 @@
-# Additive runtime Max Context discovery
+# Additive Max Context with an absolute background VRAM budget
 
-**Discovery augments the normal context selector. It never reduces normal model/backend choices.** An ordinary option means "request this supported context", not "this configuration is guaranteed to fit available memory". A discovered `(FP16)` or `(Q8)` option additionally has exact-context startup, health, effective cache/context, completed inference, and post-inference memory evidence.
+Discovery **adds** FP16/Q8 choices to the normal model/backend context selector; it never removes ordinary choices. Ordinary choices express capability, not a memory-fit guarantee. The prior 16K/32K truncation came from Toolbar hardware filtering with a 32K fallback, compounded by 64K preset/profile caps and confusing loaded `n_ctx` with capability. These architectural fixes remain unchanged: normal presets use the backend/profile limit clamped by bounded GGUF trained-context metadata, and fitting evidence is separate.
 
-## Capability and fitting are separate
+Selecting a discovered choice atomically configures context, main/draft cache precision and existing KV offload, persisting only after effective launcher confirmation. An ordinary choice resets default F16/GPU KV. Model changes invalidate discovery and reset custom contexts/cache overrides to a normal target-model configuration.
 
-The previous 16K/32K GLM dropdown was caused by Toolbar filtering ordinary presets against the hardware estimate/discovered ceiling, with a 32K fallback when evidence was unavailable. Independently, `llamaContextPresets` imposed a 64K ceiling and GLM's registry profile was 64K despite its backend profile supporting 128K. Backend model information could also mistake the currently allocated server `n_ctx` for model capability.
+## Effective VRAM policy
 
-Normal presets now derive only from model/backend capability, clamped by the installed GGUF's architecture-specific trained-context metadata. A bounded GGUF metadata reader does not inspect tensor payloads or infer capacity from model names. Backend model information no longer substitutes the loaded context for capability. Hardware results enter a separate additive choice builder; equal ordinary/discovered configurations are annotated rather than duplicated. Results above a changed capability are rejected, never silently offered as an unverified clamped candidate.
+All byte accounting uses MiB = 1048576 bytes. The policy is LLM-first:
 
-Selecting a discovered option sends context, main/draft K/V precision, and KV offload atomically through the launcher transaction. Conversation settings are persisted only after effective startup confirmation; failures roll back. Selecting an ordinary context resets F16/GPU-KV defaults, including after Q8. Changing models resets cache overrides and moves a custom context to a normal preset of the new model instead of reusing the previous model's discovery. An explicitly invalid llama.cpp context request is rejected rather than silently changed.
+```text
+T = NVIDIA memory.total (actual reported value)
+U = NVIDIA memory.used
+F = NVIDIA memory.free (not T - U)
+L = used_gpu_memory attributed to the owned llama-server PID
+N = U - L                         # current non-LLM usage
+R = T - U - F                     # unavailable driver-reserved memory
+B = 1550 MiB                      # TOTAL non-LLM budget, not added to N
+M = 384 MiB                       # single additional estimator margin
 
-## Bounded fitting search
-
-`Найти Max Context` is an explicit, mutually exclusive operation on the selected launcher-managed model. It refuses concurrent generation, switching, and duplicate discovery, displays stable restart/probe progress, and restores the exact preceding model/context/cache/offload configuration before publishing any results. A restoration failure clears all staged options.
-
-For F16 and then Q8_0, the service:
-
-1. Bounds context by the actual GGUF trained limit and backend limit.
-2. Establishes a verified base at up to 16K, sampling fresh RAM/VRAM and logged allocations.
-3. Predicts a region using measured target/draft KV cost and compute/output/recurrent allocation growth. Before a second point exists, it conservatively budgets non-KV buffers as context-proportional; subsequent points measure growth. Shared draft weights, projector, fixed buffers, CUDA/runtime/desktop residency and sequence slots remain included in the measured allocation/free-memory baseline.
-4. Searches upward/downward with bounded binary-style candidates: at most six search iterations per mode, 4K buckets and an 8K stopping resolution. Predicted unsafe candidates are recorded but **not started**.
-5. Requires each real probe to remain alive, pass `/health`, match effective per-sequence context and target/draft cache types/placement, and return non-empty assistant content. Reasoning-only output is insufficient.
-6. Applies one final reserve policy, starts the resulting exact context if it differs from the last verified point, and checks remaining memory. At most one lower midpoint retry is allowed; unverified or reserve-failing candidates are not offered.
-
-The emergency search guard is 4 GiB available host RAM / 1 GiB available device memory, plus 256 MiB forecast uncertainty. The final default reserve is **8 GiB host / 2 GiB device**, with the same small forecast uncertainty when choosing the final bucket. Environment reserve overrides may increase, not decrease, these defaults. There is no former 25% KV multiplier or 20% context reduction. Q8 is offered only after matching real startup/inference evidence and a verified improvement of at least 8K over FP16.
-
-Allocation parsing distinguishes an incomplete log from a fully loaded KV-only runtime. The actual "no implementations specified for speculative decoding" message establishes disabled draft decoding; verified process arguments establish absence of a projector; a completed verbose KV-only startup without a recurrent module establishes zero recurrent allocation. Enabled modules still require their allocation evidence. MLA's reported zero-byte V cache is valid evidence, not a reason to manufacture a V allocation.
-
-VRAM availability uses NVIDIA's reported `memory.free`, **not total minus used**: driver-reserved memory is not available for allocation. This machine reserved approximately 458 MiB outside its used-memory figure; earlier preliminary results that counted that space were optimistic and are superseded by the final acceptance below. Missing/invalid free-memory telemetry cannot validate a maximum. Multiple GPUs require per-device accounting and currently produce unavailable discovery evidence rather than an unsafe combined estimate.
-
-Results include exact probe arguments, outcomes, memory and diagnostics. Identity includes model/projector/server file identities, normalized effective runtime arguments, trained/backend limits and speculative configuration, excluding only context/cache precision so sibling modes survive selection. Results expire after 30 minutes. Status polling and selection re-sample memory: a reconstructed baseline change exceeding 2 GiB host or 512 MiB device, or even a smaller change that consumes the final reserves, invalidates discovery. Model/backend/draft/offload changes invalidate it; merely opening the dropdown does not. Failed/unsupported discovery retains diagnostics and leaves all normal choices intact.
-
-## Primary-checkout live acceptance, 2026-10-03
-
-Final acceptance used the rebuilt primary Electron/IPC/UI flow and real llama.cpp commit `d1d3c3396aa13a5f239109a822666c4870490ad5`, with an isolated copied database/runtime root and port **18081**. The user's default port 8081 was free; no external process was signalled and the user database was not modified. Hardware was RTX 3090, 24 GiB VRAM, 62.699 GiB total system RAM. Initial no-model sampling showed approximately 0.933 GiB GPU used / 22.622 GiB free and 49.608 GiB available RAM.
-
-| Model | GGUF trained limit | Effective hard limit | Normal before discovery | Normal after discovery | Added verified values |
-|---|---:|---:|---|---|---|
-| Qwen 3.8 27B, MTP + host projector | 262144 | 262144 | 16K, 32K, 64K, 128K, 256K | unchanged | 60K FP16, 92K Q8 |
-| GLM-4.7-Flash, no draft/projector | 202752 | 131072 | 16K, 32K, 64K, 128K | unchanged | 56K FP16, 104K Q8 |
-
-These are measured values from this run, not constants or universal model maxima. Both discovered configurations were selected through the real DOM context selector, confirmed in launcher state and persisted in the isolated conversation, and each completed another real inference returning `"2"`. Selecting ordinary 16K afterward restored F16/GPU KV. Qwen also completed a real Agent turn.
-
-### Exact search sequences
-
-Values below are tokens, in chronological order. `skip` means the forecast rejected the candidate without starting a process; it is not an observed OOM failure. All non-skipped probes passed startup, health, reported context/cache matching, and completed assistant-content inference. No startup/inference failure or OOM was encountered.
-
-| Model / cache | Probe sequence | Highest tested search point | Final offered context |
-|---|---|---:|---:|
-| Qwen F16 | 16384 base; 49152; 155648 skip; 102400 skip; 73728; 86016 skip; 77824; 61440 final | 77824 | 61440 |
-| Qwen Q8_0 | 16384 base; 65536; 163840 skip; 114688; 139264 skip; 126976 skip; 118784; 94208 final | 118784 | 94208 |
-| GLM F16 | 16384 base; 73728; 102400 skip; 86016 skip; 77824; 57344 final | 77824 | 57344 |
-| GLM Q8_0 | 16384 base; 122880; 126976; 106496 final | 126976 | 106496 |
-
-### Measured memory after each real probe
-
-All values are GiB. RAM "used" is total minus Linux available RAM, not a process RSS. Samples of used and available memory are taken immediately after inference but are not atomic; small differences can occur. Device total is 24 GiB and host total is 62.699 GiB. GPU used plus free does not equal total because driver-reserved memory is excluded from actual free memory.
-
-| Model | Cache | Context | Phase | RAM used | RAM available | VRAM used | VRAM free |
-|---|---|---:|---|---:|---:|---:|---:|
-| Qwen | F16 | 16384 | base | 15.491 | 47.231 | 18.157 | 5.396 |
-| Qwen | F16 | 49152 | search | 15.616 | 47.080 | 20.326 | 3.228 |
-| Qwen | F16 | 73728 | search | 15.890 | 46.810 | 21.938 | 1.615 |
-| Qwen | F16 | 77824 | search | 15.731 | 46.979 | 22.212 | 1.342 |
-| Qwen | F16 | 61440 | final | 15.612 | 47.080 | 21.124 | 2.430 |
-| Qwen | Q8_0 | 16384 | base | 15.432 | 47.264 | 17.712 | 5.842 |
-| Qwen | Q8_0 | 65536 | search | 15.732 | 46.974 | 19.875 | 3.680 |
-| Qwen | Q8_0 | 114688 | search | 15.519 | 47.169 | 22.043 | 1.512 |
-| Qwen | Q8_0 | 118784 | search | 15.484 | 47.202 | 22.227 | 1.327 |
-| Qwen | Q8_0 | 94208 | final | 15.408 | 47.290 | 21.146 | 2.408 |
-| GLM | F16 | 16384 | base | 14.990 | 47.723 | 19.029 | 4.524 |
-| GLM | F16 | 73728 | search | 15.203 | 47.489 | 21.989 | 1.564 |
-| GLM | F16 | 77824 | search | 14.599 | 48.124 | 22.195 | 1.359 |
-| GLM | F16 | 57344 | final | 14.307 | 48.392 | 21.122 | 2.433 |
-| GLM | Q8_0 | 16384 | base | 14.252 | 48.440 | 18.654 | 4.899 |
-| GLM | Q8_0 | 122880 | search | 14.333 | 48.366 | 21.740 | 1.813 |
-| GLM | Q8_0 | 126976 | search | 14.222 | 48.478 | 21.822 | 1.731 |
-| GLM | Q8_0 | 106496 | final | 14.266 | 48.438 | 21.244 | 2.311 |
-
-### Exact final commands
-
-Within each model/cache sequence above, other real probes used these same arguments with only `--ctx-size` replaced by the listed exact context. Qwen's target and draft caches both used the reported precision; GLM has no draft cache to configure.
-
-```sh
-/media/yaroslav/DATA/llama.cpp/build-cuda/bin/llama-server --log-verbosity 5 -m /media/yaroslav/DATA/llama-models/qwen3.8-27b-q4_K_M.gguf --alias qwen3.8:27b-q4_K_M --mmproj /media/yaroslav/DATA/llama-models/qwen3.8-27b-mmproj.gguf --no-mmproj-offload --host 127.0.0.1 --port 18081 --ctx-size 61440 --gpu-layers 999 --flash-attn on --parallel 1 --spec-type draft-mtp --cache-type-k f16 --cache-type-v f16 --cache-type-k-draft f16 --cache-type-v-draft f16 --kv-offload
-/media/yaroslav/DATA/llama.cpp/build-cuda/bin/llama-server --log-verbosity 5 -m /media/yaroslav/DATA/llama-models/qwen3.8-27b-q4_K_M.gguf --alias qwen3.8:27b-q4_K_M --mmproj /media/yaroslav/DATA/llama-models/qwen3.8-27b-mmproj.gguf --no-mmproj-offload --host 127.0.0.1 --port 18081 --ctx-size 94208 --gpu-layers 999 --flash-attn on --parallel 1 --spec-type draft-mtp --cache-type-k q8_0 --cache-type-v q8_0 --cache-type-k-draft q8_0 --cache-type-v-draft q8_0 --kv-offload
-/media/yaroslav/DATA/llama.cpp/build-cuda/bin/llama-server --log-verbosity 5 -m /media/yaroslav/DATA/llama-models/GLM-4.7-Flash-Q4_K.gguf --alias glm-4.7-flash:q4_k --host 127.0.0.1 --port 18081 --ctx-size 57344 --gpu-layers 999 --flash-attn on --cache-type-k f16 --cache-type-v f16 --kv-offload --batch-size 512 --ubatch-size 512 --parallel 1 --jinja --reasoning on --no-warmup
-/media/yaroslav/DATA/llama.cpp/build-cuda/bin/llama-server --log-verbosity 5 -m /media/yaroslav/DATA/llama-models/GLM-4.7-Flash-Q4_K.gguf --alias glm-4.7-flash:q4_k --host 127.0.0.1 --port 18081 --ctx-size 106496 --gpu-layers 999 --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --kv-offload --batch-size 512 --ubatch-size 512 --parallel 1 --jinja --reasoning on --no-warmup
+llmBudget = T - B - M
+availableLlmBudget = min(llmBudget, L + F - M)
+                  = min(T - B - M, T - N - R - M)
+offered candidate must satisfy: measured/predicted L <= availableLlmBudget
 ```
 
-The primary Rust Agent sidecar completed an Agent turn with visible `"2"`, final event and exit 0. During inference, `/proc/129438/exe` resolved to `/media/yaroslav/DATA/local-ai-desktop/rust-agent/target/debug/local-ai-agent-runtime`. Cargo verified/rebuilt the primary target; unchanged Rust sources retained binary mtime `2026-10-03 16:19:53.632880314 +03:00`, size 22124624 bytes, SHA-256 `81e1be032246cf010692a308087756d380efcfebcb16a76af7282d9b73dfdf5f`. This was not a worktree sidecar.
+Thus 1100 MiB of current desktop usage leaves only 450 MiB within the 1550 MiB background budget, **not another 1550 MiB**. Driver-reserved memory is never presented as free; when background plus unavailable driver memory binds more tightly, the actual free-memory formulation takes precedence. If `N > B`, diagnostics explicitly flag background over budget. On this measured 24576 MiB device, the nominal LLM budget is **22642 MiB**; neither device size nor discovered context values are hardcoded.
 
-`npm run test:max-context` passed the primary build/typecheck, option/capability/metadata/estimator/search/backend/controller/database regressions and launcher/sandbox checks. Rust tests and Agent protocol regressions passed. Changed-file ESLint had only two pre-existing unused-symbol errors (`homedir`, `inlineConfirmation` in `register-ipc.ts`); the preceding commit has those same findings. No unrelated lint fixes were made.
+The measured LLM process allocation includes target/draft weights, KV, compute/output, device projector/state allocations, CUDA context and other unlogged residency. It comes from `nvidia-smi --query-compute-apps=pid,used_gpu_memory`, matched to the current owned server. Discovery is unavailable if this accounting or single-device free-memory telemetry cannot be verified. It does not subtract process allocations from a host-only log or assume a model-specific KV formula.
 
-## Limits and operational safety
+**Why 384 MiB:** in the final live run, process VRAM minus logged device allocations was 311.50–315.63 MiB across Qwen MTP and GLM modes/contexts; its variation was approximately 4.13 MiB. Qwen measured KV/context increments were about 280 MiB per 4K F16 and 184–186 MiB per 4K Q8; GLM F16 increments were approximately 214–216 MiB per 4K. The fixed residual is already included in measured `L`, not silently added as another reserve. A 384 MiB contingency can absorb roughly one additional measured unlogged context/graph footprint, exceeds the observed residual variation and one context bucket's incremental allocation, and remains within the requested 150–800 MiB range. It is conservative against short-workload uncertainty, not a guarantee for every full-context workload.
 
-This is a bounded, exact-candidate-verified **safe-search maximum**, not a proof of the physical OOM boundary. Unsafe forecasts are not launched, external memory use may change between samples, and short inference does not stress a completely filled context or every workload. Larger ordinary capability options remain available but carry no fitting guarantee. The configured reserve and launch confirmation/rollback reduce risk; they cannot eliminate concurrent allocation or unexpected nonlinear runtime growth.
+There is no 2 GiB device reserve or extra 256 MiB VRAM forecast margin. The old device-reserve environment override no longer modifies discovery's VRAM policy. The only startup guard is **150 MiB actually free**: it is an emergency floor during the search, not added to the 384 MiB final margin. Search may use the pre-margin LLM budget, while final offered candidates must satisfy the full equation above. Host policy remains unchanged: 8 GiB final available RAM, 4 GiB emergency host reserve and 256 MiB host forecast uncertainty.
 
-Qwen did run 64K F16 successfully in an earlier exact-context probe with 2.071 GiB genuinely free VRAM, and the final search ran 76K F16 with 1.342 GiB free. The final offered 60K is lower because it must preserve the 2 GiB policy plus forecast uncertainty under freshly sampled resources; it is not a model/selector cap or a claim that 64K cannot run. Ordinary 64K remains selectable.
+## Bounded search, verification and invalidation
 
-Results are measured independently for the existing offload/slots/draft/projector setup. This acceptance covered single-slot, single-GPU KV only; CPU-KV placement, multiple devices, other models/backends and different slot counts were not live-validated. Ollama does not expose the required allocation evidence and offers no hardware-discovered precision options. Both tested llama.cpp modes require effective runtime evidence; there is no unconditional Q8 control.
+The existing binary-style architecture is retained. Each mode establishes a real base up to 16K, estimates growth from actual target/draft KV and compute/output/state allocations, then searches upward/downward in 4K buckets with 8K resolution and at most eight search iterations. Every real probe must remain alive, pass `/health`, match effective context/main-and-draft cache types/offload, and return non-empty assistant content. Reasoning-only output does not count. Predicted candidates beyond the absolute budget or actual-free startup floor are recorded as **skipped**, not as observed allocation failures.
 
-All owned Electron, launcher and server processes were stopped; ports 18081/19223 were closed and the inspected isolated runtime/database directory was removed. Post-cleanup NVIDIA telemetry showed 1063 MiB used / 23056 MiB actually free. No orphan model server remained.
+The final candidate applies the single VRAM margin and unchanged RAM policy. If its exact measured allocation fails the budget, at most one lower retry is calculated from that new measurement, rather than unnecessarily halving a known working context. Failed startup/inference, incorrect effective context/cache, and invalid allocation evidence never produce options. Q8 must be verified and improve at least 8K over F16.
 
-The experimental branch remains `feat/max-safe-context-discovery`, based on the Branch 1 merged `v2-migration` commit `5a46482e3d4d740d9cab92acc558c252875ea06f`. No merge into that branch or push is part of this work. Runtime logs, copied user data and test-only processes are not committed.
+Progress is explicit and stable; concurrent discovery, runtime changes and generation are excluded. The exact preceding runtime is restored before any staged options are published. Failed restoration clears all staged options. The launcher owns/reaps each tested server and rolls back failed switches.
+
+Results expire after 30 minutes. Model/projector/server file identities, backend limits, normalized effective runtime/draft/slot/offload arguments invalidate fitting evidence; context/cache selection alone does not invalidate its sibling option. Background VRAM changes exceeding **256 MiB** invalidate results without reserving that amount. Even smaller changes invalidate a candidate if the budget equation no longer fits. VRAM validation no longer uses the old 512 MiB reconstructed allocation-baseline rule. The existing 2 GiB host-baseline tolerance and host reserve checks are retained. Opening the dropdown does not invalidate results.
+
+UI details expose GPU total, observed and currently polled non-LLM usage/free memory, total 1550 MiB background budget, 384 MiB margin, nominal and actual-availability LLM budgets, measured LLM usage/free memory/driver reserve, highest tested boundary/reason, and offered Max. The main readout remains compact.
+
+## Primary-checkout acceptance, 2026-10-03
+
+The rebuilt primary Electron UI/IPC and installed real llama.cpp `d1d3c3396aa13a5f239109a822666c4870490ad5` ran sequential tests on an RTX 3090, reported total **24576 MiB**, with **62.699 GiB RAM**. Preflight: NVIDIA used 941 MiB, actually free 23178 MiB; ports 8081 and 18081 were unoccupied. Tests used an isolated read-only `VACUUM INTO` database snapshot and port **18081**. No user app/server was terminated and the original DB was not modified.
+
+| Model | Trained / effective hard limit | Normal choices before AND after | Offered FP16 | Offered Q8 |
+|---|---|---|---:|---:|
+| Qwen 3.8 27B + MTP + host projector | 262144 / 262144 | 16K,32K,64K,128K,256K | 88K (90112) | 132K (135168) |
+| GLM-4.7-Flash, no draft/projector | 202752 / 131072 | 16K,32K,64K,128K | 88K (90112) | 128K (131072) |
+
+Both offered modes were selected through the actual UI selector, verified in launcher state and isolated conversation persistence, and completed real inference returning visible `"2"`. Selecting ordinary 16K restored F16/GPU KV. Qwen also completed a real Agent turn. GLM's ordinary 128K and discovered 128K Q8 remain distinct because their cache configurations differ.
+
+### Full chronological probe sequences
+
+Values are tokens. All real probes passed startup, `/health`, exact effective context/cache checks and content inference. `skip` is a forecast-only rejection; it did not start a process. "Final rejected" means inference succeeded but measured VRAM failed the final policy, not a CUDA OOM.
+
+| Model / cache | Sequence | Highest successful startup/inference | Boundary conclusion | Offered |
+|---|---|---:|---|---:|
+| Qwen F16 | 16384 base; 57344; 159744 skip; 106496 skip; 81920; 94208; 98304 skip; 90112 final | 94208 | budget/free guard; no physical OOM proved | 90112 |
+| Qwen Q8 | 16384 base; 77824; 172032 skip; 122880; 147456 skip; 135168; 139264; 135168 final | 139264 | budget/free guard; no physical OOM proved | 135168 |
+| GLM F16 | 16384 base; 90112; 110592 skip; 98304; 102400 skip; 94208 final rejected; 90112 final | 98304 | exact 94208 final failed current budget; retry passed | 90112 |
+| GLM Q8 | 16384 base; 131072 | 131072 | **model/backend hard limit reached first** | 131072 |
+
+### Per-probe measured memory
+
+VRAM values are MiB; GPU total is 24576 MiB, non-LLM budget 1550 MiB, margin 384 MiB, nominal LLM budget 22642 MiB for every row. RAM values are GiB. RAM used means total minus Linux available RAM, not process RSS; used/free telemetry is sampled sequentially, not atomically. NVIDIA driver reserve was approximately 457–458 MiB.
+
+| Model | Cache | Context | Phase | Non-LLM | LLM process | Actually free | RAM used | RAM available | Process minus logged VRAM |
+|---|---|---:|---|---:|---:|---:|---:|---:|---:|
+| Qwen | F16 | 16384 | base | 1119 | 17590 | 5410 | 16.107 | 46.599 | 312.02 |
+| Qwen | F16 | 57344 | search | 1118 | 20390 | 2611 | 16.210 | 46.482 | 312.02 |
+| Qwen | F16 | 81920 | search | 1085 | 22040 | 995 | 16.269 | 46.434 | 312.02 |
+| Qwen | F16 | 94208 | search | 1061 | 22880 | 178 | 16.274 | 46.411 | 312.02 |
+| Qwen | F16 | 90112 | final | 1061 | 22600 | 458 | 16.077 | 46.618 | 312.02 |
+| Qwen | Q8 | 16384 | base | 1077 | 17148 | 5894 | 16.032 | 46.699 | 311.50 |
+| Qwen | Q8 | 77824 | search | 1060 | 19916 | 3143 | 16.150 | 46.504 | 312.00 |
+| Qwen | Q8 | 122880 | search | 1072 | 21946 | 1101 | 16.244 | 46.457 | 312.50 |
+| Qwen | Q8 | 135168 | search | 1053 | 22500 | 566 | 16.307 | 46.388 | 313.00 |
+| Qwen | Q8 | 139264 | search | 1051 | 22684 | 384 | 16.168 | 46.535 | 312.50 |
+| Qwen | Q8 | 135168 | final | 1051 | 22500 | 568 | 16.253 | 46.440 | 313.00 |
+| GLM | F16 | 16384 | base | 1050 | 18474 | 4596 | 15.845 | 46.825 | 314.13 |
+| GLM | F16 | 90112 | search | 1050 | 22354 | 716 | 15.762 | 46.923 | 315.13 |
+| GLM | F16 | 98304 | search | 1066 | 22784 | 269 | 15.587 | 47.114 | 314.13 |
+| GLM | F16 | 94208 | final rejected | 1182 | 22570 | 367 | 15.406 | 47.275 | 315.63 |
+| GLM | F16 | 90112 | final | 1269 | 22354 | 496 | 15.206 | 47.497 | 315.13 |
+| GLM | Q8 | 16384 | base | 1155 | 18104 | 4860 | 15.106 | 47.598 | 313.80 |
+| GLM | Q8 | 131072 | model limit | 1155 | 21488 | 1476 | 15.171 | 47.556 | 313.74 |
+
+GLM's rejected final had only 367 MiB actually free, below the 384 MiB margin; the recalculated 88K retry had 496 MiB free. At that retry, current background plus driver reserve bound the LLM budget below the nominal 22642 MiB. There was no extra 1550 MiB deduction on top of observed background.
+
+### Exact final server commands
+
+Other real probes used the same arguments with only `--ctx-size` changed to their listed context. Qwen target/draft cache precision matched; GLM has no draft cache.
+
+```sh
+/media/yaroslav/DATA/llama.cpp/build-cuda/bin/llama-server --log-verbosity 5 -m /media/yaroslav/DATA/llama-models/qwen3.8-27b-q4_K_M.gguf --alias qwen3.8:27b-q4_K_M --mmproj /media/yaroslav/DATA/llama-models/qwen3.8-27b-mmproj.gguf --no-mmproj-offload --host 127.0.0.1 --port 18081 --ctx-size 90112 --gpu-layers 999 --flash-attn on --parallel 1 --spec-type draft-mtp --cache-type-k f16 --cache-type-v f16 --cache-type-k-draft f16 --cache-type-v-draft f16 --kv-offload
+/media/yaroslav/DATA/llama.cpp/build-cuda/bin/llama-server --log-verbosity 5 -m /media/yaroslav/DATA/llama-models/qwen3.8-27b-q4_K_M.gguf --alias qwen3.8:27b-q4_K_M --mmproj /media/yaroslav/DATA/llama-models/qwen3.8-27b-mmproj.gguf --no-mmproj-offload --host 127.0.0.1 --port 18081 --ctx-size 135168 --gpu-layers 999 --flash-attn on --parallel 1 --spec-type draft-mtp --cache-type-k q8_0 --cache-type-v q8_0 --cache-type-k-draft q8_0 --cache-type-v-draft q8_0 --kv-offload
+/media/yaroslav/DATA/llama.cpp/build-cuda/bin/llama-server --log-verbosity 5 -m /media/yaroslav/DATA/llama-models/GLM-4.7-Flash-Q4_K.gguf --alias glm-4.7-flash:q4_k --host 127.0.0.1 --port 18081 --ctx-size 90112 --gpu-layers 999 --flash-attn on --cache-type-k f16 --cache-type-v f16 --kv-offload --batch-size 512 --ubatch-size 512 --parallel 1 --jinja --reasoning on --no-warmup
+/media/yaroslav/DATA/llama.cpp/build-cuda/bin/llama-server --log-verbosity 5 -m /media/yaroslav/DATA/llama-models/GLM-4.7-Flash-Q4_K.gguf --alias glm-4.7-flash:q4_k --host 127.0.0.1 --port 18081 --ctx-size 131072 --gpu-layers 999 --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --kv-offload --batch-size 512 --ubatch-size 512 --parallel 1 --jinja --reasoning on --no-warmup
+```
+
+### Real failed-startup cleanup and rollback
+
+After the acceptance launcher was stopped, a sequential isolated copy of the same launcher injected an invalid cache argument for one 20480-token GLM request only. It still executed the real installed llama-server, not a fake server. The exact failure was:
+
+```text
+--ctx-size 20480 ... --cache-type-k deliberate-invalid-cache-for-owned-rollback-test
+error while handling argument "--cache-type-k": Unsupported cache type: deliberate-invalid-cache-for-owned-rollback-test
+```
+
+The process exited before `/health` and before model allocations. Failed PID **148512** was confirmed absent; preceding owned PID **148383** was also absent. The controller returned `ok:false`, `rolledBack:true`, restored GLM 16384/F16/GPU on owned PID **148556**, `/health` returned `{"status":"ok"}`, and real inference returned visible `"2"`. This verifies cleanup and rollback for a genuine server-startup failure without intentionally exhausting desktop VRAM. The launcher error field was generic; its diagnostics log retained the exact parser failure shown above.
+
+### Builds, sidecar and limits
+
+`npm run test:max-context` passed primary build/typecheck, absolute-budget equation/margin/invalidation tests, normal/additive context tests, exact-context search/failure/model-limit regressions, allocation/metadata/backend/controller/database tests and launcher/sandbox checks. Rust tests (98 + 16) and Agent bridge regressions also passed. Changed policy surfaces passed ESLint; IPC retains only its two confirmed pre-existing unused-symbol errors (`homedir`, `inlineConfirmation`). Primary Rust/Agent artifacts are rebuilt by the build script.
+
+During real Agent inference, `/proc/146583/exe` resolved to `/media/yaroslav/DATA/local-ai-desktop/rust-agent/target/debug/local-ai-agent-runtime`; the Agent emitted visible `"2"`, a final event and exit 0. The primary binary remained 22124624 bytes, mtime `2026-10-03 16:19:53.632880314 +03:00`, SHA-256 `81e1be032246cf010692a308087756d380efcfebcb16a76af7282d9b73dfdf5f`. Rust sources were unchanged; Cargo verified the existing primary artifact rather than using a worktree sidecar.
+
+**Boundary limitation:** Qwen and GLM F16 reached budget/actual-free guard boundaries, not intentionally induced CUDA OOM. There is no claim that their next bucket would physically fail startup. GLM Q8 reached its model/backend hard limit. The controlled failing-startup test is not an OOM test. This is a bounded aggressive safe-budget maximum, not proof of a physical OOM boundary; short inference does not stress a completely filled context. GPU-heavy apps opened afterward may invalidate it.
+
+All owned Electron/launcher/server processes exited, including the failed PID and restored fixture server. Ports 18081/19223 were closed and the inspected isolated root, copied DB and controlled fixture were removed. Post-cleanup NVIDIA telemetry: 24576 MiB total, 1088 MiB used, 23031 MiB actually free.
+
+Single-slot, single-GPU GPU-KV was live-tested. CPU-KV, multiple GPUs and other models are not live-validated; incomplete process/availability evidence is rejected. Host protection remains unchanged. No runtime logs, copied DB/user content or test-only fixtures are committed. Work stays on `feat/max-safe-context-discovery`; `v2-migration` remains at `5a46482e3d4d740d9cab92acc558c252875ea06f`, with no merge or push.

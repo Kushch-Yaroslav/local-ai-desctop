@@ -13,6 +13,7 @@ export function Toolbar() {
   const [discoveryLoading, setDiscoveryLoading] = useState(false);
   const [discoveryError, setDiscoveryError] = useState<string | null>(null);
   const [discoveryStage, setDiscoveryStage] = useState('');
+  const [currentVramBudget, setCurrentVramBudget] = useState<import('../../shared/vram-budget').VramBudget | undefined>();
   const pollsRuntime = settings?.selectedBackend === 'llama-cpp';
   useEffect(() => {
     if (!pollsRuntime) return undefined;
@@ -34,6 +35,7 @@ export function Toolbar() {
   useEffect(() => {
     setDiscovery(null);
     setDiscoveryError(null);
+    setCurrentVramBudget(undefined);
   }, [selectedModelId, settings?.selectedBackend]);
   useEffect(() => {
     if (!pollsRuntime) return undefined;
@@ -47,6 +49,7 @@ export function Toolbar() {
         if (progress.modelId === selectedModelId) {
           setDiscovery(progress.result ?? null);
           setDiscoveryError(progress.error ?? null);
+          setCurrentVramBudget(progress.currentVramBudget);
         }
       } catch (error) {
         if (current) setDiscoveryError(error instanceof Error ? error.message : String(error));
@@ -110,6 +113,12 @@ export function Toolbar() {
             <p><span>Найдено</span><b>{maxContextLabel}</b></p>
             <p><span>Активное окно</span><b>{actualRuntimeContext ? `${Math.round(actualRuntimeContext / 1024)}K` : 'runtime не загружен'}</b></p>
             {discoveryForModel?.options.map((option) => <p key={`${option.kvCacheType}-${option.contextWindow}`}><span>{option.kvCacheType.toUpperCase()} · запас после inference</span><b>RAM {Math.round(option.measuredHeadroom.hostBytes / 1024 ** 3 * 10) / 10} GiB · VRAM {Math.round(option.measuredHeadroom.deviceBytes / 1024 ** 3 * 10) / 10} GiB</b></p>)}
+            {discoveryForModel?.options.map((option) => option.vramBudget && <details key={`budget-${option.kvCacheType}`}><summary>{cacheModeLabel(option.kvCacheType)} · бюджет VRAM</summary>
+              {currentVramBudget && <p>Сейчас non-LLM {currentVramBudget.nonLlmBytes / 1024 ** 2} MiB; свободно {currentVramBudget.freeBytes / 1024 ** 2} MiB; доступный LLM budget {currentVramBudget.availableLlmBytes / 1024 ** 2} MiB.</p>}
+              <p>GPU total {option.vramBudget.totalBytes / 1024 ** 2} MiB; non-LLM {option.vramBudget.nonLlmBytes / 1024 ** 2} MiB; общий non-LLM бюджет {option.vramBudget.backgroundBudgetBytes / 1024 ** 2} MiB; margin {option.vramBudget.marginBytes / 1024 ** 2} MiB.</p>
+              <p>LLM budget {option.vramBudget.llmBudgetBytes / 1024 ** 2} MiB; фактический доступный LLM budget {option.vramBudget.availableLlmBytes / 1024 ** 2} MiB; LLM used {option.vramBudget.llmBytes / 1024 ** 2} MiB; driver reserved {option.vramBudget.driverReservedBytes / 1024 ** 2} MiB.</p>
+              <p>Boundary {(option.boundaryTokens ?? 0) / 1024}K ({option.boundaryReason}); safe Max {option.contextWindow / 1024}K. {option.vramBudget.backgroundOverBudget ? 'Non-LLM превышает бюджет; ограничение — фактически свободная VRAM.' : ''}</p>
+            </details>)}
             {discoveryError && <small>Discovery не завершён: {discoveryError}</small>}
             {discoveryForModel?.unsupported.map((item) => <small key={item.kvCacheType}>{item.kvCacheType.toUpperCase()} не предложен: {item.reason}</small>)}
             <details><summary>Диагностика</summary>

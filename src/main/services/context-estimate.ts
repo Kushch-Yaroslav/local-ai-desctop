@@ -3,6 +3,7 @@ import { resolve } from 'node:path';
 import type { HardwareStats } from '../../shared/types';
 import { estimateHardwareSafeContext, type ContextEstimatorInput, type RuntimeContextEstimate, type SpeculativeMode } from '../../shared/context-estimator';
 import type { RuntimeContextEvidence } from '../backends/types';
+import { vramEstimatorMarginBytes } from '../../shared/vram-budget';
 
 type AllocationLocation = 'host' | 'device';
 type AllocationKind = 'weights' | 'compute' | 'output' | 'kv' | 'speculativeWeights' | 'speculativeCompute' | 'speculativeKv' | 'ssm';
@@ -37,7 +38,7 @@ export interface ContextEstimateRequest {
 }
 
 export const defaultContextHostReserveBytes = 8 * 1024 ** 3;
-export const defaultContextDeviceReserveBytes = 2 * 1024 ** 3;
+export const defaultContextDeviceReserveBytes = vramEstimatorMarginBytes;
 
 export function resolveContextReserve(value: string | undefined, variable: string, defaultBytes: number): { bytes: number | null; error?: string } {
   if (value === undefined) return { bytes: defaultBytes };

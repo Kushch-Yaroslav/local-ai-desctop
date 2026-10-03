@@ -1,10 +1,11 @@
 import { BrowserWindow, dialog, ipcMain } from 'electron';
 import { randomUUID } from 'node:crypto';
 import type { AnalysisRun, ApprovalDecision, ApprovalStatus, ChatRequest, Conversation, ProjectReference, ProjectSuggestion, RiskCategory, ThinkingTimelineEvent } from '../../shared/types';
-import { discoveryHasReserveHeadroom, findFreshContextDiscoveryOption, memoryBaselineWithinTolerance, type ContextDiscoveryOption, type ContextDiscoveryResult, type ContextDiscoveryProgress, type RuntimeContextEstimate } from '../../shared/context-estimator';
+import { findFreshContextDiscoveryOption, type ContextDiscoveryOption, type ContextDiscoveryResult, type ContextDiscoveryProgress, type RuntimeContextEstimate } from '../../shared/context-estimator';
 import { defaultLlamaKv, normalContextForModel, resolveLlamaKvSelection } from '../../shared/context-options';
 import { Database } from '../services/database';
-import { getHardwareStats } from '../services/hardware';
+import { getHardwareStats, getOwnedServerVramBudget } from '../services/hardware';
+import { vramBudgetStillFits, vramProbeGuardBytes } from '../../shared/vram-budget';
 import { OllamaBackend } from '../backends/ollama-backend';
 import { LlamaCppBackend } from '../backends/llama-cpp-backend';
 import { LAUNCHER_ABSENT, LlamaRuntimeController, type LlamaRuntimeState } from '../services/llama-runtime-controller';
@@ -73,11 +74,12 @@ let contextDiscoveryBusy = false;
 let runtimeSelectionBusy = false;
 let contextDiscoveryProgress: ContextDiscoveryProgress = { busy: false, modelId: null, stage: '', probeCount: 0 };
 const discoveryKey = (modelId: string, contextWindow: number, kvCacheType: 'f16' | 'q8_0', kvOffload: boolean) => `${modelId}:${contextWindow}:${kvCacheType}:${kvOffload ? 'gpu' : 'ram'}`;
-function currentDiscoveryHeadroomFits(option: ContextDiscoveryOption, baseline: ContextDiscoveryOption['memoryBaseline']): boolean {
+function currentDiscoveryHeadroomFits(option: ContextDiscoveryOption, current: RuntimeContextEstimate): boolean {
   const host = resolveContextReserve(process.env.LOCAL_AI_CONTEXT_HOST_RESERVE_BYTES, 'LOCAL_AI_CONTEXT_HOST_RESERVE_BYTES', defaultContextHostReserveBytes);
-  const device = resolveContextReserve(process.env.LOCAL_AI_CONTEXT_DEVICE_RESERVE_BYTES, 'LOCAL_AI_CONTEXT_DEVICE_RESERVE_BYTES', defaultContextDeviceReserveBytes);
-  if (host.bytes === null || device.bytes === null) throw new Error(host.error ?? device.error ?? 'Invalid discovery reserve.');
-  return discoveryHasReserveHeadroom(option, baseline, host.bytes, device.bytes);
+  if (host.bytes === null) throw new Error(host.error ?? 'Invalid discovery reserve.');
+  return !!current.memoryBaseline && !!current.vramBudget && !!option.vramBudget
+    && option.measuredHeadroom.hostBytes + current.memoryBaseline.hostAvailableBytes - option.memoryBaseline.hostAvailableBytes >= host.bytes
+    && vramBudgetStillFits(option.vramBudget, current.vramBudget);
 }
 async function modelFileIdentity(path: string): Promise<string> {
   const file = await stat(path);
@@ -122,6 +124,7 @@ async function estimateModelContext(modelId: string): Promise<RuntimeContextEsti
   const contextPresets = selectedBackend === 'llama-cpp' ? llamaContextPresets(modelId) : profile ? contextPresetsFor(profile.maxContext) : [];
   const hardware = await getHardwareStats();
   let runtime = null;
+  let vramBudget: RuntimeContextEstimate['vramBudget'];
   let runtimeArguments: string[] | undefined;
   if (configuredMaxTokens) {
     if (selectedBackend === 'llama-cpp' && llamaProfile) {
@@ -129,15 +132,17 @@ async function estimateModelContext(modelId: string): Promise<RuntimeContextEsti
       if (current.status === 'ready' && current.launcherPid !== undefined && current.modelId === modelId && current.kvCacheType && current.kvOffload !== undefined) {
         await syncLlamaBackend();
         runtime = await llamaCpp.getRuntimeContextEvidence(modelId);
-        if (current.serverPid) runtimeArguments = (await readFile(`/proc/${current.serverPid}/cmdline`, 'utf8')).split('\0').filter(Boolean);
+        if (current.serverPid) {
+          runtimeArguments = (await readFile(`/proc/${current.serverPid}/cmdline`, 'utf8')).split('\0').filter(Boolean);
+          vramBudget = await getOwnedServerVramBudget(current.serverPid);
+        }
       }
     } else if (selectedBackend === 'ollama' && profile) {
       runtime = await ollama.getRuntimeContextEvidence(modelId);
     }
   }
   const hostReserve = resolveContextReserve(process.env.LOCAL_AI_CONTEXT_HOST_RESERVE_BYTES, 'LOCAL_AI_CONTEXT_HOST_RESERVE_BYTES', defaultContextHostReserveBytes);
-  const deviceReserve = resolveContextReserve(process.env.LOCAL_AI_CONTEXT_DEVICE_RESERVE_BYTES, 'LOCAL_AI_CONTEXT_DEVICE_RESERVE_BYTES', defaultContextDeviceReserveBytes);
-  return collectRuntimeContextEstimate({
+  const estimate = await collectRuntimeContextEstimate({
     backend: selectedBackend,
     modelId,
     configuredMaxTokens: Math.min(configuredMaxTokens ?? 0, runtime?.modelTrainContextTokens ?? Number.MAX_SAFE_INTEGER),
@@ -146,10 +151,16 @@ async function estimateModelContext(modelId: string): Promise<RuntimeContextEsti
     runtime,
     startupLogPath: selectedBackend === 'llama-cpp' ? process.env.LOCAL_AI_LLAMA_SERVER_LOG ?? join(paths.logs, 'llama-cpp-mtp-server.log') : null,
     hostReserveBytes: hostReserve.bytes,
-    deviceReserveBytes: deviceReserve.bytes,
-    reserveErrors: [hostReserve.error, deviceReserve.error].filter((error): error is string => Boolean(error)),
+    deviceReserveBytes: vramBudget ? vramBudget.freeBytes + vramBudget.llmBytes - vramBudget.availableLlmBytes : defaultContextDeviceReserveBytes,
+    reserveErrors: [hostReserve.error].filter((error): error is string => Boolean(error)),
     runtimeArguments,
   });
+  if (vramBudget && estimate.allocationEvidence) {
+    const loggedDeviceBytes = Object.values(estimate.allocationEvidence.allocations).reduce((sum, allocation) => sum + (allocation.device ?? 0), 0);
+    vramBudget = { ...vramBudget, loggedDeviceBytes, unloggedDeviceBytes: vramBudget.llmBytes - loggedDeviceBytes };
+  }
+  return { ...estimate, vramBudget, memoryHeadroom: estimate.memoryHeadroom && vramBudget
+    ? { ...estimate.memoryHeadroom, deviceBytes: vramBudget.freeBytes } : estimate.memoryHeadroom };
 }
 async function discoverModelContexts(modelId: string): Promise<ContextDiscoveryResult> {
   const profile = llamaRuntimeProfile(modelId);
@@ -178,13 +189,12 @@ async function discoverModelContexts(modelId: string): Promise<ContextDiscoveryR
       ? Object.values(initialEstimate.allocationEvidence.allocations.kv).reduce((sum, value) => sum + (value ?? 0), 0)
         + Object.values(initialEstimate.allocationEvidence.allocations.speculativeKv).reduce((sum, value) => sum + (value ?? 0), 0)
       : 0;
-    if (baseHeadroom.deviceBytes - (offload ? precisionExpansion : 0) < 1.25 * 1024 ** 3
+    if (baseHeadroom.deviceBytes - (offload ? precisionExpansion : 0) < vramProbeGuardBytes
       || baseHeadroom.hostBytes - (offload ? 0 : precisionExpansion) < 4.25 * 1024 ** 3) throw new Error('Недостаточно свежей свободной памяти для безопасного базового FP16 probe.');
     const hostReserve = resolveContextReserve(process.env.LOCAL_AI_CONTEXT_HOST_RESERVE_BYTES, 'LOCAL_AI_CONTEXT_HOST_RESERVE_BYTES', defaultContextHostReserveBytes);
-    const deviceReserve = resolveContextReserve(process.env.LOCAL_AI_CONTEXT_DEVICE_RESERVE_BYTES, 'LOCAL_AI_CONTEXT_DEVICE_RESERVE_BYTES', defaultContextDeviceReserveBytes);
-    if (hostReserve.bytes === null || deviceReserve.bytes === null) throw new Error(hostReserve.error ?? deviceReserve.error);
+    if (hostReserve.bytes === null) throw new Error(hostReserve.error);
     const result = await discoverContextBoundary({
-      modelId, hardLimit, kvOffload: offload, hostReserveBytes: hostReserve.bytes, deviceReserveBytes: deviceReserve.bytes,
+      modelId, hardLimit, kvOffload: offload, hostReserveBytes: hostReserve.bytes, deviceReserveBytes: 0,
       progress: (stage, probeCount) => { contextDiscoveryProgress = { busy: true, modelId, stage, probeCount }; },
       probe: async (contextWindow, kvCacheType, phase): Promise<DiscoveryProbe> => {
         const started = Date.now();
@@ -210,6 +220,7 @@ async function discoverModelContexts(modelId: string): Promise<ContextDiscoveryR
           estimate = await estimateModelContext(modelId);
           record.headroom = estimate.memoryHeadroom;
           record.memoryBaseline = estimate.memoryBaseline;
+          record.vramBudget = estimate.vramBudget;
           record.hardware = await getHardwareStats();
           if (estimate.status !== 'estimated') record.reason = estimate.unknownReasons.join('; ');
           return { record, estimate };
@@ -266,8 +277,8 @@ async function validateDiscoveredOption(modelId: string, contextWindow: number, 
   if (!cached || await runtimeConfigurationIdentity(modelId) !== cached.modelIdentity) throw new Error('Runtime/model/draft configuration changed since discovery; run Discover again.');
   const current = await estimateModelContext(modelId);
   if (current.status !== 'estimated' || !current.memoryBaseline || current.observedContextTokens === null) throw new Error('Current runtime memory evidence is unavailable; run Discover again.');
-  if (!memoryBaselineWithinTolerance(current.memoryBaseline, option.memoryBaseline, 2 * 1024 ** 3, 512 * 1024 ** 2)
-    || !currentDiscoveryHeadroomFits(option, current.memoryBaseline)) {
+  if (Math.abs(current.memoryBaseline.hostAvailableBytes - option.memoryBaseline.hostAvailableBytes) > 2 * 1024 ** 3
+    || !currentDiscoveryHeadroomFits(option, current)) {
     throw new Error('Available memory changed materially since discovery; run Discover again before selecting this context.');
   }
 }
@@ -278,9 +289,12 @@ async function discoveryStatus(): Promise<ContextDiscoveryProgress> {
     if (!result.configurationId || await runtimeConfigurationIdentity(result.modelId) !== result.configurationId) throw new Error('Модель/runtime/draft изменились; повторите discovery.');
     const estimate = await estimateModelContext(result.modelId);
     if (result.options.length && (!estimate.memoryBaseline || result.options.some((option) => !findFreshContextDiscoveryOption([option], option)
-      || !memoryBaselineWithinTolerance(estimate.memoryBaseline!, option.memoryBaseline, 2 * 1024 ** 3, 512 * 1024 ** 2)
-      || !currentDiscoveryHeadroomFits(option, estimate.memoryBaseline!)))) {
+      || Math.abs(estimate.memoryBaseline!.hostAvailableBytes - option.memoryBaseline.hostAvailableBytes) > 2 * 1024 ** 3
+      || !currentDiscoveryHeadroomFits(option, estimate)))) {
       throw new Error('Ресурсы существенно изменились или результат устарел; повторите discovery.');
+    }
+    if (contextDiscoveryProgress.result === result && !contextDiscoveryBusy && !runtimeSelectionBusy) {
+      contextDiscoveryProgress = { ...contextDiscoveryProgress, currentVramBudget: estimate.vramBudget };
     }
   } catch (error) {
     if (contextDiscoveryProgress.result !== result || contextDiscoveryBusy || runtimeSelectionBusy) return contextDiscoveryProgress;

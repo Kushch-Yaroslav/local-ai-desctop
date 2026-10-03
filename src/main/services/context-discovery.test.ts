@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict';
 import { discoverContextBoundary, predictContextHeadroom, type DiscoveryProbe } from './context-discovery';
 import type { RuntimeContextEstimate } from '../../shared/context-estimator';
+import { createVramBudget } from '../../shared/vram-budget';
 
 const GiB = 1024 ** 3;
 function fixture(context: number, mode: 'f16' | 'q8_0', phase: 'base' | 'search' | 'final'): DiscoveryProbe {
   const kv = context * (mode === 'f16' ? 64 * 1024 : 34 * 1024);
   const headroom = { hostBytes: 40 * GiB, deviceBytes: 7 * GiB - kv };
   const estimate: RuntimeContextEstimate = {
+    vramBudget: createVramBudget(24 * GiB, 17 * GiB + kv, headroom.deviceBytes, 17 * GiB + kv),
     backend: 'llama-cpp', modelId: 'model', configuredMaxTokens: 262144, modelTrainContextTokens: 262144,
     observedContextTokens: context, modelFileSizeBytes: 10 * GiB, observedResidentBytes: null, observedDeviceResidentBytes: null,
     hardwareSafeTokens: 262144, activeKvCacheType: mode, activeKvOffload: true, memoryBaseline: { hostAvailableBytes: 50 * GiB, deviceAvailableBytes: 24 * GiB },
@@ -29,8 +31,8 @@ export async function runContextDiscoveryRegression() {
   for (const option of result.options) {
     const record = result.probes!.find((probe) => probe.contextWindow === option.contextWindow && probe.kvCacheType === option.kvCacheType && probe.inference);
     assert(record, 'offered maximum was never inferred at the exact candidate context');
-    assert(option.measuredHeadroom.deviceBytes >= 2 * GiB);
-    assert(result.probes!.filter((probe) => probe.kvCacheType === option.kvCacheType && probe.startup).length <= 9, 'discovery exceeded its bounded startup budget');
+    assert(option.vramBudget!.llmBytes <= option.vramBudget!.availableLlmBytes);
+    assert(result.probes!.filter((probe) => probe.kvCacheType === option.kvCacheType && probe.startup).length <= 11, 'discovery exceeded its bounded startup budget');
   }
   assert(result.probes!.some((probe) => !probe.startup && probe.reason?.includes('Skipped')), 'predicted unsafe candidates must be rejected without startup');
   await assert.rejects(discoverContextBoundary({ modelId: 'model', hardLimit: 131072, kvOffload: true, hostReserveBytes: 8 * GiB, deviceReserveBytes: 2 * GiB,
@@ -57,6 +59,30 @@ export async function runContextDiscoveryRegression() {
     probe: async (context, mode, phase) => { const probe = fixture(context, 'f16', phase); probe.record.kvCacheType = mode; probe.estimate!.activeKvCacheType = mode; return probe; },
     restore: async () => undefined, progress: () => undefined });
   assert.deepEqual(unimproved.options.map((option) => option.kvCacheType), ['f16'], 'Q8 must not be offered without a meaningful verified improvement');
+  let failures = 0;
+  const recovered = await discoverContextBoundary({ modelId: 'model', hardLimit: 131072, kvOffload: true,
+    hostReserveBytes: 8 * GiB, deviceReserveBytes: 0,
+    probe: async (context, mode, phase) => {
+      const probe = fixture(context, mode, phase);
+      if (context >= 73728) {
+        failures += 1;
+        probe.record.startup = false;
+        probe.record.health = false;
+        probe.record.inference = false;
+        probe.record.reason = 'llama-server exited before health: controlled invalid cache argument';
+        probe.estimate = null;
+      }
+      return probe;
+    }, restore: async () => { restored += 1; }, progress: () => undefined });
+  assert(failures > 0);
+  assert(recovered.options.every((option) => option.contextWindow < 73728));
+  assert(recovered.probes!.some((probe) => probe.reason?.includes('controlled invalid cache')));
+  assert.equal(restored, 3, 'failed startups must still restore the original runtime');
+  const modelLimited = await discoverContextBoundary({ modelId: 'model', hardLimit: 32768, kvOffload: true,
+    hostReserveBytes: 8 * GiB, deviceReserveBytes: 0,
+    probe: async (context, mode, phase) => fixture(context, mode, phase), restore: async () => undefined, progress: () => undefined });
+  assert.equal(modelLimited.options[0].boundaryReason, 'model-limit');
+  assert.equal(modelLimited.options[0].contextWindow, 32768, 'model-limit success must not suffer a second context reduction');
 }
 
 if (require.main === module) void runContextDiscoveryRegression().catch((error) => { console.error(error); process.exitCode = 1; });

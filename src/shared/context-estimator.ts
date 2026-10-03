@@ -29,6 +29,7 @@ export interface ContextEstimatorResult {
 }
 
 export interface RuntimeContextEstimate {
+  vramBudget?: import('./vram-budget').VramBudget;
   backend: 'ollama' | 'llama-cpp';
   modelId: string;
   configuredMaxTokens: number | null;
@@ -61,6 +62,9 @@ export interface RuntimeContextEstimate {
 }
 
 export interface ContextDiscoveryOption {
+  vramBudget?: import('./vram-budget').VramBudget;
+  boundaryReason?: 'model-limit' | 'probe-failure' | 'budget-guard' | 'bounded-search';
+  failedContextTokens?: number;
   modelId: string;
   contextWindow: number;
   kvCacheType: 'f16' | 'q8_0';
@@ -72,6 +76,7 @@ export interface ContextDiscoveryOption {
 }
 
 export interface ContextProbeRecord {
+  vramBudget?: import('./vram-budget').VramBudget;
   kvCacheType: 'f16' | 'q8_0';
   contextWindow: number;
   phase: 'base' | 'search' | 'final';
@@ -88,6 +93,7 @@ export interface ContextProbeRecord {
 }
 
 export interface ContextDiscoveryProgress {
+  currentVramBudget?: import('./vram-budget').VramBudget;
   busy: boolean;
   modelId: string | null;
   stage: string;
