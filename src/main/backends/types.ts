@@ -58,4 +58,6 @@ export interface RuntimeContextEvidence {
   modelFileSizeBytes?: number;
   residentBytes?: number;
   deviceResidentBytes?: number;
+  kvCacheType?: 'f16' | 'q8_0';
+  kvOffload?: boolean;
 }

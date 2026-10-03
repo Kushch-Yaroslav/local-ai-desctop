@@ -1,7 +1,9 @@
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { llamaContextPresets, llamaRuntimeProfile } from '../models/llama-runtime-policy';
+import { llamaRuntimeProfile } from '../models/llama-runtime-policy';
+import type { LlamaKvCacheType } from '../../shared/types';
+import { llamaCapabilityLimit } from './gguf-context';
 
 /**
  * What the launcher says is running. `modelId`/`contextWindow` describe the
@@ -11,12 +13,15 @@ export type LlamaRuntimeState = {
   status: 'starting' | 'ready' | 'switching' | 'offline' | 'stopped';
   modelId: string | null;
   contextWindow: number | null;
+  kvCacheType?: LlamaKvCacheType;
+  kvOffload?: boolean;
   error?: string;
   requestId?: string;
   /** The requested runtime failed to start and the previous one was restored. */
   rolledBack?: boolean;
   /** The launcher that wrote this state; a state whose launcher is gone describes nothing. */
   launcherPid?: number;
+  serverPid?: number;
 };
 
 export type LlamaSwitchResult =
@@ -34,6 +39,7 @@ type Deps = {
   signal: (pid: number) => void;
   sleep: (ms: number) => Promise<void>;
   now: () => number;
+  capabilityLimit: (modelId: string) => Promise<number>;
 };
 
 const defaultDeps: Deps = {
@@ -41,6 +47,7 @@ const defaultDeps: Deps = {
   signal: (pid) => { process.kill(pid, 'SIGUSR1'); },
   sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   now: () => Date.now(),
+  capabilityLimit: llamaCapabilityLimit,
 };
 
 /** Error text of a state with no live launcher; callers fall back to the startup environment. */
@@ -56,10 +63,13 @@ export function parseLlamaRuntimeState(raw: string): LlamaRuntimeState | null {
     const contextWindow = typeof value.contextWindow === 'number' && value.contextWindow > 0 ? value.contextWindow : null;
     return {
       status, modelId, contextWindow,
+      ...(value.kvCacheType === 'f16' || value.kvCacheType === 'q8_0' ? { kvCacheType: value.kvCacheType } : {}),
+      ...(typeof value.kvOffload === 'boolean' ? { kvOffload: value.kvOffload } : {}),
       ...(typeof value.error === 'string' && value.error ? { error: value.error } : {}),
       ...(typeof value.requestId === 'string' && value.requestId ? { requestId: value.requestId } : {}),
       ...(value.rolledBack === true ? { rolledBack: true } : {}),
       ...(typeof value.launcherPid === 'number' && value.launcherPid > 0 ? { launcherPid: value.launcherPid } : {}),
+      ...(typeof value.serverPid === 'number' && value.serverPid > 0 ? { serverPid: value.serverPid } : {}),
     };
   } catch { return null; }
 }
@@ -90,16 +100,16 @@ export class LlamaRuntimeController {
   }
 
   /** Switches are serialized: two concurrent requests would otherwise race on one request file. */
-  switchTo(modelId: string, contextWindow: number): Promise<LlamaSwitchResult> {
-    const run = this.chain.then(() => this.perform(modelId, contextWindow));
+  switchTo(modelId: string, contextWindow: number, kvCacheType: LlamaKvCacheType = 'f16', kvOffload = true): Promise<LlamaSwitchResult> {
+    const run = this.chain.then(() => this.perform(modelId, contextWindow, kvCacheType, kvOffload));
     this.chain = run.catch(() => undefined);
     return run;
   }
 
-  private async perform(modelId: string, contextWindow: number): Promise<LlamaSwitchResult> {
+  private async perform(modelId: string, contextWindow: number, kvCacheType: LlamaKvCacheType, kvOffload: boolean): Promise<LlamaSwitchResult> {
     const profile = llamaRuntimeProfile(modelId);
     if (!profile) return { ok: false, state: await this.state(), error: `Модель ${modelId} не поддерживается llama.cpp runtime` };
-    if (!llamaContextPresets(modelId).includes(contextWindow)) return { ok: false, state: await this.state(), error: `Контекст ${contextWindow} не поддерживается для ${modelId}` };
+    if (!Number.isSafeInteger(contextWindow) || contextWindow < 4_096 || contextWindow > await this.deps.capabilityLimit(modelId) || contextWindow % 4_096 !== 0) return { ok: false, state: await this.state(), error: `Контекст ${contextWindow} не поддерживается для ${modelId}` };
 
     const launcherPid = Number((await this.deps.readText(this.files.launcherPidFile).catch(() => '')).trim());
     if (!Number.isSafeInteger(launcherPid) || launcherPid <= 0) return { ok: false, state: await this.state(), error: 'Launcher llama.cpp не запущен: перезапуск модели невозможен без него.' };
@@ -109,7 +119,7 @@ export class LlamaRuntimeController {
     const requestId = randomUUID();
     await mkdir(dirname(this.files.requestFile), { recursive: true });
     const temporary = `${this.files.requestFile}.${process.pid}.tmp`;
-    await writeFile(temporary, `REQUEST_ID=${requestId}\nMODEL_ID=${modelId}\nCONTEXT=${contextWindow}\n`, 'utf8');
+    await writeFile(temporary, `REQUEST_ID=${requestId}\nMODEL_ID=${modelId}\nCONTEXT=${contextWindow}\nKV_TYPE=${kvCacheType}\nKV_OFFLOAD=${kvOffload ? 1 : 0}\n`, 'utf8');
     await rename(temporary, this.files.requestFile);
     try { this.deps.signal(launcherPid); }
     catch (error) {
@@ -121,7 +131,7 @@ export class LlamaRuntimeController {
     while (this.deps.now() < deadline) {
       const state = await this.state();
       if (state.requestId === requestId && (state.status === 'ready' || state.status === 'offline')) {
-        if (state.status === 'ready' && !state.error && state.modelId === modelId && state.contextWindow === contextWindow) return { ok: true, state };
+        if (state.status === 'ready' && !state.error && state.modelId === modelId && state.contextWindow === contextWindow && state.kvCacheType === kvCacheType && state.kvOffload === kvOffload) return { ok: true, state };
         return { ok: false, state, error: state.error ?? 'llama.cpp не подтвердил запрошенную модель' };
       }
       await this.deps.sleep(500);

@@ -21,21 +21,30 @@ async function fixture(timeoutMs = 5_000) {
     },
     sleep: async () => { clock += 500; await new Promise((resolve) => setImmediate(resolve)); },
     now: () => clock,
+    capabilityLimit: async (modelId) => modelId === qwen ? 262144 : 131072,
   }) };
 }
 
-const state = (fields: Record<string, unknown>) => JSON.stringify({ status: 'ready', requestId: '', modelId: '', contextWindow: 0, serverPid: 1, launcherPid: 4242, error: '', rolledBack: false, ...fields });
+const state = (fields: Record<string, unknown>) => JSON.stringify({ status: 'ready', requestId: '', modelId: '', contextWindow: 0, kvCacheType: 'f16', kvOffload: true, serverPid: 1, launcherPid: 4242, error: '', rolledBack: false, ...fields });
 
 export async function runLlamaRuntimeControllerRegression(): Promise<void> {
   assert.equal(parseLlamaRuntimeState('not json'), null);
   assert.equal(parseLlamaRuntimeState(state({ status: 'weird' })), null);
-  assert.deepEqual(parseLlamaRuntimeState(state({ modelId: qwen, contextWindow: 65_536 })), { status: 'ready', modelId: qwen, contextWindow: 65_536, launcherPid: 4242 });
+  assert.deepEqual(parseLlamaRuntimeState(state({ modelId: qwen, contextWindow: 65_536, kvCacheType: 'f16', kvOffload: true })), { status: 'ready', modelId: qwen, contextWindow: 65_536, kvCacheType: 'f16', kvOffload: true, launcherPid: 4242, serverPid: 1 });
 
   {
     const { files, signals, make } = await fixture();
-    const controller = make(async (request) => { await writeFile(files.stateFile, state({ status: 'ready', requestId: request.REQUEST_ID, modelId: request.MODEL_ID, contextWindow: Number(request.CONTEXT) })); });
-    const result = await controller.switchTo(qwen, 65_536);
+    let captured: Record<string, string> = {};
+    const controller = make(async (request) => { captured = request; await writeFile(files.stateFile, state({ status: 'ready', requestId: request.REQUEST_ID, modelId: request.MODEL_ID, contextWindow: Number(request.CONTEXT), kvCacheType: request.KV_TYPE, kvOffload: request.KV_OFFLOAD === '1' })); });
+    const result = await controller.switchTo(qwen, 73_728, 'q8_0', false);
     assert.equal(result.ok, true, 'a confirmed switch must succeed');
+    if (result.ok) {
+      assert.equal(result.state.contextWindow, 73_728);
+      assert.equal(result.state.kvCacheType, 'q8_0');
+      assert.equal(result.state.kvOffload, false);
+    }
+    assert.equal(captured.KV_TYPE, 'q8_0');
+    assert.equal(captured.KV_OFFLOAD, '0');
     assert.deepEqual(signals, [4242]);
   }
   {
@@ -81,6 +90,8 @@ export async function runLlamaRuntimeControllerRegression(): Promise<void> {
     const controller = make(async () => undefined);
     assert.equal((await controller.switchTo('unknown-model', 65_536)).ok, false);
     assert.equal((await controller.switchTo(qwen, 12_345)).ok, false, 'an unsupported context was sent to the launcher');
+    assert.equal((await controller.switchTo(qwen, 131_076)).ok, false, 'unaligned custom context was sent to the launcher');
+    assert.equal((await controller.switchTo(qwen, 266_240)).ok, false, 'context above the model limit was sent to the launcher');
     await writeFile(files.launcherPidFile, '');
     assert.equal((await controller.switchTo(qwen, 65_536)).ok, false, 'without a launcher there is nothing to switch');
   }
