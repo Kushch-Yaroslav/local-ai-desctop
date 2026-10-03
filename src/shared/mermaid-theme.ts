@@ -1,5 +1,55 @@
 export type MermaidTheme = 'dark' | 'light';
 
+type ColorChannels = [number, number, number, number];
+
+function colorChannels(color: string): ColorChannels | null {
+  const hex = /^#([\da-f]{3}|[\da-f]{6})$/i.exec(color.trim());
+  if (hex) {
+    const channels = hex[1].length === 3
+      ? [...hex[1]].map(channel => parseInt(channel + channel, 16))
+      : hex[1].match(/.{2}/g)!.map(channel => parseInt(channel, 16));
+    return [channels[0], channels[1], channels[2], 1];
+  }
+  const rgb = /^rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)(?:\s*[,/]\s*([\d.]+))?\s*\)$/i.exec(color.trim());
+  return rgb ? [Number(rgb[1]), Number(rgb[2]), Number(rgb[3]), rgb[4] === undefined ? 1 : Number(rgb[4])] : null;
+}
+
+function luminance(color: string, underlay?: string): number | null {
+  const channels = colorChannels(color);
+  if (!channels) return null;
+  let [red, green, blue] = channels;
+  if (channels[3] < 1) {
+    const underlayChannels = underlay ? colorChannels(underlay) : null;
+    if (!underlayChannels || underlayChannels[3] < 1) return null;
+    red = red * channels[3] + underlayChannels[0] * (1 - channels[3]);
+    green = green * channels[3] + underlayChannels[1] * (1 - channels[3]);
+    blue = blue * channels[3] + underlayChannels[2] * (1 - channels[3]);
+  }
+  const linear = [red, green, blue].map(channel => {
+    const value = channel / 255;
+    return value <= .04045 ? value / 12.92 : ((value + .055) / 1.055) ** 2.4;
+  });
+  return linear[0] * .2126 + linear[1] * .7152 + linear[2] * .0722;
+}
+
+function contrast(foreground: string, background: string, underlay?: string): number | null {
+  const foregroundLuminance = luminance(foreground, underlay);
+  const backgroundLuminance = luminance(background, underlay);
+  if (foregroundLuminance === null || backgroundLuminance === null) return null;
+  return (Math.max(foregroundLuminance, backgroundLuminance) + .05)
+    / (Math.min(foregroundLuminance, backgroundLuminance) + .05);
+}
+
+/** Return an accessible label color only when the theme's current label color fails on a rendered fill. */
+export function mermaidLabelColorForContrast(currentColor: string, backgroundColor: string, underlayColor?: string): string | null {
+  const currentContrast = contrast(currentColor, backgroundColor, underlayColor);
+  if (currentContrast === null || currentContrast >= 4.5) return null;
+  const blackContrast = contrast('#000000', backgroundColor, underlayColor);
+  const whiteContrast = contrast('#ffffff', backgroundColor, underlayColor);
+  if (blackContrast === null || whiteContrast === null) return null;
+  return blackContrast >= whiteContrast ? '#000000' : '#ffffff';
+}
+
 export function mermaidThemeVariables(theme: MermaidTheme) {
   return theme === 'dark' ? {
     background: '#141311',

@@ -2,10 +2,49 @@ import { memo, useEffect, useId, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
-import { mermaidThemeVariables } from '../../shared/mermaid-theme';
+import { mermaidLabelColorForContrast, mermaidThemeVariables } from '../../shared/mermaid-theme';
 
 // Mermaid configuration is global; serialize themed renders from different messages.
 let mermaidQueue = Promise.resolve();
+
+function correctRenderedLabelContrast(svg: SVGSVGElement, underlayColor: string) {
+  const surfaces = [
+    ['.node', '.nodeLabel, .labelText'],
+    ['.cluster', '.cluster-label div, .cluster-label text, .clusterLabel div, .clusterLabel text, .clusterLabelText'],
+    ['.edgeLabel', '.labelBkg, .edgeLabel'],
+    ['.actor', 'text'],
+    ['.note', '.noteText'],
+    ['.task', '.taskText'],
+  ] as const;
+
+  for (const [surfaceSelector, labelSelector] of surfaces) {
+    for (const surface of svg.querySelectorAll<Element>(surfaceSelector)) {
+      const shape = Array.from(surface.querySelectorAll<SVGElement>('rect, polygon, path'))
+        .find(element => {
+          const fill = getComputedStyle(element).fill;
+          return fill !== 'none' && !/,\s*0\)$/.test(fill);
+        });
+      const labelBackground = surface.querySelector<HTMLElement>('.labelBkg');
+      const backgroundColor = shape
+        ? getComputedStyle(shape).fill
+        : labelBackground ? getComputedStyle(labelBackground).backgroundColor : '';
+      if (!backgroundColor) continue;
+      for (const label of surface.querySelectorAll<HTMLElement | SVGElement>(labelSelector)) {
+        const targets = [label, ...label.querySelectorAll<HTMLElement | SVGElement>('div, span, p, text, tspan')];
+        for (const target of targets) {
+          const styles = getComputedStyle(target);
+          const currentColor = target.namespaceURI === 'http://www.w3.org/2000/svg' ? styles.fill : styles.color;
+          const correctedColor = mermaidLabelColorForContrast(currentColor, backgroundColor, underlayColor);
+          if (!correctedColor) continue;
+          target.style.setProperty('color', correctedColor, 'important');
+          if (target.namespaceURI === 'http://www.w3.org/2000/svg') {
+            target.style.setProperty('fill', correctedColor, 'important');
+          }
+        }
+      }
+    }
+  }
+}
 
 function MermaidBlock({ source }: { source: string }) {
   const id = useId().replace(/[^a-zA-Z0-9]/g, '');
@@ -72,10 +111,24 @@ function MermaidBlock({ source }: { source: string }) {
         });
         const result = await mermaid.render(`mermaid-${id}`, source, scratch);
         if (!cancelled) {
-          const rendered = new DOMParser().parseFromString(result.svg, 'image/svg+xml').documentElement;
-          const width = Number(rendered.getAttribute('viewBox')?.trim().split(/\s+/)[2]);
-          setNaturalWidth(Number.isFinite(width) && width > 0 ? width : 0);
-          setSvg(result.svg);
+          const preview = document.createElement('div');
+          preview.className = `mermaid-block mermaid-${theme}`;
+          preview.style.cssText = 'position:fixed;left:-10000px;top:0;visibility:hidden;width:1000px';
+          const canvas = document.createElement('div');
+          canvas.className = 'mermaid-canvas';
+          canvas.innerHTML = result.svg;
+          preview.append(canvas);
+          document.body.append(preview);
+          try {
+            const rendered = canvas.querySelector('svg');
+            if (!rendered) throw new Error('Mermaid returned SVG without a root element');
+            correctRenderedLabelContrast(rendered, getComputedStyle(preview).backgroundColor);
+            const width = Number(rendered.getAttribute('viewBox')?.trim().split(/\s+/)[2]);
+            setNaturalWidth(Number.isFinite(width) && width > 0 ? width : 0);
+            setSvg(rendered.outerHTML);
+          } finally {
+            preview.remove();
+          }
         }
       } catch {
         if (!cancelled) setError('Не удалось отобразить диаграмму. Проверьте исходный Mermaid-код.');
