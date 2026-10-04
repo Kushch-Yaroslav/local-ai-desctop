@@ -31,6 +31,17 @@ use std::sync::{
     Arc, Mutex,
 };
 
+/// What file and terminal tools may act on in this run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolScope {
+    /// No project and no directory named by the user: no execution tools.
+    None,
+    /// Only directories the user named explicitly.
+    Workspace,
+    /// A selected project (optionally plus explicitly named directories).
+    Project,
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub run_id: String,
@@ -40,6 +51,9 @@ pub struct Config {
     pub user: String,
     pub root: Option<String>,
     pub secondary_root: Option<String>,
+    /// Directories the user named explicitly. File tools may use absolute paths
+    /// inside them; without a project the first one is also the terminal's cwd.
+    pub workspace_roots: Vec<String>,
     pub context_limit: usize,
     pub reasoning_mode: String,
     pub supports_reasoning: bool,
@@ -52,6 +66,30 @@ pub struct Config {
     pub cancelled: Arc<AtomicBool>,
     pub steering: Arc<Mutex<Vec<String>>>,
     pub steering_closed: Arc<AtomicBool>,
+}
+
+impl Config {
+    pub fn tool_scope(&self) -> ToolScope {
+        if self.root.is_some() {
+            ToolScope::Project
+        } else if !self.workspace_roots.is_empty() {
+            ToolScope::Workspace
+        } else {
+            ToolScope::None
+        }
+    }
+
+    /// Root of file tools and cwd of the terminal: the selected project, else
+    /// the first directory the user named.
+    fn work_root(&self) -> Option<&str> {
+        self.root
+            .as_deref()
+            .or_else(|| self.workspace_roots.first().map(String::as_str))
+    }
+
+    fn grants(&self) -> Vec<PathBuf> {
+        self.workspace_roots.iter().map(PathBuf::from).collect()
+    }
 }
 
 /// Initial values follow Jan's shape but are deliberately configurable at the
@@ -467,6 +505,24 @@ fn stable_prefix(config: &Config) -> String {
     if let Some(root) = &config.secondary_root {
         prefix.push_str(&format!("\nProject 2 root: {root}. Use project=2 for its tools. Roots are distinct identities; attribute findings to the selected project and do not infer one project's content from the other."));
     }
+    match config.tool_scope() {
+        ToolScope::Project if !config.workspace_roots.is_empty() => {
+            prefix.push_str(&format!(
+                "\nThe user also named these directories explicitly; file tools accept absolute paths inside them: {}.",
+                config.workspace_roots.join(", ")
+            ));
+        }
+        ToolScope::Workspace => {
+            prefix.push_str(&format!(
+                "\nNo project is selected. The user named these directories explicitly: {}. File tools accept absolute paths inside them, and a relative path resolves against the first one. run_terminal starts in the first one. Project knowledge tools are not available.",
+                config.workspace_roots.join(", ")
+            ));
+        }
+        ToolScope::None => {
+            prefix.push_str("\nNo project is selected and the user has not named a directory, so file and terminal tools are not available in this run. If the task needs them, say so and ask the user to name a directory or select a project. Do not claim an action was performed that no tool performed.");
+        }
+        ToolScope::Project => {}
+    }
     prefix
 }
 
@@ -554,7 +610,7 @@ fn emit_knowledge_diagnostics(config: &Config, state: &AgentState) {
     );
 }
 
-fn tool_schemas(has_project_root: bool) -> Vec<Value> {
+fn tool_schemas(scope: ToolScope) -> Vec<Value> {
     // Native tool grammars enumerate object-root properties, not union roots.
     // Action-specific requirements are enforced transactionally at dispatch.
     let mut tools = vec![
@@ -562,7 +618,7 @@ fn tool_schemas(has_project_root: bool) -> Vec<Value> {
         json!({"type":"function","function":{"name":"observation_index","description":"List historical tool observations by stable ID, with source path and outcome metadata. Use source to select the raw observation for the needed file. If more=true, continue at the returned next_offset. Observation IDs start with obs-.","parameters":{"type":"object","properties":{"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":50}}}}}),
         json!({"type":"function","function":{"name":"observation_read","description":"Recover a bounded exact slice of a stored historical tool result by observation ID. The response distinguishes historical evidence from current source and reports whether the source changed.","parameters":{"type":"object","properties":{"id":{"type":"string"},"offset_chars":{"type":"integer","minimum":0},"max_chars":{"type":"integer","minimum":1,"maximum":16000}},"required":["id"]}}}),
     ];
-    if has_project_root {
+    if scope != ToolScope::None {
         tools.extend([
             json!({"type":"function","function":{"name":"apply_patch","description":"Apply a project patch.","parameters":{"type":"object","properties":{"patch":{"type":"string"}},"required":["patch"]}}}),
             json!({"type":"function","function":{"name":"create_file","description":"Create a new project file.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}),
@@ -576,6 +632,10 @@ fn tool_schemas(has_project_root: bool) -> Vec<Value> {
             json!({"type":"function","function":{"name":"write_file","description":"Write a project file.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}),
         ]);
     }
+    if scope == ToolScope::Workspace {
+        // The .ai-framework cache belongs to a selected project.
+        tools.retain(|tool| !tool_name(tool).starts_with("project_knowledge_"));
+    }
     tools.sort_by(|left, right| tool_name(left).cmp(tool_name(right)));
     tools
 }
@@ -583,8 +643,8 @@ fn tool_schemas(has_project_root: bool) -> Vec<Value> {
 /// cannot strand the model behind an approval-only capability. Task Memory and
 /// explicit knowledge reads remain available so analysis has a complete
 /// working contract.
-fn tool_schemas_for_policy(has_project_root: bool, policy: RunPolicy) -> Vec<Value> {
-    let mut tools = tool_schemas(has_project_root);
+fn tool_schemas_for_policy(scope: ToolScope, policy: RunPolicy) -> Vec<Value> {
+    let mut tools = tool_schemas(scope);
     if policy == RunPolicy::Safe {
         tools.retain(|tool| {
             matches!(
@@ -641,8 +701,8 @@ fn user_requests_read_only(user: &str) -> bool {
     .any(|marker| user.contains(marker))
 }
 
-fn tool_schemas_for_request(has_project_root: bool, policy: RunPolicy, user: &str) -> Vec<Value> {
-    let mut tools = tool_schemas_for_policy(has_project_root, policy);
+fn tool_schemas_for_request(scope: ToolScope, policy: RunPolicy, user: &str) -> Vec<Value> {
+    let mut tools = tool_schemas_for_policy(scope, policy);
     if user_requests_read_only(user) {
         tools.retain(|tool| !is_project_side_effect_tool(tool_name(tool)));
     }
@@ -2375,8 +2435,8 @@ fn run_scoped_tool(
         }
         "run_terminal" => {
             let root = config
-                .root
-                .as_ref()
+                .work_root()
+                .map(str::to_owned)
                 .ok_or_else(|| "no project scope".to_owned())?;
             let command = tool
                 .arguments
@@ -2385,7 +2445,7 @@ fn run_scoped_tool(
                 .unwrap_or_default()
                 .to_owned();
             let value = crate::tools::shell::execute(
-                &PathBuf::from(root),
+                &PathBuf::from(&root),
                 &tool.arguments,
                 || config.cancelled.load(Ordering::Relaxed),
                 |pid, pgid, session_id, started_at| {
@@ -2425,12 +2485,19 @@ fn run_scoped_tool(
         }
         name => {
             let root = config
-                .root
-                .as_ref()
+                .work_root()
                 .ok_or_else(|| "no project scope".to_owned())?;
-            let result =
-                crate::tools::filesystem::execute(&PathBuf::from(root), name, &tool.arguments)?;
-            if matches!(name, "read_file" | "list_directory")
+            let grants = config.grants();
+            let result = crate::tools::filesystem::execute_in(
+                &crate::tools::filesystem::Scope {
+                    root: Path::new(root),
+                    grants: &grants,
+                },
+                name,
+                &tool.arguments,
+            )?;
+            if config.root.is_some()
+                && matches!(name, "read_file" | "list_directory")
                 && !user_requests_read_only(&config.user)
             {
                 let _ = crate::tools::knowledge::observe_tool(
@@ -2612,19 +2679,34 @@ fn run_scoped_read_tool(
     let scoped = scoped_tool_config(config, tool)?;
     let config = &scoped;
     let root = config
-        .root
-        .as_ref()
+        .work_root()
         .ok_or_else(|| "no project scope".to_owned())?;
     match tool.name.as_str() {
         "project_knowledge_index" => {
+            let root = config
+                .root
+                .as_ref()
+                .ok_or_else(|| "no project scope".to_owned())?;
             crate::tools::knowledge::index(&PathBuf::from(root)).map(|value| (value, None))
         }
         "project_knowledge_read" => {
+            let root = config
+                .root
+                .as_ref()
+                .ok_or_else(|| "no project scope".to_owned())?;
             crate::tools::knowledge::read(&PathBuf::from(root), &tool.arguments)
                 .map(|value| (value, None))
         }
         "read_file" | "list_directory" => {
-            crate::tools::filesystem::execute(&PathBuf::from(root), &tool.name, &tool.arguments)
+            let grants = config.grants();
+            crate::tools::filesystem::execute_in(
+                &crate::tools::filesystem::Scope {
+                    root: Path::new(root),
+                    grants: &grants,
+                },
+                &tool.name,
+                &tool.arguments,
+            )
         }
         _ => Err(format!("{} is not a safe read-only tool", tool.name)),
     }
@@ -2813,7 +2895,7 @@ pub fn run(config: Config) {
     };
     let stable = stable_prefix(&config);
     transcript.set_secondary_project_root(config.secondary_root.as_deref().map(Path::new));
-    let mut schemas = tool_schemas_for_request(config.root.is_some(), config.policy, &config.user);
+    let mut schemas = tool_schemas_for_request(config.tool_scope(), config.policy, &config.user);
     if config.secondary_root.is_some() {
         for schema in &mut schemas {
             if !matches!(
@@ -3742,7 +3824,7 @@ pub fn run(config: Config) {
                     &tool.name,
                     concise_tool_error(if tool.name == "run_terminal" && tool.arguments.get("command").and_then(Value::as_str).is_some_and(|c| c.contains("git ")) {
                         "approval required for shell composition. For read-only history, retry as one scoped command: git -C <selected-project> log --oneline -30. Do not treat this attempt as evidence of repository history."
-                    } else { "approval required" }),
+                    } else if tool.name == "run_terminal" { "approval required: this command uses shell composition (&&, ||, ;, redirection, substitution, a wrapper) or affects the user session, and it was not run. Run each step as its own simple command; the terminal already starts in the working directory, so cd is not needed. Do not treat this refusal as a result." } else { "approval required" }),
                 );
                 continue;
             }
@@ -4214,6 +4296,7 @@ mod tests {
             user: "audit".into(),
             root: None,
             secondary_root: None,
+            workspace_roots: Vec::new(),
             context_limit: window,
             reasoning_mode: "fast".into(),
             supports_reasoning: true,
@@ -4366,7 +4449,7 @@ mod tests {
 
     #[test]
     fn experimental_toolset_excludes_todo_and_keeps_production_capabilities() {
-        let schemas = tool_schemas(true);
+        let schemas = tool_schemas(ToolScope::Project);
         let names = schemas.iter().map(tool_name).collect::<Vec<_>>();
         assert!(!names.contains(&"todo"));
         for name in [
@@ -4404,7 +4487,7 @@ mod tests {
 
     #[test]
     fn task_memory_schema_exposes_parameters_at_object_root() {
-        let memory = tool_schemas(true)
+        let memory = tool_schemas(ToolScope::Project)
             .into_iter()
             .find(|tool| tool_name(tool) == "task_memory")
             .unwrap();
@@ -4429,7 +4512,7 @@ mod tests {
 
     #[test]
     fn provider_serialization_preserves_declared_tool_parameter_order() {
-        let schemas = tool_schemas(true);
+        let schemas = tool_schemas(ToolScope::Project);
         let payload = json!({"tools": schemas});
         let wire = serde_json::to_string(&payload).unwrap();
         let decoded: Value = serde_json::from_str(&wire).unwrap();
@@ -4536,7 +4619,7 @@ mod tests {
     #[test]
     fn explicit_read_only_request_removes_project_mutations_from_toolset() {
         for prompt in ["Не изменяй файлы.", "Do not modify files."] {
-            let schemas = tool_schemas_for_request(true, RunPolicy::Auto, prompt);
+            let schemas = tool_schemas_for_request(ToolScope::Project, RunPolicy::Auto, prompt);
             let names = schemas.iter().map(tool_name).collect::<Vec<_>>();
             for name in [
                 "apply_patch",
@@ -4560,7 +4643,11 @@ mod tests {
             }
         }
 
-        let writable = tool_schemas_for_request(true, RunPolicy::Auto, "Update the project files.");
+        let writable = tool_schemas_for_request(
+            ToolScope::Project,
+            RunPolicy::Auto,
+            "Update the project files.",
+        );
         assert!(writable.iter().any(|tool| tool_name(tool) == "write_file"));
     }
 

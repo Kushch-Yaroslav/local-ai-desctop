@@ -66,24 +66,52 @@ fn returned_line_range(
     Some((start_line, end_line, starts_mid_line))
 }
 
-fn scoped(root: &Path, path: &str) -> Result<PathBuf, String> {
-    let candidate = root.join(path);
-    let normalized = match fs::canonicalize(&candidate) {
-        Ok(path) => path,
-        Err(_) => {
-            let parent = candidate
-                .parent()
-                .ok_or_else(|| "invalid path".to_owned())?;
-            fs::canonicalize(parent)
-                .map_err(|error| error.to_string())?
-                .join(
-                    candidate
-                        .file_name()
-                        .ok_or_else(|| "invalid path".to_owned())?,
-                )
+/// Where file tools may act: the primary root plus directories the user named
+/// explicitly. Relative paths resolve against the primary root.
+#[derive(Clone, Copy)]
+pub struct Scope<'a> {
+    pub root: &'a Path,
+    pub grants: &'a [PathBuf],
+}
+
+/// Canonicalize the deepest existing ancestor and re-append the components that
+/// do not exist yet, so a file can be created below directories that are about
+/// to be created. A missing tail can never contain `..` or a symlink.
+fn resolve_with_missing_tail(candidate: &Path) -> Result<PathBuf, String> {
+    let mut missing = Vec::new();
+    let mut current = candidate.to_path_buf();
+    loop {
+        match fs::canonicalize(&current) {
+            Ok(mut base) => {
+                base.extend(missing.iter().rev());
+                return Ok(base);
+            }
+            Err(error) => {
+                let Some(name) = current.file_name().map(|name| name.to_owned()) else {
+                    return Err(format!("invalid path: {error}"));
+                };
+                missing.push(name);
+                if !current.pop() {
+                    return Err("invalid path".to_owned());
+                }
+            }
         }
-    };
-    if !normalized.starts_with(root) {
+    }
+}
+
+fn scoped(scope: &Scope, path: &str) -> Result<PathBuf, String> {
+    let root = fs::canonicalize(scope.root).unwrap_or_else(|_| scope.root.to_path_buf());
+    let normalized = resolve_with_missing_tail(&root.join(path))?;
+    let allowed = std::iter::once(root.clone()).chain(
+        scope
+            .grants
+            .iter()
+            .map(|grant| fs::canonicalize(grant).unwrap_or_else(|_| grant.clone())),
+    );
+    if !allowed
+        .into_iter()
+        .any(|allowed| normalized.starts_with(allowed))
+    {
         return Err("path escapes project scope".to_owned());
     }
     Ok(normalized)
@@ -117,13 +145,22 @@ fn is_knowledge_cache(root: &Path, target: &Path) -> bool {
         .is_some_and(|component| component.as_os_str() == ".ai-framework")
 }
 pub fn execute(root: &Path, name: &str, args: &Value) -> Result<(Value, Option<String>), String> {
+    execute_in(&Scope { root, grants: &[] }, name, args)
+}
+
+pub fn execute_in(
+    scope: &Scope,
+    name: &str,
+    args: &Value,
+) -> Result<(Value, Option<String>), String> {
+    let root = scope.root;
     let object = args
         .as_object()
         .ok_or_else(|| "arguments must be an object".to_owned())?;
     let path = object.get("path").and_then(Value::as_str).unwrap_or(".");
     match name {
         "list_directory" => {
-            let target = scoped(root, path)?;
+            let target = scoped(scope, path)?;
             if is_runtime_temporary(root, &target) || is_knowledge_cache(root, &target) {
                 return Err(
                     "internal runtime/cache files are excluded from project discovery".to_owned(),
@@ -145,7 +182,7 @@ pub fn execute(root: &Path, name: &str, args: &Value) -> Result<(Value, Option<S
             Ok((json!({"entries":items,"complete":complete}), None))
         }
         "read_file" => {
-            let target = scoped(root, path)?;
+            let target = scoped(scope, path)?;
             if is_runtime_temporary(root, &target) || is_knowledge_cache(root, &target) {
                 return Err(
                     "internal runtime/cache files are excluded from project discovery".to_owned(),
@@ -221,7 +258,7 @@ pub fn execute(root: &Path, name: &str, args: &Value) -> Result<(Value, Option<S
                 .get("content")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "content is required".to_owned())?;
-            let target = scoped(root, path)?;
+            let target = scoped(scope, path)?;
             let before = fs::read_to_string(&target).unwrap_or_default();
             if name == "create_file" && target.exists() {
                 return Err("file already exists; use write_file".to_owned());
@@ -235,13 +272,13 @@ pub fn execute(root: &Path, name: &str, args: &Value) -> Result<(Value, Option<S
                 Some(format!("--- {path}\n+++ {path}\n-{}\n+{}", before, content)),
             ))
         }
-        "apply_patch" => apply_patch(root, object),
+        "apply_patch" => apply_patch(scope, object),
         "delete_file" => {
             let content = object
                 .get("path")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "path is required".to_owned())?;
-            let target = scoped(root, content)?;
+            let target = scoped(scope, content)?;
             if !target.is_file() {
                 return Err("only regular files can be deleted".to_owned());
             }
@@ -259,7 +296,7 @@ pub fn execute(root: &Path, name: &str, args: &Value) -> Result<(Value, Option<S
 /// untouched because the rewrite happens in memory until the last byte is
 /// validated.
 fn apply_patch(
-    root: &Path,
+    scope: &Scope,
     object: &serde_json::Map<String, Value>,
 ) -> Result<(Value, Option<String>), String> {
     let patch = object
@@ -288,7 +325,7 @@ fn apply_patch(
         }
         if let Some(rel) = header.strip_prefix("*** Add File: ") {
             let rel = rel.trim();
-            let target = scoped(root, rel)?;
+            let target = scoped(scope, rel)?;
             if target.exists() {
                 return Err(format!("file already exists: {rel}"));
             }
@@ -311,7 +348,7 @@ fn apply_patch(
         }
         if let Some(rel) = header.strip_prefix("*** Delete File: ") {
             let rel = rel.trim();
-            let target = scoped(root, rel)?;
+            let target = scoped(scope, rel)?;
             if !target.is_file() {
                 return Err(format!("only regular files can be deleted: {rel}"));
             }
@@ -321,7 +358,7 @@ fn apply_patch(
         }
         if let Some(rel) = header.strip_prefix("*** Update File: ") {
             let rel = rel.trim();
-            let target = scoped(root, rel)?;
+            let target = scoped(scope, rel)?;
             let before =
                 fs::read_to_string(&target).map_err(|e| format!("cannot read {rel}: {e}"))?;
             let body = collect_body(&lines, &mut cursor);
@@ -588,7 +625,10 @@ mod tests {
         ]
         .join("\n");
         let result = apply_patch(
-            &root,
+            &Scope {
+                root: &root,
+                grants: &[],
+            },
             &serde_json::json!({"patch": patch})
                 .as_object()
                 .cloned()
@@ -608,7 +648,10 @@ mod tests {
         assert!(!root.join("src/old.txt").exists());
 
         let bad = apply_patch(
-            &root,
+            &Scope {
+                root: &root,
+                grants: &[],
+            },
             &serde_json::json!({"patch":"*** Begin Patch\n*** Update File: src/a.txt\n-DOES-NOT-EXIST\n+X\n*** End Patch"})
                 .as_object()
                 .cloned()
@@ -667,5 +710,74 @@ mod tests {
         .is_err());
 
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn files_can_be_created_below_directories_that_do_not_exist_yet() {
+        let root = std::env::temp_dir().join(format!("fs-nested-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        execute(
+            &root,
+            "create_file",
+            &json!({"path":"src/components/ui/Board.tsx","content":"x"}),
+        )
+        .unwrap();
+        assert!(root.join("src/components/ui/Board.tsx").is_file());
+        for escape in [
+            "new/../../escape.txt",
+            "../escape.txt",
+            "a/b/../../../escape.txt",
+        ] {
+            assert!(
+                execute(&root, "write_file", &json!({"path":escape,"content":"x"})).is_err(),
+                "{escape}"
+            );
+        }
+        assert!(!root.parent().unwrap().join("escape.txt").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn granted_directories_extend_scope_and_symlinks_cannot_escape_them() {
+        let base = std::env::temp_dir().join(format!("fs-grants-{}", std::process::id()));
+        let (root, granted, other) = (base.join("root"), base.join("granted"), base.join("other"));
+        for dir in [&root, &granted, &other] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let (root, granted, other) = (
+            root.canonicalize().unwrap(),
+            granted.canonicalize().unwrap(),
+            other.canonicalize().unwrap(),
+        );
+        std::os::unix::fs::symlink(&other, granted.join("link")).unwrap();
+        let grants = [granted.clone()];
+        let scope = Scope {
+            root: &root,
+            grants: &grants,
+        };
+        let inside = granted.join("new/ok.txt");
+        execute_in(
+            &scope,
+            "create_file",
+            &json!({"path":inside,"content":"ok"}),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&inside).unwrap(), "ok");
+        for denied in [other.join("x.txt"), granted.join("link/x.txt")] {
+            let error = execute_in(&scope, "write_file", &json!({"path":denied,"content":"no"}))
+                .unwrap_err();
+            assert!(error.contains("escapes"), "{error}");
+        }
+        assert!(!other.join("x.txt").exists());
+        assert!(execute_in(
+            &Scope {
+                root: &root,
+                grants: &[]
+            },
+            "write_file",
+            &json!({"path":inside,"content":"no"})
+        )
+        .is_err());
+        std::fs::remove_dir_all(base).unwrap();
     }
 }

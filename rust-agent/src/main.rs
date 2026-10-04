@@ -66,6 +66,7 @@ fn main() {
                 evidence_dir,
                 task_memory,
                 provider_max_output,
+                workspace_roots,
             } => {
                 if !controls.is_empty() {
                     local_ai_agent_runtime::protocol::emit(
@@ -93,6 +94,7 @@ fn main() {
                         user,
                         root: project_root,
                         secondary_root: secondary_project_root,
+                        workspace_roots,
                         context_limit,
                         reasoning_mode,
                         supports_reasoning,

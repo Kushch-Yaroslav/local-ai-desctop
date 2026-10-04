@@ -82,7 +82,7 @@ export function App() {
   return <div className="app-shell"><Sidebar /><main className="main"><Toolbar /><section ref={conversationRef} onScroll={updateFollowState} className="conversation">
     {error && <p className="attachment-error" role="alert">{error}</p>}
     {generationConversationId && generationConversationId !== activeId && <p role="status">Генерация продолжается в другом чате. Откройте отмеченный чат, чтобы увидеть ход работы или остановить её.</p>}
-    {active?.mode === 'agent' && <div className="agent-notice"><Bot size={17} /> {active.workingDirectory ? 'Файловые инструменты ограничены выбранным проектом; terminal стартует в его корне.' : 'Без выбранного проекта доступны conversation и planning; файловые инструменты и terminal отключены.'}</div>}
+    {active?.mode === 'agent' && <div className="agent-notice"><Bot size={17} /> {active.workingDirectory ? 'Файловые инструменты ограничены выбранным проектом и папками, которые вы назвали в сообщениях; terminal стартует в корне проекта.' : 'Проект не выбран: файловые инструменты и terminal доступны только для папок, абсолютный путь к которым вы укажете в сообщении (terminal стартует в последней названной). Без пути — только рассуждение и планирование.'}</div>}
     {messages.length === 0 && <div className="welcome"><Bot size={34} /><h1>Чем могу помочь?</h1><p>Выберите одну из локальных моделей и начните разговор.</p></div>}
     {messages.map((message) => {
       if (message.role === 'user' && embeddedSteeringIds.has(message.id)) return null;
