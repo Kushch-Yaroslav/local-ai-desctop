@@ -2,9 +2,8 @@ import { createInterface } from 'node:readline';
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { join } from 'node:path';
-import { createHash } from 'node:crypto';
 import { paths } from './paths';
+import { agentEvidenceDir } from './agent-evidence';
 import type { AgentPlan, AgentPlanStepStatus, ChatMessage, ModelTodo, ReasoningMode, StreamEvent, TerminalExecution, ToolActivity, WebMode } from '../../shared/types';
 import { maxOutputTokens } from '../models/model-registry';
 
@@ -156,7 +155,7 @@ export class RustAgentRuntime {
       user: current.user, project_root: projects[0]?.root, secondary_project_root: projects[1]?.root,
       context_limit: contextLimit, reasoning_mode: reasoningMode, supports_reasoning: supportsReasoning, reasoning_options: reasoningOptions, web_mode: webMode, policy: 'auto',
       history: current.prior.filter((message) => !message.agentError && !message.agentCancelled).map((message) => ({ role: message.role, content: message.content })),
-      ...(conversationId ? { evidence_dir: join(paths.userData, 'agent-evidence', createHash('sha256').update(conversationId).digest('hex')) } : {}),
+      ...(conversationId ? { evidence_dir: agentEvidenceDir(paths.userData, conversationId) } : {}),
       ...(persistedTaskMemory ? { task_memory: persistedTaskMemory } : {}),
       provider_max_output: maxOutputTokens,
     };

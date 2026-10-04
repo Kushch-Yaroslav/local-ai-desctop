@@ -2,6 +2,8 @@ import { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
 import type { AgentPlan, AnalysisRun, Attachment, AttachmentKind, AttachmentStatus, ChatMessage, ChatMode, Conversation, GenerationDiagnostics, GenerationStats, LlamaKvCacheType, ProjectReference, ProjectReferenceKind, ReasoningMode, ThinkingTimelineEvent, ToolActivity, WebMode } from '../../shared/types';
 import { paths } from './paths';
+import { isPersistableDiscoveryOption, parseStoredDiscoveryOption } from './context-discovery-persistence';
+import type { ContextDiscoveryOption } from '../../shared/context-estimator';
 
 type ConversationRow = {
   id: string; title: string; model_id: string | null; mode: ChatMode; working_directory: string | null;
@@ -129,6 +131,11 @@ export class Database {
         finish_reason TEXT NOT NULL, prompt_eval_count INTEGER, prompt_eval_duration INTEGER,
         eval_count INTEGER, eval_duration INTEGER, tokens_per_second REAL, prompt_tokens_per_second REAL,
         time_to_first_token_ms REAL, created_at TEXT NOT NULL
+      ) STRICT;
+      CREATE TABLE IF NOT EXISTS context_discoveries (
+        config_key TEXT NOT NULL, kv_cache_type TEXT NOT NULL, kv_offload INTEGER NOT NULL, model_id TEXT NOT NULL,
+        context_window INTEGER NOT NULL, option TEXT NOT NULL, identity TEXT NOT NULL, saved_at TEXT NOT NULL,
+        PRIMARY KEY (config_key, kv_cache_type, kv_offload)
       ) STRICT;
       CREATE INDEX IF NOT EXISTS generation_diagnostics_conversation_idx ON generation_diagnostics(conversation_id, created_at DESC);
     `);
@@ -361,7 +368,10 @@ export class Database {
     this.db.prepare('DELETE FROM attachments WHERE message_id IN (SELECT id FROM messages WHERE conversation_id=? AND rowid>?)').run(target.conversation_id, target.rowid);
     this.db.prepare('DELETE FROM project_references WHERE message_id IN (SELECT id FROM messages WHERE conversation_id=? AND rowid>?)').run(target.conversation_id, target.rowid);
     this.db.prepare('DELETE FROM messages WHERE conversation_id=? AND rowid>?').run(target.conversation_id, target.rowid);
-    this.db.prepare('UPDATE conversations SET updated_at=? WHERE id=?').run(new Date().toISOString(), target.conversation_id);
+    // Task Memory and the context meter describe the dropped attempt. Their
+    // evidence lives only in that attempt, so they are discarded with it.
+    this.db.prepare('DELETE FROM agent_plans WHERE conversation_id=?').run(target.conversation_id);
+    this.db.prepare('UPDATE conversations SET context_tokens=NULL, context_model_id=NULL, updated_at=? WHERE id=?').run(new Date().toISOString(), target.conversation_id);
     if (commit) this.db.exec('COMMIT');
     return this.listMessages(target.conversation_id);
   }
@@ -407,6 +417,41 @@ export class Database {
       if (activity.kind !== 'progress') this.db.prepare('UPDATE analysis_runs SET action_count=action_count+1 WHERE id=?').run(runId);
     }
     return this.getAnalysisRun(runId)!;
+  }
+
+  /** A run still `running` when the process starts was killed mid-flight: no
+   * live generation can own it. Marking it keeps it distinguishable from a
+   * completed or cancelled run. Its Task Memory and evidence are retained. */
+  recoverInterruptedRuns(): number {
+    return Number(this.db.prepare("UPDATE analysis_runs SET status='interrupted', completed_at=? WHERE status='running'").run(new Date().toISOString()).changes);
+  }
+
+  /** The last successful Max Context result per stable configuration and KV mode. Only
+   * complete, valid options are written, all-or-nothing, so a failed run never reaches here. */
+  saveContextDiscoveryOptions(configKey: string, identity: string, options: readonly ContextDiscoveryOption[]): number {
+    const valid = options.filter((option) => isPersistableDiscoveryOption(option));
+    if (!valid.length) return 0;
+    const statement = this.db.prepare('INSERT OR REPLACE INTO context_discoveries (config_key, kv_cache_type, kv_offload, model_id, context_window, option, identity, saved_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+    const savedAt = new Date().toISOString();
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const option of valid) {
+        const persisted: Partial<ContextDiscoveryOption> = { ...option };
+        delete persisted.restored;
+        statement.run(configKey, option.kvCacheType, option.kvOffload ? 1 : 0, option.modelId, option.contextWindow, JSON.stringify(persisted), identity, savedAt);
+      }
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+    return valid.length;
+  }
+
+  /** Rows that fail validation are ignored rather than trusted or thrown. */
+  loadContextDiscoveryOptions(configKey: string, modelId: string, hardLimit?: number): ContextDiscoveryOption[] {
+    const rows = this.db.prepare('SELECT kv_cache_type, kv_offload, option FROM context_discoveries WHERE config_key=? AND model_id=?').all(configKey, modelId) as unknown as Array<{ kv_cache_type: string; kv_offload: number; option: string }>;
+    return rows.flatMap((row) => parseStoredDiscoveryOption(row.option, { modelId, kvCacheType: row.kv_cache_type, kvOffload: row.kv_offload === 1, hardLimit }) ?? []);
   }
 
   finishAnalysisRun(runId: string, status: AnalysisRun['status'], assistantMessageId: string | null): AnalysisRun {

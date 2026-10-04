@@ -294,7 +294,7 @@ export interface AnalysisRun {
   conversationId: string;
   assistantMessageId: string | null;
   reasoningMode: ReasoningMode;
-  status: 'running' | 'completed' | 'error' | 'cancelled';
+  status: 'running' | 'completed' | 'error' | 'cancelled' | 'interrupted';
   actionCount: number;
   actions: ToolActivity[];
   createdAt: string;
@@ -346,7 +346,7 @@ export interface LocalAiApi {
   hardware: { get(): Promise<HardwareStats> };
   contextEstimate(modelId: string): Promise<RuntimeContextEstimate>;
   contextDiscover(modelId: string): Promise<ContextDiscoveryResult>;
-  contextDiscoveryStatus(): Promise<import('./context-estimator').ContextDiscoveryProgress>;
+  contextDiscoveryStatus(modelId?: string | null): Promise<import('./context-estimator').ContextDiscoveryProgress>;
   dialog: { chooseDirectory(initialDirectory?: string | null): Promise<string | null> };
   chat: {
     send(request: ChatRequest): Promise<void>;

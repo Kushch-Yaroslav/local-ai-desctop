@@ -29,6 +29,26 @@ export function parseNvidiaMemorySnapshot(text: string) {
     vramAvailableBytes: free * 1024 ** 2, gpuUtilization: utilization };
 }
 
+export function parseNvidiaGpuIdentity(text: string): { name: string; vramTotalBytes: number } | null {
+  const rows = text.trim().split(/\r?\n/);
+  if (rows.length !== 1) return null;
+  const separator = rows[0].lastIndexOf(',');
+  const name = rows[0].slice(0, separator).trim();
+  const total = Number(rows[0].slice(separator + 1));
+  return separator > 0 && name && Number.isFinite(total) && total > 0 ? { name, vramTotalBytes: total * 1024 ** 2 } : null;
+}
+
+let gpuIdentity: { name: string; vramTotalBytes: number } | null = null;
+/** Model name and total VRAM only: stable across restarts, unlike used/free memory. Cached once found. */
+export async function getGpuIdentity(): Promise<{ name: string; vramTotalBytes: number }> {
+  if (gpuIdentity) return gpuIdentity;
+  const { stdout } = await execFileAsync('nvidia-smi', ['--query-gpu=name,memory.total', '--format=csv,noheader,nounits'], { timeout: 2_000 });
+  const parsed = parseNvidiaGpuIdentity(stdout);
+  if (!parsed) throw new Error('GPU identity unavailable.');
+  gpuIdentity = parsed;
+  return parsed;
+}
+
 export async function getHardwareStats(): Promise<HardwareStats> {
   const memory = await readFile('/proc/meminfo', 'utf8');
   const fields = Object.fromEntries([...memory.matchAll(/^(MemTotal|MemAvailable):\s+(\d+) kB$/gm)].map(([, key, value]) => [key, Number(value) * 1024]));

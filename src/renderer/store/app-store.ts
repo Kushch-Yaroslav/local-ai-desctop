@@ -119,6 +119,7 @@ export const useAppStore = create<State>((rawSet, rawGet) => {
   const regenerateSavedBranch = async (saved: ChatMessage[], errorMessage: string, activeId: string): Promise<boolean> => {
     const chat = get().conversations.find((item) => item.id === activeId); const model = chat?.modelId ?? get().models[0]?.id;
     if (!activeId || !chat || !model) return false;
+    set((state) => ({ conversations: state.conversations.map((item) => item.id === activeId ? { ...item, contextTokens: null, contextModelId: null } : item) }));
     const generationId = crypto.randomUUID(); const streaming: ChatMessage = { id: assistantId(generationId), conversationId: activeId, role: 'assistant', content: '', createdAt: now() };
     withView(activeId, () => set({ messages: [...saved, streaming], isGenerating: true, generationId, generationConversationId: activeId, generationState: 'thinking', error: null, toolActivities: [], toolActivityCount: 0, analysisProgress: [], lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false, steeringStatus: null, agentTelemetry: { turn: 0, inputTokens: 0, outputTokens: 0, actions: 0, startedAt: now() } }));
     try { await window.localAi.chat.send({ conversationId: activeId, model, mode: chat.mode, messages: saved, generationId, persistUserMessage: false }); }
