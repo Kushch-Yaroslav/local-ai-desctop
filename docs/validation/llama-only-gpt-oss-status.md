@@ -1,4 +1,129 @@
-# Llama-only / GPT-OSS paused validation handoff
+# Llama-only / GPT-OSS validation record
+
+## Resumed investigation: demonstrated generic cause and targeted pass
+
+The 2026-10-04 continuation first verified a clean
+`feat/llama-only-gpt-oss` at
+`440940dcb0853b30b0fc429d7bfa69249d603224`, with `v2-migration` still at the
+preservation merge. The earlier pause handoff below is historical, not the
+current GPT-OSS result.
+
+Three controlled requests used equal seed 42, temperature 0, output budget
+2048, reasoning high, and the same eight-field Task Memory operation.
+Changing only the schema property order with the same user instruction
+changed the actual result:
+
+| Control | Actual tool argument fields |
+| --- | --- |
+| Alphabetically serialized schema, action/ID/finding/evidence instruction | action, ID, next, status, supersedes; finding/evidence/implication missing |
+| Same schema, instruction following its alphabetical grammar order | all eight fields |
+| Declaration-ordered schema, original instruction unchanged | all eight fields |
+
+The native server log records different `tool-task-memory-schema` optional
+branches for the sorted and declaration-ordered schemas. In
+`common/json-schema-to-grammar.cpp::_build_object_rule`, selecting `id` from
+the alphabetical optional-property branch excludes earlier `finding` and
+`evidence` fields. The app's default serde_json map had alphabetized a schema
+declared as `action, id, finding, evidence, implication, next, supersedes,
+status`. These probes establish an actual generic serialization/native
+grammar interoperability defect; the cause is no longer inferred merely
+from the model's final answer or its reasoning text.
+
+The fix enables serde_json `preserve_order`, retaining declaration order in
+provider schemas. No field is forced, tool contract changed, turn limit
+raised, error suppressed, or model name inspected. A regression exercises
+serialized/deserialized provider tool metadata for Task Memory and
+`read_file`. History hashes explicitly sort recursively, retaining the old
+persisted lineage identity despite order-preserving wire serialization;
+a deterministic test checks the exact legacy sorted bytes and reordered
+equivalent history.
+The coherent generic fix commit is
+`5ac169fde81d2e5d48af7f74d7ab245d84aecbd3`; it preserves the earlier
+transactional evidence-invariant commit
+`b8d9fffea8a06007b51ad29cd893bd8868ccef10`.
+
+The rebuilt primary sidecar is SHA-256
+`18eac6b26ecdd4b616300ce8e67f7f46a64c7bea2bd762effac6d58d9ec332af`,
+mtime `2026-10-04T11:40:29.131Z`; live `/proc` identity matches the on-disk
+primary executable. Rust passed 119 unit and 18 integration tests, fmt and
+diff checks. Targeted TypeScript typecheck, Rust bridge, llama backend, and
+database tests also passed.
+
+GPT-OSS rerun `revised-gpt-oss-20b-deep-1791114051394` completed naturally in
+39 turns / 38 calls, with two accepted Confirmed memory mutations, revision
+2, zero malformed Task Memory calls, no compaction or lifecycle finalization
+transition, six tools still available at the final request, and exactly one
+complete final. Eight explicit recoverable errors were six out-of-range
+end-line requests, one unchanged repeat read, and one nonmatching read-only
+grep. Fast completed in eight turns / seven calls. Chat Fast/Deep streaming,
+reasoning separation, Chat/Agent cancellation, idle slots, and one-turn
+persisted Confirmed-memory replay passed. The server was stopped afterward.
+No benchmark source/user DB changes were made.
+
+The latest final still overstates a concurrency risk: source has an explicit
+`activeGenerations.size` admission guard. Valid observation references and
+accepted Confirmed status are not semantic proof. Model-quality limitations
+remain documented separately from the now-passing GPT runtime gate.
+All 15 references in the final saved memory resolve to actual canonical
+observations and were delivered in role-tool messages; the archived
+`evidence-support-proof.json` records their source/revision/call identities.
+Four references are successful read-only grep results rather than file-read
+excerpts: observations 14, 26, 28 and 34. Observation 14 contains only the
+shutdown function's declaration at line 309, not its entire body through
+line 360 as the final implies. A null source field on a terminal observation
+does not mean the operation failed. The structural validator must not be
+mistaken for semantic source verification.
+
+Retained new evidence:
+`revised-live/gpt-oss/resume-schema-order-controls.json`,
+`forensics-ordered.jsonl`, `validation-ordered/`, and
+`forensics-ordered-replay.jsonl` under the persistent evidence root below.
+The scratch live gate now checks actual finalization lifecycle transitions
+and tool availability, not just the misleading `request_policy.phase`.
+
+Since generic serialization changes native schemas for all models, affected
+Qwen/GLM live regressions were rerun after GPT-OSS passed. Their previously
+passed runs are retained and not invalidated retroactively.
+
+The affected Qwen rerun passed: Deep 36 turns / 45 calls, seven memory
+updates, two compactions, four explicit recoverable errors, one natural
+complete final, no finalization transition and six tools available. Fast
+completed in 14 turns / 15 calls without errors; Chat/cancellation and
+one-turn persisted-memory replay passed. Run ID:
+`revised-qwen3-8-27b-q4_K_M-deep-1791114229451`.
+Actual latest launcher settings were F16 K/V and F16 draft cache, MTP, 32K,
+with 4,481 MiB VRAM free while loaded, rather than the earlier Q8_0 run.
+The primary sidecar matched SHA `18eac6b...` live; llama-server matched
+`d7061d...`. Exact args/provenance are in `runtime-provenance-ordered.json`.
+Cleanup verified PIDs 12092/12161 gone and port 18081 closed.
+
+The affected GLM rerun passed: Deep 89 turns / 98 calls, 15 memory updates,
+two compactions, eight recoverable errors plus three blocked approvals,
+one natural complete final, no finalization transition and six tools
+available. Five errors were the existing two-writes-per-turn cap; each
+rejected call left memory unchanged. Other errors were a missing path, one
+exact-repeat read, and a grep with no matches. Fast completed in 16 turns /
+45 calls with eight recoverable errors. Chat/cancellation and one-turn
+persisted-memory replay passed. Run ID:
+`revised-glm-4-7-flash-q4_k-deep-1791115333376`.
+An initial scratch bootstrap attempt exited before any model request because
+HTTP health preceded ready-state publication; its log is retained as
+`regression-ordered.log`. After verifying the actual ready state, the matrix
+completed in `regression-ordered-ready.log`. No application change was made
+for this harness timing issue.
+
+All three actual request traces expose the same object-root, declaration-
+ordered schema. Each completed with one final, correct tool/result pairing,
+separate reasoning/content, and no Agent error. Known failed observations
+and approvals remain explicit model-visible outcomes, never successful
+source reads. All owned servers and sidecars are now stopped; GLM
+PIDs 14458/14528 are gone, port 18081 is closed, and GPU usage returned to
+892 MiB. User DB checksum remains `6cab1245...`.
+
+Final production build, merged-branch regressions, and conditional V2
+merge/push remain pending at this checkpoint.
+
+## Historical pause handoff (superseded where noted above)
 
 Work was paused at the user's request on 2026-10-04. No feature merge, push,
 or release approval has occurred. Do not treat a single `finish_reason=stop`
