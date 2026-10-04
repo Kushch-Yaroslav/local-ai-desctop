@@ -120,9 +120,8 @@ Findings:
   (`reasoning_effort: low` plus `enable_thinking: false`) Fast took 14–21 turns
   and 29–51 calls in 220–235 s, versus 6–8 turns and 24–30 calls in ~180 s
   with the old Fast options (`reasoning_effort: low`, thinking left on). The
-  profile entry is shared with plain Chat, so it was not changed here. It is
-  the likely cause if Fast feels slower or noisier, and a candidate for a
-  separate change.
+  profile entry is shared with plain Chat. This was fixed afterwards: see
+  "Fast reasoning" below.
 - GLM Deep/Fast and GPT-OSS Deep/Fast completed normally on this build.
 
 ## Interrupted runs and Regenerate
@@ -175,3 +174,17 @@ reused for a different model, build, flags or hardware.
   one is selected, so a stale value is rejected instead of started.
 - Nothing is probed automatically. The Max button remains a manual
   recalibration, and selecting a restored value remains a manual action.
+
+## Fast reasoning
+
+Reasoning is a model setting; Fast and Deep are agent strategies. Both modes keep
+model thinking on:
+
+| Mode | Model reasoning (`llama-runtime-policy.ts` profile) | Agent strategy |
+|---|---|---|
+| Fast | thinking on, `reasoning_effort: low` | Fast guidance |
+| Deep | thinking on, strongest effort the model supports | Deep guidance + checkpoints |
+
+Only the final tool-free turn (`final`) disables thinking. A regression test
+iterates every runtime profile and fails if Fast or Deep disable thinking or use a
+no-reasoning effort. Models without a profile entry send no reasoning options.
