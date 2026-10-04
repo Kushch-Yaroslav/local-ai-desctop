@@ -1161,3 +1161,63 @@ fn execution_tool_calls_and_results_are_persisted_as_matched_pairs() {
     assert_eq!(calls.len(), 1, "{journal:?}");
     assert_eq!(calls, results, "a tool call has no persisted result");
 }
+
+fn tree(root: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    let mut files = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                files.push((
+                    path.strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    std::fs::read(&path).unwrap(),
+                ));
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+/// Reading a reference project (Project 2) must leave it byte-identical:
+/// passive knowledge caching is limited to the primary project.
+#[test]
+fn reading_the_secondary_project_never_modifies_it_while_writes_land_in_the_primary() {
+    let fixture = Workspace::new(&[("a.txt", "primary")]);
+    let secondary = fixture.base.join("reference");
+    std::fs::create_dir_all(secondary.join("src")).unwrap();
+    std::fs::write(secondary.join("src/theme.css"), ":root{--c:#0a0}").unwrap();
+    std::fs::write(secondary.join("index.html"), "<html></html>").unwrap();
+    let before = tree(&secondary);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Tools(vec![
+            ("list_directory", json!({"path":".","project":2})),
+            ("read_file", json!({"path":"src/theme.css","project":2})),
+            ("project_knowledge_index", json!({"project":2})),
+        ]),
+        1 => Reply::Tools(vec![(
+            "create_file",
+            json!({"path":"theme.css","content":":root{--c:#0a0}","project":1}),
+        )]),
+        _ => Reply::Text("done".into()),
+    });
+    let mut config = fixture.config(&provider.endpoint, "adapt the reference theme");
+    config.secondary_root = Some(secondary.to_string_lossy().into_owned());
+    run(config);
+    assert_eq!(
+        tree(&secondary),
+        before,
+        "the reference project was modified"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("theme.css")).unwrap(),
+        ":root{--c:#0a0}"
+    );
+    assert!(completed(&fixture.journal()));
+}

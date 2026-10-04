@@ -2300,6 +2300,35 @@ fn request_shape(messages: &[Value]) -> Vec<String> {
         .collect()
 }
 
+/// Project 2 is a reference the user may only want to read. Passive knowledge
+/// caching writes into the project's `.ai-framework`, so it is limited to the
+/// primary project; an explicit `project_knowledge_update` stays the model's choice.
+fn targets_secondary_project(tool: &ValidatedCall) -> bool {
+    tool.arguments.get("project").and_then(Value::as_u64) == Some(2)
+}
+
+/// A reference project without a knowledge cache stays that way: the knowledge
+/// tools would otherwise create `.ai-framework` in it just to answer "nothing here".
+fn absent_reference_knowledge(config: &Config, tool: &ValidatedCall) -> Option<Value> {
+    if !targets_secondary_project(tool)
+        || !matches!(
+            tool.name.as_str(),
+            "project_knowledge_index" | "project_knowledge_read"
+        )
+    {
+        return None;
+    }
+    let root = config.root.as_deref()?;
+    if Path::new(root).join(".ai-framework").exists() {
+        return None;
+    }
+    Some(json!({
+        "exists": false,
+        "entries": [],
+        "message": "Project 2 has no knowledge cache and the runtime does not create one in a reference project. Read its files directly."
+    }))
+}
+
 fn scoped_tool_config(config: &Config, tool: &ValidatedCall) -> Result<Config, String> {
     let slot = match tool.arguments.get("project") {
         None => 1,
@@ -2363,6 +2392,9 @@ fn run_scoped_tool(
 ) -> Result<(Value, Option<String>), String> {
     let scoped = scoped_tool_config(config, tool)?;
     let config = &scoped;
+    if let Some(absent) = absent_reference_knowledge(config, tool) {
+        return Ok((absent, None));
+    }
     match tool.name.as_str() {
         "project_knowledge_index" => {
             let root = config
@@ -2497,6 +2529,7 @@ fn run_scoped_tool(
                 &tool.arguments,
             )?;
             if config.root.is_some()
+                && !targets_secondary_project(tool)
                 && matches!(name, "read_file" | "list_directory")
                 && !user_requests_read_only(&config.user)
             {
@@ -2678,6 +2711,9 @@ fn run_scoped_read_tool(
 ) -> Result<(Value, Option<String>), String> {
     let scoped = scoped_tool_config(config, tool)?;
     let config = &scoped;
+    if let Some(absent) = absent_reference_knowledge(config, tool) {
+        return Ok((absent, None));
+    }
     let root = config
         .work_root()
         .ok_or_else(|| "no project scope".to_owned())?;
@@ -2722,6 +2758,9 @@ fn record_safe_read_effect(
         return;
     };
     let config = &scoped;
+    if absent_reference_knowledge(config, tool).is_some() {
+        return;
+    }
     match tool.name.as_str() {
         "project_knowledge_index" | "project_knowledge_read" => {
             if tool.name == "project_knowledge_read" {
@@ -2747,7 +2786,7 @@ fn record_safe_read_effect(
             emit_knowledge_diagnostics(config, state);
         }
         "read_file" | "list_directory" => {
-            if !user_requests_read_only(&config.user) {
+            if !user_requests_read_only(&config.user) && !targets_secondary_project(tool) {
                 if let Some(root) = config.root.as_deref() {
                     let _ = crate::tools::knowledge::observe_tool(
                         &PathBuf::from(root),
