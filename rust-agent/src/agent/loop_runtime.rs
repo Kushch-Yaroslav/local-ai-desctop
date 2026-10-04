@@ -4428,6 +4428,55 @@ mod tests {
     }
 
     #[test]
+    fn provider_serialization_preserves_declared_tool_parameter_order() {
+        let schemas = tool_schemas(true);
+        let payload = json!({"tools": schemas});
+        let wire = serde_json::to_string(&payload).unwrap();
+        let decoded: Value = serde_json::from_str(&wire).unwrap();
+        let memory = decoded["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool_name(tool) == "task_memory")
+            .unwrap();
+        // Native JSON grammars allow optional fields only in declaration order.
+        // Sorting these keys moves finding/evidence before the model's entry ID.
+        assert_eq!(
+            memory["function"]["parameters"]["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            [
+                "action",
+                "id",
+                "finding",
+                "evidence",
+                "implication",
+                "next",
+                "supersedes",
+                "status"
+            ]
+        );
+        let read = decoded["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool_name(tool) == "read_file")
+            .unwrap();
+        assert_eq!(
+            read["function"]["parameters"]["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["path", "start_line", "end_line", "offset_chars"]
+        );
+    }
+
+    #[test]
     fn task_memory_rejects_invalid_actions_and_missing_fields_without_mutation() {
         let mut state = AgentState::default();
         apply_task_memory(

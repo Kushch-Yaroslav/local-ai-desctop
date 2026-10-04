@@ -159,9 +159,12 @@ pub struct EvidenceStore {
 }
 
 pub fn history_hash(history: &[Value]) -> String {
+    let mut canonical = Value::Array(history.to_vec());
+    // Persisted lineage hashes predate order-preserving tool schema serialization.
+    canonical.sort_all_objects();
     format!(
         "{:x}",
-        Sha256::digest(serde_json::to_vec(history).unwrap_or_default())
+        Sha256::digest(serde_json::to_vec(&canonical).unwrap_or_default())
     )
 }
 
@@ -609,6 +612,22 @@ fn safe_name(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_hash_preserves_legacy_sorted_object_identity() {
+        let history = vec![serde_json::json!({
+            "role": "assistant",
+            "content": "saved",
+            "metadata": {"z": 1, "a": 2}
+        })];
+        let legacy = br#"[{"content":"saved","metadata":{"a":2,"z":1},"role":"assistant"}]"#;
+        assert_eq!(
+            history_hash(&history),
+            format!("{:x}", Sha256::digest(legacy))
+        );
+        let reordered: Vec<Value> = serde_json::from_slice(legacy).unwrap();
+        assert_eq!(history_hash(&history), history_hash(&reordered));
+    }
 
     #[test]
     fn chunked_observation_records_its_line_range_and_partial_boundaries() {

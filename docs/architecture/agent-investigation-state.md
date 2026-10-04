@@ -24,6 +24,16 @@ Runtime validation remains authoritative: `action` is required, record/update
 needs a nonempty string `finding`, and invalidate needs a known `id`.
 Malformed calls return recoverable errors without memory mutation.
 
+Schema property order is preserved through JSON serialization. Native JSON
+tool grammars allow optional properties in their declared order, not arbitrary
+permutations. Sorting the declared `action, id, finding, evidence, ...` schema
+alphabetically made `finding` and `evidence` unavailable after an `id` field
+was generated. Equal-setting llama.cpp probes reproduced missing fields with
+the sorted schema and complete fields with the declaration-ordered schema.
+This is wire-schema interoperability, not model-specific memory enforcement.
+Durable history hashes still canonicalize object keys to preserve preexisting
+conversation lineage identities.
+
 An effective `confirmed` status requires nonempty `evidence` with a resolvable
 observation ID or an exact source path present in the transcript's observation
 store (including cited paths with spaces or Unicode). Paths must match at
