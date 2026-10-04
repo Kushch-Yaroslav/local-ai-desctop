@@ -3,6 +3,7 @@ import { createServer, type Server } from 'node:http';
 import { once } from 'node:events';
 import { LlamaCppBackend, LlamaCppContextExhaustedError, LlamaCppRequestError, validateLlamaMessageSequence } from './llama-cpp-backend';
 import type { ToolMessage } from './types';
+import { llamaRuntimeProfiles } from '../models/llama-runtime-policy';
 import type { ChatMessage } from '../../shared/types';
 
 const model = 'qwen3.8:27b-q4_K_M';
@@ -61,6 +62,18 @@ const toolSchema = [{ type: 'function', function: { name: 'read_file', descripti
 const call = (backend: LlamaCppBackend, messages: ToolMessage[], tools: unknown[] | undefined = toolSchema) => backend.chatWithTools(model, messages, tools, new AbortController().signal, 65_536, 'deep');
 
 export async function runLlamaCppBackendRegression(): Promise<void> {
+  // Fast and Deep both keep model thinking on; they differ in effort. Only the final tool-free turn may turn thinking off.
+  for (const profile of llamaRuntimeProfiles) {
+    const options = profile.reasoningOptions;
+    if (!options) continue;
+    for (const mode of ['fast', 'deep'] as const) {
+      const kwargs = options[mode]?.chat_template_kwargs as { enable_thinking?: boolean } | undefined;
+      assert.notEqual(kwargs?.enable_thinking, false, `${profile.id} ${mode} must not disable thinking`);
+      assert.notEqual(options[mode]?.reasoning_effort, 'none', `${profile.id} ${mode} must not use no-reasoning effort`);
+    }
+    assert.equal(options.fast?.reasoning_effort, 'low', `${profile.id} Fast must use low reasoning effort`);
+    assert.notEqual(options.deep?.reasoning_effort, options.fast?.reasoning_effort, `${profile.id} Deep must differ from Fast`);
+  }
   {
     const scenario: Scenario = { serverContext: 16_384, trainContext: 262_144, modelSize: 16_799_719_424, requestBodies: [], countBodies: [] }; const { server, url } = await startServer(scenario);
     try {
@@ -111,7 +124,7 @@ export async function runLlamaCppBackendRegression(): Promise<void> {
       assert.equal(response.response.thinking, 'Choose tool. ', 'streamed reasoning was not assembled');
       assert.deepEqual(response.response.tool_calls?.map((call) => [call.id, call.function.name, call.function.arguments]), [['call-write', 'write_file', '{"path":"a.txt","content":"x"}'], ['call-read', 'read_file', '{"path":"b.txt"}']], 'fragmented native tool calls were not assembled in index order');
       assert.equal(scenario.requestBodies[0].stream, true, 'Agent tool inference did not request streaming');
-      assert.deepEqual(scenario.requestBodies[0].chat_template_kwargs, { enable_thinking: false }, 'Qwen fast execution turn did not disable template thinking');
+      assert.deepEqual(scenario.requestBodies[0].chat_template_kwargs, { enable_thinking: true }, 'Qwen fast execution turn must keep template thinking enabled');
       assert.equal(events.filter((event) => event.type === 'tool_call_delta').length, 3, 'tool deltas were not exposed for telemetry');
     } finally { await stop(server); }
   }
@@ -213,8 +226,8 @@ export async function runLlamaCppBackendRegression(): Promise<void> {
       await backend.chatWithTools(glm, baseMessages('GLM deep'), toolSchema, new AbortController().signal, 65_536, 'deep');
       assert.equal(scenario.requestBodies[0].reasoning_effort, undefined, 'GLM Auto should leave native reasoning at the model default');
       assert.equal(scenario.requestBodies[0].chat_template_kwargs, undefined, 'GLM Auto should not override template thinking');
-      assert.deepEqual(scenario.requestBodies[1].chat_template_kwargs, { enable_thinking: false }, 'GLM fast request did not disable native thinking');
-      assert.equal(scenario.requestBodies[1].reasoning_effort, 'none', 'GLM fast request did not use llama.cpp\'s native no-reasoning setting');
+      assert.deepEqual(scenario.requestBodies[1].chat_template_kwargs, { enable_thinking: true }, 'GLM fast request must keep native thinking enabled');
+      assert.equal(scenario.requestBodies[1].reasoning_effort, 'low', 'GLM fast request must use low reasoning effort');
       assert.deepEqual(scenario.requestBodies[2].chat_template_kwargs, { enable_thinking: true }, 'GLM deep request did not enable native thinking');
       assert.equal(scenario.requestBodies[2].reasoning_effort, 'xhigh', 'GLM deep request did not use llama.cpp\'s native high-reasoning setting');
     } finally { await stop(server); }
