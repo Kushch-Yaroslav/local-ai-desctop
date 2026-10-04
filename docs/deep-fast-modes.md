@@ -188,3 +188,20 @@ model thinking on:
 Only the final tool-free turn (`final`) disables thinking. A regression test
 iterates every runtime profile and fails if Fast or Deep disable thinking or use a
 no-reasoning effort. Models without a profile entry send no reasoning options.
+
+## Effective modes in the Context panel
+
+The Context popover shows the **effective** Reasoning (Fast/Deep) and Mode
+(Chat/Agent), not the raw selector value. Effective means the last value the main
+process confirmed in the stored conversation, which is what the next request
+uses. A selection that has been sent but not confirmed is shown separately as
+`→ Deep` and is never presented as active. For a model without configurable
+reasoning the panel shows `—`. If llama.cpp is starting or serving a different
+model the panel adds a runtime line.
+
+Switching Reasoning, Mode, Web or Project does not touch llama.cpp. These
+`conversations:update` patches no longer wait for (or get refused by) a runtime
+switch, and a refused patch rolls back only its own keys. Previously a selection
+made while a runtime switch was in flight was refused with "wait for runtime
+switching" and the renderer restored an older whole-conversation snapshot, which
+showed as Deep jumping back to Fast.
