@@ -1,4 +1,5 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
+import { useShallow } from 'zustand/react/shallow';
 import { useAppStore } from '../store/app-store';
 import { formatContextTokens } from '../../shared/context-format';
 import { effectiveModes } from '../../shared/conversation-settings';
@@ -15,15 +16,25 @@ function Stat({ label, value, hint }: { label: string; value: string; hint?: str
 
 export function ContextUsage({ initiallyOpen = false }: { initiallyOpen?: boolean } = {}) {
   const [open, setOpen] = useState(initiallyOpen);
-  const { conversations, activeId, activeContextWindow, agentTelemetry, models, settings, modeTransitions } = useAppStore();
+  const { conversations, activeId, activeContextWindow, agentTelemetry, models, settings, modeTransitions } = useAppStore(useShallow((state) => ({ conversations: state.conversations, activeId: state.activeId, activeContextWindow: state.activeContextWindow, agentTelemetry: state.agentTelemetry, models: state.models, settings: state.settings, modeTransitions: state.modeTransitions })));
   const chat = conversations.find((item) => item.id === activeId);
+  // Elapsed time advances on its own. The ticker lives here, runs only while the popover is open during a run, and
+  // re-renders only this component; it never goes through the store.
+  const running = Boolean(agentTelemetry && !agentTelemetry.finishedAt);
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!open || !running) return undefined;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [open, running]);
   if (!chat) return null;
   const maximum = activeContextWindow ?? chat.contextWindow;
   const current = chat.contextModelId === chat.modelId ? chat.contextTokens : null;
   const used = Math.min(current ?? 0, maximum); const percent = current === null ? 0 : Math.min(100, used / maximum * 100);
   const tone = percent >= 90 ? 'danger' : percent >= 80 ? 'warning' : percent >= 60 ? 'cool' : 'calm';
   const status = current === null ? 'Будет измерен после следующего ответа модели.' : percent >= 100 ? 'Старые сообщения уже начинают вытесняться.' : 'После достижения лимита самые ранние сообщения начнут вытесняться.';
-  const elapsed = agentTelemetry ? Math.max(0, Math.round(((agentTelemetry.finishedAt ? new Date(agentTelemetry.finishedAt).getTime() : Date.now()) - new Date(agentTelemetry.startedAt).getTime()) / 1000)) : null;
+  const elapsed = agentTelemetry ? Math.max(0, Math.round(((agentTelemetry.finishedAt ? new Date(agentTelemetry.finishedAt).getTime() : now) - new Date(agentTelemetry.startedAt).getTime()) / 1000)) : null;
   const cachedTokens = agentTelemetry?.cachedTokens;
   const cacheRate = typeof cachedTokens === 'number' && (agentTelemetry?.inputTokens ?? 0) > 0 ? Math.min(100, cachedTokens / agentTelemetry!.inputTokens * 100) : null;
   const model = models.find((item) => item.id === chat.modelId);

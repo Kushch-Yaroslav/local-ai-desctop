@@ -711,7 +711,10 @@ export function registerIpc(): void {
           const visibleActivity = { ...activity };
           delete visibleActivity.rawOutput;
           event.sender.send('chat:stream', { ...chunk, activity: visibleActivity, runId: run.id, conversationId: request.conversationId, generationId: generation.id });
-          event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run: updated });
+          // The renderer shows a live action from `toolActivities`; the run snapshot only matters when an action appears or
+          // finishes (and the final snapshot follows). Re-sending the whole run for every terminal output line made the
+          // payload grow with the run and replaced renderer state on each line.
+          if (existingPosition === undefined || activity.state !== 'running') event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run: updated });
         } else event.sender.send('chat:stream', { ...chunk, conversationId: request.conversationId, generationId: generation.id });
       }
       if (!current()) { if (run) database.finishAnalysisRun(run.id, 'cancelled', null); return; }

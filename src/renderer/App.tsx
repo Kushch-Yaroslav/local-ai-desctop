@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useShallow } from 'zustand/react/shallow';
 import { Bot, Check, Copy, File, Folder, Pencil, RotateCcw, X } from 'lucide-react';
 import { Sidebar } from './components/Sidebar';
 import { Toolbar } from './components/Toolbar';
@@ -68,7 +69,7 @@ function GenerationStatsView({ stats }: { stats: GenerationStats }) {
 }
 
 export function App() {
-  const { initialize, refreshHardware, handleStream, activeId, conversations, messages, isGenerating, generationConversationId, generationState, toolActivities, analysisRuns, editMessage, regenerateMessage, lastFinishReason, error } = useAppStore();
+  const { initialize, refreshHardware, handleStream, activeId, conversations, messages, isGenerating, generationConversationId, generationState, toolActivities, analysisRuns, editMessage, regenerateMessage, lastFinishReason, error } = useAppStore(useShallow((state) => ({ initialize: state.initialize, refreshHardware: state.refreshHardware, handleStream: state.handleStream, activeId: state.activeId, conversations: state.conversations, messages: state.messages, isGenerating: state.isGenerating, generationConversationId: state.generationConversationId, generationState: state.generationState, toolActivities: state.toolActivities, analysisRuns: state.analysisRuns, editMessage: state.editMessage, regenerateMessage: state.regenerateMessage, lastFinishReason: state.lastFinishReason, error: state.error })));
   const endRef = useRef<HTMLDivElement>(null); const conversationRef = useRef<HTMLElement>(null); const followStream = useRef(true);
   const [editingId, setEditingId] = useState<string | null>(null); const [editingText, setEditingText] = useState('');
   const [agentClock, setAgentClock] = useState(() => Date.now());
@@ -76,7 +77,20 @@ export function App() {
   useEffect(() => { void initialize(); const timer = window.setInterval(() => void refreshHardware(), 2_000); const unlisten = window.localAi.chat.onStream(handleStream); return () => { window.clearInterval(timer); unlisten(); }; }, [initialize, refreshHardware, handleStream]);
   useEffect(() => { if (!isGenerating || active?.mode !== 'agent') return; setAgentClock(Date.now()); const timer = window.setInterval(() => setAgentClock(Date.now()), 1_000); return () => window.clearInterval(timer); }, [isGenerating, active?.mode]);
   useLayoutEffect(() => { followStream.current = true; }, [activeId]);
-  useLayoutEffect(() => { const conversation = conversationRef.current; if (!conversation || !followStream.current) return; conversation.scrollTo({ top: conversation.scrollHeight, behavior: isGenerating ? 'auto' : 'smooth' }); }, [messages, isGenerating, toolActivities]);
+  // Following the stream must not read layout in the commit phase: `scrollHeight` forces a synchronous style
+  // recalculation and layout of the whole conversation, which grows with the run. One scroll per frame is
+  // scheduled instead; the browser needs that layout for painting anyway, so the follow costs nothing extra.
+  const scrollFrame = useRef<number | null>(null);
+  useEffect(() => {
+    if (!followStream.current || scrollFrame.current !== null) return;
+    const behavior = isGenerating ? 'auto' : 'smooth';
+    scrollFrame.current = window.requestAnimationFrame(() => {
+      scrollFrame.current = null;
+      const conversation = conversationRef.current;
+      if (conversation && followStream.current) conversation.scrollTo({ top: conversation.scrollHeight, behavior });
+    });
+  }, [messages, isGenerating, toolActivities]);
+  useEffect(() => () => { if (scrollFrame.current !== null) window.cancelAnimationFrame(scrollFrame.current); }, []);
   const updateFollowState = () => { const element = conversationRef.current; if (element) followStream.current = element.scrollHeight - element.scrollTop - element.clientHeight < 96; };
   const embeddedSteeringIds = steeringMessageIds(messages);
   return <div className="app-shell"><Sidebar /><main className="main"><Toolbar /><section ref={conversationRef} onScroll={updateFollowState} className="conversation">

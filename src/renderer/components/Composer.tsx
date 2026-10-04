@@ -1,3 +1,4 @@
+import { useShallow } from 'zustand/react/shallow';
 import { ChevronDown, File, Folder, Paperclip, Send, Square, X } from 'lucide-react';
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import { useAppStore } from '../store/app-store';
@@ -10,7 +11,7 @@ const isImageFile = (file: File): boolean => file.type.startsWith('image/') || /
 export function Composer() {
   const [value, setValue] = useState(''); const [files, setFiles] = useState<File[]>([]); const [projectReferences, setProjectReferences] = useState<ProjectReference[]>([]); const [suggestions, setSuggestions] = useState<ProjectSuggestion[]>([]); const [referenceQuery, setReferenceQuery] = useState<{ start: number; text: string } | null>(null); const [activeSuggestion, setActiveSuggestion] = useState(0); const [attachmentError, setAttachmentError] = useState<string | null>(null); const ref = useRef<HTMLTextAreaElement>(null); const inputRef = useRef<HTMLInputElement>(null);
   const manualHeight = useRef<number | null>(null); const resizeHandle = useRef(false);
-  const { sendMessage, steer, steeringStatus, stop, isGenerating, generationConversationId, conversations, activeId } = useAppStore();
+  const { sendMessage, steer, steeringStatus, stop, isGenerating, generationConversationId, conversations, activeId } = useAppStore(useShallow((state) => ({ sendMessage: state.sendMessage, steer: state.steer, steeringStatus: state.steeringStatus, stop: state.stop, isGenerating: state.isGenerating, generationConversationId: state.generationConversationId, conversations: state.conversations, activeId: state.activeId })));
   const chat = conversations.find((item) => item.id === activeId);
   const projectEnabled = Boolean(chat?.workingDirectory);
   const resetHeight = () => { const textarea = ref.current; if (!textarea) return; manualHeight.current = null; textarea.style.height = ''; textarea.style.overflowY = 'hidden'; };

@@ -75,6 +75,11 @@ const Action = memo(function Action({ activity }: { activity: ToolActivity }) {
   return <section className={`agent-timeline-action ${activity.kind ?? 'other'} ${activity.state ?? 'running'} ${expanded ? 'expanded' : ''}`}><button type="button" className="agent-timeline-action-head" onClick={() => hasBody && setExpanded((value) => !value)} aria-expanded={hasBody ? expanded : undefined}><b>{state} {actionTitle(activity)}</b>{summary && <span>{summary}</span>}{activity.state === 'running' && <em>running…</em>}</button>{expanded && <div className="agent-timeline-action-body">{activity.kind === 'terminal' ? <TerminalDetails terminal={activity.terminal} fallback={output} /> : output && <pre>{output}</pre>}{typeof diff === 'string' && <details><summary>Diff</summary><pre>{diff}</pre></details>}</div>}</section>;
 });
 
+/** A finished thought never changes, so memoization on its primitive props skips it on every later frame. */
+const Thought = memo(function Thought({ content, live, title, duration }: { content: string; live: boolean; title: string; duration: string | null }) {
+  return <section className="agent-timeline-thought"><header><b>{title}</b>{live && duration && <span>· {duration}</span>}</header><Markdown streaming={live} lazy>{content}</Markdown></section>;
+});
+
 export const AgentTimeline = memo(function AgentTimeline({ timeline, activities, messages, reasoning, streaming, now, error, cancelled }: Props) {
   const items = thinkingTimeline(reasoning, activities, streaming, timeline, messages);
   if (!items.length && !error && !cancelled) return null;
@@ -82,8 +87,9 @@ export const AgentTimeline = memo(function AgentTimeline({ timeline, activities,
     if (item.kind === 'reasoning') {
       if (!item.content.trim()) return null;
       const duration = elapsed(item.startedAt, item.completedAt, now);
-      const live = streaming && !item.completedAt;
-      return <section className="agent-timeline-thought" key={item.id}><header><b>{live ? 'Thinking' : duration ? `Thought for ${duration}` : 'Thought'}</b>{live && duration && <span>· {duration}</span>}</header><Markdown streaming={live}>{item.content}</Markdown></section>;
+      // Only the paragraph still being written is live; later paragraphs of a finished thought carry no completion time.
+      const live = streaming && item.live;
+      return <Thought key={item.id} content={item.content} live={live} title={live ? 'Thinking' : duration ? `Thought for ${duration}` : 'Thought'} duration={live ? duration : null} />;
     }
     if (item.kind === 'steering') return <section className={`agent-timeline-steering ${item.status}`} key={item.id}><header><b>{item.status === 'applied' ? 'Уточнение передано модели' : 'Уточнение принято'}</b></header><p>{item.message.content}</p></section>;
     return <Action key={item.id} activity={item.activity} />;

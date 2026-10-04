@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { useShallow } from 'zustand/react/shallow';
 import { FolderOpen, X } from 'lucide-react';
 import { useAppStore } from '../store/app-store';
 import { Hardware } from './Hardware';
@@ -7,7 +8,7 @@ import type { ContextDiscoveryResult, RuntimeContextEstimate } from '../../share
 import { buildContextChoices, cacheModeLabel, contextChoiceId } from '../../shared/context-options';
 
 export function Toolbar() {
-  const { conversations, activeId, models, hardware, settings, activeContextWindow, isGenerating, updateConversation, refreshRuntime } = useAppStore();
+  const { conversations, activeId, models, hardware, settings, activeContextWindow, isGenerating, updateConversation, refreshRuntime } = useAppStore(useShallow((state) => ({ conversations: state.conversations, activeId: state.activeId, models: state.models, hardware: state.hardware, settings: state.settings, activeContextWindow: state.activeContextWindow, isGenerating: state.isGenerating, updateConversation: state.updateConversation, refreshRuntime: state.refreshRuntime })));
   const [estimateResponse, setEstimateResponse] = useState<{ modelId: string; value?: RuntimeContextEstimate; error?: string } | null>(null);
   const [discovery, setDiscovery] = useState<ContextDiscoveryResult | null>(null);
   const [discoveryLoading, setDiscoveryLoading] = useState(false);
