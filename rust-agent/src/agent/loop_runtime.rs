@@ -43,6 +43,7 @@ pub struct Config {
     pub context_limit: usize,
     pub reasoning_mode: String,
     pub supports_reasoning: bool,
+    pub reasoning_options: Option<Value>,
     pub policy: RunPolicy,
     pub history: Vec<Value>,
     pub evidence_dir: Option<String>,
@@ -96,6 +97,7 @@ const AGENT_GUIDANCE: &str = r#"
 - Use the latest user's language for all user-visible natural-language text: streamed reasoning/progress, tool preambles, brief status updates, and the final answer. Follow an explicit language request if present. Keep code, paths, identifiers, commands, API/tool syntax, and literal source quotations in their original form. Do not translate protocol fields.
 - For non-trivial architecture relationships, use a compact multiline Mermaid flowchart when it improves readability, or a properly indented multiline tree. Do not compress a diagram into one long arrow chain; avoid decorative box art.
 - Task Memory = durable semantic continuity for this task. Record meaningful findings, decisions, blockers, and next actions, and cite the observation IDs (obs-…) a finding rests on in its evidence field. After compaction, trust a precise Task Memory finding from an unchanged inspected file; reread only for a missing fact, ambiguity, possible change, exact detail, or targeted verification.
+- Set Task Memory status and evidence as JSON fields, not prose inside finding. Confirmed entries require evidence containing an observation ID or exact inspected source path from this transcript. A valid reference does not prove the claim; use inferred or unknown for unverified conclusions.
 - Investigation state = a mechanical inventory the runtime keeps of this run's tool observations: files read with their observation IDs, listed entries and local files referenced by sources you read that were not opened yet, failed operations, and commands run. It is not a task list and nothing in it is required. Use it to avoid rereading and to notice code you have not seen; follow a reference only when what you are about to claim depends on it. Recover an exact stored body with observation_read.
 - Ground claims in what you observed. Keep observed facts, inferences and unknowns apart, and mark inferences as inferences. Something you did not open is unknown, not absent. State that something does not exist only for a scope you actually covered (a complete directory listing, a complete file read, or a search whose scope you can name) and name that scope; otherwise say it was not found in what you inspected. A failed or approval-blocked operation is a blocker, not evidence.
 - When the request lists areas or questions, answer each from something you inspected or report it as not inspected. Do not spend further tool calls only to re-verify what you have already read.
@@ -143,13 +145,25 @@ pub fn dynamic_output_limit(
 }
 
 /// SAFETY FALLBACK, not the fix for any loop: once the runtime has withdrawn
-/// tools and asked for a final answer, hidden reasoning is switched off so that
-/// answer is written as visible content rather than into the thinking channel.
+/// tools, the model's configured finalization options are used for the answer.
 /// The primary contract (reasoning is recorded and replayed with the turn that
 /// produced it) is in `Transcript::assistant_*_with_reasoning`.
 fn request_reasoning(config: &Config, finalizing: bool) -> Option<Value> {
     if !config.supports_reasoning {
         return None;
+    }
+    if let Some(options) = config.reasoning_options.as_ref().and_then(|options| {
+        let key = if finalizing {
+            "final"
+        } else {
+            match policy::reasoning(&config.reasoning_mode, "agent") {
+                Reasoning::Off | Reasoning::Low => "fast",
+                Reasoning::Deep => "deep",
+            }
+        };
+        options.get(key).filter(|value| value.is_object())
+    }) {
+        return Some(options.clone());
     }
     Some(
         match if finalizing {
@@ -160,76 +174,6 @@ fn request_reasoning(config: &Config, finalizing: bool) -> Option<Value> {
             Reasoning::Off => json!({"chat_template_kwargs":{"enable_thinking":false}}),
             Reasoning::Low => json!({"reasoning_effort":"low"}),
             Reasoning::Deep => json!({"reasoning_effort":"xhigh"}),
-        },
-    )
-}
-
-fn is_ollama_native_endpoint(endpoint: &str) -> bool {
-    endpoint.trim_end_matches('/').ends_with("/api/chat")
-}
-
-fn ollama_native_messages(messages: &[Value]) -> Vec<Value> {
-    messages
-        .iter()
-        .cloned()
-        .map(|mut message| {
-            let Some(object) = message.as_object_mut() else {
-                return message;
-            };
-            // Ollama's native tool protocol identifies historic results by
-            // order/name and expects function arguments as JSON values rather
-            // than OpenAI's JSON string convention.
-            object.remove("tool_call_id");
-            object.remove("_observation_id");
-            object.remove("_result_policy");
-            object.remove("_rehydration");
-            // Ollama's native spelling of a prior assistant turn's reasoning.
-            if let Some(reasoning) = object.remove("reasoning_content") {
-                object.insert("thinking".into(), reasoning);
-            }
-            if object.get("role").and_then(Value::as_str) == Some("tool") {
-                object.remove("name");
-            }
-            if let Some(calls) = object.get_mut("tool_calls").and_then(Value::as_array_mut) {
-                for call in calls {
-                    if let Some(call) = call.as_object_mut() {
-                        call.remove("id");
-                        call.remove("type");
-                        let arguments = call
-                            .get("function")
-                            .and_then(|function| function.get("arguments"))
-                            .and_then(Value::as_str)
-                            .map(str::to_owned);
-                        if let Some(arguments) = arguments {
-                            if let Ok(parsed) = serde_json::from_str::<Value>(&arguments) {
-                                if let Some(function) =
-                                    call.get_mut("function").and_then(Value::as_object_mut)
-                                {
-                                    function.insert("arguments".into(), parsed);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            message
-        })
-        .collect()
-}
-
-fn ollama_native_think(config: &Config, finalizing: bool) -> Option<Value> {
-    if !config.supports_reasoning {
-        return None;
-    }
-    Some(
-        match if finalizing {
-            Reasoning::Off
-        } else {
-            policy::reasoning(&config.reasoning_mode, "agent")
-        } {
-            Reasoning::Off => json!(false),
-            Reasoning::Low => json!("low"),
-            Reasoning::Deep => json!("high"),
         },
     )
 }
@@ -288,19 +232,6 @@ fn request_payload_for_phase(
         stripped = without_replayed_reasoning(messages);
         stripped.as_slice()
     };
-    if is_ollama_native_endpoint(&config.endpoint) {
-        let mut payload = json!({
-            "model": config.model,
-            "messages": ollama_native_messages(messages),
-            "stream": true,
-            "tools": schemas,
-            "options": {"num_ctx": config.context_limit, "num_predict": max_tokens},
-        });
-        if let Some(think) = ollama_native_think(config, finalizing) {
-            payload["think"] = think;
-        }
-        return payload;
-    }
     let wire_messages = wire_messages(messages);
     let mut payload = json!({
         "model": config.model,
@@ -624,6 +555,8 @@ fn emit_knowledge_diagnostics(config: &Config, state: &AgentState) {
 }
 
 fn tool_schemas(has_project_root: bool) -> Vec<Value> {
+    // Native tool grammars enumerate object-root properties, not union roots.
+    // Action-specific requirements are enforced transactionally at dispatch.
     let mut tools = vec![
         json!({"type":"function","function":{"name":"task_memory","description":"Durable semantic memory for the current task across compaction. Record/update meaningful findings, decisions, blockers, or unresolved questions; view reads it; invalidate needs id. Record/update requires finding and may include evidence, implication, next, id, supersedes, status. Trust precise unchanged-file memory; reread only for a concrete missing, ambiguous, changed, exact-detail, or verification need.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["record","update","invalidate","view"]},"id":{"type":"string"},"finding":{"type":"string"},"evidence":{"type":"string"},"implication":{"type":"string"},"next":{"type":"string"},"supersedes":{"type":"string"},"status":{"type":"string","enum":["confirmed","inferred","unknown","contradicted"],"description":"How well established the finding is: confirmed (observed, cited), inferred (reasoned, not observed), unknown (open; put the resolving step in next), contradicted (evidence disagrees)."}},"required":["action"]}}}),
         json!({"type":"function","function":{"name":"observation_index","description":"List historical tool observations by stable ID, with source path and outcome metadata. Use source to select the raw observation for the needed file. If more=true, continue at the returned next_offset. Observation IDs start with obs-.","parameters":{"type":"object","properties":{"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":50}}}}}),
@@ -797,21 +730,88 @@ fn task_memory_conflict(
         .get("evidence")
         .and_then(Value::as_str)
         .unwrap_or("");
-    if transcript
-        .observations()
-        .iter()
-        .any(|o| o.id != cited.id && new_evidence.contains(&o.id))
-    {
+    if transcript.observations().iter().any(|o| {
+        new_evidence.contains(&o.id)
+            || o.source
+                .as_deref()
+                .is_some_and(|source| new_evidence == source)
+    }) {
         return None;
     }
     Some(format!("Potential evidence conflict: {} cites exact historical observation {}. Retrieve that observation with observation_read and cite a verified observation before replacing this finding.", prior.id, cited.id))
 }
 
-fn apply_task_memory(state: &mut AgentState, arguments: &Value) -> Result<(Value, bool), String> {
-    let action = arguments
-        .get("action")
-        .and_then(Value::as_str)
-        .unwrap_or("record");
+fn validate_confirmed_memory(
+    entry: &crate::agent::task_memory::TaskMemoryEntry,
+    transcript: &Transcript,
+) -> Result<(), String> {
+    use crate::agent::task_memory::Status;
+    if entry.status != Some(Status::Confirmed) {
+        return Ok(());
+    }
+    let reference_character = |character: char| {
+        character.is_alphanumeric() || matches!(character, '-' | '_' | '.' | '/' | '\\')
+    };
+    let tokens = entry
+        .evidence
+        .split(|character| !reference_character(character))
+        .flat_map(|token| token.split(".."))
+        .map(|token| token.trim_matches('.'));
+    let mut found = transcript.observations().iter().any(|observation| {
+        observation.source.as_deref().is_some_and(|source| {
+            !source.is_empty()
+                && entry
+                    .evidence
+                    .match_indices(source)
+                    .any(|(start, matched)| {
+                        let end = start + matched.len();
+                        !entry.evidence[..start]
+                            .chars()
+                            .next_back()
+                            .is_some_and(reference_character)
+                            && !entry.evidence[end..]
+                                .chars()
+                                .next()
+                                .is_some_and(reference_character)
+                    })
+        })
+    });
+    for token in tokens.filter(|token| !token.is_empty()) {
+        if token.starts_with("obs-") {
+            if transcript.observation(token).is_none() {
+                return Err(format!("Confirmed Task Memory cites unknown observation '{token}'. Use observation_index to find a valid reference and retry; no memory was changed."));
+            }
+            found = true;
+        }
+    }
+    if !found {
+        return Err("Confirmed Task Memory requires nonempty evidence referencing an observation ID or exact source path inspected in this transcript. Use observation_index and retry with evidence, or explicitly use inferred/unknown when unverified; no memory was changed.".into());
+    }
+    Ok(())
+}
+
+fn restore_task_memory(
+    value: Option<&Value>,
+    transcript: &Transcript,
+) -> Result<crate::agent::task_memory::TaskMemory, String> {
+    let memory: crate::agent::task_memory::TaskMemory = match value {
+        Some(value) => serde_json::from_value(value.clone())
+            .map_err(|error| format!("Invalid saved Task Memory: {error}"))?,
+        None => return Ok(Default::default()),
+    };
+    for entry in memory.entries.iter().filter(|entry| !entry.invalidated) {
+        validate_confirmed_memory(entry, transcript)
+            .map_err(|error| format!("Invalid saved Task Memory entry '{}': {error}", entry.id))?;
+    }
+    Ok(memory)
+}
+
+fn apply_task_memory(
+    state: &mut AgentState,
+    arguments: &Value,
+    transcript: &Transcript,
+) -> Result<(Value, bool), String> {
+    let action = required_text(arguments, "action")?;
     if action == "view" {
         return Ok((
             json!({"task_memory": state.task_memory, "updated": false}),
@@ -826,11 +826,20 @@ fn apply_task_memory(state: &mut AgentState, arguments: &Value) -> Result<(Value
         if state.memory_writes_this_turn >= strategy::MAX_MEMORY_WRITES_PER_TURN {
             return Err(format!("Task Memory accepts at most {} writes per turn. Merge the remaining findings into one entry (update an existing id) instead of one entry per fact.", strategy::MAX_MEMORY_WRITES_PER_TURN));
         }
-        write_task_memory(&mut state.task_memory, arguments)?;
+        let mut candidate = state.task_memory.clone();
+        let id = write_task_memory(&mut candidate, arguments)?;
+        let entry = candidate
+            .entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .ok_or_else(|| "Task Memory write did not create an entry".to_owned())?;
+        validate_confirmed_memory(entry, transcript)?;
+        state.task_memory = candidate;
         state.memory_writes_this_turn += 1;
     } else {
         return Err("unsupported task_memory action".into());
     }
+    state.calls_since_memory = 0;
     Ok((
         json!({"task_memory": state.task_memory, "updated": true}),
         true,
@@ -1331,7 +1340,6 @@ fn stream_call(
     emit_visible: bool,
     emit_content: bool,
 ) -> Result<StreamedTurn, String> {
-    let native_ollama = is_ollama_native_endpoint(endpoint);
     let without = endpoint.trim_start_matches("http://");
     let (host_port, path) = without
         .split_once('/')
@@ -1464,15 +1472,7 @@ fn stream_call(
                 .read_exact(&mut crlf)
                 .map_err(|error| error.to_string())?;
             buffer.push_str(&String::from_utf8_lossy(&bytes));
-            consume_transport_buffer(
-                &mut buffer,
-                &mut turn,
-                run_id,
-                turn_index,
-                emit_visible,
-                emit_content,
-                native_ollama,
-            )?;
+            consume_sse(&mut buffer, &mut turn, run_id, emit_visible, emit_content)?;
         }
     } else {
         let mut bytes = [0_u8; 8192];
@@ -1496,15 +1496,7 @@ fn stream_call(
                 break;
             }
             buffer.push_str(&String::from_utf8_lossy(&bytes[..count]));
-            consume_transport_buffer(
-                &mut buffer,
-                &mut turn,
-                run_id,
-                turn_index,
-                emit_visible,
-                emit_content,
-                native_ollama,
-            )?;
+            consume_sse(&mut buffer, &mut turn, run_id, emit_visible, emit_content)?;
         }
     }
     // Some OpenAI-compatible local servers close the connection immediately
@@ -1512,24 +1504,12 @@ fn stream_call(
     // Treat that final complete frame as SSE rather than silently losing its
     // usage or finish reason.
     if !buffer.trim().is_empty() {
-        if native_ollama {
-            if !buffer.ends_with('\n') {
-                buffer.push('\n');
-            }
-        } else if buffer.ends_with('\n') {
+        if !buffer.ends_with("\n\n") && buffer.ends_with('\n') {
             buffer.push('\n');
-        } else {
+        } else if !buffer.ends_with("\n\n") {
             buffer.push_str("\n\n");
         }
-        consume_transport_buffer(
-            &mut buffer,
-            &mut turn,
-            run_id,
-            turn_index,
-            emit_visible,
-            emit_content,
-            native_ollama,
-        )?;
+        consume_sse(&mut buffer, &mut turn, run_id, emit_visible, emit_content)?;
     }
     flush_reasoning(&mut turn, run_id, emit_visible);
     trace_forensics(
@@ -1548,117 +1528,6 @@ fn stream_call(
         }),
     );
     Ok(turn)
-}
-
-fn consume_transport_buffer(
-    buffer: &mut String,
-    turn: &mut StreamedTurn,
-    run_id: &str,
-    turn_index: usize,
-    emit_visible: bool,
-    emit_content: bool,
-    native_ollama: bool,
-) -> Result<(), String> {
-    if native_ollama {
-        consume_ollama_ndjson(buffer, turn, run_id, turn_index, emit_visible, emit_content)
-    } else {
-        consume_sse(buffer, turn, run_id, emit_visible, emit_content)
-    }
-}
-
-fn consume_ollama_ndjson(
-    buffer: &mut String,
-    turn: &mut StreamedTurn,
-    run_id: &str,
-    turn_index: usize,
-    emit_visible: bool,
-    emit_content: bool,
-) -> Result<(), String> {
-    while let Some(end) = buffer.find('\n') {
-        let line = buffer[..end].trim().to_owned();
-        buffer.drain(..end + 1);
-        if line.is_empty() {
-            continue;
-        }
-        let value: Value = serde_json::from_str(&line)
-            .map_err(|error| format!("invalid Ollama NDJSON: {error}"))?;
-        if let Some(error) = value.get("error").and_then(Value::as_str) {
-            return Err(format!("Ollama error: {error}"));
-        }
-        turn.prompt_tokens = value
-            .get("prompt_eval_count")
-            .and_then(Value::as_u64)
-            .or(turn.prompt_tokens);
-        turn.completion_tokens = value
-            .get("eval_count")
-            .and_then(Value::as_u64)
-            .or(turn.completion_tokens);
-        turn.prompt_ms = value
-            .get("prompt_eval_duration")
-            .and_then(Value::as_f64)
-            .map(|duration| duration / 1_000_000.0)
-            .or(turn.prompt_ms);
-        turn.predicted_ms = value
-            .get("eval_duration")
-            .and_then(Value::as_f64)
-            .map(|duration| duration / 1_000_000.0)
-            .or(turn.predicted_ms);
-        if let (Some(tokens), Some(duration)) = (
-            value.get("eval_count").and_then(Value::as_f64),
-            value.get("eval_duration").and_then(Value::as_f64),
-        ) {
-            if duration > 0.0 {
-                turn.predicted_per_second = Some(tokens * 1_000_000_000.0 / duration);
-            }
-        }
-        if let Some(reasoning) = value.pointer("/message/thinking").and_then(Value::as_str) {
-            append_reasoning(turn, run_id, reasoning, emit_visible);
-        }
-        if let Some(content) = value.pointer("/message/content").and_then(Value::as_str) {
-            turn.content.push_str(content);
-            if emit_content {
-                emit(
-                    run_id,
-                    Event::ContentDelta {
-                        content: content.to_owned(),
-                    },
-                );
-            }
-        }
-        if let Some(calls) = value
-            .pointer("/message/tool_calls")
-            .and_then(Value::as_array)
-        {
-            for (index, call) in calls.iter().enumerate() {
-                let entry = turn.calls.entry(index).or_insert_with(|| {
-                    // Native Ollama tool calls do not carry an OpenAI call id.
-                    // The id is persisted by the Electron bridge, so it must be
-                    // stable for streaming updates and unique across Agent turns.
-                    json!({"id":format!("ollama-{run_id}-{turn_index}-{index}"),"type":"function","function":{"name":"","arguments":""}})
-                });
-                if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
-                    entry["function"]["name"] = json!(name);
-                }
-                if let Some(arguments) = call.pointer("/function/arguments") {
-                    let encoded = if let Some(arguments) = arguments.as_str() {
-                        arguments.to_owned()
-                    } else {
-                        arguments.to_string()
-                    };
-                    entry["function"]["arguments"] = json!(encoded);
-                }
-            }
-        }
-        if value.get("done").and_then(Value::as_bool) == Some(true) {
-            turn.finish_reason = value
-                .get("done_reason")
-                .and_then(Value::as_str)
-                .unwrap_or("stop")
-                .to_owned();
-            flush_reasoning(turn, run_id, emit_visible);
-        }
-    }
-    Ok(())
 }
 
 fn consume_sse(
@@ -1904,24 +1773,10 @@ fn mark_if_cut_at_output_limit(text: &str, finish_reason: &str) -> String {
 }
 
 /// The summary call is a provider turn like any other and must use the same
-/// protocol options (notably the context size, which an Ollama runner is keyed
-/// on: omitting it silently truncates the input to the server default and
-/// forces a model reload). Reasoning is switched off: a handoff is written, not
-/// derived.
+/// context and model capability options. Reasoning is disabled for this
+/// handoff-writing phase.
 fn summary_payload(config: &Config, messages: &[Value], max_tokens: usize) -> Value {
-    let mut payload = request_payload(config, messages, &[], max_tokens);
-    if let Some(object) = payload.as_object_mut() {
-        if is_ollama_native_endpoint(&config.endpoint) {
-            object.insert("think".into(), json!(false));
-        } else {
-            object.remove("reasoning_effort");
-            object.insert(
-                "chat_template_kwargs".into(),
-                json!({"enable_thinking": false}),
-            );
-        }
-    }
-    payload
+    request_payload_for_phase(config, messages, &[], max_tokens, true)
 }
 
 fn summary_source(plan: &CompactionPlan, max_chars: usize) -> String {
@@ -2433,15 +2288,18 @@ fn run_tool(
     config: &Config,
     state: &mut AgentState,
     tool: &ValidatedCall,
+    transcript: &Transcript,
 ) -> Result<(Value, Option<String>), String> {
     state.record_tool_call(&tool.name);
-    run_scoped_tool(config, state, tool).map(|result| project_result(config, tool, result))
+    run_scoped_tool(config, state, tool, transcript)
+        .map(|result| project_result(config, tool, result))
 }
 
 fn run_scoped_tool(
     config: &Config,
     state: &mut AgentState,
     tool: &ValidatedCall,
+    transcript: &Transcript,
 ) -> Result<(Value, Option<String>), String> {
     let scoped = scoped_tool_config(config, tool)?;
     let config = &scoped;
@@ -2503,7 +2361,7 @@ fn run_scoped_tool(
             Ok((value, None))
         }
         "task_memory" => {
-            let (value, changed) = apply_task_memory(state, &tool.arguments)?;
+            let (value, changed) = apply_task_memory(state, &tool.arguments, transcript)?;
             if changed {
                 emit(
                     &config.run_id,
@@ -2930,11 +2788,19 @@ pub fn run(config: Config) {
     }
     let mut state = AgentState::default();
     state.strategy = Strategy::from_mode(&config.reasoning_mode);
-    state.task_memory = config
-        .task_memory
-        .as_ref()
-        .and_then(|memory| serde_json::from_value(memory.clone()).ok())
-        .unwrap_or_default();
+    state.task_memory = match restore_task_memory(config.task_memory.as_ref(), &transcript) {
+        Ok(memory) => memory,
+        Err(message) => {
+            emit(
+                &config.run_id,
+                Event::AgentError {
+                    code: "task_memory".into(),
+                    message,
+                },
+            );
+            return;
+        }
+    };
     if !user_requests_read_only(&config.user) {
         if let Some(root) = config.root.as_deref() {
             let _ = crate::tools::knowledge::bootstrap(&PathBuf::from(root));
@@ -3274,13 +3140,8 @@ pub fn run(config: Config) {
         ) {
             Ok(streamed) => {
                 overflow_attempts = 0;
-                // Native Ollama reports only the tokens it evaluated for this
-                // request (the cached prefix is excluded), so its count is not
-                // the prompt size and must not teach the estimate.
-                if !is_ollama_native_endpoint(&config.endpoint) {
-                    if let Some(actual) = streamed.prompt_tokens {
-                        learn_token_calibration(projected, actual as usize);
-                    }
+                if let Some(actual) = streamed.prompt_tokens {
+                    learn_token_calibration(projected, actual as usize);
                 }
                 if !sent_tail.is_empty() {
                     transcript.record_prompt_tail(&sent_tail);
@@ -3934,10 +3795,10 @@ pub fn run(config: Config) {
                     {
                         Err(conflict)
                     } else {
-                        run_tool(&config, &mut state, tool)
+                        run_tool(&config, &mut state, tool, &transcript)
                     }
                 }
-                _ => run_tool(&config, &mut state, tool),
+                _ => run_tool(&config, &mut state, tool, &transcript),
             };
             match outcome {
                 Ok((value, diff)) => {
@@ -4114,35 +3975,26 @@ mod tests {
     }
 
     #[test]
-    fn native_ollama_tool_ids_are_unique_across_provider_turns() {
-        let frame = || {
-            format!(
-                "{}\n",
-                json!({
-                    "message":{
-                        "tool_calls":[{
-                            "function":{
-                                "name":"read_file",
-                                "arguments":{"path":"src/App.tsx"}
-                            }
-                        }]
-                    }
-                })
-            )
-        };
+    fn openai_stream_tool_call_ids_are_preserved_across_turns() {
         let mut first = StreamedTurn::default();
-        let mut first_frame = frame();
-        consume_ollama_ndjson(&mut first_frame, &mut first, "run", 1, false, false).unwrap();
+        let mut first_frame = format!(
+            "data: {}\n\n",
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-first","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"src/App.tsx\"}"}}]}}]})
+        );
+        consume_sse(&mut first_frame, &mut first, "run", false, false).unwrap();
         let first_id = first.calls[&0]["id"].as_str().unwrap();
 
         let mut second = StreamedTurn::default();
-        let mut second_frame = frame();
-        consume_ollama_ndjson(&mut second_frame, &mut second, "run", 2, false, false).unwrap();
+        let mut second_frame = format!(
+            "data: {}\n\n",
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-second","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"src/App.tsx\"}"}}]}}]})
+        );
+        consume_sse(&mut second_frame, &mut second, "run", false, false).unwrap();
         let second_id = second.calls[&0]["id"].as_str().unwrap();
 
         assert_ne!(first_id, second_id);
-        assert_eq!(first_id, "ollama-run-1-0");
-        assert_eq!(second_id, "ollama-run-2-0");
+        assert_eq!(first_id, "call-first");
+        assert_eq!(second_id, "call-second");
     }
 
     #[test]
@@ -4195,25 +4047,20 @@ mod tests {
     fn finalizing_provider_payload_disables_supported_reasoning() {
         let mut config = test_config(32_768);
         config.reasoning_mode = "deep".into();
+        config.reasoning_options = Some(json!({
+            "fast":{"reasoning_effort":"low"},
+            "deep":{"reasoning_effort":"high"},
+            "final":{"reasoning_effort":"low"}
+        }));
         let messages = vec![json!({"role":"user","content":"answer"})];
         let openai = request_payload_for_phase(&config, &messages, &[], 1_024, false);
         let final_openai = request_payload_for_phase(&config, &messages, &[], 1_024, true);
-        assert_eq!(openai["reasoning_effort"], "xhigh");
-        assert_eq!(
-            final_openai["chat_template_kwargs"]["enable_thinking"],
-            false
-        );
-        assert!(final_openai.get("reasoning_effort").is_none());
-
-        config.endpoint = "http://localhost/api/chat".into();
-        let native = request_payload_for_phase(&config, &messages, &[], 1_024, false);
-        let final_native = request_payload_for_phase(&config, &messages, &[], 1_024, true);
-        assert_eq!(native["think"], "high");
-        assert_eq!(final_native["think"], false);
+        assert_eq!(openai["reasoning_effort"], "high");
+        assert_eq!(final_openai["reasoning_effort"], "low");
 
         config.supports_reasoning = false;
         let unsupported = request_payload_for_phase(&config, &messages, &[], 1_024, true);
-        assert!(unsupported.get("think").is_none());
+        assert!(unsupported.get("reasoning_effort").is_none());
     }
 
     #[test]
@@ -4252,24 +4099,6 @@ mod tests {
         text.push_str(&unterminated.push("", true));
         assert_eq!(text, "plan ");
         assert!(unterminated.hid_markup);
-    }
-
-    #[test]
-    fn ollama_usage_durations_produce_generation_speed_only_when_reported() {
-        let mut turn = StreamedTurn::default();
-        let mut frames = format!(
-            "{}\n",
-            json!({"done":true,"prompt_eval_count":20,"prompt_eval_duration":2_000_000_000_u64,"eval_count":8,"eval_duration":4_000_000_000_u64})
-        );
-        consume_ollama_ndjson(&mut frames, &mut turn, "fixture", 1, false, false).unwrap();
-        assert_eq!(turn.prompt_ms, Some(2_000.0));
-        assert_eq!(turn.predicted_ms, Some(4_000.0));
-        assert_eq!(turn.predicted_per_second, Some(2.0));
-
-        let mut unsupported = StreamedTurn::default();
-        let mut frame = format!("{}\n", json!({"done":true,"eval_count":8}));
-        consume_ollama_ndjson(&mut frame, &mut unsupported, "fixture", 1, false, false).unwrap();
-        assert_eq!(unsupported.predicted_per_second, None);
     }
 
     #[test]
@@ -4388,6 +4217,7 @@ mod tests {
             context_limit: window,
             reasoning_mode: "fast".into(),
             supports_reasoning: true,
+            reasoning_options: None,
             policy: RunPolicy::Safe,
             history: Vec::new(),
             evidence_dir: None,
@@ -4460,29 +4290,24 @@ mod tests {
         assert!(!checkpoint.contains("Do not restart broad project discovery"));
     }
 
-    /// Failure shape: the compaction summary request omitted the protocol
-    /// options of every other request, so Ollama truncated its input to the
-    /// server's default context and reloaded the model.
+    /// The summary request preserves the context and profile-specific
+    /// finalization options used by the rest of the run.
     #[test]
-    fn summary_requests_carry_the_run_context_and_do_not_think() {
+    fn summary_requests_preserve_context_and_model_finalization_options() {
         let mut config = test_config(65_536);
-        config.endpoint = "http://127.0.0.1:11434/api/chat".into();
+        config.reasoning_options = Some(json!({
+            "final":{"reasoning_effort":"low","chat_template_kwargs":{"enable_thinking":false}}
+        }));
         let messages = vec![json!({"role":"user","content":"summarize"})];
-        let native = summary_payload(&config, &messages, 1_024);
-        assert_eq!(native["options"]["num_ctx"], 65_536);
-        assert_eq!(native["options"]["num_predict"], 1_024);
-        assert_eq!(native["think"], json!(false));
-        assert_eq!(native["stream"], json!(true));
-
-        config.endpoint = "http://127.0.0.1:8081/v1/chat/completions".into();
-        let compatible = summary_payload(&config, &messages, 1_024);
-        assert_eq!(compatible["max_tokens"], 1_024);
+        let payload = summary_payload(&config, &messages, 1_024);
+        assert_eq!(payload["max_tokens"], 1_024);
+        assert_eq!(payload["stream"], json!(true));
+        assert_eq!(payload["reasoning_effort"], "low");
         assert_eq!(
-            compatible["chat_template_kwargs"]["enable_thinking"],
+            payload["chat_template_kwargs"]["enable_thinking"],
             json!(false)
         );
-        assert!(compatible.get("reasoning_effort").is_none());
-        assert!(compatible.get("tools").is_none());
+        assert!(payload.get("tools").is_none());
     }
 
     /// Failure shape: one turn of parallel reads/recoveries larger than the
@@ -4578,6 +4403,137 @@ mod tests {
     }
 
     #[test]
+    fn task_memory_schema_exposes_parameters_at_object_root() {
+        let memory = tool_schemas(true)
+            .into_iter()
+            .find(|tool| tool_name(tool) == "task_memory")
+            .unwrap();
+        let parameters = &memory["function"]["parameters"];
+        assert_eq!(parameters["type"], "object");
+        assert_eq!(parameters["required"], json!(["action"]));
+        assert!(parameters.get("oneOf").is_none());
+        assert!(parameters.get("anyOf").is_none());
+        for field in [
+            "action",
+            "id",
+            "finding",
+            "evidence",
+            "implication",
+            "next",
+            "supersedes",
+            "status",
+        ] {
+            assert_eq!(parameters["properties"][field]["type"], "string", "{field}");
+        }
+    }
+
+    #[test]
+    fn provider_serialization_preserves_declared_tool_parameter_order() {
+        let schemas = tool_schemas(true);
+        let payload = json!({"tools": schemas});
+        let wire = serde_json::to_string(&payload).unwrap();
+        let decoded: Value = serde_json::from_str(&wire).unwrap();
+        let memory = decoded["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool_name(tool) == "task_memory")
+            .unwrap();
+        // Native JSON grammars allow optional fields only in declaration order.
+        // Sorting these keys moves finding/evidence before the model's entry ID.
+        assert_eq!(
+            memory["function"]["parameters"]["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            [
+                "action",
+                "id",
+                "finding",
+                "evidence",
+                "implication",
+                "next",
+                "supersedes",
+                "status"
+            ]
+        );
+        let read = decoded["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool_name(tool) == "read_file")
+            .unwrap();
+        assert_eq!(
+            read["function"]["parameters"]["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["path", "start_line", "end_line", "offset_chars"]
+        );
+    }
+
+    #[test]
+    fn task_memory_rejects_invalid_actions_and_missing_fields_without_mutation() {
+        let mut state = AgentState::default();
+        apply_task_memory(
+            &mut state,
+            &json!({"action":"record","id":"existing","finding":"preserved"}),
+            &Transcript::default(),
+        )
+        .unwrap();
+        state.calls_since_memory = 7;
+        let before = state.task_memory.clone();
+        for arguments in [
+            json!({}),
+            json!({"finding":"missing action"}),
+            json!({"action":"unsupported","finding":"invalid"}),
+            json!({"action":"record"}),
+            json!({"action":"update","id":"existing"}),
+            json!({"action":"record","finding":""}),
+            json!({"action":"record","finding":42}),
+            json!({"action":"invalidate"}),
+            json!({"action":"invalidate","id":"unknown"}),
+        ] {
+            assert!(
+                apply_task_memory(&mut state, &arguments, &Transcript::default()).is_err(),
+                "{arguments}"
+            );
+            assert_eq!(state.task_memory, before);
+            assert_eq!(state.memory_writes_this_turn, 1);
+            assert_eq!(state.calls_since_memory, 7);
+        }
+    }
+
+    #[test]
+    fn saved_memory_is_not_silently_dropped_or_trusted_without_support() {
+        let transcript = Transcript::default();
+        assert!(restore_task_memory(Some(&json!({"entries":"invalid"})), &transcript).is_err());
+        let mut saved = json!({"revision":3,"entries":[{
+            "id":"old","finding":"legacy finding","status":"confirmed","evidence":""
+        }]});
+        assert!(restore_task_memory(Some(&saved), &transcript).is_err());
+        saved["entries"][0]["invalidated"] = json!(true);
+        assert_eq!(
+            restore_task_memory(Some(&saved), &transcript)
+                .unwrap()
+                .revision,
+            3
+        );
+        saved["entries"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("status");
+        saved["entries"][0]["invalidated"] = json!(false);
+        let restored = restore_task_memory(Some(&saved), &transcript).unwrap();
+        assert_eq!(restored.entries[0].status, None);
+        assert_eq!(restored.revision, 3);
+    }
+
+    #[test]
     fn explicit_read_only_request_removes_project_mutations_from_toolset() {
         for prompt in ["Не изменяй файлы.", "Do not modify files."] {
             let schemas = tool_schemas_for_request(true, RunPolicy::Auto, prompt);
@@ -4646,7 +4602,7 @@ mod tests {
                 name: name.into(),
                 arguments,
             };
-            let (value, _) = run_tool(&config, &mut state, &call).unwrap();
+            let (value, _) = run_tool(&config, &mut state, &call, &Transcript::default()).unwrap();
             record_safe_read_effect(&config, &mut state, &call, &value);
         }
         emit_knowledge_diagnostics(&config, &state);
@@ -4672,17 +4628,10 @@ mod tests {
         assert!(wire_messages(&projected)[0]
             .get("_observation_id")
             .is_none());
-        assert!(ollama_native_messages(&projected)[0]
-            .get("_observation_id")
-            .is_none());
-        for wire in [
-            wire_messages(&projected),
-            ollama_native_messages(&projected),
-        ] {
-            assert!(wire[0].get("_result_policy").is_none());
-            assert!(wire[0].get("_rehydration").is_none());
-            assert_eq!(wire[0]["content"], "result");
-        }
+        let wire = wire_messages(&projected);
+        assert!(wire[0].get("_result_policy").is_none());
+        assert!(wire[0].get("_rehydration").is_none());
+        assert_eq!(wire[0]["content"], "result");
     }
 
     #[test]
@@ -4921,7 +4870,12 @@ mod tests {
         assert!(deep.contains("investigation_checkpoint"));
         assert!(deep.contains("open_unknowns"));
         assert!(deep.contains("what the handler forwards to"));
-        state.record_tool_call("task_memory");
+        apply_task_memory(
+            &mut state,
+            &json!({"action":"record","finding":"checkpoint recorded","status":"inferred"}),
+            &transcript,
+        )
+        .unwrap();
         assert!(
             !dynamic_tail(&state, None, "", &transcript, "").contains("investigation_checkpoint")
         );
@@ -4966,20 +4920,31 @@ mod tests {
             apply_task_memory(
                 &mut state,
                 &json!({"action":"record","finding":format!("f{n}")}),
+                &Transcript::default(),
             )
             .unwrap();
         }
-        let refused = apply_task_memory(&mut state, &json!({"action":"record","finding":"extra"}));
+        let refused = apply_task_memory(
+            &mut state,
+            &json!({"action":"record","finding":"extra"}),
+            &Transcript::default(),
+        );
         assert!(refused.unwrap_err().contains("at most"));
         assert_eq!(
             state.task_memory.entries.len(),
             strategy::MAX_MEMORY_WRITES_PER_TURN
         );
-        assert!(apply_task_memory(&mut state, &json!({"action":"view"})).is_ok());
+        assert!(apply_task_memory(
+            &mut state,
+            &json!({"action":"view"}),
+            &Transcript::default()
+        )
+        .is_ok());
         state.memory_writes_this_turn = 0;
         apply_task_memory(
             &mut state,
             &json!({"action":"record","finding":"next turn"}),
+            &Transcript::default(),
         )
         .unwrap();
     }
@@ -4990,6 +4955,7 @@ mod tests {
         apply_task_memory(
             &mut state,
             &json!({"action":"record","id":"a","finding":"x","status":"inferred"}),
+            &Transcript::default(),
         )
         .unwrap();
         assert_eq!(
@@ -4999,6 +4965,7 @@ mod tests {
         apply_task_memory(
             &mut state,
             &json!({"action":"update","id":"a","finding":"y"}),
+            &Transcript::default(),
         )
         .unwrap();
         assert_eq!(
@@ -5007,9 +4974,188 @@ mod tests {
         );
         assert!(apply_task_memory(
             &mut state,
-            &json!({"action":"record","finding":"z","status":"maybe"})
+            &json!({"action":"record","finding":"z","status":"maybe"}),
+            &Transcript::default(),
         )
         .is_err());
+    }
+
+    #[test]
+    fn confirmed_memory_checks_effective_status_before_mutation() {
+        let base = std::env::temp_dir().join(format!(
+            "confirmed-memory-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(base.join("project")).unwrap();
+        let root = base.join("project");
+        std::fs::write(root.join("source.ts"), "export const value = 1;\n").unwrap();
+        let mut transcript =
+            Transcript::durable(&base.join("store"), "confirmed-test", &[], root.to_str()).unwrap();
+        transcript.push_run_user(json!({"role":"user","content":"inspect source"}));
+        transcript.assistant_tool_turn(
+            String::new(),
+            &[ValidatedCall {
+                id: "read".into(),
+                name: "read_file".into(),
+                arguments: json!({"path":"source.ts"}),
+            }],
+        );
+        transcript.tool_result(
+            "read",
+            "read_file",
+            json!({"path":"source.ts","content":"export const value = 1;"}).to_string(),
+        );
+        let observation = transcript.observations()[0].id.clone();
+        let mut cited = crate::agent::task_memory::TaskMemoryEntry {
+            status: Some(crate::agent::task_memory::Status::Confirmed),
+            evidence: format!("{observation}..{observation}."),
+            ..Default::default()
+        };
+        assert!(validate_confirmed_memory(&cited, &transcript).is_ok());
+        cited.evidence = format!("{observation}..obs-99999999.");
+        assert!(validate_confirmed_memory(&cited, &transcript).is_err());
+        let mut state = AgentState::default();
+        state.calls_since_memory = 7;
+        for evidence in ["", "obs-99999999", "source.ts obs-99999999"] {
+            let before = state.task_memory.clone();
+            assert!(apply_task_memory(&mut state, &json!({
+                "action":"record","id":"fact","finding":"observed","status":"confirmed","evidence":evidence
+            }), &transcript).is_err());
+            assert_eq!(state.task_memory, before);
+            assert_eq!(state.calls_since_memory, 7);
+            assert_eq!(state.memory_writes_this_turn, 0);
+        }
+        apply_task_memory(&mut state, &json!({
+            "action":"record","id":"fact","finding":"observed","status":"confirmed","evidence":format!("source.ts ({observation})")
+        }), &transcript).unwrap();
+        assert_eq!(state.calls_since_memory, 0);
+        let before = state.task_memory.clone();
+        for arguments in [
+            json!({"action":"update","id":"fact","finding":"replacement","evidence":""}),
+            json!({"action":"record","supersedes":"fact","finding":"replacement","status":"confirmed","evidence":"obs-99999999"}),
+        ] {
+            assert!(apply_task_memory(&mut state, &arguments, &transcript).is_err());
+            assert_eq!(state.task_memory, before);
+            assert_eq!(state.memory_writes_this_turn, 1);
+        }
+        apply_task_memory(
+            &mut state,
+            &json!({
+                "action":"update","id":"fact","finding":"revised","evidence":"source.ts"
+            }),
+            &transcript,
+        )
+        .unwrap();
+        assert_eq!(
+            state.task_memory.entries[0].status,
+            Some(crate::agent::task_memory::Status::Confirmed)
+        );
+        state.memory_writes_this_turn = 0;
+        apply_task_memory(
+            &mut state,
+            &json!({
+                "action":"record","id":"hypothesis","finding":"possible","status":"unknown"
+            }),
+            &transcript,
+        )
+        .unwrap();
+        let before = state.task_memory.clone();
+        assert!(apply_task_memory(
+            &mut state,
+            &json!({
+                "action":"update","id":"hypothesis","finding":"promoted","status":"confirmed"
+            }),
+            &transcript
+        )
+        .is_err());
+        assert_eq!(state.task_memory, before);
+        let serialized = serde_json::to_value(&state.task_memory).unwrap();
+        let restored = restore_task_memory(Some(&serialized), &transcript).unwrap();
+        assert_eq!(restored, state.task_memory);
+        state.memory_writes_this_turn = 0;
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let spaced_source = "src/\u{00fc}ber view.ts";
+        std::fs::write(root.join(spaced_source), "source with a spaced path").unwrap();
+        transcript.assistant_tool_turn(
+            String::new(),
+            &[ValidatedCall {
+                id: "spaced".into(),
+                name: "read_file".into(),
+                arguments: json!({"path":spaced_source}),
+            }],
+        );
+        transcript.tool_result(
+            "spaced",
+            "read_file",
+            json!({"path":spaced_source,"content":"source with a spaced path"}).to_string(),
+        );
+        apply_task_memory(
+            &mut state,
+            &json!({
+                "action":"record","finding":"spaced path inspected","status":"confirmed",
+                "evidence":format!("`{spaced_source}:1`")
+            }),
+            &transcript,
+        )
+        .unwrap();
+        let before = state.task_memory.clone();
+        for evidence in [
+            format!("other/{spaced_source}"),
+            format!("{spaced_source}.unread"),
+            format!("{spaced_source} obs-99999999"),
+        ] {
+            assert!(apply_task_memory(
+                &mut state,
+                &json!({
+                    "action":"record","finding":"bad path","status":"confirmed","evidence":evidence
+                }),
+                &transcript
+            )
+            .is_err());
+            assert_eq!(state.task_memory, before);
+            assert_eq!(state.memory_writes_this_turn, 1);
+        }
+        state.memory_writes_this_turn = 0;
+        transcript.assistant_tool_turn(
+            String::new(),
+            &[ValidatedCall {
+                id: "missing".into(),
+                name: "read_file".into(),
+                arguments: json!({"path":"missing.ts"}),
+            }],
+        );
+        transcript.tool_result(
+            "missing",
+            "read_file",
+            json!({"error":"file not found","path":"missing.ts"}).to_string(),
+        );
+        let failed_id = transcript
+            .observation_for_call("missing")
+            .unwrap()
+            .id
+            .clone();
+        apply_task_memory(
+            &mut state,
+            &json!({
+                "action":"record","finding":"read failed","status":"confirmed","evidence":failed_id
+            }),
+            &transcript,
+        )
+        .unwrap();
+        // Existence is structural support for an error/blocker, not proof of source contents.
+        assert!(transcript.observation_for_call("missing").unwrap().error);
+        transcript.compact("findings retained".into(), transcript.entries().len());
+        assert!(validate_confirmed_memory(&restored.entries[0], &transcript).is_ok());
+        drop(transcript);
+        let resumed =
+            Transcript::durable(&base.join("store"), "confirmed-test", &[], root.to_str()).unwrap();
+        assert!(validate_confirmed_memory(&restored.entries[0], &resumed).is_ok());
+        assert_eq!(
+            restore_task_memory(Some(&serde_json::to_value(&restored).unwrap()), &resumed).unwrap(),
+            restored
+        );
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

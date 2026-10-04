@@ -59,6 +59,7 @@ fn main() {
                 context_limit,
                 reasoning_mode,
                 supports_reasoning,
+                reasoning_options,
                 web_mode: _,
                 policy,
                 history,
@@ -95,6 +96,7 @@ fn main() {
                         context_limit,
                         reasoning_mode,
                         supports_reasoning,
+                        reasoning_options,
                         policy: if policy == "safe" {
                             RunPolicy::Safe
                         } else {

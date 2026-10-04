@@ -1,5 +1,8 @@
 # Session runtime and context UX: implementation and validation
 
+Historical validation record for the commits below. Backend references describe
+that snapshot, not the current llama.cpp-only application support.
+
 Validation date: 2026-10-03. All code work took place in the isolated
 `kushch-yaroslav-special-sniffle` worktree. No primary-checkout edits, pushes,
 or feature merge-back were performed.

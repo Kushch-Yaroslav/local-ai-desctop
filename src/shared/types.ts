@@ -2,7 +2,7 @@ import type { ContextDiscoveryResult, RuntimeContextEstimate } from './context-e
 
 export type ChatMode = 'chat' | 'agent';
 export type WebMode = 'off' | 'auto';
-export type BackendId = 'ollama' | 'llama-cpp';
+export type BackendId = 'llama-cpp';
 export type LlamaKvCacheType = 'f16' | 'q8_0';
 /** A backend-native reasoning control. It never changes the output token budget. */
 export type ReasoningMode = 'auto' | 'fast' | 'deep';
@@ -58,7 +58,7 @@ export interface GenerationDiagnostics {
   inputTokens: number;
   agentStepCount: number;
   finishReason: FinishReason;
-  /** All duration values are whole nanoseconds. Ollama reports them natively; llama.cpp milliseconds are converted and rounded. evalCount contains generated completion tokens only. */
+  /** All duration values are whole nanoseconds. llama.cpp milliseconds are converted and rounded. evalCount contains generated completion tokens only. */
   promptEvalCount?: number;
   promptEvalDuration?: number;
   evalCount?: number;
@@ -67,8 +67,6 @@ export interface GenerationDiagnostics {
   promptTokensPerSecond?: number;
   timeToFirstTokenMs?: number;
   /** Agent-only runtime diagnostics; persisted logs retain the full per-attempt detail. */
-  ollamaRequestAttempt?: number;
-  ollamaRetryCount?: number;
   toolResultContextSize?: number;
   toolResultContextBudget?: number;
   toolResultCompacted?: number;
@@ -179,7 +177,7 @@ export interface ChatMessage {
   agentError?: string;
   agentCancelled?: boolean;
   agentFinishedAt?: string;
-  /** Ephemeral base64 image inputs for Ollama. These are rebuilt from managed attachment storage and are never persisted in SQLite. */
+  /** Ephemeral base64 image inputs, rebuilt from managed attachment storage and never persisted in SQLite. */
   images?: string[];
 }
 
@@ -194,8 +192,6 @@ export interface HardwareStats {
 }
 
 export interface AppSettings {
-  selectedBackend: BackendId;
-  ollamaUrl: string;
   llamaServerPath: string | null;
   llamaRuntimeModelId?: string;
   /** Live state of the launcher-managed llama-server; the authority on what is running. */

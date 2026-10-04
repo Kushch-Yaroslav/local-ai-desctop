@@ -1,9 +1,8 @@
 import type { ChatMessage, FinishReason, ModelInfo, ReasoningMode, StreamEvent } from '../../shared/types';
 import { createHash } from 'node:crypto';
-import { wholeNanoseconds, type InferenceDiagnostics, type LlmBackend, type RuntimeContextEvidence, type ToolCallingBackend, type ToolInferenceRequestContext, type ToolInferenceStreamEvent, type ToolMessage } from './types';
+import { wholeNanoseconds, type ContextWindow, type InferenceDiagnostics, type LlmBackend, type RuntimeContextEvidence, type ToolCallingBackend, type ToolInferenceRequestContext, type ToolInferenceStreamEvent, type ToolMessage } from './types';
 import { getModelProfile, maxOutputTokens, modelInfo, outputBudget, outputSafetyReserveTokens } from '../models/model-registry';
 import { llamaContextPresets, llamaRuntimeInstalled, llamaRuntimeProfile, llamaRuntimeProfiles } from '../models/llama-runtime-policy';
-import type { ContextWindow } from './ollama-backend';
 import { log } from '../services/logger';
 import type { LlamaKvCacheType } from '../../shared/types';
 import { llamaCapabilityLimit } from '../services/gguf-context';
@@ -14,17 +13,9 @@ type ChatResponse = { choices?: Choice[]; usage?: { prompt_tokens?: number; comp
 type ModelsResponse = { data?: Array<{ meta?: { n_ctx?: number; n_ctx_train?: number; size?: number } }> };
 type InputTokenResponse = { input_tokens?: unknown };
 const qwenModel = 'qwen3.8:27b-q4_K_M';
-const glmFlashModel = 'glm-4.7-flash:q4_k';
-// Qwen3.8's template supports a native think switch.  A mechanical Agent
-// continuation needs a direct tool decision, not another hidden design essay;
-// Deep is still enabled for planning, investigation and synthesis.
 function llamaCppReasoning(model: string, mode: ReasoningMode): Record<string, unknown> {
   if (mode === 'auto') return {};
-  if (model === qwenModel) return mode === 'fast'
-    ? { reasoning_effort: 'low', chat_template_kwargs: { enable_thinking: false } }
-    : { reasoning_effort: 'xhigh', chat_template_kwargs: { enable_thinking: true } };
-  if (model === glmFlashModel) return { reasoning_effort: mode === 'fast' ? 'none' : 'xhigh', chat_template_kwargs: { enable_thinking: mode !== 'fast' } };
-  return {};
+  return llamaRuntimeProfile(model)?.reasoningOptions?.[mode] ?? {};
 }
 type RequestDiagnostics = { endpoint: string; status: number; serverError?: string; userMessage?: string; backend: 'llama-cpp'; model: string; contextSize: number; requestedMaxOutput: number; effectiveMaxOutput: number; messageCount: number; toolCount: number; hasImages: boolean; estimatedPromptTokens: number; exactPromptTokens?: number; contextClassification: 'backend_context_rejected' | 'http_error' };
 type ContextAccounting = {
@@ -120,7 +111,7 @@ export class LlamaCppBackend implements LlmBackend, ToolCallingBackend {
     this.runtimeModelId = runtimeModelId;
   }
   private url(path: string): string { return `${this.baseUrl.replace(/\/$/, '')}${path}`; }
-  supportsReasoning(model: string): boolean { return model === qwenModel || model === glmFlashModel; }
+  supportsReasoning(model: string): boolean { return getModelProfile(model)?.supportsReasoning === true; }
   updateRuntimeSelection(model: string, contextLimit: number, kvCacheType: LlamaKvCacheType = 'f16', kvOffload = true): void {
     const runtime = llamaRuntimeProfiles.find((candidate) => candidate.id === model);
     if (!runtime || !Number.isSafeInteger(contextLimit) || contextLimit < 4_096 || contextLimit > runtime.maxContext || contextLimit % 4_096 !== 0) throw new Error('llama.cpp runtime selection is unsupported');
@@ -150,8 +141,8 @@ export class LlamaCppBackend implements LlmBackend, ToolCallingBackend {
       const trainedLimit = active ? data.data?.[0]?.meta?.n_ctx_train : undefined;
       const capability = Math.min(installed ? await llamaCapabilityLimit(runtime.id) : runtime.maxContext, trainedLimit ?? runtime.maxContext);
       result.push({
-        ...modelInfo(profile, active && (data.data ?? []).length > 0 ? true : installed, active ? data.data?.[0]?.meta?.size : undefined, capability, active ? (runtime.id === qwenModel || runtime.id === glmFlashModel) : profile.supportsReasoning),
-        backend: 'llama-cpp' as const,
+        ...modelInfo(profile, active && (data.data ?? []).length > 0 ? true : installed, active ? data.data?.[0]?.meta?.size : undefined, capability, profile.supportsReasoning),
+        backend: 'llama-cpp',
         supportedContextPresets: llamaContextPresets(runtime.id, capability),
       });
     }
@@ -184,7 +175,7 @@ export class LlamaCppBackend implements LlmBackend, ToolCallingBackend {
       kvOffload: this.kvOffload,
     };
   }
-  async supportsVision(model: string): Promise<boolean> { return model === qwenModel && this.runtimeModelId === qwenModel && this.visionEnabled; }
+  async supportsVision(model: string): Promise<boolean> { return llamaRuntimeProfile(model)?.vision === true && this.runtimeModelId === model && this.visionEnabled; }
   async resolveContextWindow(model: string, requested: number, signal?: AbortSignal): Promise<ContextWindow> {
     if (model !== this.runtimeModelId) throw new Error(`llama.cpp launcher запущен с моделью ${this.runtimeModelId}`);
     // The launch setting is a ceiling, not proof that a separately managed

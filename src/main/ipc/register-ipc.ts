@@ -6,23 +6,20 @@ import { defaultLlamaKv, normalContextForModel, resolveLlamaKvSelection } from '
 import { Database } from '../services/database';
 import { getHardwareStats, getOwnedServerVramBudget } from '../services/hardware';
 import { vramBudgetStillFits, vramProbeGuardBytes } from '../../shared/vram-budget';
-import { OllamaBackend } from '../backends/ollama-backend';
 import { LlamaCppBackend } from '../backends/llama-cpp-backend';
 import { LAUNCHER_ABSENT, LlamaRuntimeController, type LlamaRuntimeState } from '../services/llama-runtime-controller';
 import { RustAgentRuntime, taskPlan, type AgentProject } from '../services/rust-agent-runtime';
 import { paths } from '../services/paths';
 import { log } from '../services/logger';
-import { contextPresetsFor, getModelProfile, modelRegistry } from '../models/model-registry';
+import { getModelProfile } from '../models/model-registry';
 import { llamaContextPresets, llamaRuntimeProfile } from '../models/llama-runtime-policy';
 import { WebBrowserService } from '../web/web-tools';
 import { WebChatService } from '../services/web-chat';
 import { chatMessagesWithSystemPrefix, chatSystemContext } from '../services/capabilities';
-import { ReadonlyProjectTools, type ApprovalResult, type ConfirmAction } from '../tools/project-tools';
+import { ReadonlyProjectTools, type ApprovalResult } from '../tools/project-tools';
 import { AttachmentService } from '../services/attachment-service';
 import { AttachmentPipeline } from '../services/attachment-pipeline';
 import { readFile, stat } from 'node:fs/promises';
-import { homedir } from 'node:os';
-import { ollamaErrorDiagnostics } from '../backends/ollama-errors';
 import { saveGenerationDiagnosticsBestEffort } from '../services/generation-diagnostics';
 import { projectDirectoryName } from '../../shared/project-references';
 import { executionMode } from '../../shared/generation-mode';
@@ -33,7 +30,6 @@ import { llamaCapabilityLimit } from '../services/gguf-context';
 import { discoverContextBoundary, predictContextHeadroom, type DiscoveryProbe } from '../services/context-discovery';
 
 const database = new Database();
-const selectedBackend = process.env.LOCAL_AI_BACKEND === 'llama-cpp' ? 'llama-cpp' : 'ollama';
 const llamaRuntimeModelId = process.env.LOCAL_AI_LLAMA_MODEL_ID ?? 'qwen3.8:27b-q4_K_M';
 const defaultLlamaContext = 32_768;
 const maximumLlamaContext = llamaRuntimeProfile(llamaRuntimeModelId)?.maxContext ?? defaultLlamaContext;
@@ -41,11 +37,11 @@ const configuredLlamaContext = Number(process.env.LOCAL_AI_LLAMA_CONTEXT ?? defa
 const llamaContextLimit = Number.isSafeInteger(configuredLlamaContext) && configuredLlamaContext >= 4_096 && configuredLlamaContext <= maximumLlamaContext && configuredLlamaContext % 4_096 === 0 ? configuredLlamaContext : defaultLlamaContext;
 const initialLlamaKvType = process.env.LOCAL_AI_LLAMA_KV_TYPE === 'q8_0' ? 'q8_0' : 'f16';
 const initialLlamaKvOffload = process.env.LOCAL_AI_LLAMA_KV_OFFLOAD !== '0';
-const ollama = new OllamaBackend();
-const llamaCpp = new LlamaCppBackend(process.env.LOCAL_AI_LLAMA_CPP_URL ?? 'http://127.0.0.1:8081', llamaContextLimit, process.env.LOCAL_AI_LLAMA_CPP_VISION === '1', llamaRuntimeModelId);
-const backend = selectedBackend === 'llama-cpp' ? llamaCpp : ollama;
+const llamaCppUrl = process.env.LOCAL_AI_LLAMA_CPP_URL ?? 'http://127.0.0.1:8081';
+const llamaCpp = new LlamaCppBackend(llamaCppUrl, llamaContextLimit, process.env.LOCAL_AI_LLAMA_CPP_VISION === '1', llamaRuntimeModelId);
+const backend = llamaCpp;
 const web = new WebBrowserService();
-const rustAgent = new RustAgentRuntime(process.env.LOCAL_AI_AGENT_ENDPOINT ?? (selectedBackend === 'llama-cpp' ? process.env.LOCAL_AI_LLAMA_CPP_URL ?? 'http://127.0.0.1:8081/v1/chat/completions' : 'http://127.0.0.1:11434/api/chat'));
+const rustAgent = new RustAgentRuntime(process.env.LOCAL_AI_AGENT_ENDPOINT ?? `${llamaCppUrl.replace(/\/$/, '')}/v1/chat/completions`);
 const webChat = new WebChatService(backend, web);
 const attachments = new AttachmentService(database);
 const attachmentPipeline = new AttachmentPipeline(database, attachments);
@@ -119,15 +115,15 @@ async function syncLlamaBackend(): Promise<LlamaRuntimeState> {
 }
 async function estimateModelContext(modelId: string): Promise<RuntimeContextEstimate> {
   const profile = getModelProfile(modelId);
-  const llamaProfile = selectedBackend === 'llama-cpp' ? llamaRuntimeProfile(modelId) : undefined;
-  const configuredMaxTokens = selectedBackend === 'llama-cpp' && llamaProfile ? await llamaCapabilityLimit(modelId) : profile?.maxContext;
-  const contextPresets = selectedBackend === 'llama-cpp' ? llamaContextPresets(modelId) : profile ? contextPresetsFor(profile.maxContext) : [];
+  const llamaProfile = llamaRuntimeProfile(modelId);
+  const configuredMaxTokens = profile && llamaProfile ? await llamaCapabilityLimit(modelId) : undefined;
+  const contextPresets = profile && llamaProfile ? llamaContextPresets(modelId) : [];
   const hardware = await getHardwareStats();
   let runtime = null;
   let vramBudget: RuntimeContextEstimate['vramBudget'];
   let runtimeArguments: string[] | undefined;
   if (configuredMaxTokens) {
-    if (selectedBackend === 'llama-cpp' && llamaProfile) {
+    if (llamaProfile) {
       const current = await llamaRuntime.state();
       if (current.status === 'ready' && current.launcherPid !== undefined && current.modelId === modelId && current.kvCacheType && current.kvOffload !== undefined) {
         await syncLlamaBackend();
@@ -137,19 +133,17 @@ async function estimateModelContext(modelId: string): Promise<RuntimeContextEsti
           vramBudget = await getOwnedServerVramBudget(current.serverPid);
         }
       }
-    } else if (selectedBackend === 'ollama' && profile) {
-      runtime = await ollama.getRuntimeContextEvidence(modelId);
     }
   }
   const hostReserve = resolveContextReserve(process.env.LOCAL_AI_CONTEXT_HOST_RESERVE_BYTES, 'LOCAL_AI_CONTEXT_HOST_RESERVE_BYTES', defaultContextHostReserveBytes);
   const estimate = await collectRuntimeContextEstimate({
-    backend: selectedBackend,
+    backend: 'llama-cpp',
     modelId,
     configuredMaxTokens: Math.min(configuredMaxTokens ?? 0, runtime?.modelTrainContextTokens ?? Number.MAX_SAFE_INTEGER),
     contextPresets,
     hardware,
     runtime,
-    startupLogPath: selectedBackend === 'llama-cpp' ? process.env.LOCAL_AI_LLAMA_SERVER_LOG ?? join(paths.logs, 'llama-cpp-mtp-server.log') : null,
+    startupLogPath: process.env.LOCAL_AI_LLAMA_SERVER_LOG ?? join(paths.logs, 'llama-cpp-mtp-server.log'),
     hostReserveBytes: hostReserve.bytes,
     deviceReserveBytes: vramBudget ? vramBudget.freeBytes + vramBudget.llmBytes - vramBudget.availableLlmBytes : defaultContextDeviceReserveBytes,
     reserveErrors: [hostReserve.error].filter((error): error is string => Boolean(error)),
@@ -167,7 +161,7 @@ async function discoverModelContexts(modelId: string): Promise<ContextDiscoveryR
   if (contextDiscoveryBusy) throw new Error('Max Context discovery is already running.');
   if (runtimeSelectionBusy) throw new Error('Дождитесь завершения переключения runtime.');
   discoveredContextOptions.clear();
-  if (selectedBackend !== 'llama-cpp' || !profile) throw new Error('Max Context discovery requires an installed llama.cpp model.');
+  if (!profile) throw new Error('Max Context discovery requires an installed llama.cpp model.');
   contextDiscoveryBusy = true;
   contextDiscoveryProgress = { busy: true, modelId, stage: 'Подготовка; llama.cpp будет перезапущен несколько раз…', probeCount: 0 };
   let original: LlamaRuntimeState | null = null;
@@ -314,14 +308,10 @@ const waitFor = (promise: Promise<void>, timeoutMs: number): Promise<void> => ne
 /** Called by Electron's main lifecycle before process exit, never by a renderer. */
 export async function shutdownRuntime(): Promise<void> {
   const active = [...activeGenerations.values()];
-  log('runtime.shutdown.started', { backend: selectedBackend, activeGenerations: active.length });
+  log('runtime.shutdown.started', { backend: 'llama-cpp', activeGenerations: active.length });
   for (const generation of active) generation.abort.abort();
   await Promise.allSettled(active.map((generation) => waitFor(generation.settled, 4_000)));
-  if (selectedBackend === 'ollama') {
-    try { await ollama.unloadTrackedModels(); }
-    catch (error) { log('runtime.shutdown.ollama-unload.failed', ollamaErrorDiagnostics(error)); }
-  }
-  log('runtime.shutdown.finished', { backend: selectedBackend });
+  log('runtime.shutdown.finished', { backend: 'llama-cpp' });
 }
 
 function settleApproval(pending: PendingApproval, result: ApprovalResult, status: Exclude<ApprovalStatus, 'pending'>): void {
@@ -342,31 +332,10 @@ async function cancelGeneration(conversationId: string, generationId?: string, r
   active.abort.abort(); await active.settled;
 }
 
-function inlineConfirmation(event: Electron.IpcMainInvokeEvent, conversationId: string, generation: ActiveGeneration, root: string): ConfirmAction {
-  const emit = (payload: Record<string, unknown>) => event.sender.send('chat:stream', payload);
-  return async (request, signal) => {
-    if (signal.aborted || activeGenerations.get(conversationId) !== generation) return { approved: false, reason: 'cancelled' };
-    const requestRoot = request.root ?? root;
-    const session = sessionApprovals.get(conversationId);
-    if (session?.root === requestRoot && session.categories.has(request.category)) {
-      emit({ type: 'approval-resolved', conversationId, generationId: generation.id, actionId: request.actionId, approvalId: `session-${randomUUID()}`, status: 'session-approved' });
-      return { approved: true, reason: 'session' };
-    }
-    const approvalId = randomUUID();
-    return new Promise<ApprovalResult>((resolve) => {
-      const abort = () => settleApproval(pending, { approved: false, reason: 'cancelled' }, 'rejected');
-      const pending: PendingApproval = { approvalId, conversationId, generation, actionId: request.actionId, category: request.category, root: requestRoot, resolve, settled: false, abort, emit };
-      pendingApprovals.set(approvalId, pending);
-      signal.addEventListener('abort', abort, { once: true });
-      emit({ type: 'approval-request', conversationId, generationId: generation.id, actionId: request.actionId, approval: { approvalId, category: request.category, status: 'pending' } });
-    });
-  };
-}
-
 export function registerIpc(): void {
   ipcMain.handle('conversations:list', () => database.listConversations());
   ipcMain.handle('conversations:create', async (_event, requestedModelId?: string) => {
-    const modelId = requestedModelId ?? (selectedBackend === 'llama-cpp' ? (await currentLlamaRuntime()).modelId ?? llamaRuntimeModelId : modelRegistry[0].id);
+    const modelId = requestedModelId ?? (await currentLlamaRuntime()).modelId ?? llamaRuntimeModelId;
     if (!getModelProfile(modelId)) throw new Error('Выбранная модель отсутствует в реестре приложения');
     return database.createConversation(modelId);
   });
@@ -381,20 +350,17 @@ export function registerIpc(): void {
     const nextModelId = patch.modelId ?? current.modelId;
     const profile = nextModelId ? getModelProfile(nextModelId) : undefined;
     if (nextModelId && !profile) throw new Error('Выбранная модель отсутствует в реестре приложения');
-    const capability = profile ? selectedBackend === 'llama-cpp' ? await llamaCapabilityLimit(nextModelId ?? '') : profile.maxContext : 0;
-    const allowed = profile ? (selectedBackend === 'llama-cpp' ? llamaContextPresets(nextModelId ?? '', capability) : contextPresetsFor(capability)) : [];
+    const capability = profile ? await llamaCapabilityLimit(nextModelId ?? '') : 0;
+    const allowed = profile ? llamaContextPresets(nextModelId ?? '', capability) : [];
     const requestedContext = patch.contextWindow ?? current.contextWindow;
     const modelChanged = nextModelId !== current.modelId;
-    let contextWindow = modelChanged && patch.contextWindow === undefined && allowed.length ? normalContextForModel(requestedContext, allowed) : requestedContext;
+    const contextWindow = modelChanged && patch.contextWindow === undefined && allowed.length ? normalContextForModel(requestedContext, allowed) : requestedContext;
     if (allowed.length && !allowed.includes(contextWindow)) {
-      if (selectedBackend === 'llama-cpp' && (contextWindow % 4_096 !== 0 || contextWindow > capability || contextWindow <= 0)) {
+      if (contextWindow % 4_096 !== 0 || contextWindow > capability || contextWindow <= 0) {
         throw new Error(`Requested context ${contextWindow} is outside the model/backend capability or runtime bucket size.`);
       }
-      if (selectedBackend !== 'llama-cpp') {
-        contextWindow = allowed.at(-1)!;
-      }
     }
-    if (selectedBackend === 'llama-cpp' && nextModelId && profile) {
+    if (nextModelId && profile) {
       const isRuntimeRequest = patch.modelId !== undefined || patch.contextWindow !== undefined || patch.llamaKvCacheType !== undefined || patch.llamaKvOffload !== undefined;
       const { llamaKvCacheType: kvCacheType, llamaKvOffload: kvOffload } = resolveLlamaKvSelection(current, patch, modelChanged);
       const requiresDiscovery = !allowed.includes(contextWindow) || kvCacheType !== defaultLlamaKv.llamaKvCacheType || kvOffload !== defaultLlamaKv.llamaKvOffload;
@@ -421,7 +387,6 @@ export function registerIpc(): void {
     const updated = database.updateConversation(id, { ...patch, contextWindow });
     if ((patch.workingDirectory !== undefined && patch.workingDirectory !== current.workingDirectory) || (patch.secondaryWorkingDirectory !== undefined && patch.secondaryWorkingDirectory !== current.secondaryWorkingDirectory)) sessionApprovals.delete(id);
     if (patch.modelId !== undefined && patch.modelId !== current.modelId) database.setContextUsage(id, null, null);
-    if (selectedBackend === 'ollama' && patch.modelId !== undefined && patch.modelId !== current.modelId && current.modelId) void ollama.unloadModel(current.modelId);
     return database.getConversation(id) ?? updated;
     } finally {
       runtimeSelectionBusy = false;
@@ -471,11 +436,11 @@ export function registerIpc(): void {
   ipcMain.handle('analysis:list', (_event, conversationId: string) => database.listAnalysisRuns(conversationId));
   ipcMain.handle('models:list', async () => {
     try { return await backend.getModels(); }
-    catch (error) { log('backend.models.failed', { backend: selectedBackend, message: error instanceof Error ? error.message : String(error) }); return []; }
+    catch (error) { log('backend.models.failed', { backend: 'llama-cpp', message: error instanceof Error ? error.message : String(error) }); return []; }
   });
   ipcMain.handle('settings:get', async () => {
-    const llama = selectedBackend === 'llama-cpp' ? await syncLlamaBackend() : null;
-    return { selectedBackend, ollamaUrl: 'http://127.0.0.1:11434', llamaServerPath: selectedBackend === 'llama-cpp' ? process.env.LOCAL_AI_LLAMA_SERVER_PATH ?? null : null, ...(llama ? { llamaRuntimeModelId: llama.modelId ?? undefined, llamaRuntime: llama } : {}), modelsPath: paths.models };
+    const llama = await syncLlamaBackend();
+    return { llamaServerPath: process.env.LOCAL_AI_LLAMA_SERVER_PATH ?? null, llamaRuntimeModelId: llama.modelId ?? undefined, llamaRuntime: llama, modelsPath: paths.models };
   });
   ipcMain.handle('hardware:get', getHardwareStats);
   ipcMain.handle('context:estimate', async (_event, modelId: string): Promise<RuntimeContextEstimate> => {
@@ -557,13 +522,13 @@ export function registerIpc(): void {
       }
     }
     if (!current()) return;
-    // Ollama advertises capabilities with the installed tag. This governs routing
-    // for every image turn in the active history, rather than guessing from names.
+    // Runtime capabilities govern routing for every image turn in the active
+    // history, rather than guessing from model names.
     const hasImages = database.listAttachmentsForConversation(request.conversationId).some((attachment) => attachment.kind === 'image');
     const requestUser = user ?? [...request.messages].reverse().find((message) => message.role === 'user');
     const retryAttachmentIds = requestUser ? database.listAttachments(requestUser.id).filter((attachment) => attachment.status === 'pending' || attachment.status === 'cancelled').map((attachment) => attachment.id) : [];
     const nativeImagesRequested = attachmentPipeline.hasNativeImagesForRequest(request.messages);
-    const nativeVision = nativeImagesRequested && await backend.supportsVision(request.model, abort.signal);
+    const nativeVision = nativeImagesRequested && await backend.supportsVision(request.model);
     const preprocessIds = [...new Set([...attachmentIds, ...retryAttachmentIds])];
     log('attachment.vision-routing', { generationId: generation.id, modelId: request.model, hasImages, nativeImagesRequested, route: nativeVision ? 'native' : nativeImagesRequested ? 'unsupported' : hasImages ? 'deferred' : 'none' });
     if (preprocessIds.length) await attachmentPipeline.preprocessCurrent(preprocessIds, abort.signal, emitAttachment, nativeVision);
@@ -581,31 +546,14 @@ export function registerIpc(): void {
       const context = await backend.resolveContextWindow(request.model, conversation.contextWindow, abort.signal);
       if (!current()) return;
       event.sender.send('chat:stream', { type: 'context', conversationId: request.conversationId, generationId: generation.id, ...context });
-      if (mode === 'agent' && selectedBackend === 'ollama') {
-        // Prepare the native runner before the Rust sidecar's matching native
-        // request so a stale 32K/64K allocation is reconfigured explicitly.
-        await ollama.prepareAgentContext(request.model, context.active, abort.signal);
-        if (!current()) return;
-        log('ollama.agent.transport', {
-          model: request.model,
-          selectedContext: context.active,
-          endpoint: 'http://127.0.0.1:11434/api/chat',
-          transport: 'native',
-          generationNumCtx: context.active,
-        });
-      }
       // Image descriptions are excluded for native-vision requests: the original
       // image payload is attached only to its owning user turn below.
       let history = attachmentPipeline.buildContext(request.messages, !hasImages);
       if (nativeVision) history = await attachmentPipeline.prepareNativeImages(history, abort.signal);
       const persistedTaskMemory = mode === 'agent' ? taskPlan(database.getAgentPlan(request.conversationId) ?? {}).taskMemory : undefined;
-      const agentSupportsReasoning = mode === 'agent'
-        ? selectedBackend === 'ollama'
-          ? await ollama.supportsReasoning(request.model, abort.signal)
-          : llamaCpp.supportsReasoning(request.model)
-        : false;
+      const agentSupportsReasoning = mode === 'agent' && llamaCpp.supportsReasoning(request.model);
       const stream = mode === 'agent'
-        ? rustAgent.stream(request.model, history, agentProjects, abort.signal, context.active, conversation.reasoningMode, conversation.webMode, generation.id, persistedTaskMemory, request.conversationId, agentSupportsReasoning)
+        ? rustAgent.stream(request.model, history, agentProjects, abort.signal, context.active, conversation.reasoningMode, conversation.webMode, generation.id, persistedTaskMemory, request.conversationId, agentSupportsReasoning, llamaRuntimeProfile(request.model)?.reasoningOptions)
         : conversation.webMode === 'auto'
           ? webChat.stream(request.model, history, abort.signal, context.active, conversation.reasoningMode)
           : backend.streamChat(request.model, chatMessagesWithSystemPrefix(history, [chatSystemContext({ webAvailable: false }, conversation.reasoningMode === 'deep' ? 'deep' : 'fast')], request.conversationId, `capability-${request.conversationId}`), abort.signal, context.active, conversation.reasoningMode);
@@ -680,7 +628,7 @@ export function registerIpc(): void {
       if (run) event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run: database.finishAnalysisRun(run.id, 'completed', assistant?.id ?? null) });
       event.sender.send('chat:stream', { type: 'done', conversationId: request.conversationId, generationId: generation.id, assistant, finishReason });
     } catch (error) {
-      log('generation.failed', { generationId: generation.id, conversationId: request.conversationId, model: request.model, ...ollamaErrorDiagnostics(error) });
+      log('generation.failed', { generationId: generation.id, conversationId: request.conversationId, model: request.model, message: error instanceof Error ? error.message : String(error) });
       if (run) { const finished = database.finishAnalysisRun(run.id, abort.signal.aborted ? 'cancelled' : 'error', null); if (current()) event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run: finished }); }
       if (current()) event.sender.send('chat:stream', { type: 'error', conversationId: request.conversationId, generationId: generation.id, message: 'Не удалось выполнить запрос', details: error instanceof Error ? error.message : String(error) });
     } finally {

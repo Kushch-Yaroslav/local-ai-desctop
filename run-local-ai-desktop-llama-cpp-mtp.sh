@@ -64,7 +64,8 @@ select_variant() {
       MMPROJ="/media/yaroslav/DATA/llama-models/qwen3.8-27b-mmproj.gguf"
       RUNTIME_MODEL_ID="qwen3.8:27b-q4_K_M"; RUNTIME_LABEL="Qwen3.8 MTP"; DEFAULT_LLAMA_CONTEXT=32768; MAX_LLAMA_CONTEXT=262144 ;;
     gpt-oss:20b)
-      LAUNCH_ERROR="gpt-oss llama.cpp runtime needs ggml-org/gpt-oss-20b-GGUF and a compatible EAGLE-3 GGUF; neither is installed."; return 1 ;;
+      VARIANT="gpt-oss"; MODEL="/media/yaroslav/DATA/llama-models/gpt-oss-20b-MXFP4.gguf"; MMPROJ=""
+      RUNTIME_MODEL_ID="gpt-oss:20b"; RUNTIME_LABEL="GPT-OSS-20B"; DEFAULT_LLAMA_CONTEXT=32768; MAX_LLAMA_CONTEXT=131072 ;;
     *)
       LAUNCH_ERROR="Unknown Local AI llama.cpp model: $1"; return 1 ;;
   esac
@@ -140,8 +141,8 @@ server_failure_reason() {
 
 # launch_server <model_id> <context> <kv_type> <kv_offload>
 # Success means: the process is alive, /health is ok, /v1/models reports the
-# requested alias with exactly the requested n_ctx, and (MTP) the draft context
-# exists. Anything else stops the process and leaves LAUNCH_ERROR.
+# requested alias with exactly the requested n_ctx, and (for MTP) the draft
+# context exists. Anything else stops the process and leaves LAUNCH_ERROR.
 launch_server() {
   local model_id="$1" context="$2" kv_type="${3:-f16}" kv_offload="${4:-1}"
   LAUNCH_ERROR=""; REQUEST_CONTEXT_FOR_ERROR="$context"
@@ -151,7 +152,7 @@ launch_server() {
   [[ "$kv_offload" == "0" || "$kv_offload" == "1" ]] || { LAUNCH_ERROR="Неподдерживаемая настройка KV offload"; return 1; }
   [[ -x "$LLAMA_BIN" ]] || { LAUNCH_ERROR="Не найден исполняемый llama-server: $LLAMA_BIN"; return 1; }
   [[ -f "$MODEL" ]] || { LAUNCH_ERROR="Не найден GGUF выбранной модели: $MODEL"; return 1; }
-  [[ -z "$MMPROJ" || -f "$MMPROJ" ]] || { LAUNCH_ERROR="Не найден Qwen vision projector: $MMPROJ"; return 1; }
+  [[ -z "$MMPROJ" || -f "$MMPROJ" ]] || { LAUNCH_ERROR="Не найден vision projector: $MMPROJ"; return 1; }
 
   local context_args=(--cache-type-k "$kv_type" --cache-type-v "$kv_type") gpu_layers=999
   if [[ "$VARIANT" == "qwen-mtp" ]]; then context_args+=(--cache-type-k-draft "$kv_type" --cache-type-v-draft "$kv_type"); fi
@@ -164,8 +165,10 @@ launch_server() {
   local server_args=() printed_command
   if [[ "$VARIANT" == "glm-4.7-flash" ]]; then
     server_args=(--log-verbosity 5 -m "$MODEL" --alias "$RUNTIME_MODEL_ID" --host 127.0.0.1 --port "$PORT" --ctx-size "$context" --gpu-layers "$gpu_layers" --flash-attn on "${context_args[@]}" --batch-size 512 --ubatch-size 512 --parallel 1 --jinja --reasoning on --no-warmup)
-  else
+  elif [[ "$VARIANT" == "qwen-mtp" ]]; then
     server_args=(--log-verbosity 5 -m "$MODEL" --alias "$RUNTIME_MODEL_ID" --mmproj "$MMPROJ" --no-mmproj-offload --host 127.0.0.1 --port "$PORT" --ctx-size "$context" --gpu-layers "$gpu_layers" --flash-attn on --parallel 1 --spec-type draft-mtp "${context_args[@]}")
+  else
+    server_args=(--log-verbosity 5 -m "$MODEL" --alias "$RUNTIME_MODEL_ID" --host 127.0.0.1 --port "$PORT" --ctx-size "$context" --gpu-layers "$gpu_layers" --flash-attn on "${context_args[@]}" --parallel 1 --spec-type none --jinja --reasoning on --reasoning-format auto --no-warmup)
   fi
   printf -v printed_command '%q ' "$LLAMA_BIN" "${server_args[@]}"
   log "llama-server.command=${printed_command% }"
@@ -329,7 +332,6 @@ export NPM_CONFIG_CACHE="$APP_DIR/local-cache/npm"
 export XDG_CACHE_HOME="$STATE_DIR/cache"
 export XDG_CONFIG_HOME="$STATE_DIR/app-data"
 export ELECTRON_ENABLE_LOGGING=1
-export LOCAL_AI_BACKEND="llama-cpp"
 export LOCAL_AI_LLAMA_CPP_URL="$URL"
 export LOCAL_AI_LLAMA_SERVER_PATH="$LLAMA_BIN"
 export LOCAL_AI_LLAMA_SERVER_LOG="$SERVER_LOG"
@@ -357,7 +359,7 @@ if [[ "${LOCAL_AI_LAUNCHER_HEADLESS:-}" == "1" ]]; then
   done
 fi
 
-log "electron.start command=$ELECTRON_BIN cwd=$(pwd) backend=$LOCAL_AI_BACKEND"
+log "electron.start command=$ELECTRON_BIN cwd=$(pwd) runtime=llama.cpp"
 "$ELECTRON_BIN" "$APP_DIR" >> "$LOG_FILE" 2>&1 &
 ELECTRON_PID=$!
 log "electron.pid=$ELECTRON_PID"

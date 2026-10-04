@@ -17,7 +17,7 @@ function tooltip(value: GenerationDiagnostics | null, isGenerating: boolean): st
   return lines.join('\n');
 }
 
-/** The primary value is authoritative: Ollama eval_count / eval_duration. Live output stays blank until that metric exists. */
+/** The primary value is authoritative: llama.cpp's reported completion metrics. Live output stays blank until that metric exists. */
 export function InferencePerformance({ value, isGenerating }: { value: GenerationDiagnostics | null; isGenerating: boolean }) {
   const label = value?.tokensPerSecond !== undefined ? rate(value.tokensPerSecond) : '— ток/с';
   return <span className={`performance-indicator${isGenerating && !value ? ' pending' : ''}`} title={tooltip(value, isGenerating)} aria-label={`Скорость генерации: ${label}`}>Ген. {label}</span>;
