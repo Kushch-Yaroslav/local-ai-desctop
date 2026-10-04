@@ -1,3 +1,4 @@
+import { localizeProjectLabel } from '../../shared/localization';
 import { useShallow } from 'zustand/react/shallow';
 import { ChevronDown, File, Folder, Paperclip, Send, Square, X } from 'lucide-react';
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
@@ -81,14 +82,14 @@ export function Composer() {
     {isGenerating && chat?.mode === 'agent' && <button className="steering-button" type="button" disabled={!value.trim() || files.length > 0 || projectReferences.length > 0 || steeringSubmitting} onClick={submit} title={steeringStatus === 'applied' ? 'Предыдущее уточнение передано модели' : steeringStatus === 'accepted' ? 'Предыдущее уточнение принято; ожидает границы хода' : 'Отправить уточнение без остановки Agent'}>Уточнить</button>}
     <button className="attach-button" type="button" disabled={isGenerating} title="Прикрепить файлы" onClick={() => inputRef.current?.click()}><Paperclip size={18} /></button>
     <textarea ref={ref} value={value} placeholder="Напишите сообщение…" rows={1} onPointerDown={startResize} onPointerUp={finishResize} onChange={(event) => updateValue(event.target.value, event.target.selectionStart)} onKeyDown={(event) => { if (suggestions.length) { if (event.key === 'ArrowDown' || event.key === 'ArrowUp') { event.preventDefault(); setActiveSuggestion((index) => (index + (event.key === 'ArrowDown' ? 1 : suggestions.length - 1)) % suggestions.length); return; } if ((event.key === 'Enter' || event.key === 'Tab') && suggestions[activeSuggestion]) { event.preventDefault(); selectSuggestion(suggestions[activeSuggestion]); return; } if (event.key === 'Escape') { event.preventDefault(); setReferenceQuery(null); setSuggestions([]); return; } } if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); submit(); } }} />
-    {suggestions.length > 0 && <div className="project-reference-menu" role="listbox" aria-label="Файлы проекта">{suggestions.map((suggestion, index) => <button type="button" role="option" aria-selected={index === activeSuggestion} className={index === activeSuggestion ? 'active' : ''} key={suggestion.id} onMouseDown={(event) => { event.preventDefault(); selectSuggestion(suggestion); }} onMouseEnter={() => setActiveSuggestion(index)}>{suggestion.kind === 'folder' ? <Folder size={15} /> : <File size={15} />}<span>{suggestion.relativePath}</span><small className={`project-badge project-${suggestion.projectSlot}`}>{suggestion.projectLabel}</small></button>)}</div>}
+    {suggestions.length > 0 && <div className="project-reference-menu" role="listbox" aria-label="Файлы проекта">{suggestions.map((suggestion, index) => <button type="button" role="option" aria-selected={index === activeSuggestion} className={index === activeSuggestion ? 'active' : ''} key={suggestion.id} onMouseDown={(event) => { event.preventDefault(); selectSuggestion(suggestion); }} onMouseEnter={() => setActiveSuggestion(index)}>{suggestion.kind === 'folder' ? <Folder size={15} /> : <File size={15} />}<span>{suggestion.relativePath}</span><small className={`project-badge project-${suggestion.projectSlot}`}>{localizeProjectLabel(suggestion.projectLabel)}</small></button>)}</div>}
     <ContextUsage />{isGenerating ? <button className="send-button stop" onClick={() => void stop()} title="Остановить генерацию"><Square size={16} fill="currentColor" /></button> : <button className="send-button" disabled={Boolean(generationConversationId) || (!value.trim() && files.length === 0)} onClick={submit} title={generationConversationId ? 'Генерация выполняется в другом чате' : 'Отправить'}><Send size={18} /></button>}
   </div>{attachmentError && <p className="attachment-error" role="status">{attachmentError}</p>}<p>Enter — отправить · Shift+Enter — новая строка · вставьте или перетащите файлы</p></div>;
 }
 
 export function taskPlanningItems(plan: AgentPlan): ModelTodoItem[] {
   const legacy = plan.steps ?? [];
-  const milestones = plan.milestones ?? (legacy.length ? [{ id: 'legacy-plan', label: 'Previous plan', status: legacy.some((step) => step.status === 'in_progress') ? 'in_progress' as const : 'pending' as const, workPlan: { tasks: legacy } }] : []);
+  const milestones = plan.milestones ?? (legacy.length ? [{ id: 'legacy-plan', label: 'Предыдущий план', status: legacy.some((step) => step.status === 'in_progress') ? 'in_progress' as const : 'pending' as const, workPlan: { tasks: legacy } }] : []);
   return plan.modelTodo?.phases.flatMap((phase) => phase.items) ?? milestones.flatMap((milestone) => milestone.workPlan.tasks.map((task) => ({ id: task.id, content: task.label, status: task.status })));
 }
 
@@ -99,10 +100,10 @@ export function TaskPlanPanel({ plan, active = false }: { plan: AgentPlan; activ
   const todoItems = taskPlanningItems(plan);
   if (!todoItems.length) return null;
   const completed = todoItems.filter((task) => task.status === 'completed' || task.status === 'abandoned').length;
-  return <section className={`task-plan-panel milestone-plan${active ? ' active' : ''}${collapsed ? ' collapsed' : ''}`} aria-label="Task Planning">
+  return <section className={`task-plan-panel milestone-plan${active ? ' active' : ''}${collapsed ? ' collapsed' : ''}`} aria-label="План задач">
     <header>
       <button type="button" className="task-plan-toggle" aria-expanded={!collapsed} aria-controls={contentId} onClick={() => setCollapsed((value) => !value)}>
-        <strong>Task Planning</strong><span>{completed}/{todoItems.length}</span><ChevronDown size={15} aria-hidden="true" />
+        <strong>План задач</strong><span>{completed}/{todoItems.length}</span><ChevronDown size={15} aria-hidden="true" />
       </button>
     </header>
     <div id={contentId} className="task-plan-collapse" inert={collapsed}>
@@ -114,11 +115,11 @@ export function TaskPlanPanel({ plan, active = false }: { plan: AgentPlan; activ
 }
 
 function ProjectReferenceChip({ reference, onRemove }: { reference: ProjectReference; onRemove: () => void }) {
-  return <div className={`project-reference-chip project-${reference.projectSlot}`}>{reference.kind === 'folder' ? <Folder size={13} /> : <File size={13} />}<span>{reference.relativePath}</span><small>{reference.projectLabel}</small><button type="button" title="Удалить ссылку на проект" onClick={onRemove}><X size={12} /></button></div>;
+  return <div className={`project-reference-chip project-${reference.projectSlot}`}>{reference.kind === 'folder' ? <Folder size={13} /> : <File size={13} />}<span>{reference.relativePath}</span><small>{localizeProjectLabel(reference.projectLabel)}</small><button type="button" title="Удалить ссылку на проект" onClick={onRemove}><X size={12} /></button></div>;
 }
 
 function DraftAttachment({ file, index, onRemove }: { file: File; index: number; onRemove: () => void }) {
   const [url, setUrl] = useState<string | null>(null);
   useEffect(() => { if (!isImageFile(file)) return; const next = URL.createObjectURL(file); setUrl(next); return () => URL.revokeObjectURL(next); }, [file]);
-  return <div className={`attachment-draft-item ${url ? 'image' : ''}`}>{url ? <img src={url} alt={`Image ${index + 1}`} /> : <span className="attachment-file-icon">{file.name.split('.').at(-1)?.toUpperCase() ?? 'FILE'}</span>}<span className="attachment-number">{url ? index + 1 : file.name}</span><button type="button" title="Удалить вложение" onClick={onRemove}><X size={13} /></button></div>;
+  return <div className={`attachment-draft-item ${url ? 'image' : ''}`}>{url ? <img src={url} alt={`Изображение ${index + 1}`} /> : <span className="attachment-file-icon">{file.name.split('.').at(-1)?.toUpperCase() ?? 'FILE'}</span>}<span className="attachment-number">{url ? index + 1 : file.name}</span><button type="button" title="Удалить вложение" onClick={onRemove}><X size={13} /></button></div>;
 }

@@ -62,9 +62,9 @@ export async function runContextEstimateRegression(): Promise<void> {
   assert.deepEqual(resolveContextReserve(undefined, 'HOST_RESERVE', defaultContextHostReserveBytes), { bytes: 8 * 1024 ** 3 });
   assert.deepEqual(resolveContextReserve(undefined, 'DEVICE_RESERVE', defaultContextDeviceReserveBytes), { bytes: 384 * 1024 ** 2 });
   assert.deepEqual(resolveContextReserve(String(12 * 1024 ** 3), 'HOST_RESERVE', defaultContextHostReserveBytes), { bytes: 12 * 1024 ** 3 });
-  assert.match(resolveContextReserve(String(7 * 1024 ** 3), 'HOST_RESERVE', defaultContextHostReserveBytes).error ?? '', /at least/);
-  assert.match(resolveContextReserve('invalid', 'DEVICE_RESERVE', defaultContextDeviceReserveBytes).error ?? '', /integer byte count/);
-  assert.match(resolveContextReserve(String(Number.MAX_SAFE_INTEGER + 1), 'DEVICE_RESERVE', defaultContextDeviceReserveBytes).error ?? '', /safe integer/);
+  assert.match(resolveContextReserve(String(7 * 1024 ** 3), 'HOST_RESERVE', defaultContextHostReserveBytes).error ?? '', /не меньше/);
+  assert.match(resolveContextReserve('invalid', 'DEVICE_RESERVE', defaultContextDeviceReserveBytes).error ?? '', /целым числом байт/);
+  assert.match(resolveContextReserve(String(Number.MAX_SAFE_INTEGER + 1), 'DEVICE_RESERVE', defaultContextDeviceReserveBytes).error ?? '', /допустимым целым числом/);
 
   const parsed = parseLlamaAllocationLog(allocationLog);
   assert.equal(parsed.contextTokens, 32_768);
@@ -142,7 +142,7 @@ I srv llama_server: model loaded
   assert.deepEqual(kvOnly.allocations.ssm, { host: 0, device: 0 });
   assert.deepEqual(kvOnly.unknownReasons, [], 'complete non-recurrent/non-vision allocation evidence was rejected');
   const partialKvOnly = parseLlamaAllocationLog(kvOnlyLog.replace('I srv llama_server: model loaded', ''), ['llama-server']);
-  assert(partialKvOnly.unknownReasons.some((reason) => reason.includes('recurrent-state')), 'partial startup must not manufacture an absent recurrent allocation');
+  assert(partialKvOnly.unknownReasons.some((reason) => reason.includes('рекуррентному состоянию')), 'partial startup must not manufacture an absent recurrent allocation');
   const q8Response = await collectRuntimeContextEstimate({
     backend: 'llama-cpp',
     modelId: runtime.modelId,
@@ -208,7 +208,7 @@ I common_speculative_init_result: creating MTP draft context
   assert.equal(observedOnly.status, 'observed', 'a working runtime is useful evidence even when projection data is missing');
   assert.equal(observedOnly.observedContextTokens, 32_768);
   assert.equal(observedOnly.hardwareSafeTokens, null, 'minimal logs must not be extrapolated');
-  assert(observedOnly.unknownReasons.some((reason) => reason.includes('K/V cache precisions')));
+  assert(observedOnly.unknownReasons.some((reason) => reason.includes('точность K/V-кэша')));
 
   const oldLogForOtherContext = await collectRuntimeContextEstimate({
     backend: 'llama-cpp',
@@ -244,7 +244,7 @@ I common_speculative_init_result: creating MTP draft context
     deviceReserveBytes: 4 * 1024 ** 3,
   }, async () => ({ text: allocationLog }));
   assert.equal(unavailableHardware.hardwareSafeTokens, null, 'stale hardware snapshot was used for a safe estimate');
-  assert(unavailableHardware.unknownReasons.some((reason) => reason.includes('memory snapshot is unavailable')));
+  assert(unavailableHardware.unknownReasons.some((reason) => reason.includes('снимок системной памяти недоступен')));
   const missingFreeMemory = await collectRuntimeContextEstimate({
     backend: 'llama-cpp', modelId: runtime.modelId, configuredMaxTokens: 131072,
     contextPresets: [32768], hardware: { ...hardware, vramAvailableBytes: null }, runtime,
@@ -277,7 +277,7 @@ I common_speculative_init_result: creating MTP draft context
   });
   assert.equal(noRuntime.status, 'unknown');
   assert.equal(noRuntime.observedContextTokens, null);
-  assert(noRuntime.unknownReasons.some((reason) => reason.includes('active runtime context is not reported')));
+  assert(noRuntime.unknownReasons.some((reason) => reason.includes('не сообщён активный контекст')));
 }
 
 if (require.main === module) void runContextEstimateRegression();

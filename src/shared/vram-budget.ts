@@ -21,7 +21,7 @@ export interface VramBudget {
 
 export function createVramBudget(totalBytes: number, usedBytes: number, freeBytes: number, llmBytes: number): VramBudget {
   if (![totalBytes, usedBytes, freeBytes, llmBytes].every((value) => Number.isFinite(value) && value >= 0)
-    || totalBytes <= 0 || usedBytes + freeBytes > totalBytes || llmBytes > usedBytes) throw new Error('Invalid owned-process VRAM accounting.');
+    || totalBytes <= 0 || usedBytes + freeBytes > totalBytes || llmBytes > usedBytes) throw new Error('Некорректные данные о памяти VRAM процесса llama-server.');
   const nonLlmBytes = usedBytes - llmBytes;
   const driverReservedBytes = totalBytes - usedBytes - freeBytes;
   const llmBudgetBytes = totalBytes - nonLlmBudgetBytes - vramEstimatorMarginBytes;

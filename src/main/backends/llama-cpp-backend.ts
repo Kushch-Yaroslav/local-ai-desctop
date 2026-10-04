@@ -114,8 +114,8 @@ export class LlamaCppBackend implements LlmBackend, ToolCallingBackend {
   supportsReasoning(model: string): boolean { return getModelProfile(model)?.supportsReasoning === true; }
   updateRuntimeSelection(model: string, contextLimit: number, kvCacheType: LlamaKvCacheType = 'f16', kvOffload = true): void {
     const runtime = llamaRuntimeProfiles.find((candidate) => candidate.id === model);
-    if (!runtime || !Number.isSafeInteger(contextLimit) || contextLimit < 4_096 || contextLimit > runtime.maxContext || contextLimit % 4_096 !== 0) throw new Error('llama.cpp runtime selection is unsupported');
-    if (kvCacheType !== 'f16' && kvCacheType !== 'q8_0') throw new Error('llama.cpp KV cache type is unsupported');
+    if (!runtime || !Number.isSafeInteger(contextLimit) || contextLimit < 4_096 || contextLimit > runtime.maxContext || contextLimit % 4_096 !== 0) throw new Error('Выбранная конфигурация llama.cpp не поддерживается');
+    if (kvCacheType !== 'f16' && kvCacheType !== 'q8_0') throw new Error('Выбранный тип KV-кэша llama.cpp не поддерживается');
     this.runtimeModelId = model;
     this.contextLimit = contextLimit;
     this.kvCacheType = kvCacheType;
@@ -334,7 +334,7 @@ export class LlamaCppBackend implements LlmBackend, ToolCallingBackend {
         const health = connectionError ? await this.probeHealth() : undefined;
         log('llama-cpp.agent.inference.failed', { ...agentDiagnostics, failedAt: new Date(failedAt).toISOString(), elapsedMs: failedAt - startedAt, signalAborted: signal.aborted, ...summary, health });
       }
-      if (connectionError && !signal.aborted) throw new Error(`llama.cpp inference connection failed: ${summary.error}`, { cause: error });
+      if (connectionError && !signal.aborted) throw new Error(`Не удалось подключиться к llama.cpp: ${summary.error}`, { cause: error });
       throw error;
     }
   }

@@ -12,6 +12,6 @@ export function runVramBudgetRegression() {
   assert.equal(vramBudgetStillFits(value, budget(1250, 2000)), true);
   assert.equal(vramBudgetStillFits(value, budget(1400, 2000)), false, 'material background change invalidates');
   assert.equal(vramBudgetStillFits(budget(1000, 22640), budget(1100, 2000)), false, 'budget violation invalidates even a small background change');
-  assert.throws(() => createVramBudget(10, 8, 5, 2), /Invalid/);
+  assert.throws(() => createVramBudget(10, 8, 5, 2), /Некорректные данные о памяти VRAM/);
 }
 if (require.main === module) runVramBudgetRegression();

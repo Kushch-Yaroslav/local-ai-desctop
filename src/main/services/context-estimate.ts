@@ -42,10 +42,10 @@ export const defaultContextDeviceReserveBytes = vramEstimatorMarginBytes;
 
 export function resolveContextReserve(value: string | undefined, variable: string, defaultBytes: number): { bytes: number | null; error?: string } {
   if (value === undefined) return { bytes: defaultBytes };
-  if (!/^\d+$/.test(value)) return { bytes: null, error: `${variable} must be an integer byte count at least ${defaultBytes}` };
+  if (!/^\d+$/.test(value)) return { bytes: null, error: `${variable} должно быть целым числом байт не меньше ${defaultBytes}` };
   const bytes = Number(value);
   if (!Number.isSafeInteger(bytes) || bytes < defaultBytes) {
-    return { bytes: null, error: `${variable} must be a safe integer byte count at least ${defaultBytes}` };
+    return { bytes: null, error: `${variable} должно быть допустимым целым числом байт не меньше ${defaultBytes}` };
   }
   return { bytes };
 }
@@ -258,23 +258,23 @@ export function parseLlamaAllocationLog(text: string, runtimeArguments?: readonl
   }
 
   const unknownReasons: string[] = [];
-  if (!contextTokens) unknownReasons.push('startup log has no active per-sequence context allocation');
-  if (!sequenceSlots) unknownReasons.push('startup log has no target sequence-slot count');
-  if (speculativeMode === 'unknown') unknownReasons.push('startup log does not confirm speculative mode');
-  if (speculativeMode !== 'none' && !speculativeSlots) unknownReasons.push('startup log has no draft sequence-slot count');
-  if (!targetKvTypesSeen || !kvTypeK || !kvTypeV) unknownReasons.push('startup log does not report target K/V cache precisions');
-  if (speculativeMode !== 'none' && (!speculativeKvTypesSeen || !speculativeKvTypeK || !speculativeKvTypeV)) unknownReasons.push('startup log does not report draft K/V cache precisions');
-  if (visionPresent === null) unknownReasons.push('startup log does not confirm whether a vision projector is loaded');
-  if (visionPresent && !visionWeightsBytes) unknownReasons.push('startup log has no vision projector weight size');
-  if (visionPresent && !visionComputeBytes) unknownReasons.push('startup log has no vision projector compute reservation');
+  if (!contextTokens) unknownReasons.push('в журнале запуска нет размера контекста на последовательность');
+  if (!sequenceSlots) unknownReasons.push('в журнале запуска нет числа слотов основной модели');
+  if (speculativeMode === 'unknown') unknownReasons.push('журнал запуска не подтверждает режим спекулятивного декодирования');
+  if (speculativeMode !== 'none' && !speculativeSlots) unknownReasons.push('в журнале запуска нет числа слотов draft-модели');
+  if (!targetKvTypesSeen || !kvTypeK || !kvTypeV) unknownReasons.push('журнал запуска не сообщает точность K/V-кэша основной модели');
+  if (speculativeMode !== 'none' && (!speculativeKvTypesSeen || !speculativeKvTypeK || !speculativeKvTypeV)) unknownReasons.push('журнал запуска не сообщает точность K/V-кэша draft-модели');
+  if (visionPresent === null) unknownReasons.push('журнал запуска не подтверждает, загружен ли визуальный проектор');
+  if (visionPresent && !visionWeightsBytes) unknownReasons.push('в журнале запуска нет размера весов визуального проектора');
+  if (visionPresent && !visionComputeBytes) unknownReasons.push('в журнале запуска нет резерва вычислений визуального проектора');
   for (const kind of allocationKinds) {
     if (kind === 'speculativeWeights' && (speculativeMode === 'none' || speculativeUsesTargetModel)) continue;
     if (speculativeMode === 'none' && ['speculativeCompute', 'speculativeKv'].includes(kind)) continue;
-    if (!Object.keys(allocations[kind]).length) unknownReasons.push(`startup log has no final ${kind} allocation`);
+    if (!Object.keys(allocations[kind]).length) unknownReasons.push(`в журнале запуска нет итогового выделения памяти: ${kind}`);
   }
-  if (!sawTargetKvSummary) unknownReasons.push('startup log has no target KV allocation summary');
-  if (speculativeMode !== 'none' && !sawSpeculativeKvSummary) unknownReasons.push('startup log has no draft KV allocation summary');
-  if (!sawTargetRsSummary) unknownReasons.push('startup log has no recurrent-state allocation summary');
+  if (!sawTargetKvSummary) unknownReasons.push('в журнале запуска нет сводки по KV-кэшу основной модели');
+  if (speculativeMode !== 'none' && !sawSpeculativeKvSummary) unknownReasons.push('в журнале запуска нет сводки по KV-кэшу draft-модели');
+  if (!sawTargetRsSummary) unknownReasons.push('в журнале запуска нет сводки по рекуррентному состоянию');
   return {
     modelPath,
     contextTokens,
@@ -339,11 +339,11 @@ function createEstimatorInput(request: ContextEstimateRequest, log: LlamaAllocat
 }
 
 export async function readLlamaAllocationLog(path: string | null | undefined): Promise<{ text: string | null; reason?: string }> {
-  if (!path) return { text: null, reason: 'LOCAL_AI_LLAMA_SERVER_LOG is not configured' };
+  if (!path) return { text: null, reason: 'не задана переменная LOCAL_AI_LLAMA_SERVER_LOG' };
   try {
     return { text: await readFile(path, 'utf8') };
   } catch (error) {
-    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return { text: null, reason: 'configured llama-server allocation log was not found' };
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return { text: null, reason: 'журнал выделения памяти llama-server не найден' };
     throw error;
   }
 }
@@ -394,38 +394,38 @@ export async function collectRuntimeContextEstimate(
     return { ...base, unknownReasons: [...request.reserveErrors] };
   }
   if (!observed) {
-    return { ...base, unknownReasons: ['active runtime context is not reported for this model; startup log alone does not prove it is currently loaded'] };
+    return { ...base, unknownReasons: ['для этой модели не сообщён активный контекст; один журнал запуска не доказывает, что она загружена сейчас'] };
   }
   const logResult = await readLog(request.startupLogPath);
   if (!logResult.text) {
-    return { ...base, unknownReasons: [logResult.reason ?? 'llama-server allocation log unavailable'] };
+    return { ...base, unknownReasons: [logResult.reason ?? 'журнал выделения памяти llama-server недоступен'] };
   }
   const allocationEvidence = parseLlamaAllocationLog(logResult.text, request.runtimeArguments);
   if (allocationEvidence.contextTokens !== observed.activeContextTokens) {
     return {
       ...base,
-      unknownReasons: [`allocation log context (${allocationEvidence.contextTokens ?? 'unknown'}) does not match active runtime context (${observed.activeContextTokens})`],
+      unknownReasons: [`контекст в журнале выделения памяти (${allocationEvidence.contextTokens ?? 'неизвестен'}) не совпадает с активным контекстом (${observed.activeContextTokens})`],
       allocationEvidence,
     };
   }
   if (!observed.kvCacheType || observed.kvOffload === undefined) {
-    return { ...base, unknownReasons: ['active launcher did not report the effective KV-cache type and offload setting'], allocationEvidence };
+    return { ...base, unknownReasons: ['launcher не сообщил фактический тип KV-кэша и его размещение (GPU/RAM)'], allocationEvidence };
   }
   const loggedKvTypes = [allocationEvidence.kvTypeK, allocationEvidence.kvTypeV];
   const draftTypes = [allocationEvidence.speculativeKvTypeK, allocationEvidence.speculativeKvTypeV];
   if (loggedKvTypes.some((type) => type !== null && type !== observed.kvCacheType)
     || (allocationEvidence.speculativeMode !== 'none' && draftTypes.some((type) => type !== null && type !== observed.kvCacheType))) {
-    return { ...base, unknownReasons: ['startup log cache precisions do not match the active launcher selection'], allocationEvidence };
+    return { ...base, unknownReasons: ['точность кэша в журнале запуска не совпадает с выбором в launcher'], allocationEvidence };
   }
   const hostKvBytes = totalFor(allocationEvidence.allocations.kv, 'host') + totalFor(allocationEvidence.allocations.speculativeKv, 'host');
   const deviceKvBytes = totalFor(allocationEvidence.allocations.kv, 'device') + totalFor(allocationEvidence.allocations.speculativeKv, 'device');
   if (hostKvBytes + deviceKvBytes > 0 && ((observed.kvOffload && deviceKvBytes <= hostKvBytes) || (!observed.kvOffload && hostKvBytes <= deviceKvBytes))) {
-    return { ...base, unknownReasons: ['KV allocation placement does not match the active launcher offload setting'], allocationEvidence };
+    return { ...base, unknownReasons: ['размещение KV-кэша не совпадает с выбором GPU/RAM в launcher'], allocationEvidence };
   }
   if (!observed.modelPath || !allocationEvidence.modelPath || resolve(observed.modelPath) !== resolve(allocationEvidence.modelPath)) {
     return {
       ...base,
-      unknownReasons: ['allocation log model path does not confirm the currently selected runtime model'],
+      unknownReasons: ['путь к модели в журнале не подтверждает выбранную сейчас модель'],
       allocationEvidence,
     };
   }
@@ -434,15 +434,15 @@ export async function collectRuntimeContextEstimate(
     const vramTotalBytes = request.hardware.vramTotalBytes;
     const vramUsedBytes = request.hardware.vramUsedBytes;
     const reserveReasons = [
-      ...(request.hostReserveBytes == null ? ['explicit system RAM reserve is not configured'] : []),
-      ...(request.deviceReserveBytes == null ? ['explicit accelerator-memory reserve is not configured'] : []),
-      ...(!request.hardware.available || request.hardware.ramTotalBytes <= 0 || request.hardware.ramUsedBytes < 0 || request.hardware.ramUsedBytes > request.hardware.ramTotalBytes ? ['system memory snapshot is unavailable or invalid'] : []),
+      ...(request.hostReserveBytes == null ? ['не задан явный резерв системной памяти (RAM)'] : []),
+      ...(request.deviceReserveBytes == null ? ['не задан явный резерв памяти ускорителя (VRAM)'] : []),
+      ...(!request.hardware.available || request.hardware.ramTotalBytes <= 0 || request.hardware.ramUsedBytes < 0 || request.hardware.ramUsedBytes > request.hardware.ramTotalBytes ? ['снимок системной памяти недоступен или некорректен'] : []),
       ...(vramTotalBytes === null || vramUsedBytes === null || vramTotalBytes <= 0 || vramUsedBytes < 0 || vramUsedBytes > vramTotalBytes
         || request.hardware.vramAvailableBytes === null || !Number.isFinite(request.hardware.vramAvailableBytes)
         || request.hardware.vramAvailableBytes < 0 || request.hardware.vramAvailableBytes > vramTotalBytes - vramUsedBytes
-        ? ['accelerator memory availability is unavailable or invalid (requires reported free memory for one device)'] : []),
-      ...(!completeAllocationTier(allocationEvidence, 'host') ? ['startup log does not provide complete host allocation categories'] : []),
-      ...(!completeAllocationTier(allocationEvidence, 'device') ? ['startup log does not provide complete accelerator allocation categories'] : []),
+        ? ['данные о доступной памяти ускорителя недоступны или некорректны (нужна свободная память ровно одного устройства)'] : []),
+      ...(!completeAllocationTier(allocationEvidence, 'host') ? ['журнал запуска не содержит всех категорий выделения памяти в RAM'] : []),
+      ...(!completeAllocationTier(allocationEvidence, 'device') ? ['журнал запуска не содержит всех категорий выделения памяти в VRAM'] : []),
     ];
     return {
       ...base,

@@ -3,12 +3,13 @@ import { useShallow } from 'zustand/react/shallow';
 import { useAppStore } from '../store/app-store';
 import { formatContextTokens } from '../../shared/context-format';
 import { effectiveModes } from '../../shared/conversation-settings';
+import { chatModeLabel, formatCount, formatDuration, reasoningModeLabel, tokensWord } from '../../shared/localization';
 
 export { formatContextTokens } from '../../shared/context-format';
 
-const reasoningLabel = { fast: 'Fast', deep: 'Deep' } as const;
-const modeLabel = { chat: 'Chat', agent: 'Agent' } as const;
-const number = (value: number | undefined | null) => typeof value === 'number' ? value.toLocaleString('en-US') : '—';
+const reasoningLabel = reasoningModeLabel;
+const modeLabel = chatModeLabel;
+const number = formatCount;
 
 function Stat({ label, value, hint }: { label: string; value: string; hint?: string }) {
   return <div className="ctx-stat"><span>{label}</span><b title={hint ?? value}>{value}</b></div>;
@@ -40,28 +41,28 @@ export function ContextUsage({ initiallyOpen = false }: { initiallyOpen?: boolea
   const model = models.find((item) => item.id === chat.modelId);
   const modes = effectiveModes(chat, Boolean(model?.supportsReasoning), modeTransitions[chat.id]);
   const llama = settings?.llamaRuntime;
-  const runtimeState = !chat.modelId ? null : llama?.status === 'switching' || llama?.status === 'starting' ? 'Runtime запускается…' : llama && llama.status !== 'ready' ? 'Runtime не запущен' : llama?.modelId && llama.modelId !== chat.modelId ? 'Runtime: другая модель' : null;
-  return <div className={`context-usage ${tone}`}><button type="button" title="Контекст и telemetry" onClick={() => setOpen((value) => !value)} aria-expanded={open} aria-label={`Контекст: ${percent.toFixed(1)}%`}><svg viewBox="0 0 36 36" aria-hidden="true"><circle className="context-track" cx="18" cy="18" r="15.5" /><circle className="context-progress" cx="18" cy="18" r="15.5" pathLength="100" strokeDasharray={`${percent} ${100 - percent}`} /></svg><span>{current === null ? '—' : `${Math.round(percent)}%`}</span></button>{open && <section className={`context-usage-popover ${tone}`} aria-label="Context">
-    <header className="ctx-head"><div><span className="ctx-kicker">Context</span><strong className="ctx-percent">{current === null ? '—' : `${percent.toFixed(0)}%`}</strong></div><span className="ctx-amount">{formatContextTokens(used)} / {formatContextTokens(maximum)}</span></header>
+  const runtimeState = !chat.modelId ? null : llama?.status === 'switching' || llama?.status === 'starting' ? 'llama.cpp запускается…' : llama && llama.status !== 'ready' ? 'llama.cpp не запущен' : llama?.modelId && llama.modelId !== chat.modelId ? 'Загружена другая модель' : null;
+  return <div className={`context-usage ${tone}`}><button type="button" title="Контекст и telemetry" onClick={() => setOpen((value) => !value)} aria-expanded={open} aria-label={`Контекст: ${percent.toFixed(1)}%`}><svg viewBox="0 0 36 36" aria-hidden="true"><circle className="context-track" cx="18" cy="18" r="15.5" /><circle className="context-progress" cx="18" cy="18" r="15.5" pathLength="100" strokeDasharray={`${percent} ${100 - percent}`} /></svg><span>{current === null ? '—' : `${Math.round(percent)}%`}</span></button>{open && <section className={`context-usage-popover ${tone}`} aria-label="Контекст">
+    <header className="ctx-head"><div><span className="ctx-kicker">Контекст</span><strong className="ctx-percent">{current === null ? '—' : `${percent.toFixed(0)}%`}</strong></div><span className="ctx-amount">{formatContextTokens(used)} / {formatContextTokens(maximum)}</span></header>
     <div className="ctx-meter" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(percent)}><i style={{ width: `${percent}%` }} /></div>
     <div className="ctx-modes">
-      <div className="ctx-mode"><span>Reasoning</span>{modes.reasoning ? <b className={`ctx-chip reasoning-${modes.reasoning}`}>{reasoningLabel[modes.reasoning]}</b> : <b className="ctx-chip muted" title="Модель не поддерживает настройку рассуждения">—</b>}{modes.pendingReasoning && <em className="ctx-pending" title="Выбрано, ещё не подтверждено runtime">→ {reasoningLabel[modes.pendingReasoning]}</em>}</div>
-      <div className="ctx-mode"><span>Mode</span><b className={`ctx-chip mode-${modes.mode}`}>{modeLabel[modes.mode]}</b>{modes.pendingMode && <em className="ctx-pending" title="Выбрано, ещё не подтверждено runtime">→ {modeLabel[modes.pendingMode]}</em>}</div>
+      <div className="ctx-mode"><span>Рассуждение</span>{modes.reasoning ? <b className={`ctx-chip reasoning-${modes.reasoning}`}>{reasoningLabel[modes.reasoning]}</b> : <b className="ctx-chip muted" title="Модель не поддерживает настройку рассуждения">—</b>}{modes.pendingReasoning && <em className="ctx-pending" title="Выбрано, ещё не подтверждено runtime">→ {reasoningLabel[modes.pendingReasoning]}</em>}</div>
+      <div className="ctx-mode"><span>Режим</span><b className={`ctx-chip mode-${modes.mode}`}>{modeLabel[modes.mode]}</b>{modes.pendingMode && <em className="ctx-pending" title="Выбрано, ещё не подтверждено runtime">→ {modeLabel[modes.pendingMode]}</em>}</div>
     </div>
     {runtimeState && <p className="ctx-runtime" role="status">{runtimeState}</p>}
     <div className="ctx-grid">
-      <Stat label="Input tokens" value={number(agentTelemetry?.inputTokens)} />
-      <Stat label="Output tokens" value={number(agentTelemetry?.outputTokens)} />
-      <Stat label="Total run" value={agentTelemetry ? number(agentTelemetry.inputTokens + agentTelemetry.outputTokens) : '—'} />
+      <Stat label="Входные токены" value={number(agentTelemetry?.inputTokens)} />
+      <Stat label="Выходные токены" value={number(agentTelemetry?.outputTokens)} />
+      <Stat label="Всего за запуск" value={agentTelemetry ? number(agentTelemetry.inputTokens + agentTelemetry.outputTokens) : '—'} />
     </div>
-    {typeof cachedTokens === 'number' && <div className="ctx-row"><span>Prompt cache</span><b>{cacheRate === null ? `${cachedTokens} tokens` : `${cacheRate.toFixed(0)}% · ${number(cachedTokens)} tokens`}</b></div>}
-    {typeof agentTelemetry?.cacheWriteTokens === 'number' && <div className="ctx-row"><span>Cache writes</span><b>{number(agentTelemetry.cacheWriteTokens)} tokens</b></div>}
+    {typeof cachedTokens === 'number' && <div className="ctx-row"><span>Кэш промпта</span><b>{cacheRate === null ? `${number(cachedTokens)} ${tokensWord(cachedTokens)}` : `${cacheRate.toFixed(0)}% · ${number(cachedTokens)} ${tokensWord(cachedTokens)}`}</b></div>}
+    {typeof agentTelemetry?.cacheWriteTokens === 'number' && <div className="ctx-row"><span>Запись в кэш</span><b>{number(agentTelemetry.cacheWriteTokens)} {tokensWord(agentTelemetry.cacheWriteTokens)}</b></div>}
     <div className="ctx-grid ctx-grid-wide">
-      {typeof agentTelemetry?.tokensPerSecond === 'number' && <Stat label="Speed" value={`${agentTelemetry.tokensPerSecond.toFixed(1)} tok/s`} hint="Generation speed" />}
-      <Stat label="Elapsed" value={elapsed === null ? '—' : `${Math.floor(elapsed / 60)}m ${elapsed % 60}s`} />
-      <Stat label="Turn" value={String(agentTelemetry?.turn ?? '—')} />
-      <Stat label="Actions" value={String(agentTelemetry?.actions ?? '—')} />
-      <Stat label="Compactions" value={String(agentTelemetry?.compactions ?? 0)} />
+      {typeof agentTelemetry?.tokensPerSecond === 'number' && <Stat label="Скорость" value={`${agentTelemetry.tokensPerSecond.toFixed(1).replace(".", ",")} ток/с`} hint="Скорость генерации" />}
+      <Stat label="Прошло" value={elapsed === null ? '—' : formatDuration(elapsed)} />
+      <Stat label="Ход" value={String(agentTelemetry?.turn ?? '—')} />
+      <Stat label="Действия" value={String(agentTelemetry?.actions ?? '—')} />
+      <Stat label="Сжатия" value={String(agentTelemetry?.compactions ?? 0)} />
     </div>
     <small>{status}</small>
   </section>}</div>;

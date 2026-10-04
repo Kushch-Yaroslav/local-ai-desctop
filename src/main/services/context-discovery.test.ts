@@ -34,7 +34,7 @@ export async function runContextDiscoveryRegression() {
     assert(option.vramBudget!.llmBytes <= option.vramBudget!.availableLlmBytes);
     assert(result.probes!.filter((probe) => probe.kvCacheType === option.kvCacheType && probe.startup).length <= 11, 'discovery exceeded its bounded startup budget');
   }
-  assert(result.probes!.some((probe) => !probe.startup && probe.reason?.includes('Skipped')), 'predicted unsafe candidates must be rejected without startup');
+  assert(result.probes!.some((probe) => !probe.startup && probe.reason?.includes('Пропущено')), 'predicted unsafe candidates must be rejected without startup');
   await assert.rejects(discoverContextBoundary({ modelId: 'model', hardLimit: 131072, kvOffload: true, hostReserveBytes: 8 * GiB, deviceReserveBytes: 2 * GiB,
     probe: async () => { throw new Error('fatal probe'); }, restore: async () => { restored += 1; }, progress: () => undefined }), /fatal probe/);
   assert.equal(restored, 2, 'fatal discovery must still restore');

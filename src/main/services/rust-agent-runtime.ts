@@ -51,7 +51,7 @@ export function runtimeTextEvent(event: Pick<RuntimeEvent, 'type' | 'content'>, 
 /** The latest actual user node owns an Agent run. */
 export function splitAgentRunHistory(history: ChatMessage[]): { user: string; prior: ChatMessage[] } {
   const currentIndex = history.map((message) => message.role).lastIndexOf('user');
-  if (currentIndex < 0 || !history[currentIndex].content.trim()) throw new Error('Agent request has no current user message.');
+  if (currentIndex < 0 || !history[currentIndex].content.trim()) throw new Error('В запросе агента нет текущего сообщения пользователя.');
   return { user: history[currentIndex].content, prior: history.slice(0, currentIndex) };
 }
 
@@ -244,7 +244,7 @@ export class RustAgentRuntime {
       if (child.stdin.writable) child.stdin.end();
       if (!child.killed && child.exitCode === null) child.kill('SIGTERM');
     }
-    if (stderr.trim()) throw new Error(`Rust Agent Runtime V2 stderr: ${stderr.trim()}`);
+    if (stderr.trim()) throw new Error(`Ошибка Rust Agent Runtime V2 (stderr): ${stderr.trim()}`);
   }
 }
 

@@ -21,7 +21,7 @@ export async function runGgufContextRegression() {
     await writeFile(path, Buffer.concat([model(65536), Buffer.from('changed-identity')]));
     assert.equal(await ggufTrainContext(path), 65536, 'replaced model file must invalidate metadata cache');
     await writeFile(path, Buffer.from('not gguf'));
-    await assert.rejects(ggufTrainContext(path), /not GGUF/);
+    await assert.rejects(ggufTrainContext(path), /не в формате GGUF/);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
