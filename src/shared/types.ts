@@ -1,6 +1,9 @@
+import type { ContextDiscoveryResult, RuntimeContextEstimate } from './context-estimator';
+
 export type ChatMode = 'chat' | 'agent';
 export type WebMode = 'off' | 'auto';
-export type BackendId = 'ollama' | 'llama-cpp';
+export type BackendId = 'llama-cpp';
+export type LlamaKvCacheType = 'f16' | 'q8_0';
 /** A backend-native reasoning control. It never changes the output token budget. */
 export type ReasoningMode = 'auto' | 'fast' | 'deep';
 export type FinishReason = 'stop' | 'length' | 'cancelled' | 'error';
@@ -55,7 +58,7 @@ export interface GenerationDiagnostics {
   inputTokens: number;
   agentStepCount: number;
   finishReason: FinishReason;
-  /** All duration values are whole nanoseconds. Ollama reports them natively; llama.cpp milliseconds are converted and rounded. evalCount contains generated completion tokens only. */
+  /** All duration values are whole nanoseconds. llama.cpp milliseconds are converted and rounded. evalCount contains generated completion tokens only. */
   promptEvalCount?: number;
   promptEvalDuration?: number;
   evalCount?: number;
@@ -64,8 +67,6 @@ export interface GenerationDiagnostics {
   promptTokensPerSecond?: number;
   timeToFirstTokenMs?: number;
   /** Agent-only runtime diagnostics; persisted logs retain the full per-attempt detail. */
-  ollamaRequestAttempt?: number;
-  ollamaRetryCount?: number;
   toolResultContextSize?: number;
   toolResultContextBudget?: number;
   toolResultCompacted?: number;
@@ -131,6 +132,8 @@ export interface Conversation {
   secondaryWorkingDirectory: string | null;
   secondaryProjectId: string | null;
   contextWindow: number;
+  llamaKvCacheType?: LlamaKvCacheType;
+  llamaKvOffload?: boolean;
   reasoningMode: ReasoningMode;
   contextTokens: number | null;
   contextModelId: string | null;
@@ -174,7 +177,7 @@ export interface ChatMessage {
   agentError?: string;
   agentCancelled?: boolean;
   agentFinishedAt?: string;
-  /** Ephemeral base64 image inputs for Ollama. These are rebuilt from managed attachment storage and are never persisted in SQLite. */
+  /** Ephemeral base64 image inputs, rebuilt from managed attachment storage and never persisted in SQLite. */
   images?: string[];
 }
 
@@ -183,15 +186,16 @@ export interface HardwareStats {
   ramTotalBytes: number;
   vramUsedBytes: number | null;
   vramTotalBytes: number | null;
+  vramAvailableBytes: number | null;
   gpuUtilization: number | null;
   available: boolean;
 }
 
 export interface AppSettings {
-  selectedBackend: BackendId;
-  ollamaUrl: string;
   llamaServerPath: string | null;
   llamaRuntimeModelId?: string;
+  /** Live state of the launcher-managed llama-server; the authority on what is running. */
+  llamaRuntime?: { status: 'starting' | 'ready' | 'switching' | 'offline' | 'stopped'; modelId: string | null; contextWindow: number | null; kvCacheType?: LlamaKvCacheType; kvOffload?: boolean; error?: string; rolledBack?: boolean };
   modelsPath: string;
 }
 
@@ -252,7 +256,8 @@ export interface TerminalExecution {
 
 export type ThinkingTimelineEvent =
   | { id: string; kind: 'reasoning'; content: string; position: number; startedAt?: string; completedAt?: string }
-  | { id: string; kind: 'activity'; activityId: string; position: number };
+  | { id: string; kind: 'activity'; activityId: string; position: number }
+  | { id: string; kind: 'steering'; messageId: string; position: number; status: 'accepted' | 'applied' };
 
 export type AgentPlanStepStatus = 'pending' | 'in_progress' | 'completed' | 'abandoned';
 /** Kept optional for reading messages saved by the pre-milestone renderer. */
@@ -305,6 +310,7 @@ export type StreamEvent =
   | { type: 'token'; content: string }
   | { type: 'thinking'; content: string; timelinePosition?: number }
   | { type: 'task-memory'; memory: NonNullable<AgentPlan['taskMemory']> }
+  | { type: 'steering'; userMessage: ChatMessage; status: 'accepted' | 'applied'; timelinePosition?: number }
   | { type: 'tool'; activity: ToolActivity; runId?: string }
   | { type: 'attachment'; activity: ToolActivity }
   | { type: 'approval-request'; actionId: string; approval: ActionApproval }
@@ -323,7 +329,7 @@ export interface LocalAiApi {
   conversations: {
     list(): Promise<Conversation[]>;
     create(modelId?: string): Promise<Conversation>;
-    update(id: string, patch: Partial<Pick<Conversation, 'title' | 'modelId' | 'mode' | 'workingDirectory' | 'secondaryWorkingDirectory' | 'contextWindow' | 'reasoningMode' | 'webMode'>>): Promise<Conversation>;
+    update(id: string, patch: Partial<Pick<Conversation, 'title' | 'modelId' | 'mode' | 'workingDirectory' | 'secondaryWorkingDirectory' | 'contextWindow' | 'llamaKvCacheType' | 'llamaKvOffload' | 'reasoningMode' | 'webMode'>>): Promise<Conversation>;
     delete(id: string): Promise<void>;
   };
   messages: { list(conversationId: string): Promise<ChatMessage[]>; edit(id: string, content: string, fallback?: Pick<ChatMessage, 'conversationId' | 'content'>): Promise<ChatMessage[]>; regenerate(id: string): Promise<ChatMessage[]> };
@@ -338,9 +344,13 @@ export interface LocalAiApi {
   models: { list(): Promise<ModelInfo[]> };
   settings: { get(): Promise<AppSettings> };
   hardware: { get(): Promise<HardwareStats> };
+  contextEstimate(modelId: string): Promise<RuntimeContextEstimate>;
+  contextDiscover(modelId: string): Promise<ContextDiscoveryResult>;
+  contextDiscoveryStatus(): Promise<import('./context-estimator').ContextDiscoveryProgress>;
   dialog: { chooseDirectory(initialDirectory?: string | null): Promise<string | null> };
   chat: {
     send(request: ChatRequest): Promise<void>;
+    steer(conversationId: string, generationId: string, content: string): Promise<ChatMessage>;
     stop(conversationId: string, generationId?: string): Promise<void>;
     approve(request: { conversationId: string; generationId: string; approvalId: string; decision: ApprovalDecision }): Promise<boolean>;
     onStream(listener: (event: StreamEvent & { conversationId: string; generationId: string; modelId?: string }) => void): () => void;

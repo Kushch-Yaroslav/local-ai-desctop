@@ -6,7 +6,7 @@ import type { ToolMessage } from './types';
 import type { ChatMessage } from '../../shared/types';
 
 const model = 'qwen3.8:27b-q4_K_M';
-type Scenario = { tokenCounts?: number[]; lastTokenCount?: number; tokenCountStatus?: number; chatStatus?: number; chatError?: string; timings?: { prompt_ms?: number; predicted_ms?: number }; stream?: boolean; toolStream?: boolean; serverContext?: number; requestBodies: Array<Record<string, unknown>>; countBodies: Array<Record<string, unknown>> };
+type Scenario = { tokenCounts?: number[]; lastTokenCount?: number; tokenCountStatus?: number; chatStatus?: number; chatError?: string; timings?: { prompt_ms?: number; predicted_ms?: number }; stream?: boolean; toolStream?: boolean; serverContext?: number; trainContext?: number; modelSize?: number; requestBodies: Array<Record<string, unknown>>; countBodies: Array<Record<string, unknown>> };
 
 async function readBody(request: AsyncIterable<Uint8Array>): Promise<Record<string, unknown>> {
   const chunks: Uint8Array[] = [];
@@ -20,7 +20,7 @@ async function startServer(scenario: Scenario): Promise<{ server: Server; url: s
   const server = createServer(async (request, response) => {
     const path = new URL(request.url ?? '/', 'http://127.0.0.1').pathname;
     if (path === '/health') { reply(response, 200, { status: 'ok' }); return; }
-    if (path === '/v1/models') { reply(response, 200, { data: [{ meta: { n_ctx: scenario.serverContext ?? 131_072 } }] }); return; }
+    if (path === '/v1/models') { reply(response, 200, { data: [{ meta: { n_ctx: scenario.serverContext ?? 131_072, ...(scenario.trainContext === undefined ? {} : { n_ctx_train: scenario.trainContext }), ...(scenario.modelSize === undefined ? {} : { size: scenario.modelSize }) } }] }); return; }
     const body = await readBody(request);
     if (path === '/v1/chat/completions/input_tokens') {
       scenario.countBodies.push(body);
@@ -62,10 +62,43 @@ const call = (backend: LlamaCppBackend, messages: ToolMessage[], tools: unknown[
 
 export async function runLlamaCppBackendRegression(): Promise<void> {
   {
-    const scenario: Scenario = { serverContext: 32_768, requestBodies: [], countBodies: [] }; const { server, url } = await startServer(scenario);
+    const scenario: Scenario = { serverContext: 16_384, trainContext: 262_144, modelSize: 16_799_719_424, requestBodies: [], countBodies: [] }; const { server, url } = await startServer(scenario);
     try {
-      const context = await new LlamaCppBackend(url, 131_072).resolveContextWindow(model, 131_072, new AbortController().signal);
-      assert.deepEqual(context, { requested: 131_072, active: 32_768, supported: 32_768 }, 'Agent context did not clamp to the actual llama-server n_ctx');
+      const backend = new LlamaCppBackend(url, 131_072);
+      const context = await backend.resolveContextWindow(model, 131_072, new AbortController().signal);
+      assert.deepEqual(context, { requested: 131_072, active: 16_384, supported: 16_384 }, 'Agent context did not clamp to the actual llama-server n_ctx');
+      assert.deepEqual(await backend.getRuntimeContextEvidence(model), {
+        backend: 'llama-cpp',
+        modelId: model,
+        activeContextTokens: 16_384,
+        modelPath: '/media/yaroslav/DATA/llama-models/qwen3.8-27b-q4_K_M.gguf',
+        modelTrainContextTokens: 262_144,
+        modelFileSizeBytes: 16_799_719_424,
+        kvCacheType: 'f16',
+        kvOffload: true,
+      }, 'live llama-server n_ctx was not exposed as runtime evidence');
+      assert.equal(await backend.getRuntimeContextEvidence('other-model'), null, 'llama.cpp reported evidence for a model that is not loaded');
+      const models = await backend.getModels();
+      assert.deepEqual(models.find((item) => item.id === model)?.supportedContextPresets, [16384, 32768, 65536, 131072, 262144], 'loaded 16K must not redefine model capability');
+      assert.deepEqual(models.find((item) => item.id === 'glm-4.7-flash:q4_k')?.supportedContextPresets, [16384, 32768, 65536, 131072], 'GLM normal options were truncated by an active runtime or another model');
+      const gptOss = models.find((item) => item.id === 'gpt-oss:20b');
+      assert(gptOss, 'GPT-OSS was not included in the llama.cpp model registry');
+      assert.equal(gptOss.backend, 'llama-cpp');
+      assert.equal(gptOss.supportsTools, true);
+      assert.equal(gptOss.supportsReasoning, true);
+      assert.deepEqual(gptOss.supportedContextPresets, [16384, 32768, 65536, 131072]);
+    } finally { await stop(server); }
+  }
+  {
+    const scenario: Scenario = { requestBodies: [], countBodies: [] }; const { server, url } = await startServer(scenario);
+    try {
+      const backend = new LlamaCppBackend(url, 32_768, false, 'gpt-oss:20b');
+      assert.equal(backend.supportsReasoning('gpt-oss:20b'), true);
+      assert.equal(await backend.supportsVision('gpt-oss:20b'), false);
+      await backend.chatWithTools('gpt-oss:20b', baseMessages(), toolSchema, new AbortController().signal, 32_768, 'deep');
+      assert.equal(scenario.requestBodies[0]?.reasoning_effort, 'high', 'GPT-OSS Deep request did not use its profile reasoning capability');
+      assert.equal(scenario.requestBodies[0]?.tools instanceof Array, true, 'GPT-OSS request did not retain the tool schema');
+      assert.equal(scenario.requestBodies[0]?.chat_template_kwargs, undefined, 'GPT-OSS request received unrelated template-specific parameters');
     } finally { await stop(server); }
   }
   {

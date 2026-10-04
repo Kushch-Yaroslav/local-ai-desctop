@@ -4,7 +4,7 @@ import { join } from 'node:path';
 // DATA is mandatory for this application. Keeping runtime files in the project
 // is intentional while the DATA mount does not allow creating a sibling folder.
 const root = '/media/yaroslav/DATA/local-ai-desktop';
-const dataRoot = join(root, 'runtime');
+const dataRoot = process.env.LOCAL_AI_RUNTIME_ROOT ?? join(root, 'runtime');
 
 export const paths = {
   root,

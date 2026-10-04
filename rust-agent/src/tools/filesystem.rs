@@ -45,6 +45,27 @@ fn bounded_read_content(
     )
 }
 
+fn returned_line_range(
+    source: &str,
+    offset_chars: usize,
+    returned: &str,
+    first_source_line: usize,
+) -> Option<(usize, usize, bool)> {
+    if returned.is_empty() {
+        return None;
+    }
+    let prefix_end = source
+        .char_indices()
+        .nth(offset_chars)
+        .map_or(source.len(), |(index, _)| index);
+    let prefix = &source[..prefix_end];
+    let start_line = first_source_line + prefix.bytes().filter(|byte| *byte == b'\n').count();
+    let newlines = returned.bytes().filter(|byte| *byte == b'\n').count();
+    let end_line = start_line + newlines.saturating_sub(usize::from(returned.ends_with('\n')));
+    let starts_mid_line = !prefix.is_empty() && !prefix.ends_with('\n');
+    Some((start_line, end_line, starts_mid_line))
+}
+
 fn scoped(root: &Path, path: &str) -> Result<PathBuf, String> {
     let candidate = root.join(path);
     let normalized = match fs::canonicalize(&candidate) {
@@ -147,8 +168,25 @@ pub fn execute(root: &Path, name: &str, args: &Value) -> Result<(Value, Option<S
                 .unwrap_or(0) as usize;
             if start_line.is_some() || end_line.is_some() {
                 let start = start_line.unwrap_or(1);
-                let end = end_line.unwrap_or(lines.len()).max(start);
-                let selected = lines
+                let end = end_line.unwrap_or(lines.len());
+                if start > lines.len() {
+                    return Err(format!(
+                        "start_line {start} is outside {path}, which has {} lines",
+                        lines.len()
+                    ));
+                }
+                if end < start {
+                    return Err(format!(
+                        "end_line {end} precedes start_line {start} for {path}"
+                    ));
+                }
+                if end > lines.len() {
+                    return Err(format!(
+                        "end_line {end} is outside {path}, which has {} lines",
+                        lines.len()
+                    ));
+                }
+                let selected_source = lines
                     .iter()
                     .skip(start.saturating_sub(1))
                     .take(end.saturating_sub(start).saturating_add(1))
@@ -156,16 +194,24 @@ pub fn execute(root: &Path, name: &str, args: &Value) -> Result<(Value, Option<S
                     .collect::<Vec<_>>()
                     .join("\n");
                 let (selected, truncated, next_offset_chars) =
-                    bounded_read_content(&selected, offset_chars, limit);
+                    bounded_read_content(&selected_source, offset_chars, limit);
+                let range = returned_line_range(&selected_source, offset_chars, &selected, start);
+                let (returned_start, returned_end, starts_mid_line) = range
+                    .map(|(start, end, partial)| (json!(start), json!(end), partial))
+                    .unwrap_or((Value::Null, Value::Null, false));
                 Ok((
-                    json!({"path":path,"content":selected,"start_line":start,"end_line":end,"total_lines":lines.len(),"targeted":true,"truncated":truncated,"offset_chars":offset_chars,"next_offset_chars":next_offset_chars,"read_result_limit_bytes":limit}),
+                    json!({"path":path,"content":selected,"start_line":returned_start,"end_line":returned_end,"requested_start_line":start,"requested_end_line":end,"starts_mid_line":starts_mid_line,"ends_mid_line":truncated && !selected.ends_with('\n'),"total_lines":lines.len(),"targeted":true,"truncated":truncated,"offset_chars":offset_chars,"next_offset_chars":next_offset_chars,"read_result_limit_bytes":limit}),
                     None,
                 ))
             } else {
-                let (content, truncated, next_offset_chars) =
+                let (chunk, truncated, next_offset_chars) =
                     bounded_read_content(&content, offset_chars, limit);
+                let range = returned_line_range(&content, offset_chars, &chunk, 1);
+                let (start, end, starts_mid_line) = range
+                    .map(|(start, end, partial)| (json!(start), json!(end), partial))
+                    .unwrap_or((Value::Null, Value::Null, false));
                 Ok((
-                    json!({"path":path,"content":content,"total_lines":lines.len(),"targeted":false,"truncated":truncated,"offset_chars":offset_chars,"next_offset_chars":next_offset_chars,"read_result_limit_bytes":limit}),
+                    json!({"path":path,"content":chunk,"start_line":start,"end_line":end,"starts_mid_line":starts_mid_line,"ends_mid_line":truncated && !chunk.ends_with('\n'),"total_lines":lines.len(),"targeted":false,"truncated":truncated,"offset_chars":offset_chars,"next_offset_chars":next_offset_chars,"read_result_limit_bytes":limit}),
                     None,
                 ))
             }
@@ -443,6 +489,77 @@ mod tests {
                 .count(),
             second["next_offset_chars"].as_u64().unwrap() as usize
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn later_read_chunk_reports_actual_source_lines() {
+        let root = std::env::temp_dir().join(format!(
+            "local-ai-desktop-line-mapped-read-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("source.txt"),
+            "one\nsecond-line\nthird line\nfourth\n",
+        )
+        .unwrap();
+
+        let first = execute(
+            &root,
+            "read_file",
+            &json!({"path":"source.txt","_result_limit_bytes":7}),
+        )
+        .unwrap()
+        .0;
+        assert_eq!(first["start_line"], 1);
+        assert_eq!(first["end_line"], 2);
+        assert_eq!(first["starts_mid_line"], false);
+        assert_eq!(first["ends_mid_line"], true);
+
+        let offset = first["next_offset_chars"].as_u64().unwrap();
+        let second = execute(
+            &root,
+            "read_file",
+            &json!({"path":"source.txt","offset_chars":offset,"_result_limit_bytes":13}),
+        )
+        .unwrap()
+        .0;
+        assert_eq!(second["content"], "ond-line\nthir");
+        assert_eq!(second["start_line"], 2);
+        assert_eq!(second["end_line"], 3);
+        assert_eq!(second["starts_mid_line"], true);
+        assert_eq!(second["ends_mid_line"], true);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn line_read_past_eof_is_an_explicit_error() {
+        let root = std::env::temp_dir().join(format!(
+            "local-ai-desktop-read-eof-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("short.txt"), "first\nsecond\n").unwrap();
+
+        let error = execute(
+            &root,
+            "read_file",
+            &json!({"path":"short.txt","start_line":3}),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "start_line 3 is outside short.txt, which has 2 lines"
+        );
+
         fs::remove_dir_all(root).unwrap();
     }
 

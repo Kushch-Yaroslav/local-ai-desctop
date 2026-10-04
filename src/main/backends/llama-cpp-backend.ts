@@ -1,28 +1,21 @@
 import type { ChatMessage, FinishReason, ModelInfo, ReasoningMode, StreamEvent } from '../../shared/types';
 import { createHash } from 'node:crypto';
-import { wholeNanoseconds, type InferenceDiagnostics, type LlmBackend, type ToolCallingBackend, type ToolInferenceRequestContext, type ToolInferenceStreamEvent, type ToolMessage } from './types';
+import { wholeNanoseconds, type ContextWindow, type InferenceDiagnostics, type LlmBackend, type RuntimeContextEvidence, type ToolCallingBackend, type ToolInferenceRequestContext, type ToolInferenceStreamEvent, type ToolMessage } from './types';
 import { getModelProfile, maxOutputTokens, modelInfo, outputBudget, outputSafetyReserveTokens } from '../models/model-registry';
-import { llamaContextPresets, llamaRuntimeInstalled, llamaRuntimeProfiles } from '../models/llama-runtime-policy';
-import type { ContextWindow } from './ollama-backend';
+import { llamaContextPresets, llamaRuntimeInstalled, llamaRuntimeProfile, llamaRuntimeProfiles } from '../models/llama-runtime-policy';
 import { log } from '../services/logger';
+import type { LlamaKvCacheType } from '../../shared/types';
+import { llamaCapabilityLimit } from '../services/gguf-context';
 
 type NativeToolCall = { index?: number; id?: string; type?: string; function?: { name?: string; arguments?: string } };
 type Choice = { finish_reason?: string | null; message?: { content?: string | null; reasoning_content?: string | null; tool_calls?: NativeToolCall[] }; delta?: { content?: string | null; reasoning_content?: string | null; tool_calls?: NativeToolCall[] } };
 type ChatResponse = { choices?: Choice[]; usage?: { prompt_tokens?: number; completion_tokens?: number }; timings?: { prompt_ms?: number; predicted_ms?: number; prompt_per_second?: number; predicted_per_second?: number } };
-type ModelsResponse = { data?: Array<{ meta?: { n_ctx?: number; size?: number } }> };
+type ModelsResponse = { data?: Array<{ meta?: { n_ctx?: number; n_ctx_train?: number; size?: number } }> };
 type InputTokenResponse = { input_tokens?: unknown };
 const qwenModel = 'qwen3.8:27b-q4_K_M';
-const glmFlashModel = 'glm-4.7-flash:q4_k';
-// Qwen3.8's template supports a native think switch.  A mechanical Agent
-// continuation needs a direct tool decision, not another hidden design essay;
-// Deep is still enabled for planning, investigation and synthesis.
 function llamaCppReasoning(model: string, mode: ReasoningMode): Record<string, unknown> {
   if (mode === 'auto') return {};
-  if (model === qwenModel) return mode === 'fast'
-    ? { reasoning_effort: 'low', chat_template_kwargs: { enable_thinking: false } }
-    : { reasoning_effort: 'xhigh', chat_template_kwargs: { enable_thinking: true } };
-  if (model === glmFlashModel) return { reasoning_effort: mode === 'fast' ? 'none' : 'xhigh', chat_template_kwargs: { enable_thinking: mode !== 'fast' } };
-  return {};
+  return llamaRuntimeProfile(model)?.reasoningOptions?.[mode] ?? {};
 }
 type RequestDiagnostics = { endpoint: string; status: number; serverError?: string; userMessage?: string; backend: 'llama-cpp'; model: string; contextSize: number; requestedMaxOutput: number; effectiveMaxOutput: number; messageCount: number; toolCount: number; hasImages: boolean; estimatedPromptTokens: number; exactPromptTokens?: number; contextClassification: 'backend_context_rejected' | 'http_error' };
 type ContextAccounting = {
@@ -105,34 +98,84 @@ export function validateLlamaMessageSequence(messages: ToolMessage[]): string | 
 /** Adapter for the launcher-managed, OpenAI-compatible llama-server. */
 export class LlamaCppBackend implements LlmBackend, ToolCallingBackend {
   private lastActualPromptTokens: number | undefined;
+  private contextLimit: number;
+  private visionEnabled: boolean;
+  private runtimeModelId: string;
+  private kvCacheType: LlamaKvCacheType = 'f16';
+  private kvOffload = true;
   /** Avoid a second input_tokens request after context management just counted it. */
   private readonly preparedInputTokens = new WeakMap<object, { tools: unknown[] | undefined; reasoningMode: ReasoningMode; tokens: number }>();
-  constructor(private readonly baseUrl = 'http://127.0.0.1:8081', private readonly contextLimit = 32_768, private readonly visionEnabled = true, private readonly runtimeModelId = qwenModel) {}
+  constructor(private readonly baseUrl = 'http://127.0.0.1:8081', contextLimit = 32_768, visionEnabled = true, runtimeModelId = qwenModel) {
+    this.contextLimit = contextLimit;
+    this.visionEnabled = visionEnabled;
+    this.runtimeModelId = runtimeModelId;
+  }
   private url(path: string): string { return `${this.baseUrl.replace(/\/$/, '')}${path}`; }
+  supportsReasoning(model: string): boolean { return getModelProfile(model)?.supportsReasoning === true; }
+  updateRuntimeSelection(model: string, contextLimit: number, kvCacheType: LlamaKvCacheType = 'f16', kvOffload = true): void {
+    const runtime = llamaRuntimeProfiles.find((candidate) => candidate.id === model);
+    if (!runtime || !Number.isSafeInteger(contextLimit) || contextLimit < 4_096 || contextLimit > runtime.maxContext || contextLimit % 4_096 !== 0) throw new Error('llama.cpp runtime selection is unsupported');
+    if (kvCacheType !== 'f16' && kvCacheType !== 'q8_0') throw new Error('llama.cpp KV cache type is unsupported');
+    this.runtimeModelId = model;
+    this.contextLimit = contextLimit;
+    this.kvCacheType = kvCacheType;
+    this.kvOffload = kvOffload;
+    this.visionEnabled = runtime.vision;
+  }
 
   async getModels(): Promise<ModelInfo[]> {
-    const response = await fetch(this.url('/v1/models'));
-    if (!response.ok) throw new Error(`llama.cpp вернул HTTP ${response.status}`);
-    const data = await response.json() as ModelsResponse;
-    const runtimeContext = Math.min(this.contextLimit, data.data?.[0]?.meta?.n_ctx ?? this.contextLimit);
+    // An unreachable server must still list the installable runtimes: choosing
+    // one is how the user restarts llama.cpp after a failed switch.
+    let data: ModelsResponse = {};
+    try {
+      const response = await fetch(this.url('/v1/models'));
+      if (response.ok) data = await response.json() as ModelsResponse;
+    } catch { /* offline: only file availability is known */ }
     if (!getModelProfile(this.runtimeModelId)) throw new Error(`llama.cpp запущен с неизвестной моделью: ${this.runtimeModelId}`);
-    return llamaRuntimeProfiles.flatMap((runtime) => {
+    const result: ModelInfo[] = [];
+    for (const runtime of llamaRuntimeProfiles) {
       const profile = getModelProfile(runtime.id);
-      if (!profile) return [];
+      if (!profile) continue;
       const active = runtime.id === this.runtimeModelId;
-      return [{
-        ...modelInfo(profile, active ? (data.data ?? []).length > 0 : llamaRuntimeInstalled(runtime), active ? data.data?.[0]?.meta?.size : undefined, active ? Math.min(runtime.maxContext, runtimeContext) : runtime.maxContext, active ? (runtime.id === qwenModel || runtime.id === glmFlashModel) : profile.supportsReasoning),
-        backend: 'llama-cpp' as const,
-        supportedContextPresets: llamaContextPresets(runtime.id),
-      }];
-    });
+      const installed = llamaRuntimeInstalled(runtime);
+      const trainedLimit = active ? data.data?.[0]?.meta?.n_ctx_train : undefined;
+      const capability = Math.min(installed ? await llamaCapabilityLimit(runtime.id) : runtime.maxContext, trainedLimit ?? runtime.maxContext);
+      result.push({
+        ...modelInfo(profile, active && (data.data ?? []).length > 0 ? true : installed, active ? data.data?.[0]?.meta?.size : undefined, capability, profile.supportsReasoning),
+        backend: 'llama-cpp',
+        supportedContextPresets: llamaContextPresets(runtime.id, capability),
+      });
+    }
+    return result;
   }
 
   async getStatus(): Promise<{ available: boolean; message?: string }> {
-    try { const response = await fetch(this.url('/health')); return response.ok ? { available: true } : { available: false, message: `llama.cpp вернул HTTP ${response.status}` }; }
+    try { const response = await fetch(this.url('/health'), { signal: AbortSignal.timeout(2_000) }); return response.ok ? { available: true } : { available: false, message: `llama.cpp вернул HTTP ${response.status}` }; }
     catch (error) { return { available: false, message: error instanceof Error ? error.message : String(error) }; }
   }
-  async supportsVision(model: string): Promise<boolean> { return model === qwenModel && this.runtimeModelId === qwenModel && this.visionEnabled; }
+  /** Reports the loaded server context, not a memory-safe prediction. */
+  async getRuntimeContextEvidence(modelId = this.runtimeModelId, signal?: AbortSignal): Promise<RuntimeContextEvidence | null> {
+    if (modelId !== this.runtimeModelId) return null;
+    const response = await fetch(this.url('/v1/models'), { signal });
+    if (!response.ok) throw new Error(`llama.cpp вернул HTTP ${response.status} при чтении загруженной модели`);
+    const data = await response.json() as ModelsResponse;
+    const activeContextTokens = data.data?.[0]?.meta?.n_ctx;
+    if (typeof activeContextTokens !== 'number' || !Number.isSafeInteger(activeContextTokens) || activeContextTokens <= 0) return null;
+    const modelTrainContextTokens = data.data?.[0]?.meta?.n_ctx_train;
+    const modelFileSizeBytes = data.data?.[0]?.meta?.size;
+    const modelPath = llamaRuntimeProfile(modelId)?.modelPath;
+    return {
+      backend: 'llama-cpp',
+      modelId,
+      activeContextTokens,
+      ...(modelPath ? { modelPath } : {}),
+      ...(typeof modelTrainContextTokens === 'number' && Number.isSafeInteger(modelTrainContextTokens) && modelTrainContextTokens > 0 ? { modelTrainContextTokens } : {}),
+      ...(typeof modelFileSizeBytes === 'number' && Number.isFinite(modelFileSizeBytes) && modelFileSizeBytes >= 0 ? { modelFileSizeBytes } : {}),
+      kvCacheType: this.kvCacheType,
+      kvOffload: this.kvOffload,
+    };
+  }
+  async supportsVision(model: string): Promise<boolean> { return llamaRuntimeProfile(model)?.vision === true && this.runtimeModelId === model && this.visionEnabled; }
   async resolveContextWindow(model: string, requested: number, signal?: AbortSignal): Promise<ContextWindow> {
     if (model !== this.runtimeModelId) throw new Error(`llama.cpp launcher запущен с моделью ${this.runtimeModelId}`);
     // The launch setting is a ceiling, not proof that a separately managed

@@ -124,6 +124,12 @@ impl Transcript {
     pub fn set_project_root(&mut self, root: Option<&Path>) {
         self.project_root = root.and_then(|path| path.canonicalize().ok());
     }
+
+    pub fn set_secondary_project_root(&mut self, root: Option<&Path>) {
+        if let Some(store) = &mut self.store {
+            store.set_secondary_root(root);
+        }
+    }
     pub fn durable(
         base: &Path,
         run_id: &str,
@@ -279,7 +285,19 @@ impl Transcript {
         final_text: &str,
     ) -> Result<(), String> {
         if let (Some(store), Some(base)) = (&self.store, &self.evidence_base) {
-            store.finish(base, history, user, final_text)
+            let current = self
+                .entries
+                .iter()
+                .rposition(|entry| matches!(entry, Entry::RunUser(_)))
+                .unwrap_or(0);
+            let steering = self.entries[current..]
+                .iter()
+                .filter_map(|entry| match entry {
+                    Entry::Steering(content) => Some(content.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            store.finish(base, history, user, &steering, final_text)
         } else {
             Ok(())
         }
@@ -326,15 +344,37 @@ impl Transcript {
     }
 
     pub fn assistant_tool_turn(&mut self, content: String, calls: &[ValidatedCall]) {
-        self.push_message(json!({
+        self.assistant_tool_turn_with_reasoning(content, String::new(), calls);
+    }
+
+    /// The assistant record carries the model's own reasoning beside its
+    /// content and calls. Thinking templates render prior reasoning back into
+    /// the prompt (interleaved/preserved thinking); a record without it makes
+    /// the model re-derive its plan on every turn. Whether the field reaches
+    /// the wire is a projection decision, never a record edit.
+    pub fn assistant_tool_turn_with_reasoning(
+        &mut self,
+        content: String,
+        reasoning: String,
+        calls: &[ValidatedCall],
+    ) {
+        let mut message = json!({
             "role": "assistant",
             "content": content,
             "tool_calls": calls.iter().map(ValidatedCall::wire).collect::<Vec<_>>(),
-        }));
+        });
+        attach_reasoning(&mut message, reasoning);
+        self.push_message(message);
     }
 
     pub fn assistant_message(&mut self, content: String) {
-        self.push_message(json!({"role":"assistant", "content":content}));
+        self.assistant_message_with_reasoning(content, String::new());
+    }
+
+    pub fn assistant_message_with_reasoning(&mut self, content: String, reasoning: String) {
+        let mut message = json!({"role":"assistant", "content":content});
+        attach_reasoning(&mut message, reasoning);
+        self.push_message(message);
     }
 
     pub fn assistant_withheld_draft(&mut self, content: String, reason: &str) {
@@ -602,6 +642,12 @@ pub fn preferred_visible_language(user: &str) -> String {
 
 pub fn prompt_tail_message(content: &str) -> Value {
     json!({"role":"user", "content":format!("[RUNTIME GUIDANCE — NOT USER CONTENT]\n{content}")})
+}
+
+fn attach_reasoning(message: &mut Value, reasoning: String) {
+    if !reasoning.trim().is_empty() {
+        message["reasoning_content"] = Value::String(reasoning);
+    }
 }
 
 pub fn project_accepted_message(message: &Value) -> Value {

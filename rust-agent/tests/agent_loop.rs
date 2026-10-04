@@ -17,11 +17,217 @@ use std::sync::{Arc, Mutex};
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
+#[test]
+fn unsupported_saved_confirmed_memory_never_reaches_provider() {
+    let fixture = Workspace::new(&[("source.txt", "observed source")]);
+    let provider = Provider::start(|_, _| panic!("invalid saved memory reached provider"));
+    let mut config = fixture.config(&provider.endpoint, "Continue investigation");
+    config.task_memory = Some(json!({"entries":[{
+        "id":"saved","finding":"unsupported","status":"confirmed","evidence":"obs-99999999"
+    }],"revision":1}));
+    run(config);
+    assert!(provider.requests().is_empty());
+}
+
+#[test]
+fn confirmed_memory_rejection_is_visible_and_retry_preserves_state() {
+    let fixture = Workspace::new(&[("source.txt", "observed source")]);
+    let provider = Provider::start(move |request, turn| {
+        let parameters = &request["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["function"]["name"] == "task_memory")
+            .unwrap()["function"]["parameters"];
+        assert_eq!(parameters["type"], "object");
+        assert_eq!(parameters["properties"]["finding"]["type"], "string");
+        assert_eq!(parameters["required"], json!(["action"]));
+        assert!(parameters.get("oneOf").is_none());
+        match turn {
+            0 => Reply::Tools(vec![("read_file", json!({"path":"source.txt"}))]),
+            1 => Reply::Tools(vec![("task_memory", json!({"action":"unsupported"}))]),
+            2 => Reply::Tools(vec![("task_memory", json!({"action":"record"}))]),
+            3 => Reply::Tools(vec![("task_memory", json!({}))]),
+            4 => Reply::Tools(vec![(
+                "task_memory",
+                json!({
+                    "action":"record","id":"fact","finding":"invalid candidate","status":"confirmed","evidence":"obs-99999999"
+                }),
+            )]),
+            5 => {
+                let messages = request["messages"].as_array().unwrap();
+                assert!(messages.iter().any(|message| message["role"] == "tool"
+                    && message["content"]
+                        .as_str()
+                        .is_some_and(|body| body.contains("unknown observation")
+                            && body.contains("no memory was changed"))));
+                assert!(!messages.iter().any(|message| message["role"] == "user"
+                    && message["content"]
+                        .as_str()
+                        .is_some_and(|body| body.contains("fact [confirmed]"))));
+                Reply::Tools(vec![(
+                    "task_memory",
+                    json!({
+                        "action":"record","id":"fact","finding":"observed source","status":"confirmed","evidence":"obs-00000001"
+                    }),
+                )])
+            }
+            _ => {
+                let result = request["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .rev()
+                    .find(|message| message["role"] == "tool")
+                    .unwrap();
+                let body = result["content"].as_str().unwrap();
+                let end = body.find("\n[observation").unwrap_or(body.len());
+                let memory: Value = serde_json::from_str(&body[..end]).unwrap();
+                assert_eq!(memory["task_memory"]["revision"], 1);
+                assert_eq!(
+                    memory["task_memory"]["entries"].as_array().unwrap().len(),
+                    1
+                );
+                assert_eq!(
+                    memory["task_memory"]["entries"][0]["finding"],
+                    "observed source"
+                );
+                Reply::Text("Completed after a recoverable invalid evidence write.".into())
+            }
+        }
+    });
+    run(fixture.config(
+        &provider.endpoint,
+        "Read-only source inspection with memory",
+    ));
+    assert_eq!(provider.requests().len(), 7);
+}
+
+#[test]
+fn two_project_reads_have_distinct_evidence_and_model_visible_scope() {
+    let fixture = Workspace::new(&[("first-only.txt", "primary identity")]);
+    let secondary = fixture.base.join("secondary");
+    std::fs::create_dir_all(&secondary).unwrap();
+    std::fs::write(secondary.join("second-only.txt"), "secondary identity").unwrap();
+    let secondary_name = secondary.to_string_lossy().into_owned();
+    let expected = secondary_name.clone();
+    let provider = Provider::start(move |request, turn| {
+        assert!(request["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains(&expected));
+        if turn == 0 {
+            assert!(request["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["function"]["name"] == "read_file"
+                    && tool["function"]["parameters"]["properties"]["project"]["enum"]
+                        == json!([1, 2])));
+            Reply::Tools(vec![
+                ("read_file", json!({"path":"first-only.txt","project":1})),
+                ("read_file", json!({"path":"second-only.txt","project":2})),
+            ])
+        } else {
+            let tools = request["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry["role"] == "tool")
+                .map(|entry| entry["content"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert!(tools.iter().any(|body| body.contains("primary identity")));
+            assert!(tools.iter().any(|body| body.contains("secondary identity")));
+            Reply::Text("Project 1: obs-00000001. Project 2: obs-00000002.".into())
+        }
+    });
+    let mut config = fixture.config(&provider.endpoint, "read-only compare two projects");
+    config.secondary_root = Some(secondary_name.clone());
+    run(config);
+    let evidence = fixture.base.join("evidence");
+    let active: Value =
+        serde_json::from_slice(&std::fs::read(evidence.join("active.json")).unwrap()).unwrap();
+    let journal = std::fs::read_to_string(
+        evidence
+            .join(active["run_dir"].as_str().unwrap())
+            .join("events.jsonl"),
+    )
+    .unwrap();
+    let observations = journal
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter_map(|entry| {
+            entry
+                .get("observation")
+                .filter(|observation| !observation.is_null())
+                .cloned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(observations.len(), 2);
+    assert_eq!(observations[0]["source"], "first-only.txt");
+    assert_eq!(
+        observations[1]["source"],
+        format!("{secondary_name}/second-only.txt")
+    );
+    assert!(observations
+        .iter()
+        .all(|observation| observation["source_revision"].as_str().is_some()));
+}
+
+#[test]
+fn steering_at_completion_is_applied_before_final_and_replays() {
+    let fixture = Workspace::new(&[("identity.txt", "steering evidence")]);
+    let queue = Arc::new(Mutex::new(Vec::new()));
+    let incoming = queue.clone();
+    let provider = Provider::start(move |request, turn| {
+        if turn == 0 {
+            incoming
+                .lock()
+                .unwrap()
+                .push("Read identity.txt before answering; include STEER_OK.".into());
+            Reply::Text("Premature answer".into())
+        } else if turn == 1 {
+            assert!(request["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["role"] == "user"
+                    && entry["content"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("STEER_OK"))));
+            Reply::Tools(vec![("read_file", json!({"path":"identity.txt"}))])
+        } else {
+            Reply::Text("STEER_OK".into())
+        }
+    });
+    let mut config = fixture.config(&provider.endpoint, "inspect");
+    config.steering = queue;
+    run(config);
+    let history = vec![
+        json!({"role":"user","content":"inspect"}),
+        json!({"role":"user","content":"Read identity.txt before answering; include STEER_OK."}),
+        json!({"role":"assistant","content":"STEER_OK"}),
+    ];
+    let restored = local_ai_agent_runtime::agent::transcript::Transcript::durable(
+        &fixture.base.join("evidence"),
+        "next-run",
+        &history,
+        fixture.root.to_str(),
+    )
+    .unwrap();
+    assert!(restored.entries().iter().any(|entry| matches!(entry, local_ai_agent_runtime::agent::transcript::Entry::Steering(content) if content.contains("STEER_OK"))));
+    assert_eq!(restored.observations().len(), 1);
+}
+
 enum Reply {
     Text(String),
     /// Only reasoning, no content and no structured call.
     Reasoning(String),
     Tools(Vec<(&'static str, Value)>),
+    /// Reasoning streamed first, then structured calls.
+    ReasonedTools(String, Vec<(&'static str, Value)>),
+    /// Reasoning streamed first, then visible content.
+    ReasonedText(String, String),
 }
 
 struct Provider {
@@ -92,6 +298,21 @@ impl Provider {
                         out.push_str(&frame(json!({"reasoning_content": text}), None));
                         out.push_str(&frame(json!({}), Some("stop")));
                     }
+                    Reply::ReasonedText(reasoning, text) => {
+                        out.push_str(&frame(json!({"reasoning_content": reasoning}), None));
+                        out.push_str(&frame(json!({"content": text}), None));
+                        out.push_str(&frame(json!({}), Some("stop")));
+                    }
+                    Reply::ReasonedTools(reasoning, calls) => {
+                        out.push_str(&frame(json!({"reasoning_content": reasoning}), None));
+                        let calls = calls
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, (name, arguments))| json!({"index":index,"id":format!("call_{served}_{index}"),"type":"function","function":{"name":name,"arguments":arguments.to_string()}}))
+                            .collect::<Vec<_>>();
+                        out.push_str(&frame(json!({"tool_calls": calls}), None));
+                        out.push_str(&frame(json!({}), Some("tool_calls")));
+                    }
                     Reply::Tools(calls) => {
                         let calls = calls
                             .into_iter()
@@ -156,8 +377,11 @@ impl Workspace {
             system: "system".into(),
             user: user.into(),
             root: Some(self.root.to_string_lossy().into_owned()),
+            secondary_root: None,
             context_limit: 65_536,
             reasoning_mode: "fast".into(),
+            supports_reasoning: true,
+            reasoning_options: None,
             policy: RunPolicy::Auto,
             history: Vec::new(),
             evidence_dir: Some(self.base.join("evidence").to_string_lossy().into_owned()),
@@ -165,6 +389,7 @@ impl Workspace {
             provider_max_output: None,
             cancelled: Arc::new(AtomicBool::new(false)),
             steering: Arc::new(Mutex::new(Vec::new())),
+            steering_closed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -480,6 +705,37 @@ fn persistent_empty_responses_force_a_tool_free_answer_turn() {
     assert!(last_user_text(last).contains("MODE: FINALIZING"));
 }
 
+#[test]
+fn reasoning_only_finalizing_turn_retries_without_reasoning_and_accepts_visible_answer() {
+    let workspace = Workspace::new(SHOP);
+    let mut config = workspace.config("unused", READ_ONLY);
+    config.reasoning_mode = "deep".into();
+    let provider = Provider::start(|request, _| {
+        if request.pointer("/chat_template_kwargs/enable_thinking") == Some(&json!(false)) {
+            Reply::Text("Visible final answer.".into())
+        } else {
+            Reply::Reasoning("I will synthesize the answer now.".into())
+        }
+    });
+    config.endpoint = provider.endpoint.clone();
+    run(config);
+    assert!(completed(&workspace.journal()));
+    let requests = provider.requests();
+    assert!(requests.len() >= 2);
+    assert_eq!(
+        requests.last().unwrap()["chat_template_kwargs"]["enable_thinking"],
+        false,
+        "finalizing request must explicitly disable supported reasoning"
+    );
+    assert!(requests.last().unwrap().get("tools").is_none());
+    assert!(workspace.journal().iter().any(|entry| {
+        entry
+            .pointer("/Message/content")
+            .and_then(Value::as_str)
+            .is_some_and(|content| content.contains("Visible final answer"))
+    }));
+}
+
 /// Failure shape: a single turn of parallel reads larger than the whole window
 /// (here 8 files of 60 KB against a 16K window). Results are now bounded by the
 /// window at creation and carry a continuation offset, instead of being
@@ -534,4 +790,99 @@ fn a_burst_of_large_reads_cannot_exceed_a_small_window() {
         .unwrap();
     assert!(first_result.contains("\"truncated\":true"));
     assert!(first_result.contains("next_offset_chars"));
+}
+
+/// Failure shape: reasoning was dropped from the record, so a thinking model's
+/// template rendered every earlier assistant turn with empty thinking and the
+/// model re-derived its plan on each step.
+#[test]
+fn reasoning_is_recorded_and_replayed_with_the_assistant_turn_that_produced_it() {
+    let workspace = Workspace::new(SHOP);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::ReasonedTools(
+            "PLAN-ALPHA: read the form first".into(),
+            vec![("read_file", json!({"path":"src/Form.tsx"}))],
+        ),
+        1 => Reply::ReasonedTools(
+            "PLAN-BETA: then the endpoint".into(),
+            vec![("read_file", json!({"path":"public/api.php"}))],
+        ),
+        _ => Reply::ReasonedText("ALL-DONE".into(), "The form posts to api.php.".into()),
+    });
+    run(workspace.config(&provider.endpoint, READ_ONLY));
+    assert!(completed(&workspace.journal()));
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3);
+    let assistants = |request: &Value| {
+        request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "assistant")
+            .map(|m| {
+                m.get("reasoning_content")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned()
+            })
+            .collect::<Vec<_>>()
+    };
+    assert!(assistants(&requests[0]).is_empty());
+    assert_eq!(
+        assistants(&requests[1]),
+        vec!["PLAN-ALPHA: read the form first"]
+    );
+    assert_eq!(
+        assistants(&requests[2]),
+        vec![
+            "PLAN-ALPHA: read the form first",
+            "PLAN-BETA: then the endpoint"
+        ]
+    );
+    // The durable record keeps it too, so a restart replays the same bytes.
+    let journal = workspace.journal();
+    assert!(journal.iter().any(|entry| entry
+        .pointer("/Message/reasoning_content")
+        .and_then(Value::as_str)
+        == Some("PLAN-BETA: then the endpoint")));
+}
+
+/// Failure shape: a turn with only reasoning left no trace, so the retry
+/// regenerated the same reasoning from nothing, indefinitely.
+#[test]
+fn a_reasoning_only_turn_is_visible_to_the_retry() {
+    let workspace = Workspace::new(SHOP);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Reasoning("DRAFT-IN-THINKING: the report is: form posts to api.php".into()),
+        _ => Reply::Text("The form posts to api.php.".into()),
+    });
+    run(workspace.config(&provider.endpoint, READ_ONLY));
+    assert!(completed(&workspace.journal()));
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let retry = requests[1]["messages"].as_array().unwrap();
+    assert!(
+        retry.iter().any(|m| m["role"] == "assistant"
+            && m["reasoning_content"] == "DRAFT-IN-THINKING: the report is: form posts to api.php"),
+        "the retry did not carry the reasoning-only turn"
+    );
+    assert!(last_user_text(&requests[1]).contains("neither an answer nor a structured tool call"));
+}
+
+#[test]
+fn a_provider_without_reasoning_never_receives_replayed_reasoning() {
+    let workspace = Workspace::new(SHOP);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::ReasonedTools(
+            "hidden".into(),
+            vec![("read_file", json!({"path":"src/Form.tsx"}))],
+        ),
+        _ => Reply::Text("done".into()),
+    });
+    let mut config = workspace.config(&provider.endpoint, READ_ONLY);
+    config.supports_reasoning = false;
+    run(config);
+    assert!(!provider.requests()[1]
+        .to_string()
+        .contains("reasoning_content"));
 }

@@ -1,8 +1,9 @@
 import { memo, useState } from 'react';
-import type { TerminalExecution, ThinkingTimelineEvent, ToolActivity } from '../../shared/types';
+import type { ChatMessage, TerminalExecution, ThinkingTimelineEvent, ToolActivity } from '../../shared/types';
 import { Markdown } from './Markdown';
+import { thinkingTimeline } from '../../shared/thinking-timeline';
 
-type Props = { timeline?: ThinkingTimelineEvent[]; activities: ToolActivity[]; streaming: boolean; now: number; error?: string; cancelled?: boolean };
+type Props = { timeline?: ThinkingTimelineEvent[]; activities: ToolActivity[]; messages: ChatMessage[]; reasoning?: string; streaming: boolean; now: number; error?: string; cancelled?: boolean };
 
 const elapsed = (start?: string, end?: string, now = Date.now()) => {
   if (!start) return null; const seconds = Math.max(0, Math.round(((end ? new Date(end).getTime() : now) - new Date(start).getTime()) / 1000));
@@ -74,9 +75,8 @@ const Action = memo(function Action({ activity }: { activity: ToolActivity }) {
   return <section className={`agent-timeline-action ${activity.kind ?? 'other'} ${activity.state ?? 'running'} ${expanded ? 'expanded' : ''}`}><button type="button" className="agent-timeline-action-head" onClick={() => hasBody && setExpanded((value) => !value)} aria-expanded={hasBody ? expanded : undefined}><b>{state} {actionTitle(activity)}</b>{summary && <span>{summary}</span>}{activity.state === 'running' && <em>running…</em>}</button>{expanded && <div className="agent-timeline-action-body">{activity.kind === 'terminal' ? <TerminalDetails terminal={activity.terminal} fallback={output} /> : output && <pre>{output}</pre>}{typeof diff === 'string' && <details><summary>Diff</summary><pre>{diff}</pre></details>}</div>}</section>;
 });
 
-export const AgentTimeline = memo(function AgentTimeline({ timeline = [], activities, streaming, now, error, cancelled }: Props) {
-  const activityById = new Map(activities.map((activity) => [activity.id, activity]));
-  const items = [...timeline].sort((a, b) => a.position - b.position);
+export const AgentTimeline = memo(function AgentTimeline({ timeline, activities, messages, reasoning, streaming, now, error, cancelled }: Props) {
+  const items = thinkingTimeline(reasoning, activities, streaming, timeline, messages);
   if (!items.length && !error && !cancelled) return null;
   return <div className="agent-timeline">{items.map((item) => {
     if (item.kind === 'reasoning') {
@@ -85,7 +85,7 @@ export const AgentTimeline = memo(function AgentTimeline({ timeline = [], activi
       const live = streaming && !item.completedAt;
       return <section className="agent-timeline-thought" key={item.id}><header><b>{live ? 'Thinking' : duration ? `Thought for ${duration}` : 'Thought'}</b>{live && duration && <span>· {duration}</span>}</header><Markdown streaming={live}>{item.content}</Markdown></section>;
     }
-    const activity = activityById.get(item.activityId);
-    return activity ? <Action key={item.id} activity={activity} /> : null;
+    if (item.kind === 'steering') return <section className={`agent-timeline-steering ${item.status}`} key={item.id}><header><b>{item.status === 'applied' ? 'Уточнение передано модели' : 'Уточнение принято'}</b></header><p>{item.message.content}</p></section>;
+    return <Action key={item.id} activity={item.activity} />;
   })}{error && <section className="agent-timeline-terminal error" role="status"><b>Agent stopped with an error</b><span>{error}</span></section>}{cancelled && <section className="agent-timeline-terminal cancelled" role="status"><b>Agent stopped</b></section>}</div>;
 });

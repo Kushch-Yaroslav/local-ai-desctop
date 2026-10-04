@@ -52,6 +52,51 @@ pub fn attach_historical_index(
     messages.insert(insert, json!({"role":"user","content":content}));
 }
 
+/// Re-applies folds decided on earlier turns. A fold decision is made once, when
+/// the projection crosses the compaction trigger, and then kept: every later
+/// request shows the same receipts, so the provider's cached prefix survives
+/// until the next real fold. Recomputing the fold set from scratch each turn
+/// instead moves the first changed message forward by one result per turn and
+/// forces the whole remaining history to be evaluated again.
+pub fn apply_folds(transcript: &Transcript, messages: &mut [Value], folded: &HashSet<String>) {
+    if folded.is_empty() {
+        return;
+    }
+    for message in messages.iter_mut() {
+        if message.get("role").and_then(Value::as_str) != Some("tool") {
+            continue;
+        }
+        let Some(id) = message.get("_observation_id").and_then(Value::as_str) else {
+            continue;
+        };
+        if !folded.contains(id) {
+            continue;
+        }
+        let Some(meta) = transcript.observation(id) else {
+            continue;
+        };
+        let receipt = meta.receipt();
+        if message.get("content").and_then(Value::as_str) != Some(receipt.as_str()) {
+            message["content"] = json!(receipt);
+        }
+    }
+}
+
+/// Observation IDs whose result is currently shown as a receipt.
+#[must_use]
+pub fn folded_ids(transcript: &Transcript, messages: &[Value]) -> Vec<String> {
+    messages
+        .iter()
+        .filter(|m| m.get("role").and_then(Value::as_str) == Some("tool"))
+        .filter_map(|m| {
+            let id = m.get("_observation_id").and_then(Value::as_str)?;
+            let meta = transcript.observation(id)?;
+            (m.get("content").and_then(Value::as_str) == Some(meta.receipt().as_str()))
+                .then(|| id.to_owned())
+        })
+        .collect()
+}
+
 /// Fold completed old results first. The last assistant call group stays exact
 /// unless it alone makes the request exceed the target. Pairing remains intact.
 pub fn fold_to_budget<F>(
@@ -156,6 +201,50 @@ mod tests {
             }],
         );
         t.tool_result(id, "read_file", body.into());
+    }
+
+    #[test]
+    fn an_earlier_fold_decision_is_kept_so_the_request_prefix_stays_identical() {
+        let (base, root, mut t) = fixture();
+        t.push_run_user(json!({"role":"user","content":"audit"}));
+        for n in 0..6 {
+            read_step(
+                &mut t,
+                &format!("call-{n}"),
+                &format!("{n}{}", "x".repeat(6_000)),
+            );
+        }
+        let size = |messages: &[Value]| serde_json::to_string(messages).unwrap().len() / 3;
+        let mut first = project(&t, "system", "");
+        let target = size(&first) - 2_500;
+        let folded = fold_to_budget(&t, &mut first, target, size);
+        assert!(!folded.is_empty() && folded.len() < 6, "{folded:?}");
+        let remembered: HashSet<String> = folded_ids(&t, &first).into_iter().collect();
+        assert_eq!(remembered.len(), folded.len());
+
+        // Next turn: one more result arrived; the fold set is not recomputed, it is re-applied.
+        read_step(&mut t, "call-6", &format!("6{}", "x".repeat(6_000)));
+        let mut second = project(&t, "system", "");
+        apply_folds(&t, &mut second, &remembered);
+        let again = project(&t, "system", "");
+        let common = first
+            .iter()
+            .zip(second.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        assert_eq!(
+            common,
+            first.len(),
+            "the earlier request must be a prefix of the next one"
+        );
+        assert_eq!(second.len(), again.len());
+        assert_eq!(
+            folded_ids(&t, &second).len(),
+            remembered.len(),
+            "re-applying must not fold anything new"
+        );
+        std::fs::remove_dir_all(base).unwrap();
+        let _ = root;
     }
 
     #[test]

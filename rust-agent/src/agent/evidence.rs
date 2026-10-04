@@ -50,6 +50,60 @@ impl Observation {
     }
 }
 
+fn returned_range(parsed: &Value) -> Option<String> {
+    let range = parsed
+        .get("start_line")
+        .and_then(Value::as_u64)
+        .map(|start| {
+            format!(
+                "lines {}-{}",
+                start,
+                parsed
+                    .get("end_line")
+                    .and_then(Value::as_u64)
+                    .map_or("end".into(), |end| end.to_string())
+            )
+        })
+        .or_else(|| {
+            if parsed.get("start_line").is_some() {
+                None
+            } else {
+                parsed
+                    .get("total_lines")
+                    .and_then(Value::as_u64)
+                    .map(|lines| format!("lines 1-{lines}"))
+            }
+        })?;
+    let range = match (
+        parsed
+            .get("starts_mid_line")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        parsed
+            .get("ends_mid_line")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    ) {
+        (true, true) => format!("{range} (partial first and last lines)"),
+        (true, false) => format!("{range} (partial first line)"),
+        (false, true) => format!("{range} (partial last line)"),
+        (false, false) => range,
+    };
+    Some(
+        if let Some(next) = parsed.get("next_offset_chars").and_then(Value::as_u64) {
+            format!(
+                "{range} next_offset_chars={next} truncated={}",
+                parsed
+                    .get("truncated")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            )
+        } else {
+            range
+        },
+    )
+}
+
 pub fn classify_source_read<'a>(
     current: &Observation,
     prior: impl Iterator<Item = &'a Observation>,
@@ -97,6 +151,7 @@ pub struct EvidenceStore {
     dir: PathBuf,
     run_id: String,
     root: Option<PathBuf>,
+    secondary_root: Option<PathBuf>,
     journal: File,
     next_event: usize,
     next_observation: usize,
@@ -104,9 +159,12 @@ pub struct EvidenceStore {
 }
 
 pub fn history_hash(history: &[Value]) -> String {
+    let mut canonical = Value::Array(history.to_vec());
+    // Persisted lineage hashes predate order-preserving tool schema serialization.
+    canonical.sort_all_objects();
     format!(
         "{:x}",
-        Sha256::digest(serde_json::to_vec(history).unwrap_or_default())
+        Sha256::digest(serde_json::to_vec(&canonical).unwrap_or_default())
     )
 }
 
@@ -250,6 +308,7 @@ impl EvidenceStore {
                 dir,
                 run_id: run_id.into(),
                 root: canonical_root,
+                secondary_root: None,
                 journal,
                 next_event,
                 next_observation,
@@ -297,15 +356,19 @@ impl EvidenceStore {
                         .and_then(Value::as_str)
                         .map(str::to_owned);
                     let source_revision = source.as_ref().and_then(|p| {
-                        self.root.as_ref().and_then(|root| {
-                            let file = fs::canonicalize(root.join(p)).ok()?;
-                            if !file.starts_with(root) {
-                                return None;
-                            }
-                            fs::read(file)
-                                .ok()
-                                .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
-                        })
+                        self.secondary_root
+                            .as_ref()
+                            .filter(|root| Path::new(p).starts_with(root))
+                            .or(self.root.as_ref())
+                            .and_then(|root| {
+                                let file = fs::canonicalize(root.join(p)).ok()?;
+                                if !file.starts_with(root) {
+                                    return None;
+                                }
+                                fs::read(file)
+                                    .ok()
+                                    .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+                            })
                     });
                     let requested_range = call_args.map(|a| {
                         let lines = a.get("start_line").and_then(Value::as_u64).map(|start| {
@@ -320,40 +383,7 @@ impl EvidenceStore {
                         let offset = a.get("offset_chars").and_then(Value::as_u64).unwrap_or(0);
                         format!("{} offset_chars={offset}", lines.unwrap_or("all".into()))
                     });
-                    let returned_range = parsed
-                        .get("start_line")
-                        .and_then(Value::as_u64)
-                        .map(|n| {
-                            format!(
-                                "lines {}-{}",
-                                n,
-                                parsed
-                                    .get("end_line")
-                                    .and_then(Value::as_u64)
-                                    .map_or("end".into(), |end| end.to_string())
-                            )
-                        })
-                        .or_else(|| {
-                            parsed
-                                .get("total_lines")
-                                .and_then(Value::as_u64)
-                                .map(|n| format!("lines 1-{n}"))
-                        })
-                        .map(|range| {
-                            if let Some(next) =
-                                parsed.get("next_offset_chars").and_then(Value::as_u64)
-                            {
-                                format!(
-                                    "{range} next_offset_chars={next} truncated={}",
-                                    parsed
-                                        .get("truncated")
-                                        .and_then(Value::as_bool)
-                                        .unwrap_or(false)
-                                )
-                            } else {
-                                range
-                            }
-                        });
+                    let returned_range = returned_range(&parsed);
                     let meta = Observation {
                         id: id.clone(),
                         event_id: event_id.clone(),
@@ -435,10 +465,14 @@ impl EvidenceStore {
         base: &Path,
         history: &[Value],
         user: &str,
+        steering: &[String],
         final_text: &str,
     ) -> Result<(), String> {
         let mut next = history.to_vec();
         next.push(json!({"role":"user","content":user}));
+        for content in steering {
+            next.push(json!({"role":"user","content":content}));
+        }
         next.push(json!({"role":"assistant","content":final_text}));
         let active = Active {
             run_dir: self.dir.file_name().unwrap().to_string_lossy().into_owned(),
@@ -454,14 +488,30 @@ impl EvidenceStore {
     }
 
     pub fn read(&self, id: &str, offset: usize, limit: usize) -> Result<Value, String> {
-        read_stored_observation(
-            &self.dir,
-            self.root.as_deref(),
-            &self.observations,
-            id,
-            offset,
-            limit,
-        )
+        let root = self
+            .observations
+            .iter()
+            .find(|observation| {
+                observation.id == id
+                    || observation
+                        .id
+                        .trim_start_matches("obs-")
+                        .parse::<usize>()
+                        .ok()
+                        == id.trim_start_matches("obs-").parse::<usize>().ok()
+            })
+            .and_then(|observation| observation.source.as_deref())
+            .and_then(|source| {
+                self.secondary_root
+                    .as_deref()
+                    .filter(|root| Path::new(source).starts_with(root))
+            })
+            .or(self.root.as_deref());
+        read_stored_observation(&self.dir, root, &self.observations, id, offset, limit)
+    }
+
+    pub fn set_secondary_root(&mut self, root: Option<&Path>) {
+        self.secondary_root = root.and_then(|root| root.canonicalize().ok());
     }
 }
 
@@ -557,4 +607,53 @@ fn safe_name(s: &str) -> String {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_hash_preserves_legacy_sorted_object_identity() {
+        let history = vec![serde_json::json!({
+            "role": "assistant",
+            "content": "saved",
+            "metadata": {"z": 1, "a": 2}
+        })];
+        let legacy = br#"[{"content":"saved","metadata":{"a":2,"z":1},"role":"assistant"}]"#;
+        assert_eq!(
+            history_hash(&history),
+            format!("{:x}", Sha256::digest(legacy))
+        );
+        let reordered: Vec<Value> = serde_json::from_slice(legacy).unwrap();
+        assert_eq!(history_hash(&history), history_hash(&reordered));
+    }
+
+    #[test]
+    fn chunked_observation_records_its_line_range_and_partial_boundaries() {
+        let parsed = json!({
+            "start_line": 42,
+            "end_line": 50,
+            "starts_mid_line": true,
+            "ends_mid_line": true,
+            "next_offset_chars": 8182,
+            "truncated": true
+        });
+        assert_eq!(
+            returned_range(&parsed).as_deref(),
+            Some(
+                "lines 42-50 (partial first and last lines) next_offset_chars=8182 truncated=true"
+            )
+        );
+    }
+
+    #[test]
+    fn empty_chunk_does_not_claim_the_entire_source_as_returned() {
+        let parsed = json!({
+            "start_line": null,
+            "end_line": null,
+            "total_lines": 664
+        });
+        assert_eq!(returned_range(&parsed), None);
+    }
 }

@@ -20,6 +20,15 @@ pub enum Event {
     AgentStarted {
         run_id: String,
     },
+    SteeringAccepted {
+        content: String,
+    },
+    SteeringApplied {
+        content: String,
+    },
+    SteeringRejected {
+        message: String,
+    },
     TurnStarted {
         index: usize,
     },

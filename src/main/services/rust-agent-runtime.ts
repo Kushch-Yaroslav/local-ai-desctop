@@ -15,8 +15,8 @@ type RuntimeEvent = {
   type: string; content?: string; id?: string; name?: string; message?: string; detail?: string; status?: string;
   diff?: string | null; is_error?: boolean; plan?: unknown; memory?: unknown; used?: number; limit?: number;
   before?: number; after?: number; stream?: string; state?: string; index?: number;
-  prompt_tokens?: number; completion_tokens?: number; total_tokens?: number; cached_tokens?: number; cache_write_tokens?: number;
-  prompt_ms?: number; predicted_ms?: number; predicted_per_second?: number; finish_reason?: string;
+  prompt_tokens?: number | null; completion_tokens?: number | null; total_tokens?: number | null; cached_tokens?: number | null; cache_write_tokens?: number | null;
+  prompt_ms?: number | null; predicted_ms?: number | null; predicted_per_second?: number | null; finish_reason?: string;
   phase?: string; max_tokens?: number; context_limit?: number; projected_input_tokens?: number;
   reserved_output_tokens?: number; complete?: boolean; continuation_count?: number; chars?: number;
   continuation?: number; prior_chars?: number; next_max_tokens?: number; arguments?: Record<string, unknown>;
@@ -27,6 +27,7 @@ type RuntimeEvent = {
 type RuntimeRequest = {
   type: 'run'; run_id: string; endpoint: string; model: string; system: string; user: string;
   project_root?: string; secondary_project_root?: string; context_limit: number; reasoning_mode: ReasoningMode;
+  supports_reasoning: boolean; reasoning_options?: Record<string, Record<string, unknown>>;
   web_mode: WebMode; policy: 'auto' | 'safe'; history: unknown[]; task_memory?: AgentPlan['taskMemory']; provider_max_output?: number;
   evidence_dir?: string;
 };
@@ -119,11 +120,27 @@ export function taskPlan(value: unknown): AgentPlan {
 /** Electron bridge for the Rust runtime. It passes each content delta through
  * immediately; `final` is metadata, not a delayed text transport. */
 export class RustAgentRuntime {
+  private readonly steering = new Map<string, (content: string) => Promise<void>>();
   constructor(private readonly endpoint: string, private readonly binary = process.env.LOCAL_AI_AGENT_RUNTIME ?? resolve(process.cwd(), 'rust-agent', 'target', 'debug', 'local-ai-agent-runtime')) {}
 
-  async *stream(model: string, history: ChatMessage[], projects: AgentProject[], signal: AbortSignal, contextLimit: number, reasoningMode: ReasoningMode, webMode: WebMode, runId: string, persistedTaskMemory?: AgentPlan['taskMemory'], conversationId?: string): AsyncIterable<StreamEvent> {
+  steer(runId: string, content: string): Promise<void> {
+    const send = this.steering.get(runId);
+    if (!send) return Promise.reject(new Error('Agent ещё не готов к уточнению или уже завершён.'));
+    return send(content);
+  }
+
+  async *stream(model: string, history: ChatMessage[], projects: AgentProject[], signal: AbortSignal, contextLimit: number, reasoningMode: ReasoningMode, webMode: WebMode, runId: string, persistedTaskMemory?: AgentPlan['taskMemory'], conversationId?: string, supportsReasoning = true, reasoningOptions?: Record<string, Record<string, unknown>>): AsyncIterable<StreamEvent> {
     if (!existsSync(this.binary)) throw new Error(`Rust Agent Runtime V2 не собран: ${this.binary}. Выполните cargo build в rust-agent.`);
     const child = spawn(this.binary, [], { stdio: 'pipe' });
+    const pending: Array<{ content: string; resolve: () => void; reject: (error: Error) => void }> = [];
+    this.steering.set(runId, (content) => {
+      if (!child.stdin.writable || signal.aborted) return Promise.reject(new Error('Agent уже завершён.'));
+      if (pending.length >= 4) return Promise.reject(new Error('Слишком много ожидающих уточнений.'));
+      return new Promise<void>((resolve, reject) => {
+        pending.push({ content, resolve, reject });
+        child.stdin.write(`${JSON.stringify({ type: 'steer', run_id: runId, content })}\n`);
+      });
+    });
     let stopped = false;
     const stop = () => {
       if (stopped || !child.stdin.writable) return;
@@ -135,9 +152,9 @@ export class RustAgentRuntime {
     const current = splitAgentRunHistory(history);
     const request: RuntimeRequest = {
       type: 'run', run_id: runId, endpoint: this.endpoint, model,
-      system: 'You are Local AI Desktop Agent. Work autonomously inside the selected project scope. Use tools only with complete valid JSON arguments.',
+      system: `You are Local AI Desktop Agent. Work autonomously inside the selected project scope. Use tools only with complete valid JSON arguments.\n${projects.map((project) => `Project ${project.slot}: ${project.label}; identity=${project.id}; root=${project.root}`).join('\n')}`,
       user: current.user, project_root: projects[0]?.root, secondary_project_root: projects[1]?.root,
-      context_limit: contextLimit, reasoning_mode: reasoningMode, web_mode: webMode, policy: 'auto',
+      context_limit: contextLimit, reasoning_mode: reasoningMode, supports_reasoning: supportsReasoning, reasoning_options: reasoningOptions, web_mode: webMode, policy: 'auto',
       history: current.prior.filter((message) => !message.agentError && !message.agentCancelled).map((message) => ({ role: message.role, content: message.content })),
       ...(conversationId ? { evidence_dir: join(paths.userData, 'agent-evidence', createHash('sha256').update(conversationId).digest('hex')) } : {}),
       ...(persistedTaskMemory ? { task_memory: persistedTaskMemory } : {}),
@@ -156,7 +173,15 @@ export class RustAgentRuntime {
       for await (const line of lines) {
         let event: RuntimeEvent;
         try { event = JSON.parse(line) as RuntimeEvent; } catch { continue; }
-        if (event.type === 'thinking_delta') yield { type: 'thinking', content: event.content ?? '' };
+        if (event.type === 'steering_accepted' || event.type === 'steering_rejected') {
+          const next = pending.shift();
+          if (event.type === 'steering_accepted') next?.resolve();
+          else next?.reject(new Error(event.message ?? 'Agent уже завершён.'));
+        }
+        else if (event.type === 'steering_applied') {
+          yield { type: 'steering', userMessage: { id: '', conversationId: conversationId ?? '', role: 'user', content: event.content ?? '', createdAt: new Date().toISOString() }, status: 'applied' };
+        }
+        else if (event.type === 'thinking_delta') yield { type: 'thinking', content: event.content ?? '' };
         else if (event.type === 'turn_started') yield { type: 'agent-telemetry', telemetry: { turn: event.index ?? 0 } };
         else if (event.type === 'content_delta' || event.type === 'final_delta' || event.type === 'agent_status') {
           if (event.type === 'agent_status') statusCount += 1;
@@ -185,7 +210,16 @@ export class RustAgentRuntime {
           yield { type: 'context-usage', used: event.used ?? 0, maximum: event.limit ?? contextLimit };
           yield { type: 'agent-telemetry', telemetry: { contextUsed: event.used, contextLimit: event.limit ?? contextLimit } };
         } else if (event.type === 'turn_usage') {
-          yield { type: 'agent-telemetry', telemetry: { inputTokens: event.prompt_tokens, outputTokens: event.completion_tokens, tokensPerSecond: event.predicted_per_second, cachedTokens: event.cached_tokens, cacheWriteTokens: event.cache_write_tokens } };
+          const tokensPerSecond = finiteMetric(event.predicted_per_second);
+          const cachedTokens = finiteMetric(event.cached_tokens);
+          const cacheWriteTokens = finiteMetric(event.cache_write_tokens);
+          yield { type: 'agent-telemetry', telemetry: {
+            inputTokens: finiteMetric(event.prompt_tokens) ?? 0,
+            outputTokens: finiteMetric(event.completion_tokens) ?? 0,
+            ...(tokensPerSecond === undefined ? {} : { tokensPerSecond }),
+            ...(cachedTokens === undefined ? {} : { cachedTokens }),
+            ...(cacheWriteTokens === undefined ? {} : { cacheWriteTokens }),
+          } };
         } else if (event.type === 'agent_stopped') {
           child.stdin.end();
           yield { type: 'cancelled' };
@@ -205,6 +239,8 @@ export class RustAgentRuntime {
       if (!signal.aborted && terminalFinal) yield { type: 'done', finishReason: terminalFinishReason };
       else if (!signal.aborted && !terminalFailure) yield { type: 'error', message: 'Rust Agent Runtime V2 ended without a terminal final response', details: 'The runtime closed before emitting a final event.' };
     } finally {
+      this.steering.delete(runId);
+      for (const next of pending) next.reject(new Error('Agent завершён до принятия уточнения.'));
       signal.removeEventListener('abort', stop);
       if (child.stdin.writable) child.stdin.end();
       if (!child.killed && child.exitCode === null) child.kill('SIGTERM');
@@ -231,3 +267,4 @@ const text = (value: unknown) => typeof value === 'string' ? value : undefined;
 const number = (value: unknown) => typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 const bool = (value: unknown) => typeof value === 'boolean' ? value : undefined;
 const terminalStatus = (value: unknown): TerminalExecution['status'] | undefined => ['running', 'completed', 'partial_success', 'error', 'cancelled', 'timed_out'].includes(String(value)) ? String(value) as TerminalExecution['status'] : undefined;
+const finiteMetric = (value: number | null | undefined): number | undefined => typeof value === 'number' && Number.isFinite(value) ? value : undefined;

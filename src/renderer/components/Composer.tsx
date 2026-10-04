@@ -10,7 +10,7 @@ const isImageFile = (file: File): boolean => file.type.startsWith('image/') || /
 export function Composer() {
   const [value, setValue] = useState(''); const [files, setFiles] = useState<File[]>([]); const [projectReferences, setProjectReferences] = useState<ProjectReference[]>([]); const [suggestions, setSuggestions] = useState<ProjectSuggestion[]>([]); const [referenceQuery, setReferenceQuery] = useState<{ start: number; text: string } | null>(null); const [activeSuggestion, setActiveSuggestion] = useState(0); const [attachmentError, setAttachmentError] = useState<string | null>(null); const ref = useRef<HTMLTextAreaElement>(null); const inputRef = useRef<HTMLInputElement>(null);
   const manualHeight = useRef<number | null>(null); const resizeHandle = useRef(false);
-  const { sendMessage, stop, isGenerating, conversations, activeId } = useAppStore();
+  const { sendMessage, steer, steeringStatus, stop, isGenerating, generationConversationId, conversations, activeId } = useAppStore();
   const chat = conversations.find((item) => item.id === activeId);
   const projectEnabled = Boolean(chat?.workingDirectory);
   const resetHeight = () => { const textarea = ref.current; if (!textarea) return; manualHeight.current = null; textarea.style.height = ''; textarea.style.overflowY = 'hidden'; };
@@ -21,7 +21,16 @@ export function Composer() {
     setAttachmentError(rejected ? 'Максимум 10 изображений на сообщение' : null);
     setFiles(next);
   }, [files]);
-  const submit = () => { if (!isGenerating && (value.trim() || files.length)) { void sendMessage(value, files, projectReferences); setValue(''); setFiles([]); setProjectReferences([]); setSuggestions([]); setReferenceQuery(null); setAttachmentError(null); } };
+  const [steeringSubmitting, setSteeringSubmitting] = useState(false);
+  const submit = () => {
+    if (isGenerating && chat?.mode === 'agent' && value.trim() && !files.length && !projectReferences.length && !steeringSubmitting) {
+      const instruction = value;
+      setSteeringSubmitting(true);
+      void steer(instruction).then((accepted) => { if (accepted) setValue((draft) => draft === instruction ? '' : draft); }).finally(() => setSteeringSubmitting(false));
+      return;
+    }
+    if (!generationConversationId && (value.trim() || files.length)) { void sendMessage(value, files, projectReferences); setValue(''); setFiles([]); setProjectReferences([]); setSuggestions([]); setReferenceQuery(null); setAttachmentError(null); }
+  };
   useEffect(() => {
     if (!projectEnabled || !activeId || !referenceQuery) { setSuggestions([]); return; }
     let cancelled = false;
@@ -68,10 +77,11 @@ export function Composer() {
   return <div className="composer-wrap"><div className="composer" onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); addFiles([...event.dataTransfer.files]); }}>
     {(files.length > 0 || projectReferences.length > 0) && <div className="attachment-draft">{projectReferences.map((reference) => <ProjectReferenceChip key={reference.id} reference={reference} onRemove={() => setProjectReferences((items) => items.filter((item) => item.id !== reference.id))} />)}{files.map((file, index) => <DraftAttachment key={`${file.name}-${index}`} file={file} index={isImageFile(file) ? files.slice(0, index + 1).filter(isImageFile).length - 1 : index} onRemove={() => { setFiles((items) => items.filter((_, itemIndex) => itemIndex !== index)); setAttachmentError(null); }} />)}</div>}
     <input ref={inputRef} className="attachment-input" type="file" multiple accept=".png,.jpg,.jpeg,.webp,.txt,.md,.json,.csv,.log,.js,.ts,.jsx,.tsx,.html,.css,.yaml,.yml,.xml,.docx,.xlsx,.xls,.pdf" onChange={(event) => { addFiles([...(event.target.files ?? [])]); event.currentTarget.value = ''; }} />
+    {isGenerating && chat?.mode === 'agent' && <button className="steering-button" type="button" disabled={!value.trim() || files.length > 0 || projectReferences.length > 0 || steeringSubmitting} onClick={submit} title={steeringStatus === 'applied' ? 'Предыдущее уточнение передано модели' : steeringStatus === 'accepted' ? 'Предыдущее уточнение принято; ожидает границы хода' : 'Отправить уточнение без остановки Agent'}>Уточнить</button>}
     <button className="attach-button" type="button" disabled={isGenerating} title="Прикрепить файлы" onClick={() => inputRef.current?.click()}><Paperclip size={18} /></button>
     <textarea ref={ref} value={value} placeholder="Напишите сообщение…" rows={1} onPointerDown={startResize} onPointerUp={finishResize} onChange={(event) => updateValue(event.target.value, event.target.selectionStart)} onKeyDown={(event) => { if (suggestions.length) { if (event.key === 'ArrowDown' || event.key === 'ArrowUp') { event.preventDefault(); setActiveSuggestion((index) => (index + (event.key === 'ArrowDown' ? 1 : suggestions.length - 1)) % suggestions.length); return; } if ((event.key === 'Enter' || event.key === 'Tab') && suggestions[activeSuggestion]) { event.preventDefault(); selectSuggestion(suggestions[activeSuggestion]); return; } if (event.key === 'Escape') { event.preventDefault(); setReferenceQuery(null); setSuggestions([]); return; } } if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); submit(); } }} />
     {suggestions.length > 0 && <div className="project-reference-menu" role="listbox" aria-label="Файлы проекта">{suggestions.map((suggestion, index) => <button type="button" role="option" aria-selected={index === activeSuggestion} className={index === activeSuggestion ? 'active' : ''} key={suggestion.id} onMouseDown={(event) => { event.preventDefault(); selectSuggestion(suggestion); }} onMouseEnter={() => setActiveSuggestion(index)}>{suggestion.kind === 'folder' ? <Folder size={15} /> : <File size={15} />}<span>{suggestion.relativePath}</span><small className={`project-badge project-${suggestion.projectSlot}`}>{suggestion.projectLabel}</small></button>)}</div>}
-    <ContextUsage />{isGenerating ? <button className="send-button stop" onClick={() => void stop()} title="Остановить генерацию"><Square size={16} fill="currentColor" /></button> : <button className="send-button" disabled={!value.trim() && files.length === 0} onClick={submit} title="Отправить"><Send size={18} /></button>}
+    <ContextUsage />{isGenerating ? <button className="send-button stop" onClick={() => void stop()} title="Остановить генерацию"><Square size={16} fill="currentColor" /></button> : <button className="send-button" disabled={Boolean(generationConversationId) || (!value.trim() && files.length === 0)} onClick={submit} title={generationConversationId ? 'Генерация выполняется в другом чате' : 'Отправить'}><Send size={18} /></button>}
   </div>{attachmentError && <p className="attachment-error" role="status">{attachmentError}</p>}<p>Enter — отправить · Shift+Enter — новая строка · вставьте или перетащите файлы</p></div>;
 }
 

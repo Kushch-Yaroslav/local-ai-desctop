@@ -1,5 +1,8 @@
 # Jan vs Local AI Desktop runtime gap
 
+Historical source comparison of the revisions below; backend references are
+not a declaration of current application support.
+
 Research date: 2026-09-28. This is a source inspection only. No runtime, model, build, test, cache, or production source was changed. Local was inspected at `feat/harness-stabilization` including its uncommitted runtime/cache changes. Jan was inspected at `9925f8b6d9fab968284b4dd11566b9435229b690`.
 
 ## Scope and important distinction
