@@ -25,7 +25,7 @@ import { readFile, stat } from 'node:fs/promises';
 import { saveGenerationDiagnosticsBestEffort } from '../services/generation-diagnostics';
 import { projectDirectoryName } from '../../shared/project-references';
 import { executionMode } from '../../shared/generation-mode';
-import { explicitWorkspaceRoots } from '../services/agent-workspace';
+import { enabledAgentTools, explicitWorkspaceRoots } from '../services/agent-workspace';
 import { homedir } from 'node:os';
 import { touchesRuntime } from '../../shared/conversation-settings';
 import { existingProjectDirectory } from '../services/project-picker';
@@ -640,8 +640,7 @@ export function registerIpc(): void {
     // Directories the user named in their own messages extend the file/terminal scope; without a project they are the scope.
     const workspaceRoots = mode === 'agent' ? await explicitWorkspaceRoots(request.messages.filter((message) => message.role === 'user').map((message) => message.content), homedir()) : [];
     if (!current()) return;
-    const executionTools = ['apply_patch', 'create_file', 'delete_file', 'list_directory', 'read_file', 'run_terminal', 'write_file'];
-    const enabledTools = mode === 'agent' ? [...(agentRoot ? [...executionTools, 'project_knowledge_index', 'project_knowledge_read', 'project_knowledge_update'] : workspaceRoots.length ? executionTools : []), 'observation_index', 'observation_read', 'task_memory'].sort() : conversation.webMode === 'auto' ? ['web'] : [];
+    const enabledTools = enabledAgentTools(mode, { hasProject: Boolean(agentRoot), workspaceRootCount: workspaceRoots.length }, conversation.webMode);
     log('generation.snapshot', { generationId: generation.id, chatId: request.conversationId, mode, storedMode: conversation.mode, requestedMode: request.mode, workingDirectory: conversation.workingDirectory, resolvedWorkingDirectory: agentRoot, workspaceRoots, projects: agentProjects.map((project) => ({ id: project.id, slot: project.slot })), webMode: conversation.webMode, modelId: request.model, contextSize: conversation.contextWindow, reasoningMode: conversation.reasoningMode, enabledTools });
     run = mode === 'agent' ? database.createAnalysisRun(request.conversationId, conversation.reasoningMode) : null;
     if (run && current()) event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run });

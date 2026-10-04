@@ -4,9 +4,27 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { RustAgentRuntime } from './rust-agent-runtime';
 import type { ChatMessage } from '../../shared/types';
-import { explicitWorkspaceRoots, extractAbsolutePaths, isGrantablePath, maxWorkspaceRoots } from './agent-workspace';
+import { enabledAgentTools, explicitWorkspaceRoots, extractAbsolutePaths, isGrantablePath, maxWorkspaceRoots } from './agent-workspace';
 
 export async function runAgentWorkspaceRegression(): Promise<void> {
+  // Tool exposure by mode and scope. Chat never gets Agent capabilities; Agent gets execution tools only with a scope.
+  const execution = ['apply_patch', 'create_file', 'delete_file', 'list_directory', 'read_file', 'run_terminal', 'write_file'];
+  const knowledge = ['project_knowledge_index', 'project_knowledge_read', 'project_knowledge_update'];
+  const always = ['observation_index', 'observation_read', 'task_memory'];
+  for (const scope of [{ hasProject: false, workspaceRootCount: 0 }, { hasProject: false, workspaceRootCount: 2 }, { hasProject: true, workspaceRootCount: 0 }]) {
+    assert.deepEqual(enabledAgentTools('chat', scope, 'off'), [], 'Chat must not receive Agent tools');
+    assert.deepEqual(enabledAgentTools('chat', scope, 'auto'), ['web']);
+  }
+  assert.deepEqual(enabledAgentTools('agent', { hasProject: false, workspaceRootCount: 0 }, 'off'), always, 'an unscoped Agent must not receive execution tools');
+  assert.deepEqual(enabledAgentTools('agent', { hasProject: false, workspaceRootCount: 1 }, 'off'), [...execution, ...always].sort(), 'a named directory must unlock execution tools, not project knowledge');
+  assert.deepEqual(enabledAgentTools('agent', { hasProject: true, workspaceRootCount: 0 }, 'off'), [...execution, ...knowledge, ...always].sort());
+  assert.deepEqual(enabledAgentTools('agent', { hasProject: true, workspaceRootCount: 3 }, 'auto'), enabledAgentTools('agent', { hasProject: true, workspaceRootCount: 0 }, 'off'), 'extra directories and web mode must not change a project run\'s tools');
+  // Switching Chat -> Agent -> Chat is stateless: the same inputs always give the same tools.
+  const scope = { hasProject: true, workspaceRootCount: 0 };
+  const sequence = [enabledAgentTools('chat', scope, 'off'), enabledAgentTools('agent', scope, 'off'), enabledAgentTools('chat', scope, 'off'), enabledAgentTools('agent', scope, 'off')];
+  assert.deepEqual(sequence[0], sequence[2]);
+  assert.deepEqual(sequence[1], sequence[3]);
+  assert.ok(sequence[1]!.includes('run_terminal'));
   assert.deepEqual(extractAbsolutePaths('В папке /media/yaroslav/DATA/Projects создай папку Шашки.'), ['/media/yaroslav/DATA/Projects']);
   assert.deepEqual(extractAbsolutePaths('look at "/srv/my project/a b" and (/opt/x/y), also ~/work/z.'), ['/srv/my project/a b', '/opt/x/y', '~/work/z']);
   assert.deepEqual(extractAbsolutePaths('see https://example.com/a/b and 3/4 and a/b/c'), [], 'URLs, fractions and relative paths are not paths');

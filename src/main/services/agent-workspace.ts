@@ -71,3 +71,19 @@ export async function explicitWorkspaceRoots(userTexts: readonly string[], home:
   }
   return roots;
 }
+
+const executionTools = ['apply_patch', 'create_file', 'delete_file', 'list_directory', 'read_file', 'run_terminal', 'write_file'];
+const knowledgeTools = ['project_knowledge_index', 'project_knowledge_read', 'project_knowledge_update'];
+const alwaysAvailableAgentTools = ['observation_index', 'observation_read', 'task_memory'];
+
+/**
+ * Tools a generation exposes, by mode and scope. Chat never receives Agent-only capabilities.
+ * Agent receives file/terminal tools whenever it has a scope: a selected project, or directories the
+ * user named explicitly. It never receives them without one. Reasoning mode plays no part.
+ * Mirrors the Rust runtime's `ToolScope`, which is authoritative.
+ */
+export function enabledAgentTools(mode: 'chat' | 'agent', scope: { hasProject: boolean; workspaceRootCount: number }, webMode: 'off' | 'auto'): string[] {
+  if (mode !== 'agent') return webMode === 'auto' ? ['web'] : [];
+  const scoped = scope.hasProject ? [...executionTools, ...knowledgeTools] : scope.workspaceRootCount > 0 ? executionTools : [];
+  return [...scoped, ...alwaysAvailableAgentTools].sort();
+}
