@@ -120,8 +120,49 @@ source reads. All owned servers and sidecars are now stopped; GLM
 PIDs 14458/14528 are gone, port 18081 is closed, and GPU usage returned to
 892 MiB. User DB checksum remains `6cab1245...`.
 
-Final production build, merged-branch regressions, and conditional V2
-merge/push remain pending at this checkpoint.
+## Final V2 integration and production output
+
+The feature tip `d9930ac1db7facd0c400d0d7c052fb1548066f81` was normally
+merged into `v2-migration`, preserving both parents, at
+`7a3f2e95fdd080c7cc1b6bf7ecc917e2fcd7830c`.
+Its first parent is preservation merge
+`5df8e6a0042d442c661879b3461f4f8dd46e376f`; the merged tree exactly matches
+the feature tree tested live. No history was rewritten or feature branch
+pushed.
+
+On merged V2, `npm run build` succeeded using the existing Cargo debug,
+TypeScript noEmit, Vite and Electron TypeScript convention. Rust again
+passed 119 unit and 18 integration tests. Final compiled Rust bridge, llama
+backend, database, context options/estimator/VRAM/discovery/hardware/GGUF,
+runtime controller, thinking timeline, generation lifetime/guard and
+diagnostics tests passed, as did Electron sandbox and launcher-failure
+scripts. Changed-file TypeScript ESLint, Rust fmt and diff checks passed.
+Clippy had exited zero with advisory warnings on the identical Rust source.
+Vite's existing >500 kB chunk warning and Node's experimental SQLite warning
+are not claimed as warning-free results.
+
+The production sidecar hash is still the same live-tested
+`18eac6b26ecdd4b616300ce8e67f7f46a64c7bea2bd762effac6d58d9ec332af`.
+Executable source, Rust, scripts, launchers/config and rebuilt main/preload/
+shared JS contain no Ollama inference references. Historical research
+records are retained as history, not active setup instructions.
+
+Actual application outputs under `/media/yaroslav/DATA/local-ai-desktop`:
+
+- `dist/main/index.js`
+- `dist/preload/index.js`
+- `dist/renderer/index.html`
+- Primary renderer assets `dist/renderer/assets/index-BTuiUSzp.js` and
+  `dist/renderer/assets/index-kxWjeRcu.css` (plus bundled diagram chunks)
+- Existing primary launcher `run-local-ai-desktop.sh`
+
+No installer/AppImage packaging target exists or was invented. This is the
+normal locally built application, not a packaged distributable. Final build/
+Rust/regression/lint logs are `final-v2-*.log` in the persistent evidence root.
+The only authorized remote update is a non-force push of
+`refs/heads/v2-migration:refs/heads/v2-migration` with mirror and followTags
+disabled, after these passing gates; its exact verified SHA is reported in
+the final handoff rather than embedded in its own commit.
 
 ## Historical pause handoff (superseded where noted above)
 
