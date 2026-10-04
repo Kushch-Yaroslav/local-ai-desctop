@@ -39,7 +39,7 @@ export function Toolbar() {
     let current = true;
     const poll = async () => {
       try {
-        const progress = await window.localAi.contextDiscoveryStatus();
+        const progress = await window.localAi.contextDiscoveryStatus(selectedModelId);
         if (!current) return;
         setDiscoveryLoading(progress.busy);
         setDiscoveryStage(progress.busy ? `${progress.stage} · проверка ${progress.probeCount}` : '');
@@ -69,7 +69,7 @@ export function Toolbar() {
   const estimateLoading = Boolean(selectedModelId && (estimateResponse?.modelId !== selectedModelId || (!estimateResponse.value && !estimateResponse.error)));
   const discoveryForModel = discovery?.modelId === selectedModelId ? discovery : undefined;
   const maxContextLabel = discoveryLoading ? 'измеряется…' : discoveryForModel?.options.length
-    ? discoveryForModel.options.map((option) => `${cacheModeLabel(option.kvCacheType)} ${option.contextWindow / 1024}K`).join(' · ')
+    ? discoveryForModel.options.map((option) => `${cacheModeLabel(option.kvCacheType)} ${option.contextWindow / 1024}K${option.restored ? ' (сохранено)' : ''}`).join(' · ')
     : 'не измерен';
   const actualRuntimeContext = contextEstimate?.observedContextTokens
     ?? (llama?.status === 'ready' && llama.modelId === chat.modelId ? llama.contextWindow : null);
@@ -121,7 +121,7 @@ export function Toolbar() {
               <p><span>Предел модели/runtime</span><b>{contextEstimate?.configuredMaxTokens ? `${Math.round(contextEstimate.configuredMaxTokens / 1024)}K` : selectedModel ? `${Math.round(selectedModel.maxContext / 1024)}K` : 'неизвестен'}</b></p>
               {contextEstimate?.modelTrainContextTokens !== null && contextEstimate?.modelTrainContextTokens !== undefined && <p><span>Metadata train limit</span><b>{Math.round(contextEstimate.modelTrainContextTokens / 1024)}K</b></p>}
               {contextEstimate?.allocationEvidence && <p><span>Фактический KV</span><b>{contextEstimate.allocationEvidence.kvTypeK ?? 'unknown'} / {contextEstimate.allocationEvidence.kvTypeV ?? 'unknown'}; слоты {contextEstimate.allocationEvidence.sequenceSlots ?? '?'}, draft {contextEstimate.allocationEvidence.speculativeSlots ?? '?'}</b></p>}
-              <small>{estimateLoading ? 'Обновление runtime данных…' : estimateResponse?.error ? `Не удалось получить метаданные: ${estimateResponse.error}.` : missingEstimate ? `Нет полной активной allocation evidence: ${missingEstimate}.` : discoveryForModel?.restored ? `Измерено при ${discoveryForModel.probeContextTokens / 1024}K; runtime восстановлен.` : 'Максимум не рассчитан до явного discovery.'}</small>
+              <small>{estimateLoading ? 'Обновление runtime данных…' : estimateResponse?.error ? `Не удалось получить метаданные: ${estimateResponse.error}.` : missingEstimate ? `Нет полной активной allocation evidence: ${missingEstimate}.` : discoveryForModel?.options.some((option) => option.restored) ? 'Показан сохранённый результат прошлого измерения; перезапуска проб не было. «Найти Max Context» пересчитает его, а выбор значения всё равно проверяет текущую память.' : discoveryForModel?.restored ? `Измерено при ${discoveryForModel.probeContextTokens / 1024}K; runtime восстановлен.` : 'Максимум не рассчитан до явного discovery.'}</small>
             </details>
           </div>
         </details>

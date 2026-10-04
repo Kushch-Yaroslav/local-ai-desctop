@@ -22,7 +22,7 @@ const api: LocalAiApi = {
   hardware: { get: () => ipcRenderer.invoke('hardware:get') },
   contextEstimate: (modelId) => ipcRenderer.invoke('context:estimate', modelId),
   contextDiscover: (modelId) => ipcRenderer.invoke('context:discover', modelId),
-  contextDiscoveryStatus: () => ipcRenderer.invoke('context:discovery-status'),
+  contextDiscoveryStatus: (modelId) => ipcRenderer.invoke('context:discovery-status', modelId),
   dialog: { chooseDirectory: (initialDirectory) => ipcRenderer.invoke('dialog:chooseDirectory', initialDirectory) },
   chat: {
     send: (request) => ipcRenderer.invoke('chat:send', request),

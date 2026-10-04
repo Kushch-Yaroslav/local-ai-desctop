@@ -73,6 +73,8 @@ export interface ContextDiscoveryOption {
   memoryBaseline: { hostAvailableBytes: number; deviceAvailableBytes: number };
   measuredHeadroom: { hostBytes: number; deviceBytes: number };
   boundaryTokens?: number;
+  /** Loaded from the persistent store rather than measured in this session. */
+  restored?: boolean;
 }
 
 export interface ContextProbeRecord {
@@ -122,11 +124,12 @@ export function findFreshContextDiscoveryOption(
   return options
     .filter((option) => {
       const age = now - Date.parse(option.discoveredAt);
+      // A saved calibration has no meaningful session age; live memory checks decide.
       return option.modelId === requested.modelId
         && option.contextWindow >= requested.contextWindow
         && option.kvCacheType === requested.kvCacheType
         && option.kvOffload === requested.kvOffload
-        && Number.isFinite(age) && age >= 0 && age <= maxAgeMs;
+        && (option.restored ? Number.isFinite(age) : Number.isFinite(age) && age >= 0 && age <= maxAgeMs);
     })
     .sort((left, right) => left.contextWindow - right.contextWindow)[0] ?? null;
 }

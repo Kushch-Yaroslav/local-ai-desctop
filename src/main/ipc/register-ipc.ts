@@ -4,12 +4,14 @@ import type { AnalysisRun, ApprovalDecision, ApprovalStatus, ChatRequest, Conver
 import { findFreshContextDiscoveryOption, type ContextDiscoveryOption, type ContextDiscoveryResult, type ContextDiscoveryProgress, type RuntimeContextEstimate } from '../../shared/context-estimator';
 import { defaultLlamaKv, normalContextForModel, resolveLlamaKvSelection } from '../../shared/context-options';
 import { Database } from '../services/database';
-import { getHardwareStats, getOwnedServerVramBudget } from '../services/hardware';
+import { getGpuIdentity, getHardwareStats, getOwnedServerVramBudget } from '../services/hardware';
+import { buildContextDiscoveryIdentity, contextDiscoveryKey, mergeSavedDiscoveryOptions } from '../services/context-discovery-persistence';
 import { vramBudgetStillFits, vramProbeGuardBytes } from '../../shared/vram-budget';
 import { LlamaCppBackend } from '../backends/llama-cpp-backend';
 import { LAUNCHER_ABSENT, LlamaRuntimeController, type LlamaRuntimeState } from '../services/llama-runtime-controller';
 import { RustAgentRuntime, taskPlan, type AgentProject } from '../services/rust-agent-runtime';
 import { paths } from '../services/paths';
+import { discardAgentEvidence } from '../services/agent-evidence';
 import { log } from '../services/logger';
 import { getModelProfile } from '../models/model-registry';
 import { llamaContextPresets, llamaRuntimeProfile } from '../models/llama-runtime-policy';
@@ -67,6 +69,7 @@ const llamaRuntime = new LlamaRuntimeController({
 });
 const discoveredContextOptions = new Map<string, { option: ContextDiscoveryOption; modelIdentity: string }>();
 let contextDiscoveryBusy = false;
+let savedDiscoveryAttempted: string | null = null;
 let runtimeSelectionBusy = false;
 let contextDiscoveryProgress: ContextDiscoveryProgress = { busy: false, modelId: null, stage: '', probeCount: 0 };
 const discoveryKey = (modelId: string, contextWindow: number, kvCacheType: 'f16' | 'q8_0', kvOffload: boolean) => `${modelId}:${contextWindow}:${kvCacheType}:${kvOffload ? 'gpu' : 'ram'}`;
@@ -77,6 +80,9 @@ function currentDiscoveryHeadroomFits(option: ContextDiscoveryOption, current: R
     && option.measuredHeadroom.hostBytes + current.memoryBaseline.hostAvailableBytes - option.memoryBaseline.hostAvailableBytes >= host.bytes
     && vramBudgetStillFits(option.vramBudget, current.vramBudget);
 }
+/** Fresh results must stay near their measured baseline; a saved calibration only needs the live fit check below, since more free RAM is never unsafe. */
+const hostBaselineStable = (option: ContextDiscoveryOption, current: RuntimeContextEstimate) =>
+  option.restored || Math.abs(current.memoryBaseline!.hostAvailableBytes - option.memoryBaseline.hostAvailableBytes) <= 2 * 1024 ** 3;
 async function modelFileIdentity(path: string): Promise<string> {
   const file = await stat(path);
   return `${file.dev}:${file.ino}:${file.size}:${file.mtimeMs}`;
@@ -94,6 +100,50 @@ async function runtimeConfigurationIdentity(modelId: string): Promise<string> {
   return JSON.stringify({ args: stableArgs, model: await modelFileIdentity(profile.modelPath),
     projector: profile.mmprojPath ? await modelFileIdentity(profile.mmprojPath) : null,
     binary: await modelFileIdentity(args[0]), hardLimit: await llamaCapabilityLimit(modelId), speculative: profile.speculative });
+}
+/** Size and mtime survive restarts and remounts; device/inode numbers may not. */
+async function persistentFileFingerprint(path: string): Promise<string> {
+  const file = await stat(path);
+  return `${file.size}:${file.mtimeMs}`;
+}
+/** The stable configuration a saved Max Context calibration belongs to; requires the model's launcher-managed server to be running. */
+async function persistentDiscoveryIdentity(modelId: string): Promise<{ key: string; serialized: string; hardLimit: number }> {
+  const profile = llamaRuntimeProfile(modelId);
+  const state = await llamaRuntime.state();
+  if (!profile?.modelPath || state.status !== 'ready' || state.modelId !== modelId || !state.serverPid) throw new Error('Saved Max Context requires the model runtime to be running.');
+  const args = (await readFile(`/proc/${state.serverPid}/cmdline`, 'utf8')).split('\0').filter(Boolean);
+  const hostReserve = resolveContextReserve(process.env.LOCAL_AI_CONTEXT_HOST_RESERVE_BYTES, 'LOCAL_AI_CONTEXT_HOST_RESERVE_BYTES', defaultContextHostReserveBytes);
+  if (hostReserve.bytes === null) throw new Error(hostReserve.error ?? 'Invalid discovery reserve.');
+  const hardLimit = await llamaCapabilityLimit(modelId);
+  const identity = buildContextDiscoveryIdentity({
+    modelId, modelFingerprint: await persistentFileFingerprint(profile.modelPath),
+    projectorFingerprint: profile.mmprojPath ? await persistentFileFingerprint(profile.mmprojPath) : null,
+    runtimeFingerprint: `${args[0]}:${await persistentFileFingerprint(args[0])}`,
+    arguments: args, speculative: profile.speculative, hardLimit, gpu: await getGpuIdentity(), hostReserveBytes: hostReserve.bytes,
+  });
+  return { ...contextDiscoveryKey(identity), hardLimit };
+}
+/** Saved options never trigger probing; each is still checked against live memory when selected. */
+async function loadSavedDiscovery(modelId: string): Promise<{ options: ContextDiscoveryOption[]; hardLimit: number; key: string } | null> {
+  try {
+    const identity = await persistentDiscoveryIdentity(modelId);
+    return { options: database.loadContextDiscoveryOptions(identity.key, modelId, identity.hardLimit), hardLimit: identity.hardLimit, key: identity.key };
+  } catch (error) {
+    log('context.discovery.saved.unavailable', { modelId, message: error instanceof Error ? error.message : String(error) });
+    return null;
+  }
+}
+async function adoptSavedDiscovery(modelId: string, error?: string): Promise<void> {
+  discoveredContextOptions.clear();
+  const saved = await loadSavedDiscovery(modelId);
+  if (!saved) return;
+  savedDiscoveryAttempted = modelId;
+  if (!saved.options.length) return;
+  const configurationId = await runtimeConfigurationIdentity(modelId);
+  for (const option of saved.options) discoveredContextOptions.set(discoveryKey(modelId, option.contextWindow, option.kvCacheType, option.kvOffload), { option, modelIdentity: configurationId });
+  contextDiscoveryProgress = { busy: false, modelId, stage: 'Сохранённый результат', probeCount: 0, error,
+    result: { modelId, probeContextTokens: Math.min(16_384, saved.hardLimit), options: saved.options, unsupported: [], restored: true, hardLimit: saved.hardLimit, configurationId } };
+  log('context.discovery.saved.restored', { modelId, options: saved.options.map((option) => ({ contextWindow: option.contextWindow, kvCacheType: option.kvCacheType, kvOffload: option.kvOffload })) });
 }
 /** The launcher's state file is the authority. A manually managed server has no launcher, so the startup environment stands in. */
 async function currentLlamaRuntime(): Promise<LlamaRuntimeState> {
@@ -237,12 +287,28 @@ async function discoverModelContexts(modelId: string): Promise<ContextDiscoveryR
     // invalidate the sibling mode. Model/draft/projector/backend args do.
     result.configurationId = await runtimeConfigurationIdentity(modelId);
     if (result.configurationId !== configurationId) throw new Error('Runtime/model/draft configuration changed during discovery.');
+    // Only a completed discovery reaches here; its options replace the saved value for their KV mode.
+    // A KV mode this run did not establish keeps its last successful saved value.
+    let saved: ContextDiscoveryOption[] = [];
+    try {
+      const identity = await persistentDiscoveryIdentity(modelId);
+      database.saveContextDiscoveryOptions(identity.key, identity.serialized, result.options);
+      saved = database.loadContextDiscoveryOptions(identity.key, modelId, identity.hardLimit);
+      log('context.discovery.saved', { modelId, options: result.options.map((option) => ({ contextWindow: option.contextWindow, kvCacheType: option.kvCacheType })) });
+    } catch (error) {
+      log('context.discovery.save.failed', { modelId, message: error instanceof Error ? error.message : String(error) });
+    }
+    result.options = mergeSavedDiscoveryOptions(result.options, saved);
     for (const option of result.options) discoveredContextOptions.set(discoveryKey(modelId, option.contextWindow, option.kvCacheType, option.kvOffload), { option, modelIdentity: result.configurationId });
+    savedDiscoveryAttempted = modelId;
     contextDiscoveryProgress = { busy: false, modelId, stage: 'Готово', probeCount: result.probes?.length ?? 0, result };
     return result;
   } catch (error) {
     discoveredContextOptions.clear();
-    contextDiscoveryProgress = { busy: false, modelId, stage: 'Discovery не завершён', probeCount: contextDiscoveryProgress.probeCount, error: error instanceof Error ? error.message : String(error) };
+    const message = error instanceof Error ? error.message : String(error);
+    contextDiscoveryProgress = { busy: false, modelId, stage: 'Discovery не завершён', probeCount: contextDiscoveryProgress.probeCount, error: message };
+    // A failed or interrupted run leaves the previously saved result untouched and selectable.
+    await adoptSavedDiscovery(modelId, message).catch(() => undefined);
     throw error;
   } finally {
     contextDiscoveryBusy = false;
@@ -264,6 +330,7 @@ async function verifyContextProbeInference(modelId: string): Promise<void> {
   }
 }
 async function validateDiscoveredOption(modelId: string, contextWindow: number, kvCacheType: 'f16' | 'q8_0', kvOffload: boolean): Promise<void> {
+  if (!discoveredContextOptions.size && !contextDiscoveryBusy) await adoptSavedDiscovery(modelId).catch(() => undefined);
   const cachedOptions = [...discoveredContextOptions.values()];
   const option = findFreshContextDiscoveryOption(cachedOptions.map((item) => item.option), { modelId, contextWindow, kvCacheType, kvOffload });
   if (!option) throw new Error('Max Context discovery is missing, stale, or does not validate this KV configuration and context; run Discover again.');
@@ -271,19 +338,25 @@ async function validateDiscoveredOption(modelId: string, contextWindow: number, 
   if (!cached || await runtimeConfigurationIdentity(modelId) !== cached.modelIdentity) throw new Error('Runtime/model/draft configuration changed since discovery; run Discover again.');
   const current = await estimateModelContext(modelId);
   if (current.status !== 'estimated' || !current.memoryBaseline || current.observedContextTokens === null) throw new Error('Current runtime memory evidence is unavailable; run Discover again.');
-  if (Math.abs(current.memoryBaseline.hostAvailableBytes - option.memoryBaseline.hostAvailableBytes) > 2 * 1024 ** 3
-    || !currentDiscoveryHeadroomFits(option, current)) {
+  if (!hostBaselineStable(option, current) || !currentDiscoveryHeadroomFits(option, current)) {
     throw new Error('Available memory changed materially since discovery; run Discover again before selecting this context.');
   }
 }
-async function discoveryStatus(): Promise<ContextDiscoveryProgress> {
-  if (contextDiscoveryBusy || runtimeSelectionBusy || activeGenerations.size || !contextDiscoveryProgress.result) return contextDiscoveryProgress;
+async function discoveryStatus(_event?: unknown, requestedModelId?: string): Promise<ContextDiscoveryProgress> {
+  if (contextDiscoveryBusy || runtimeSelectionBusy || activeGenerations.size) return contextDiscoveryProgress;
+  if (typeof requestedModelId === 'string' && requestedModelId && savedDiscoveryAttempted !== requestedModelId && !contextDiscoveryProgress.error) {
+    if (contextDiscoveryProgress.modelId !== requestedModelId) contextDiscoveryProgress = { busy: false, modelId: requestedModelId, stage: '', probeCount: 0 };
+    if (!contextDiscoveryProgress.result) await adoptSavedDiscovery(requestedModelId).catch(() => undefined);
+  }
+  if (!contextDiscoveryProgress.result) return contextDiscoveryProgress;
   const result = contextDiscoveryProgress.result;
   try {
     if (!result.configurationId || await runtimeConfigurationIdentity(result.modelId) !== result.configurationId) throw new Error('Модель/runtime/draft изменились; повторите discovery.');
     const estimate = await estimateModelContext(result.modelId);
-    if (result.options.length && (!estimate.memoryBaseline || result.options.some((option) => !findFreshContextDiscoveryOption([option], option)
-      || Math.abs(estimate.memoryBaseline!.hostAvailableBytes - option.memoryBaseline.hostAvailableBytes) > 2 * 1024 ** 3
+    // Saved options stay listed under memory pressure; selecting one re-runs these same checks.
+    const measured = result.options.filter((option) => !option.restored);
+    if (measured.length && (!estimate.memoryBaseline || measured.some((option) => !findFreshContextDiscoveryOption([option], option)
+      || !hostBaselineStable(option, estimate)
       || !currentDiscoveryHeadroomFits(option, estimate)))) {
       throw new Error('Ресурсы существенно изменились или результат устарел; повторите discovery.');
     }
@@ -293,6 +366,12 @@ async function discoveryStatus(): Promise<ContextDiscoveryProgress> {
   } catch (error) {
     if (contextDiscoveryProgress.result !== result || contextDiscoveryBusy || runtimeSelectionBusy) return contextDiscoveryProgress;
     discoveredContextOptions.clear();
+    if (result.options.every((option) => option.restored)) {
+      // A saved calibration is never discarded by a transient runtime state; it is re-adopted once the runtime matches again.
+      savedDiscoveryAttempted = null;
+      contextDiscoveryProgress = { busy: false, modelId: result.modelId, stage: '', probeCount: 0 };
+      return contextDiscoveryProgress;
+    }
     contextDiscoveryProgress = { busy: false, modelId: result.modelId, stage: 'Результат недействителен', probeCount: 0, error: error instanceof Error ? error.message : String(error) };
   }
   return contextDiscoveryProgress;
@@ -333,6 +412,8 @@ async function cancelGeneration(conversationId: string, generationId?: string, r
 }
 
 export function registerIpc(): void {
+  const interruptedRuns = database.recoverInterruptedRuns();
+  if (interruptedRuns) log('generation.interrupted-recovered', { runs: interruptedRuns });
   ipcMain.handle('conversations:list', () => database.listConversations());
   ipcMain.handle('conversations:create', async (_event, requestedModelId?: string) => {
     const modelId = requestedModelId ?? (await currentLlamaRuntime()).modelId ?? llamaRuntimeModelId;
@@ -381,6 +462,7 @@ export function registerIpc(): void {
       }
       if (modelChanged) {
         discoveredContextOptions.clear();
+        savedDiscoveryAttempted = null;
         contextDiscoveryProgress = { busy: false, modelId: nextModelId, stage: '', probeCount: 0 };
       }
     }
@@ -395,6 +477,7 @@ export function registerIpc(): void {
   ipcMain.handle('conversations:delete', async (_event, id: string) => {
     if (activeGenerations.has(id)) throw new Error('Нельзя удалить чат с активной генерацией.');
     sessionApprovals.delete(id); await attachments.removeManagedFiles(database.deleteConversation(id));
+    await discardAgentEvidence(paths.userData, id);
   });
   ipcMain.handle('messages:list', (_event, conversationId: string) => database.listMessages(conversationId));
   ipcMain.handle('agent-plan:get', (_event, conversationId: string) => database.getAgentPlan(conversationId));
@@ -403,6 +486,7 @@ export function registerIpc(): void {
     const message = database.getMessage(messageId) ?? (fallback ? database.findUserMessage(fallback.conversationId, fallback.content) : null); if (!message) throw new Error('Сообщение не найдено');
     const before = database.listAttachmentsForConversation(message.conversationId);
     await cancelGeneration(message.conversationId); const edited = database.editUserMessageAndTruncate(message.id, content);
+    await discardAgentEvidence(paths.userData, message.conversationId);
     const kept = new Set(database.listAttachmentsForConversation(message.conversationId).map((attachment) => attachment.id));
     await attachments.removeManagedFiles(before.filter((attachment) => !kept.has(attachment.id)));
     return edited;
@@ -413,6 +497,7 @@ export function registerIpc(): void {
     const before = database.listAttachmentsForConversation(message.conversationId);
     await cancelGeneration(message.conversationId);
     const retained = database.regenerateUserMessageAndTruncate(message.id);
+    await discardAgentEvidence(paths.userData, message.conversationId);
     const kept = new Set(database.listAttachmentsForConversation(message.conversationId).map((attachment) => attachment.id));
     await attachments.removeManagedFiles(before.filter((attachment) => !kept.has(attachment.id)));
     return retained;
