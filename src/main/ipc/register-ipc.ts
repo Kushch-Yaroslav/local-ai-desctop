@@ -25,6 +25,7 @@ import { readFile, stat } from 'node:fs/promises';
 import { saveGenerationDiagnosticsBestEffort } from '../services/generation-diagnostics';
 import { projectDirectoryName } from '../../shared/project-references';
 import { executionMode } from '../../shared/generation-mode';
+import { touchesRuntime } from '../../shared/conversation-settings';
 import { existingProjectDirectory } from '../services/project-picker';
 import { collectRuntimeContextEstimate, defaultContextDeviceReserveBytes, defaultContextHostReserveBytes, resolveContextReserve } from '../services/context-estimate';
 import { join } from 'node:path';
@@ -421,6 +422,16 @@ export function registerIpc(): void {
     return database.createConversation(modelId);
   });
   ipcMain.handle('conversations:update', async (_event, id: string, patch: Partial<Pick<Conversation, 'title' | 'modelId' | 'mode' | 'workingDirectory' | 'secondaryWorkingDirectory' | 'contextWindow' | 'llamaKvCacheType' | 'llamaKvOffload' | 'reasoningMode' | 'webMode'>>) => {
+    // Reasoning/mode/web/project/title changes never touch llama.cpp, so they must not queue behind
+    // (or be refused by) a runtime switch: a refusal made the UI roll the user's choice back.
+    if (!touchesRuntime(patch)) {
+      if (activeGenerations.size && Object.keys(patch).some((key) => key !== 'title')) throw new Error('Дождитесь завершения активной генерации перед изменением настроек.');
+      const existing = database.getConversation(id);
+      if (!existing) throw new Error('Чат не найден');
+      const stored = database.updateConversation(id, patch);
+      if ((patch.workingDirectory !== undefined && patch.workingDirectory !== existing.workingDirectory) || (patch.secondaryWorkingDirectory !== undefined && patch.secondaryWorkingDirectory !== existing.secondaryWorkingDirectory)) sessionApprovals.delete(id);
+      return database.getConversation(id) ?? stored;
+    }
     if (contextDiscoveryBusy) throw new Error('Дождитесь завершения Max Context discovery перед изменением настроек runtime.');
     if (runtimeSelectionBusy) throw new Error('Дождитесь завершения переключения runtime.');
     runtimeSelectionBusy = true;

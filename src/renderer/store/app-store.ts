@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import type { ActionApproval, AgentTelemetry, AnalysisProgress, AnalysisRun, AppSettings, Attachment, AttachmentStatus, ApprovalDecision, ApprovalStatus, ChatMessage, Conversation, FinishReason, GenerationDiagnostics, HardwareStats, ModelInfo, ProjectReference, ThinkingTimelineEvent, ToolActivity } from '../../shared/types';
 import { isCurrentGenerationEvent } from '../../shared/generation-guard';
+import { revertRefusedPatch, type ModeTransition } from '../../shared/conversation-settings';
 
 type State = {
   conversations: Conversation[];
@@ -24,6 +25,8 @@ type State = {
   pendingApproval: { actionId: string; approval: ActionApproval } | null;
   approvalSubmitting: boolean;
   agentTelemetry: AgentTelemetry | null;
+  /** Mode selections sent to the main process but not yet confirmed, per conversation. */
+  modeTransitions: Record<string, ModeTransition>;
   initialize: () => Promise<void>;
   selectConversation: (id: string) => Promise<void>;
   createConversation: () => Promise<void>;
@@ -64,6 +67,8 @@ const mergeToolActivity = (prior: ToolActivity | undefined, next: ToolActivity):
 const viewKeys = ['messages', 'isGenerating', 'generationId', 'generationState', 'error', 'toolActivities', 'toolActivityCount', 'activeContextWindow', 'analysisProgress', 'analysisRuns', 'lastFinishReason', 'performance', 'pendingApproval', 'approvalSubmitting', 'agentTelemetry', 'steeringStatus'] as const;
 type ConversationView = Pick<State, typeof viewKeys[number]>;
 const viewOf = (state: State): ConversationView => Object.fromEntries(viewKeys.map((key) => [key, state[key]])) as ConversationView;
+
+const modeUpdatesInFlight = new Map<string, number>();
 
 export const useAppStore = create<State>((rawSet, rawGet) => {
   const views = new Map<string, ConversationView>();
@@ -128,6 +133,7 @@ export const useAppStore = create<State>((rawSet, rawGet) => {
     return true;
   };
   return {
+  modeTransitions: {},
   conversations: [], activeId: null, messages: [], models: [], hardware: null, settings: null, isGenerating: false, generationId: null, generationConversationId: null, generationState: 'idle', error: null, toolActivities: [], toolActivityCount: 0, activeContextWindow: null, analysisProgress: [], analysisRuns: [], lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false, agentTelemetry: null, steeringStatus: null,
   initialize: async () => {
     const [conversations, models, settings] = await Promise.all([window.localAi.conversations.list(), window.localAi.models.list(), window.localAi.settings.get()]);
@@ -152,13 +158,31 @@ export const useAppStore = create<State>((rawSet, rawGet) => {
   },
   updateConversation: async (id, patch) => {
     const before = get().conversations.find((chat) => chat.id === id);
+    const tracksMode = patch.reasoningMode !== undefined || patch.mode !== undefined;
+    if (tracksMode && before) {
+      modeUpdatesInFlight.set(id, (modeUpdatesInFlight.get(id) ?? 0) + 1);
+      set((state) => {
+        const existing = state.modeTransitions[id];
+        const effective = existing?.effective ?? { reasoningMode: before.reasoningMode === 'deep' ? 'deep' as const : 'fast' as const, mode: before.mode };
+        return { modeTransitions: { ...state.modeTransitions, [id]: { effective, desired: { ...existing?.desired, ...(patch.reasoningMode !== undefined ? { reasoningMode: patch.reasoningMode === 'deep' ? 'deep' : 'fast' } : {}), ...(patch.mode !== undefined ? { mode: patch.mode } : {}) } } } };
+      });
+    }
+    const settle = () => {
+      if (!tracksMode) return;
+      const remaining = (modeUpdatesInFlight.get(id) ?? 1) - 1;
+      if (remaining > 0) { modeUpdatesInFlight.set(id, remaining); return; }
+      modeUpdatesInFlight.delete(id);
+      set((state) => { const rest = { ...state.modeTransitions }; delete rest[id]; return { modeTransitions: rest }; });
+    };
     if (before) set((state) => ({ conversations: state.conversations.map((chat) => chat.id === id ? { ...chat, ...patch } : chat), activeContextWindow: state.activeId === id && patch.contextWindow !== undefined ? patch.contextWindow : state.activeContextWindow, performance: state.activeId === id && patch.modelId !== undefined ? null : state.performance }));
     try {
       const updated = await window.localAi.conversations.update(id, patch);
       set((state) => ({ conversations: state.conversations.map((chat) => chat.id === id ? updated : chat), activeContextWindow: state.activeId === id ? updated.contextWindow : state.activeContextWindow, performance: state.activeId === id && patch.modelId !== undefined ? null : state.performance }));
+      settle();
       if (patch.modelId !== undefined || patch.contextWindow !== undefined) void get().refreshRuntime();
     } catch (error) {
-      if (before) set((state) => ({ conversations: state.conversations.map((chat) => chat.id === id && Object.entries(patch).every(([key, value]) => chat[key as keyof Conversation] === value) ? before : chat), activeContextWindow: state.activeId === id ? before.contextWindow : state.activeContextWindow }));
+      if (before) set((state) => ({ conversations: state.conversations.map((chat) => chat.id === id ? revertRefusedPatch(chat, before, patch) : chat), activeContextWindow: state.activeId === id && patch.contextWindow !== undefined ? before.contextWindow : state.activeContextWindow }));
+      settle();
       // A refused runtime switch leaves the stored conversation unchanged; show the real reason and the real runtime.
       set({ error: (error instanceof Error ? error.message : String(error)).replace(/^Error invoking remote method '[^']+': (Error: )?/, '') });
       await get().refreshRuntime();
