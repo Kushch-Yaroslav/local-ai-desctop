@@ -1221,3 +1221,224 @@ fn reading_the_secondary_project_never_modifies_it_while_writes_land_in_the_prim
     );
     assert!(completed(&fixture.journal()));
 }
+
+const TWO_PART_REQUEST: &str =
+    "Do two things: add a bot mode to the game, and add a theme switch to the game.";
+
+fn deliverable(action: &str, fields: Value) -> (&'static str, Value) {
+    let mut arguments = fields;
+    arguments["action"] = json!(action);
+    ("deliverables", arguments)
+}
+
+fn add_both() -> Reply {
+    Reply::Tools(vec![
+        deliverable(
+            "add",
+            json!({"task":"bot","text":"bot opponent is selectable in the UI"}),
+        ),
+        deliverable(
+            "add",
+            json!({"task":"theme","text":"theme switch changes the theme"}),
+        ),
+    ])
+}
+
+/// The failure this guards against: the run recorded two requested deliverables,
+/// finished one, and tried to end. It must be sent back once (Fast) naming
+/// exactly what is unfinished, and the second answer is accepted so the review
+/// can never deadlock a run.
+#[test]
+fn fast_sends_a_run_with_unfinished_deliverables_back_once_then_accepts() {
+    let workspace = Workspace::new(&[("a.txt", "a")]);
+    let provider = Provider::start(|_, n| match n {
+        0 => add_both(),
+        1 => Reply::Tools(vec![deliverable(
+            "done",
+            json!({"id":"d-001","evidence":"saw it work"}),
+        )]),
+        2 => Reply::Text("Everything is finished.".into()),
+        _ => Reply::Text("The theme switch is not done: out of time.".into()),
+    });
+    run(workspace.config(&provider.endpoint, TWO_PART_REQUEST));
+    let journal = workspace.journal();
+    assert!(completed(&journal));
+    assert_eq!(
+        withheld_drafts(&journal),
+        1,
+        "the premature answer must be withheld exactly once"
+    );
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 4);
+    let reminder = last_user_text(&requests[3]);
+    assert!(reminder.contains("not all complete"), "{reminder}");
+    assert!(
+        reminder.contains("d-002 theme switch changes the theme (theme)"),
+        "{reminder}"
+    );
+    let review = reminder
+        .split("Before finishing:")
+        .nth(1)
+        .and_then(|rest| rest.split("Continue with").next())
+        .unwrap_or_default();
+    assert!(
+        !review.contains("d-001"),
+        "finished work must not be listed as pending: {review}"
+    );
+    assert!(requests[3].to_string().contains("<deliverables>"));
+}
+
+/// Marking an item blocked with a concrete reason is an honest way to end: no review is needed.
+#[test]
+fn blocked_with_a_reason_ends_without_a_review() {
+    let workspace = Workspace::new(&[("a.txt", "a")]);
+    let provider = Provider::start(|_, n| match n {
+        0 => add_both(),
+        1 => Reply::Tools(vec![
+            deliverable("done", json!({"id":"d-001","evidence":"verified"})),
+            deliverable(
+                "block",
+                json!({"id":"d-002","reason":"the theme assets cannot be reached from this environment"}),
+            ),
+        ]),
+        _ => Reply::Text("Bot done; theme blocked, see the reason.".into()),
+    });
+    run(workspace.config(&provider.endpoint, TWO_PART_REQUEST));
+    let journal = workspace.journal();
+    assert!(completed(&journal));
+    assert_eq!(withheld_drafts(&journal), 0);
+    assert_eq!(provider.requests().len(), 3);
+}
+
+/// Deep checks completion harder: it may be sent back twice, and `done` needs evidence that cites something observed.
+#[test]
+fn deep_requires_cited_evidence_for_done_and_reviews_twice() {
+    let workspace = Workspace::new(&[("a.txt", "a")]);
+    let provider = Provider::start(|_, n| match n {
+        0 => add_both(),
+        1 => Reply::Tools(vec![deliverable(
+            "done",
+            json!({"id":"d-001","evidence":"I believe it works"}),
+        )]),
+        2 => Reply::Tools(vec![("read_file", json!({"path":"a.txt"}))]),
+        3 => Reply::Tools(vec![deliverable(
+            "done",
+            json!({"id":"d-001","evidence":"obs-00000001 shows it"}),
+        )]),
+        4 | 5 => Reply::Text("Finished everything.".into()),
+        _ => Reply::Text("Theme switch remains unfinished.".into()),
+    });
+    let mut config = workspace.config(&provider.endpoint, TWO_PART_REQUEST);
+    config.reasoning_mode = "deep".into();
+    run(config);
+    let requests = provider.requests();
+    assert!(
+        tool_result_text(&requests[2]).contains("In Deep mode"),
+        "uncited evidence was accepted: {}",
+        tool_result_text(&requests[2])
+    );
+    let journal = workspace.journal();
+    assert!(completed(&journal));
+    assert_eq!(
+        withheld_drafts(&journal),
+        2,
+        "Deep reviews an unfinished list twice"
+    );
+    assert_eq!(requests.len(), 7);
+    assert!(last_user_text(&requests[6]).contains("cite the observation"));
+}
+
+/// Trivial and analysis-only prompts must stay lean: the runtime never creates a list on its own, so nothing is reviewed.
+#[test]
+fn a_run_that_never_records_deliverables_is_never_reviewed() {
+    let workspace = Workspace::new(&[("a.txt", "a")]);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Tools(vec![("read_file", json!({"path":"a.txt"}))]),
+        _ => Reply::Text("It says a.".into()),
+    });
+    run(workspace.config(&provider.endpoint, "what does a.txt say?"));
+    assert_eq!(withheld_drafts(&workspace.journal()), 0);
+    assert_eq!(provider.requests().len(), 2);
+    assert!(!provider.requests()[1]
+        .to_string()
+        .contains("<deliverables>"));
+}
+
+/// The list is persisted with Task Memory: a later run (Continue after an interruption) sees it, and a fresh run
+/// (Regenerate starts without saved memory) does not.
+#[test]
+fn saved_deliverables_return_on_continue_and_a_fresh_run_starts_empty() {
+    let workspace = Workspace::new(&[("a.txt", "a")]);
+    let provider = Provider::start(|_, _| Reply::Text("ok".into()));
+    let mut resumed = workspace.config(&provider.endpoint, "continue");
+    resumed.task_memory = Some(json!({"entries":[],"revision":0,"deliverables":{"items":[
+        {"id":"d-001","task":"bot","text":"bot opponent is selectable in the UI","status":"pending","evidence":"","reason":""}
+    ],"revision":1}}));
+    run(resumed);
+    assert!(provider.requests()[0]
+        .to_string()
+        .contains("bot opponent is selectable in the UI"));
+
+    let fresh_workspace = Workspace::new(&[("a.txt", "a")]);
+    let fresh_provider = Provider::start(|_, _| Reply::Text("ok".into()));
+    run(fresh_workspace.config(&fresh_provider.endpoint, "start over"));
+    assert!(!fresh_provider.requests()[0]
+        .to_string()
+        .contains("<deliverables>"));
+}
+
+/// A read-only request produces nothing to deliver, so the tool is not offered; other runs offer it.
+#[test]
+fn the_deliverables_tool_is_offered_except_for_read_only_requests() {
+    let workspace = Workspace::new(&[("a.txt", "a")]);
+    let provider = Provider::start(|_, _| Reply::Text("ok".into()));
+    run(workspace.config(&provider.endpoint, "do the work"));
+    assert!(tool_names(&provider.requests()[0]).contains(&"deliverables".to_owned()));
+    let read_only_provider = Provider::start(|_, _| Reply::Text("ok".into()));
+    let read_only_workspace = Workspace::new(&[("a.txt", "a")]);
+    run(read_only_workspace.config(&read_only_provider.endpoint, READ_ONLY));
+    assert!(!tool_names(&read_only_provider.requests()[0]).contains(&"deliverables".to_owned()));
+}
+
+/// Files the run created stay visible, and a pending review points at them so scratch files are not forgotten.
+#[test]
+fn files_created_in_the_run_are_listed_and_named_in_the_review() {
+    let workspace = Workspace::new(&[("a.txt", "a")]);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Tools(vec![
+            deliverable("add", json!({"text":"the feature works end to end"})),
+            (
+                "create_file",
+                json!({"path":"scratch-check.js","content":"1"}),
+            ),
+            ("write_file", json!({"path":"a.txt","content":"changed"})),
+        ]),
+        1 => Reply::Tools(vec![(
+            "run_terminal",
+            json!({"command":"echo run test ok"}),
+        )]),
+        2 => Reply::Text("done".into()),
+        3 => Reply::Tools(vec![("delete_file", json!({"path":"scratch-check.js"}))]),
+        _ => Reply::Text("done again".into()),
+    });
+    run(workspace.config(&provider.endpoint, "build the feature"));
+    let requests = provider.requests();
+    assert!(requests[1]
+        .to_string()
+        .contains("<files_created_this_run>scratch-check.js</files_created_this_run>"));
+    assert!(
+        !requests[1]
+            .to_string()
+            .contains("a.txt</files_created_this_run>"),
+        "an existing file is not a created file"
+    );
+    let review = last_user_text(&requests[3]);
+    assert!(
+        review.contains("Files you created in this run: scratch-check.js"),
+        "{review}"
+    );
+    assert!(
+        !requests[4].to_string().contains("<files_created_this_run>"),
+        "a deleted file must leave the list"
+    );
+}

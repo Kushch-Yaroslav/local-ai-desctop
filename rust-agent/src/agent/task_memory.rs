@@ -1,4 +1,5 @@
 //! Small per-run working memory. This is a handoff list, not project knowledge.
+use super::deliverables::Deliverables;
 use serde::{Deserialize, Serialize};
 
 /// How well an entry is established. Optional: entries without a status keep
@@ -62,6 +63,10 @@ pub struct TaskMemory {
     pub entries: Vec<TaskMemoryEntry>,
     #[serde(default)]
     pub revision: u64,
+    /// What the user asked to be produced, kept beside what the run learned so
+    /// both persist, restart and survive compaction together.
+    #[serde(default, skip_serializing_if = "Deliverables::is_empty")]
+    pub deliverables: Deliverables,
 }
 impl TaskMemory {
     pub fn upsert(

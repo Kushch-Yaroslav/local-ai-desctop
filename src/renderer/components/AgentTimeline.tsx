@@ -1,5 +1,5 @@
 import { memo, useState } from 'react';
-import type { ChatMessage, TerminalExecution, ThinkingTimelineEvent, ToolActivity } from '../../shared/types';
+import type { ChatMessage, DeliverableItem, TerminalExecution, ThinkingTimelineEvent, ToolActivity } from '../../shared/types';
 import { Markdown } from './Markdown';
 import { thinkingTimeline } from '../../shared/thinking-timeline';
 
@@ -26,7 +26,23 @@ function entryLine(entry: unknown): string {
 function structuredEntries(result: unknown): unknown[] | undefined {
   return result && typeof result === 'object' && !Array.isArray(result) && Array.isArray((result as { entries?: unknown }).entries) ? (result as { entries: unknown[] }).entries : undefined;
 }
+const deliverableMarker = { done: '✓', blocked: '⊘', pending: '○', dropped: '–' } as const;
+/** The requested-deliverables list from a `deliverables` tool result, as a checklist. */
+export function deliverablesChecklist(output: string | undefined): { lines: string[]; done: number; open: number; total: number } | undefined {
+  if (!output) return undefined;
+  try {
+    const items = (JSON.parse(output) as { deliverables?: { items?: DeliverableItem[] } }).deliverables?.items;
+    if (!Array.isArray(items)) return undefined;
+    const live = items.filter((item) => item.status !== 'dropped');
+    return {
+      lines: live.map((item) => `${deliverableMarker[item.status] ?? '○'} ${item.text}${item.status === 'blocked' && item.reason ? ` — не выполнено: ${item.reason}` : ''}`),
+      done: live.filter((item) => item.status === 'done').length, open: live.filter((item) => item.status === 'pending').length, total: live.length,
+    };
+  } catch { return undefined; }
+}
 export function toolResultSummary(activity: ToolActivity): string | undefined {
+  const checklist = activity.detail === 'deliverables' ? deliverablesChecklist(activity.output) : undefined;
+  if (checklist) return `выполнено ${checklist.done} из ${checklist.total}${checklist.open ? ` · осталось ${checklist.open}` : ''}`;
   if (activity.detail === 'project_knowledge_read') {
     try {
       const entries = structuredEntries(JSON.parse(activity.output ?? ''));
@@ -40,6 +56,8 @@ export function toolResultSummary(activity: ToolActivity): string | undefined {
 }
 export function displayToolResult(activity: ToolActivity): string | undefined {
   if (!activity.output) return undefined;
+  const checklist = activity.detail === 'deliverables' ? deliverablesChecklist(activity.output) : undefined;
+  if (checklist) return checklist.lines.join('\n');
   try {
     const result = JSON.parse(activity.output) as { command?: string; stdout?: string; stderr?: string; exit_code?: number; status?: string; timed_out?: boolean; cancelled?: boolean; content?: string };
     if (activity.kind === 'terminal') return `${result.command ? `$ ${result.command}\n` : ''}${result.status === 'partial_success' ? '✓ partial search result (downstream closed pipe after output)' : result.exit_code === 0 ? '✓ exit 0' : result.exit_code !== undefined ? `✗ exit ${result.exit_code}` : ''}${result.timed_out ? ' · timed out' : ''}${result.cancelled ? ' · cancelled' : ''}${result.stdout ? `\n${result.stdout}` : ''}${result.stderr ? `\n${result.stderr}` : ''}`.trim();
