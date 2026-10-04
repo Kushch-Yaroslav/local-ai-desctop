@@ -14,7 +14,7 @@
     "build:rust-agent": "cargo build --manifest-path rust-agent/Cargo.toml",
     "build": "npm run build:rust-agent && npm run typecheck && vite build && tsc -p tsconfig.electron.json",
     "test:attachments": "npm run build && node dist/main/services/attachment-pipeline.test.js",
-    "test:agent-runtime": "npm run build && node dist/main/services/rust-agent-runtime.test.js",
+    "test:agent-runtime": "npm run build && node dist/main/services/rust-agent-runtime.test.js && node dist/main/tools/process-group.test.js",
     "test:context-usage": "npm run build && node dist/shared/context-format.test.js",
     "test:database-migration": "npm run build && node dist/main/services/database.test.js && node dist/main/services/run-recovery.test.js",
     "test:web-chat": "npm run build && node dist/main/services/web-chat.test.js",
