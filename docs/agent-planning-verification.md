@@ -50,3 +50,5 @@ doc-only changes and runs without `run_terminal` are never gated, so the gate ca
 - Whether a cited check is relevant to a given deliverable is the model's claim; a vacuous script touching a changed file can count.
 - Partial reads record the whole-file revision.
 - A change demotes all verified items (run-level epoch, deliberately conservative).
+- The runtime cannot judge whether a model-written check is adequate: in a live run a jsdom check passed although the page's `<script>` in `<head>` (no `defer`) fails at load time. Guidance asks for checks through the real entry path and for stating what a stand-in does not cover; the ledger only guarantees the check really ran, after the last change, with that exit code.
+- An unrelated failing project check blocks `verify` of other items; the item must be reported as implemented, or blocked with the reason.
