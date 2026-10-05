@@ -31,7 +31,7 @@ list pass silently. The runtime never invents entries and never decides what the
 
 - Item: `id`, optional `task` (the user's task it belongs to), `text`, `status` (`pending | implemented | verified | blocked | dropped`; the legacy `done` is read as `implemented`),
   `evidence`, `reason`. At most 24 items, one short line each; re-adding the same wording returns the existing item.
-- Tool actions: `add` (optional `check`: readback | static | functional), `implemented` (the work was written; `done` is accepted as an alias), `verify` (only with fresh runtime-recorded evidence, see [planning and verification](agent-planning-verification.md)), `block` (concrete reason required), `drop` (the user
+- Tool actions: `add` (optional `check`: readback | static | build | test | runtime | browser; `functional` is an old alias of `runtime`), `implemented` (the work was written; `done` is accepted as an alias), `verify` (only with fresh runtime-recorded evidence, see [planning and verification](agent-planning-verification.md)), `block` (concrete reason required), `drop` (the user
   withdrew it; reason required), `view`. The schema is flat, in declaration order, like the other tools.
 - Stored inside the Task Memory JSON, so it is persisted with it (`agent_plans`), restored on Continue after an
   interruption, discarded with it on Regenerate or Edit, and survives restarts. Saved memory without the field still loads.
