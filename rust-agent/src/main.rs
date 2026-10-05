@@ -110,6 +110,7 @@ fn main() {
                         evidence_dir,
                         task_memory,
                         provider_max_output,
+                        browser_capability: None,
                         cancelled: control.cancelled,
                         steering: control.steering,
                         pause_requested: control.pause_requested,

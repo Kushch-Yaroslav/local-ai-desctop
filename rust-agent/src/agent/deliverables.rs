@@ -18,7 +18,7 @@
 //! evidence (see `verification`), and any later change to the project drops it
 //! back to implemented.
 
-use super::verification::Class;
+use super::verification::Need;
 
 use serde::{Deserialize, Serialize};
 
@@ -68,9 +68,10 @@ pub struct Deliverable {
     pub evidence: String,
     #[serde(default)]
     pub reason: String,
-    /// How strongly this must be shown; the run's changes decide when unset.
+    /// What must be shown for it to count as verified; the run's changes decide
+    /// when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub check: Option<Class>,
+    pub check: Option<Need>,
     /// Runtime evidence ids that verified it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proof: Vec<String>,
@@ -152,7 +153,7 @@ impl Deliverables {
         id: Option<&str>,
         task: &str,
         text: &str,
-        check: Option<Class>,
+        check: Option<Need>,
     ) -> Result<String, String> {
         let text = clean(text, MAX_TEXT_CHARS, "text")?;
         if text.is_empty() {
@@ -181,7 +182,8 @@ impl Deliverables {
                 item.task = task;
                 item.status = DeliverableStatus::Pending;
                 item.reason.clear();
-                item.check = check;
+                // A named requirement is never weakened by rewording the item.
+                item.check = item.check.or(check);
                 self.revision = self.revision.saturating_add(1);
                 return Ok(id.to_owned());
             }
@@ -301,7 +303,11 @@ impl Deliverables {
     }
 
     pub fn unverified_summary(&self) -> String {
-        self.unverified()
+        Self::summarize(&self.unverified())
+    }
+
+    pub fn summarize(items: &[&Deliverable]) -> String {
+        items
             .iter()
             .map(|item| format!("{} {}", item.id, item.text))
             .collect::<Vec<_>>()

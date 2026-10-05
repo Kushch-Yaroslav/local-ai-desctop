@@ -289,7 +289,7 @@ export interface ModelTodoPhase { name: string; items: ModelTodoItem[]; }
 export interface ModelTodo { phases: ModelTodoPhase[]; revision?: number; }
 /** `done` is the legacy spelling of `implemented`; only `verified` means a runtime-recorded check passed. */
 export type DeliverableStatus = 'pending' | 'implemented' | 'verified' | 'done' | 'blocked' | 'dropped';
-export interface DeliverableItem { id: string; text: string; status: DeliverableStatus; task?: string; evidence?: string; reason?: string; check?: 'readback' | 'static' | 'functional'; proof?: string[]; failing?: string; }
+export interface DeliverableItem { id: string; text: string; status: DeliverableStatus; task?: string; evidence?: string; reason?: string; check?: 'readback' | 'static' | 'build' | 'test' | 'runtime' | 'browser'; proof?: string[]; failing?: string; }
 export interface PlanStepItem { id: string; text: string; status: 'pending' | 'in_progress' | 'completed' | 'blocked'; note?: string; }
 export interface VerificationRecord { id: string; kind: string; class: 'readback' | 'static' | 'functional'; subject: string; pass: boolean; epoch: number; turn: number; detail?: string; }
 export interface TaskMemoryEntry { id: string; finding: string; evidence?: string; implication?: string; next?: string; todoId?: string | null; invalidated?: boolean; }

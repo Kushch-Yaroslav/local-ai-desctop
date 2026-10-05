@@ -27,6 +27,9 @@ pub struct AgentState {
     pub verification_closed: bool,
     /// The run can execute commands, so "run something to check it" is possible.
     pub can_verify: bool,
+    /// A real browser (or a driver for one) exists here, so a page can be
+    /// checked in one.
+    pub browser_available: bool,
     /// The project's own test command, looked up in Deep runs only.
     pub project_test_command: Option<String>,
     /// The single reminder about unopened requested local files was already
