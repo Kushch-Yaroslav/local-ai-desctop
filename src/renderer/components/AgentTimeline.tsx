@@ -1,5 +1,5 @@
 import { memo, useState } from 'react';
-import type { ChatMessage, DeliverableItem, TerminalExecution, ThinkingTimelineEvent, ToolActivity } from '../../shared/types';
+import type { ChatMessage, DeliverableItem, PlanStepItem, TerminalExecution, ThinkingTimelineEvent, ToolActivity } from '../../shared/types';
 import { Markdown } from './Markdown';
 import { thinkingTimeline } from '../../shared/thinking-timeline';
 import { formatDuration, pluralRu } from '../../shared/localization';
@@ -27,23 +27,40 @@ function entryLine(entry: unknown): string {
 function structuredEntries(result: unknown): unknown[] | undefined {
   return result && typeof result === 'object' && !Array.isArray(result) && Array.isArray((result as { entries?: unknown }).entries) ? (result as { entries: unknown[] }).entries : undefined;
 }
-const deliverableMarker = { done: '✓', blocked: '⊘', pending: '○', dropped: '–' } as const;
-/** The requested-deliverables list from a `deliverables` tool result, as a checklist. */
-export function deliverablesChecklist(output: string | undefined): { lines: string[]; done: number; open: number; total: number } | undefined {
+const deliverableMarker = { verified: '✓', implemented: '◐', done: '◐', blocked: '⊘', pending: '○', dropped: '–' } as const;
+const planMarker = { completed: '✓', in_progress: '▶', blocked: '⊘', pending: '○' } as const;
+/** The requested-deliverables list from a `deliverables` tool result, as a checklist.
+ * Only `verified` counts as checked; `implemented` is shown as not yet verified. */
+export function deliverablesChecklist(output: string | undefined): { lines: string[]; verified: number; implemented: number; open: number; total: number } | undefined {
   if (!output) return undefined;
   try {
     const items = (JSON.parse(output) as { deliverables?: { items?: DeliverableItem[] } }).deliverables?.items;
     if (!Array.isArray(items)) return undefined;
     const live = items.filter((item) => item.status !== 'dropped');
+    const note = (item: DeliverableItem) => item.status === 'blocked' && item.reason ? ` — не выполнено: ${item.reason}`
+      : (item.status === 'implemented' || item.status === 'done') ? ` — реализовано, не проверено${item.failing ? `; проверка не прошла: ${item.failing}` : ''}` : '';
     return {
-      lines: live.map((item) => `${deliverableMarker[item.status] ?? '○'} ${item.text}${item.status === 'blocked' && item.reason ? ` — не выполнено: ${item.reason}` : ''}`),
-      done: live.filter((item) => item.status === 'done').length, open: live.filter((item) => item.status === 'pending').length, total: live.length,
+      lines: live.map((item) => `${deliverableMarker[item.status] ?? '○'} ${item.text}${note(item)}`),
+      verified: live.filter((item) => item.status === 'verified').length,
+      implemented: live.filter((item) => item.status === 'implemented' || item.status === 'done').length,
+      open: live.filter((item) => item.status === 'pending').length, total: live.length,
     };
+  } catch { return undefined; }
+}
+/** The agent's own execution plan from a `plan` tool result. */
+export function planChecklist(output: string | undefined): { lines: string[]; completed: number; total: number } | undefined {
+  if (!output) return undefined;
+  try {
+    const steps = (JSON.parse(output) as { plan?: { steps?: PlanStepItem[] } }).plan?.steps;
+    if (!Array.isArray(steps)) return undefined;
+    return { lines: steps.map((step) => `${planMarker[step.status] ?? '○'} ${step.text}${step.status === 'blocked' && step.note ? ` — ${step.note}` : ''}`), completed: steps.filter((step) => step.status === 'completed').length, total: steps.length };
   } catch { return undefined; }
 }
 export function toolResultSummary(activity: ToolActivity): string | undefined {
   const checklist = activity.detail === 'deliverables' ? deliverablesChecklist(activity.output) : undefined;
-  if (checklist) return `выполнено ${checklist.done} из ${checklist.total}${checklist.open ? ` · осталось ${checklist.open}` : ''}`;
+  if (checklist) return `проверено ${checklist.verified} из ${checklist.total}${checklist.implemented ? ` · реализовано, не проверено ${checklist.implemented}` : ''}${checklist.open ? ` · осталось ${checklist.open}` : ''}`;
+  const plan = activity.detail === 'plan' ? planChecklist(activity.output) : undefined;
+  if (plan) return `шагов выполнено ${plan.completed} из ${plan.total}`;
   if (activity.detail === 'project_knowledge_read') {
     try {
       const entries = structuredEntries(JSON.parse(activity.output ?? ''));
@@ -59,6 +76,8 @@ export function displayToolResult(activity: ToolActivity): string | undefined {
   if (!activity.output) return undefined;
   const checklist = activity.detail === 'deliverables' ? deliverablesChecklist(activity.output) : undefined;
   if (checklist) return checklist.lines.join('\n');
+  const plan = activity.detail === 'plan' ? planChecklist(activity.output) : undefined;
+  if (plan) return plan.lines.join('\n');
   try {
     const result = JSON.parse(activity.output) as { command?: string; stdout?: string; stderr?: string; exit_code?: number; status?: string; timed_out?: boolean; cancelled?: boolean; content?: string };
     if (activity.kind === 'terminal') return `${result.command ? `$ ${result.command}\n` : ''}${result.status === 'partial_success' ? '✓ частичный результат поиска (следующая команда закрыла канал после вывода)' : result.exit_code === 0 ? '✓ код выхода 0' : result.exit_code !== undefined ? `✗ код выхода ${result.exit_code}` : ''}${result.timed_out ? ' · превышено время' : ''}${result.cancelled ? ' · отменено' : ''}${result.stdout ? `\n${result.stdout}` : ''}${result.stderr ? `\n${result.stderr}` : ''}`.trim();
