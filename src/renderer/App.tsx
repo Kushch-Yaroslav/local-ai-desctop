@@ -1,4 +1,6 @@
+import { localizeProjectLabel } from '../shared/localization';
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useShallow } from 'zustand/react/shallow';
 import { Bot, Check, Copy, File, Folder, Pencil, RotateCcw, X } from 'lucide-react';
 import { Sidebar } from './components/Sidebar';
 import { Toolbar } from './components/Toolbar';
@@ -16,7 +18,7 @@ function GenerationIndicator({ state }: { state: string }) {
 }
 
 function MessageAttachments({ attachments }: { attachments: Attachment[] }) { return <div className="message-attachments">{attachments.map((attachment) => <MessageAttachment key={attachment.id} attachment={attachment} />)}</div>; }
-function MessageProjectReferences({ references }: { references: ProjectReference[] }) { return <div className="message-project-references">{references.map((reference) => <span key={reference.id} className={`message-project-reference project-${reference.projectSlot}`}>{reference.kind === 'folder' ? <Folder size={12} /> : <File size={12} />}<span>{reference.relativePath}</span><small>{reference.projectLabel}</small></span>)}</div>; }
+function MessageProjectReferences({ references }: { references: ProjectReference[] }) { return <div className="message-project-references">{references.map((reference) => <span key={reference.id} className={`message-project-reference project-${reference.projectSlot}`}>{reference.kind === 'folder' ? <Folder size={12} /> : <File size={12} />}<span>{reference.relativePath}</span><small>{localizeProjectLabel(reference.projectLabel)}</small></span>)}</div>; }
 
 const EDITOR_MAX_HEIGHT = 320;
 
@@ -50,7 +52,7 @@ function MessageAttachment({ attachment }: { attachment: Attachment }) {
   const [url, setUrl] = useState<string | null>(null);
   useEffect(() => { if (attachment.kind !== 'image' || !attachment.storageRef) return; void window.localAi.attachments.dataUrl(attachment.id).then(setUrl); }, [attachment.id, attachment.kind, attachment.storageRef]);
   const imageNumber = Number(attachment.metadata?.imageNumber) || attachment.index + 1;
-  const name = attachment.kind === 'image' ? `Image ${imageNumber}` : attachment.filename;
+  const name = attachment.kind === 'image' ? `Изображение ${imageNumber}` : attachment.filename;
   const detail = attachment.status === 'ready' ? '✓ Готово' : attachment.status === 'processing' ? '◌ Обработка…' : attachment.status === 'ocr_required' ? 'OCR потребуется' : attachment.status === 'error' ? `✕ ${attachment.error ?? 'Ошибка'}` : attachment.status === 'cancelled' ? 'Отменено' : 'Ожидает обработки';
   return <div className={`message-attachment ${attachment.kind === 'image' ? 'image' : ''}`}>{url ? <img src={url} alt={name} /> : attachment.kind === 'image' ? <span className="attachment-image-placeholder">{imageNumber}</span> : <span className="attachment-file-icon">{attachment.filename.split('.').at(-1)?.toUpperCase() ?? 'FILE'}</span>}<span><strong>{name}</strong><small>{detail}</small></span></div>;
 }
@@ -62,13 +64,13 @@ function GenerationStatsView({ stats }: { stats: GenerationStats }) {
     return lastTwo >= 11 && lastTwo <= 14 ? 'токенов' : last === 1 ? 'токен' : last >= 2 && last <= 4 ? 'токена' : 'токенов';
   };
   const rate = stats.tokensPerSecond === undefined ? null : new Intl.NumberFormat('ru-RU', { maximumFractionDigits: stats.tokensPerSecond >= 10 ? 0 : 1 }).format(stats.tokensPerSecond);
-  const duration = stats.generationDurationMs === undefined ? null : `${(stats.generationDurationMs / 1000).toFixed(stats.generationDurationMs >= 10_000 ? 0 : 1)}s`;
+  const duration = stats.generationDurationMs === undefined ? null : `${(stats.generationDurationMs / 1000).toFixed(stats.generationDurationMs >= 10_000 ? 0 : 1)} с`;
   const details = [`Сгенерировано: ${number(stats.outputTokens)} ${tokens(stats.outputTokens)}`, rate && `Генерация: ${rate} ток/с`, duration && `Длительность генерации: ${duration}`, stats.timeToFirstTokenMs !== undefined && `Первый токен: ${(stats.timeToFirstTokenMs / 1000).toFixed(2)} с`, stats.inputTokens !== undefined && `Токенов промпта: ${number(stats.inputTokens)}`].filter(Boolean).join('\n');
   return <small className="generation-stats" title={details}>{rate ? `${rate} ток/с · ` : ''}{number(stats.outputTokens)} {tokens(stats.outputTokens)}</small>;
 }
 
 export function App() {
-  const { initialize, refreshHardware, handleStream, activeId, conversations, messages, isGenerating, generationConversationId, generationState, toolActivities, analysisRuns, editMessage, regenerateMessage, lastFinishReason, error } = useAppStore();
+  const { initialize, refreshHardware, handleStream, activeId, conversations, messages, isGenerating, generationConversationId, generationState, toolActivities, analysisRuns, editMessage, regenerateMessage, lastFinishReason, error } = useAppStore(useShallow((state) => ({ initialize: state.initialize, refreshHardware: state.refreshHardware, handleStream: state.handleStream, activeId: state.activeId, conversations: state.conversations, messages: state.messages, isGenerating: state.isGenerating, generationConversationId: state.generationConversationId, generationState: state.generationState, toolActivities: state.toolActivities, analysisRuns: state.analysisRuns, editMessage: state.editMessage, regenerateMessage: state.regenerateMessage, lastFinishReason: state.lastFinishReason, error: state.error })));
   const endRef = useRef<HTMLDivElement>(null); const conversationRef = useRef<HTMLElement>(null); const followStream = useRef(true);
   const [editingId, setEditingId] = useState<string | null>(null); const [editingText, setEditingText] = useState('');
   const [agentClock, setAgentClock] = useState(() => Date.now());
@@ -76,13 +78,26 @@ export function App() {
   useEffect(() => { void initialize(); const timer = window.setInterval(() => void refreshHardware(), 2_000); const unlisten = window.localAi.chat.onStream(handleStream); return () => { window.clearInterval(timer); unlisten(); }; }, [initialize, refreshHardware, handleStream]);
   useEffect(() => { if (!isGenerating || active?.mode !== 'agent') return; setAgentClock(Date.now()); const timer = window.setInterval(() => setAgentClock(Date.now()), 1_000); return () => window.clearInterval(timer); }, [isGenerating, active?.mode]);
   useLayoutEffect(() => { followStream.current = true; }, [activeId]);
-  useLayoutEffect(() => { const conversation = conversationRef.current; if (!conversation || !followStream.current) return; conversation.scrollTo({ top: conversation.scrollHeight, behavior: isGenerating ? 'auto' : 'smooth' }); }, [messages, isGenerating, toolActivities]);
+  // Following the stream must not read layout in the commit phase: `scrollHeight` forces a synchronous style
+  // recalculation and layout of the whole conversation, which grows with the run. One scroll per frame is
+  // scheduled instead; the browser needs that layout for painting anyway, so the follow costs nothing extra.
+  const scrollFrame = useRef<number | null>(null);
+  useEffect(() => {
+    if (!followStream.current || scrollFrame.current !== null) return;
+    const behavior = isGenerating ? 'auto' : 'smooth';
+    scrollFrame.current = window.requestAnimationFrame(() => {
+      scrollFrame.current = null;
+      const conversation = conversationRef.current;
+      if (conversation && followStream.current) conversation.scrollTo({ top: conversation.scrollHeight, behavior });
+    });
+  }, [messages, isGenerating, toolActivities]);
+  useEffect(() => () => { if (scrollFrame.current !== null) window.cancelAnimationFrame(scrollFrame.current); }, []);
   const updateFollowState = () => { const element = conversationRef.current; if (element) followStream.current = element.scrollHeight - element.scrollTop - element.clientHeight < 96; };
   const embeddedSteeringIds = steeringMessageIds(messages);
   return <div className="app-shell"><Sidebar /><main className="main"><Toolbar /><section ref={conversationRef} onScroll={updateFollowState} className="conversation">
     {error && <p className="attachment-error" role="alert">{error}</p>}
     {generationConversationId && generationConversationId !== activeId && <p role="status">Генерация продолжается в другом чате. Откройте отмеченный чат, чтобы увидеть ход работы или остановить её.</p>}
-    {active?.mode === 'agent' && <div className="agent-notice"><Bot size={17} /> {active.workingDirectory ? 'Файловые инструменты ограничены выбранным проектом; terminal стартует в его корне.' : 'Без выбранного проекта доступны conversation и planning; файловые инструменты и terminal отключены.'}</div>}
+    {active?.mode === 'agent' && <div className="agent-notice"><Bot size={17} /> {active.workingDirectory ? 'Файловые инструменты ограничены выбранным проектом и папками, которые вы назвали в сообщениях; терминал стартует в корне проекта.' : 'Проект не выбран: файловые инструменты и терминал доступны только для папок, абсолютный путь к которым вы укажете в сообщении (терминал стартует в последней названной). Без пути — только рассуждение и планирование.'}</div>}
     {messages.length === 0 && <div className="welcome"><Bot size={34} /><h1>Чем могу помочь?</h1><p>Выберите одну из локальных моделей и начните разговор.</p></div>}
     {messages.map((message) => {
       if (message.role === 'user' && embeddedSteeringIds.has(message.id)) return null;
@@ -94,7 +109,7 @@ export function App() {
       return <article className={`message ${message.role} ${editing ? 'is-editing' : ''} ${message.id.startsWith('stream-') && isGenerating ? 'is-generating' : ''}`} key={message.id}>{message.role === 'user' ? <div className="user-message-stack"><div className="message-content">{body}</div>{!editing && <UserMessageActions content={message.content} onEdit={() => { if (!generationConversationId) { setEditingId(message.id); setEditingText(message.content); } }} onRegenerate={() => { void regenerateMessage(message); }} regenerateDisabled={Boolean(generationConversationId)} />}</div> : <div className="message-content">{body}</div>}</article>;
     })}
     {!isGenerating && active?.mode === 'agent' && messages.at(-1)?.role === 'user' && analysisRuns.at(-1)?.status === 'interrupted' && <p className="agent-notice" role="status">Предыдущий запуск был прерван. Его прогресс сохранён: отправьте сообщение, чтобы продолжить, или нажмите «Сгенерировать ответ заново», чтобы начать с чистого состояния.</p>}
-    {lastFinishReason === 'length' && !isGenerating && <p className="truncation-notice" role="status">Ответ сохранён, но достигнут safety limit продолжения. Текст выше не потерян.</p>}
+    {lastFinishReason === 'length' && !isGenerating && <p className="truncation-notice" role="status">Ответ сохранён, но достигнут предел продолжения. Текст выше не потерян.</p>}
     <div ref={endRef} />
   </section><Composer /></main></div>;
 }

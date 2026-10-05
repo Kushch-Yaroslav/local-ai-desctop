@@ -25,6 +25,8 @@ import { readFile, stat } from 'node:fs/promises';
 import { saveGenerationDiagnosticsBestEffort } from '../services/generation-diagnostics';
 import { projectDirectoryName } from '../../shared/project-references';
 import { executionMode } from '../../shared/generation-mode';
+import { enabledAgentTools, explicitWorkspaceRoots } from '../services/agent-workspace';
+import { homedir } from 'node:os';
 import { touchesRuntime } from '../../shared/conversation-settings';
 import { existingProjectDirectory } from '../services/project-picker';
 import { collectRuntimeContextEstimate, defaultContextDeviceReserveBytes, defaultContextHostReserveBytes, resolveContextReserve } from '../services/context-estimate';
@@ -76,7 +78,7 @@ let contextDiscoveryProgress: ContextDiscoveryProgress = { busy: false, modelId:
 const discoveryKey = (modelId: string, contextWindow: number, kvCacheType: 'f16' | 'q8_0', kvOffload: boolean) => `${modelId}:${contextWindow}:${kvCacheType}:${kvOffload ? 'gpu' : 'ram'}`;
 function currentDiscoveryHeadroomFits(option: ContextDiscoveryOption, current: RuntimeContextEstimate): boolean {
   const host = resolveContextReserve(process.env.LOCAL_AI_CONTEXT_HOST_RESERVE_BYTES, 'LOCAL_AI_CONTEXT_HOST_RESERVE_BYTES', defaultContextHostReserveBytes);
-  if (host.bytes === null) throw new Error(host.error ?? 'Invalid discovery reserve.');
+  if (host.bytes === null) throw new Error(host.error ?? 'Некорректный резерв памяти для поиска.');
   return !!current.memoryBaseline && !!current.vramBudget && !!option.vramBudget
     && option.measuredHeadroom.hostBytes + current.memoryBaseline.hostAvailableBytes - option.memoryBaseline.hostAvailableBytes >= host.bytes
     && vramBudgetStillFits(option.vramBudget, current.vramBudget);
@@ -91,7 +93,7 @@ async function modelFileIdentity(path: string): Promise<string> {
 async function runtimeConfigurationIdentity(modelId: string): Promise<string> {
   const profile = llamaRuntimeProfile(modelId);
   const state = await llamaRuntime.state();
-  if (!profile?.modelPath || state.status !== 'ready' || state.modelId !== modelId || !state.serverPid) throw new Error('Discovery configuration is no longer running.');
+  if (!profile?.modelPath || state.status !== 'ready' || state.modelId !== modelId || !state.serverPid) throw new Error('Проверенная конфигурация llama.cpp больше не запущена.');
   const args = (await readFile(`/proc/${state.serverPid}/cmdline`, 'utf8')).split('\0').filter(Boolean);
   const stableArgs: string[] = [];
   for (let i = 0; i < args.length; i += 1) {
@@ -111,10 +113,10 @@ async function persistentFileFingerprint(path: string): Promise<string> {
 async function persistentDiscoveryIdentity(modelId: string): Promise<{ key: string; serialized: string; hardLimit: number }> {
   const profile = llamaRuntimeProfile(modelId);
   const state = await llamaRuntime.state();
-  if (!profile?.modelPath || state.status !== 'ready' || state.modelId !== modelId || !state.serverPid) throw new Error('Saved Max Context requires the model runtime to be running.');
+  if (!profile?.modelPath || state.status !== 'ready' || state.modelId !== modelId || !state.serverPid) throw new Error('Сохранённый максимальный контекст можно показать только при запущенной модели.');
   const args = (await readFile(`/proc/${state.serverPid}/cmdline`, 'utf8')).split('\0').filter(Boolean);
   const hostReserve = resolveContextReserve(process.env.LOCAL_AI_CONTEXT_HOST_RESERVE_BYTES, 'LOCAL_AI_CONTEXT_HOST_RESERVE_BYTES', defaultContextHostReserveBytes);
-  if (hostReserve.bytes === null) throw new Error(hostReserve.error ?? 'Invalid discovery reserve.');
+  if (hostReserve.bytes === null) throw new Error(hostReserve.error ?? 'Некорректный резерв памяти для поиска.');
   const hardLimit = await llamaCapabilityLimit(modelId);
   const identity = buildContextDiscoveryIdentity({
     modelId, modelFingerprint: await persistentFileFingerprint(profile.modelPath),
@@ -209,10 +211,10 @@ async function estimateModelContext(modelId: string): Promise<RuntimeContextEsti
 }
 async function discoverModelContexts(modelId: string): Promise<ContextDiscoveryResult> {
   const profile = llamaRuntimeProfile(modelId);
-  if (contextDiscoveryBusy) throw new Error('Max Context discovery is already running.');
+  if (contextDiscoveryBusy) throw new Error('Поиск максимального контекста уже выполняется.');
   if (runtimeSelectionBusy) throw new Error('Дождитесь завершения переключения runtime.');
   discoveredContextOptions.clear();
-  if (!profile) throw new Error('Max Context discovery requires an installed llama.cpp model.');
+  if (!profile) throw new Error('Для поиска максимального контекста нужна установленная модель llama.cpp.');
   contextDiscoveryBusy = true;
   contextDiscoveryProgress = { busy: true, modelId, stage: 'Подготовка; llama.cpp будет перезапущен несколько раз…', probeCount: 0 };
   let original: LlamaRuntimeState | null = null;
@@ -248,17 +250,17 @@ async function discoverModelContexts(modelId: string): Promise<ContextDiscoveryR
         try {
           const switched = await llamaRuntime.switchTo(modelId, contextWindow, kvCacheType, offload);
           if (!switched.ok) {
-            if (switched.state.status !== 'ready') throw new Error(`Discovery rollback failed: ${switched.error}`);
+            if (switched.state.status !== 'ready') throw new Error(`Не удалось вернуть исходную конфигурацию llama.cpp после проверки: ${switched.error}`);
             record.reason = switched.error;
             return { record, estimate };
           }
           record.startup = true;
           const state = await syncLlamaBackend();
-          if (state.status !== 'ready' || !state.serverPid) throw new Error('Probe server is not alive/healthy.');
+          if (state.status !== 'ready' || !state.serverPid) throw new Error('Пробный сервер llama.cpp не запущен или не отвечает.');
           process.kill(state.serverPid, 0);
           record.args = (await readFile(`/proc/${state.serverPid}/cmdline`, 'utf8')).split('\0').filter(Boolean);
           record.health = (await llamaCpp.getStatus()).available;
-          if (!record.health) throw new Error('Probe health check failed.');
+          if (!record.health) throw new Error('Пробный сервер llama.cpp не прошёл проверку состояния.');
           await verifyContextProbeInference(modelId);
           record.inference = true;
           process.kill(state.serverPid, 0);
@@ -280,14 +282,14 @@ async function discoverModelContexts(modelId: string): Promise<ContextDiscoveryR
       },
       restore: async () => {
         const restore = await llamaRuntime.switchTo(prior.modelId!, prior.contextWindow!, prior.kvCacheType!, prior.kvOffload!);
-        if (!restore.ok) throw new Error(`Max Context discovery could not restore the prior runtime: ${restore.error}`);
+        if (!restore.ok) throw new Error(`Поиск максимального контекста не смог восстановить прежнюю конфигурацию llama.cpp: ${restore.error}`);
         await syncLlamaBackend();
       },
     });
     // Identity excludes context/cache mode, so choosing an option does not
     // invalidate the sibling mode. Model/draft/projector/backend args do.
     result.configurationId = await runtimeConfigurationIdentity(modelId);
-    if (result.configurationId !== configurationId) throw new Error('Runtime/model/draft configuration changed during discovery.');
+    if (result.configurationId !== configurationId) throw new Error('Конфигурация llama.cpp (модель, режим или draft) изменилась во время поиска.');
     // Only a completed discovery reaches here; its options replace the saved value for their KV mode.
     // A KV mode this run did not establish keeps its last successful saved value.
     let saved: ContextDiscoveryOption[] = [];
@@ -307,7 +309,7 @@ async function discoverModelContexts(modelId: string): Promise<ContextDiscoveryR
   } catch (error) {
     discoveredContextOptions.clear();
     const message = error instanceof Error ? error.message : String(error);
-    contextDiscoveryProgress = { busy: false, modelId, stage: 'Discovery не завершён', probeCount: contextDiscoveryProgress.probeCount, error: message };
+    contextDiscoveryProgress = { busy: false, modelId, stage: 'Поиск не завершён', probeCount: contextDiscoveryProgress.probeCount, error: message };
     // A failed or interrupted run leaves the previously saved result untouched and selectable.
     await adoptSavedDiscovery(modelId, message).catch(() => undefined);
     throw error;
@@ -323,24 +325,24 @@ async function verifyContextProbeInference(modelId: string): Promise<void> {
     body: JSON.stringify({ model: modelId, messages: [{ role: 'user', content: 'What is 1 + 1? Reply with exactly 2 and no explanation.' }], max_tokens: 128, temperature: 0, chat_template_kwargs: { enable_thinking: false }, stream: false }),
     signal: AbortSignal.timeout(60_000),
   });
-  if (!response.ok) throw new Error(`Discovery inference failed with HTTP ${response.status}.`);
+  if (!response.ok) throw new Error(`Пробный запрос к модели завершился ошибкой HTTP ${response.status}.`);
   const value = await response.json() as { choices?: Array<{ message?: { content?: unknown; reasoning_content?: unknown } }> };
   if (!Array.isArray(value.choices) || !value.choices.length
     || !(typeof value.choices[0]?.message?.content === 'string' && value.choices[0].message.content.trim())) {
-    throw new Error('Discovery runtime returned no completed inference choice.');
+    throw new Error('Пробный запрос к модели не вернул завершённый ответ.');
   }
 }
 async function validateDiscoveredOption(modelId: string, contextWindow: number, kvCacheType: 'f16' | 'q8_0', kvOffload: boolean): Promise<void> {
   if (!discoveredContextOptions.size && !contextDiscoveryBusy) await adoptSavedDiscovery(modelId).catch(() => undefined);
   const cachedOptions = [...discoveredContextOptions.values()];
   const option = findFreshContextDiscoveryOption(cachedOptions.map((item) => item.option), { modelId, contextWindow, kvCacheType, kvOffload });
-  if (!option) throw new Error('Max Context discovery is missing, stale, or does not validate this KV configuration and context; run Discover again.');
+  if (!option) throw new Error('Результат поиска максимального контекста отсутствует, устарел или не подтверждает эту конфигурацию KV и размер контекста; запустите «Найти максимальный контекст» заново.');
   const cached = cachedOptions.find((item) => item.option === option);
-  if (!cached || await runtimeConfigurationIdentity(modelId) !== cached.modelIdentity) throw new Error('Runtime/model/draft configuration changed since discovery; run Discover again.');
+  if (!cached || await runtimeConfigurationIdentity(modelId) !== cached.modelIdentity) throw new Error('Конфигурация llama.cpp изменилась с момента поиска; запустите «Найти максимальный контекст» заново.');
   const current = await estimateModelContext(modelId);
-  if (current.status !== 'estimated' || !current.memoryBaseline || current.observedContextTokens === null) throw new Error('Current runtime memory evidence is unavailable; run Discover again.');
+  if (current.status !== 'estimated' || !current.memoryBaseline || current.observedContextTokens === null) throw new Error('Нет данных о текущей памяти llama.cpp; запустите «Найти максимальный контекст» заново.');
   if (!hostBaselineStable(option, current) || !currentDiscoveryHeadroomFits(option, current)) {
-    throw new Error('Available memory changed materially since discovery; run Discover again before selecting this context.');
+    throw new Error('Доступная память заметно изменилась с момента поиска; перед выбором этого контекста запустите «Найти максимальный контекст» заново.');
   }
 }
 async function discoveryStatus(_event?: unknown, requestedModelId?: string): Promise<ContextDiscoveryProgress> {
@@ -449,7 +451,7 @@ export function registerIpc(): void {
     const contextWindow = modelChanged && patch.contextWindow === undefined && allowed.length ? normalContextForModel(requestedContext, allowed) : requestedContext;
     if (allowed.length && !allowed.includes(contextWindow)) {
       if (contextWindow % 4_096 !== 0 || contextWindow > capability || contextWindow <= 0) {
-        throw new Error(`Requested context ${contextWindow} is outside the model/backend capability or runtime bucket size.`);
+        throw new Error(`Запрошенный контекст ${contextWindow} выходит за пределы возможностей модели и llama.cpp или не кратен допустимому шагу.`);
       }
     }
     if (nextModelId && profile) {
@@ -635,8 +637,11 @@ export function registerIpc(): void {
     const { thinkingTimeline, activityTimelinePositions } = generation;
     const agentProjects: AgentProject[] = mode === 'agent' ? [...selectedProjects] : [];
     const agentRoot = agentProjects[0]?.root ?? null;
-    const enabledTools = mode === 'agent' ? ['apply_patch', 'create_file', 'delete_file', 'list_directory', 'project_knowledge_index', 'project_knowledge_read', 'project_knowledge_update', 'read_file', 'run_terminal', 'task_memory', 'write_file'] : conversation.webMode === 'auto' ? ['web'] : [];
-    log('generation.snapshot', { generationId: generation.id, chatId: request.conversationId, mode, storedMode: conversation.mode, requestedMode: request.mode, workingDirectory: conversation.workingDirectory, resolvedWorkingDirectory: agentRoot, projects: agentProjects.map((project) => ({ id: project.id, slot: project.slot })), webMode: conversation.webMode, modelId: request.model, contextSize: conversation.contextWindow, reasoningMode: conversation.reasoningMode, enabledTools });
+    // Directories the user named in their own messages extend the file/terminal scope; without a project they are the scope.
+    const workspaceRoots = mode === 'agent' ? await explicitWorkspaceRoots(request.messages.filter((message) => message.role === 'user').map((message) => message.content), homedir()) : [];
+    if (!current()) return;
+    const enabledTools = enabledAgentTools(mode, { hasProject: Boolean(agentRoot), workspaceRootCount: workspaceRoots.length }, conversation.webMode);
+    log('generation.snapshot', { generationId: generation.id, chatId: request.conversationId, mode, storedMode: conversation.mode, requestedMode: request.mode, workingDirectory: conversation.workingDirectory, resolvedWorkingDirectory: agentRoot, workspaceRoots, projects: agentProjects.map((project) => ({ id: project.id, slot: project.slot })), webMode: conversation.webMode, modelId: request.model, contextSize: conversation.contextWindow, reasoningMode: conversation.reasoningMode, enabledTools });
     run = mode === 'agent' ? database.createAnalysisRun(request.conversationId, conversation.reasoningMode) : null;
     if (run && current()) event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run });
       const context = await backend.resolveContextWindow(request.model, conversation.contextWindow, abort.signal);
@@ -649,7 +654,7 @@ export function registerIpc(): void {
       const persistedTaskMemory = mode === 'agent' ? taskPlan(database.getAgentPlan(request.conversationId) ?? {}).taskMemory : undefined;
       const agentSupportsReasoning = mode === 'agent' && llamaCpp.supportsReasoning(request.model);
       const stream = mode === 'agent'
-        ? rustAgent.stream(request.model, history, agentProjects, abort.signal, context.active, conversation.reasoningMode, conversation.webMode, generation.id, persistedTaskMemory, request.conversationId, agentSupportsReasoning, llamaRuntimeProfile(request.model)?.reasoningOptions)
+        ? rustAgent.stream(request.model, history, agentProjects, abort.signal, context.active, conversation.reasoningMode, conversation.webMode, generation.id, persistedTaskMemory, request.conversationId, agentSupportsReasoning, llamaRuntimeProfile(request.model)?.reasoningOptions, workspaceRoots)
         : conversation.webMode === 'auto'
           ? webChat.stream(request.model, history, abort.signal, context.active, conversation.reasoningMode)
           : backend.streamChat(request.model, chatMessagesWithSystemPrefix(history, [chatSystemContext({ webAvailable: false }, conversation.reasoningMode === 'deep' ? 'deep' : 'fast')], request.conversationId, `capability-${request.conversationId}`), abort.signal, context.active, conversation.reasoningMode);
@@ -706,7 +711,10 @@ export function registerIpc(): void {
           const visibleActivity = { ...activity };
           delete visibleActivity.rawOutput;
           event.sender.send('chat:stream', { ...chunk, activity: visibleActivity, runId: run.id, conversationId: request.conversationId, generationId: generation.id });
-          event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run: updated });
+          // The renderer shows a live action from `toolActivities`; the run snapshot only matters when an action appears or
+          // finishes (and the final snapshot follows). Re-sending the whole run for every terminal output line made the
+          // payload grow with the run and replaced renderer state on each line.
+          if (existingPosition === undefined || activity.state !== 'running') event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run: updated });
         } else event.sender.send('chat:stream', { ...chunk, conversationId: request.conversationId, generationId: generation.id });
       }
       if (!current()) { if (run) database.finishAnalysisRun(run.id, 'cancelled', null); return; }

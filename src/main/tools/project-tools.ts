@@ -1,3 +1,4 @@
+import { signalOwnedGroup } from './process-group';
 import { execFile, spawn } from 'node:child_process';
 import { open, readdir, readFile, realpath, stat, unlink, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
@@ -344,7 +345,7 @@ function runTerminal(command: string, timeout: number, cwd: string, signal: Abor
     let stdout = ''; let stderr = ''; let stdoutTruncated = false; let stderrTruncated = false; let finished = false;
     const append = (current: string, chunk: string, limit: number): string => { if (current.length >= limit) return current; const next = `${current}${chunk}`; return next.length > limit ? next.slice(0, limit) : next; };
     const finish = (result: Record<string, unknown>) => { if (finished) return; finished = true; signal.removeEventListener('abort', abort); clearTimeout(timer); resolve(JSON.stringify(result)); };
-    const terminate = () => { if (child.pid) { try { process.kill(-child.pid, 'SIGTERM'); setTimeout(() => { try { process.kill(-child.pid!, 'SIGKILL'); } catch { /* Process already exited. */ } }, 2_000).unref(); } catch { child.kill('SIGTERM'); } } };
+    const terminate = () => { if (signalOwnedGroup(child, 'SIGTERM')) setTimeout(() => { signalOwnedGroup(child, 'SIGKILL'); }, 2_000).unref(); };
     const abort = () => { terminate(); finish({ cancelled: true, reason: 'Generation cancelled' }); };
     const timer = setTimeout(() => { terminate(); finish({ timed_out: true, error: `Terminal command exceeded timeout of ${timeout}ms`, command: commandDiagnostic, cwd, stdout: stdoutTruncated ? `${stdout}\n[diagnostic output truncated]` : stdout, stderr: stderrTruncated ? `${stderr}\n[diagnostic output truncated]` : stderr }); }, timeout);
     signal.addEventListener('abort', abort, { once: true });

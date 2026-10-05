@@ -276,6 +276,7 @@ export interface AgentMilestone {
 export interface ModelTodoItem { id: string; content: string; status: AgentPlanStepStatus; memoryId?: string | null; }
 export interface ModelTodoPhase { name: string; items: ModelTodoItem[]; }
 export interface ModelTodo { phases: ModelTodoPhase[]; revision?: number; }
+export interface DeliverableItem { id: string; text: string; status: 'pending' | 'done' | 'blocked' | 'dropped'; task?: string; evidence?: string; reason?: string; }
 export interface TaskMemoryEntry { id: string; finding: string; evidence?: string; implication?: string; next?: string; todoId?: string | null; invalidated?: boolean; }
 /** Persistent agent planning state: stable milestones plus only the active
  * milestone's adaptive Work Plan in the primary UI. */
@@ -284,7 +285,7 @@ export interface AgentPlan {
   activeMilestoneId?: string | null;
   revision?: number;
   modelTodo?: ModelTodo;
-  taskMemory?: { entries: TaskMemoryEntry[]; revision?: number };
+  taskMemory?: { entries: TaskMemoryEntry[]; revision?: number; deliverables?: { items: DeliverableItem[]; revision?: number } };
   /** Legacy persisted snapshots are normalized at the Electron boundary. */
   steps?: AgentPlanStep[];
 }

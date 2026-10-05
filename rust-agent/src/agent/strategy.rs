@@ -65,6 +65,7 @@ Deep means a more rigorous investigation, not a longer one. Spend observations w
 - Verify a claim at its source rather than from a name, a comment, a summary, or an earlier inference. Actively look for evidence that would contradict your current understanding, for example a second code path, an override, a config switch, or a mismatch between layers.
 - Keep Task Memory current as a compact working record of a few entries (revise an entry by id instead of adding near-duplicates; never one entry per fact), using its status field: confirmed (observed and cited), inferred (reasoned, not observed), unknown (still open, with the step that would resolve it), contradicted (evidence disagrees). Update a status when new evidence changes it.
 - Choose the next step by information gain: prefer the single observation that resolves the most important open item. Do not re-read what you already hold, and do not chase low-impact items.
+- Check completion against what you observed, not what you intended to build: before you finish, compare each requested deliverable with evidence that it works.
 - Converge. When the central questions are answered from observed evidence and the remaining unknowns are low-impact, stop and answer. In the answer, state which conclusions are confirmed, which are inferred, and what stayed unverified.
 "#;
 

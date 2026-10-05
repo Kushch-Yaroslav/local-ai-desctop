@@ -378,6 +378,7 @@ impl Workspace {
             user: user.into(),
             root: Some(self.root.to_string_lossy().into_owned()),
             secondary_root: None,
+            workspace_roots: Vec::new(),
             context_limit: 65_536,
             reasoning_mode: "fast".into(),
             supports_reasoning: true,
@@ -885,4 +886,559 @@ fn a_provider_without_reasoning_never_receives_replayed_reasoning() {
     assert!(!provider.requests()[1]
         .to_string()
         .contains("reasoning_content"));
+}
+
+fn tool_result_text(request: &Value) -> String {
+    request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .map(|m| m["content"].as_str().unwrap_or("").to_owned())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+const EXECUTION_TOOLS: &[&str] = &[
+    "apply_patch",
+    "create_file",
+    "delete_file",
+    "list_directory",
+    "read_file",
+    "run_terminal",
+    "write_file",
+];
+
+/// No selected project, but the user named a directory: the model must receive
+/// execution tools scoped to it, actually run them, and see the real result.
+#[test]
+fn explicit_directory_without_a_project_exposes_execution_tools_and_really_executes() {
+    let workspace = Workspace::new(&[("granted/keep.txt", "keep")]);
+    let granted = workspace.root.join("granted");
+    let target = granted.join("Шашки");
+    let outside = workspace.root.join("outside.txt");
+    let (target_arg, outside_arg) = (
+        target.to_string_lossy().into_owned(),
+        outside.to_string_lossy().into_owned(),
+    );
+    let provider = Provider::start(move |_, n| match n {
+        0 => Reply::Tools(vec![(
+            "run_terminal",
+            json!({"command": format!("mkdir '{target_arg}'")}),
+        )]),
+        1 => Reply::Tools(vec![(
+            "create_file",
+            json!({"path": outside_arg, "content": "must not exist"}),
+        )]),
+        2 => Reply::Tools(vec![("list_directory", json!({"path": "."}))]),
+        _ => Reply::Text("done".into()),
+    });
+    let mut config = workspace.config(&provider.endpoint, "create the folder");
+    config.root = None;
+    config.workspace_roots = vec![granted.to_string_lossy().into_owned()];
+    run(config);
+    assert!(target.is_dir(), "the terminal command did not run");
+    assert!(
+        !outside.exists(),
+        "a file tool escaped the granted directory"
+    );
+    let requests = provider.requests();
+    let names = tool_names(&requests[0]);
+    for tool in EXECUTION_TOOLS {
+        assert!(
+            names.contains(&(*tool).to_owned()),
+            "{tool} missing: {names:?}"
+        );
+    }
+    assert!(!names
+        .iter()
+        .any(|name| name.starts_with("project_knowledge_")));
+    assert!(requests[0]
+        .to_string()
+        .contains(&granted.to_string_lossy().into_owned()));
+    assert!(
+        tool_result_text(&requests[2]).contains("escapes"),
+        "the refusal was not reported"
+    );
+    assert!(
+        tool_result_text(&requests[3]).contains("Шашки"),
+        "the real listing was not returned"
+    );
+    assert!(completed(&workspace.journal()));
+    assert!(
+        !granted.join(".ai-framework").exists() && !workspace.root.join(".ai-framework").exists(),
+        "a workspace run must not create a project knowledge cache"
+    );
+}
+
+/// Neither a project nor a named directory: no execution tools, and the model
+/// is told so rather than being left to guess.
+#[test]
+fn without_any_scope_no_execution_tools_are_exposed_and_the_model_is_told() {
+    let workspace = Workspace::new(&[("unused.txt", "")]);
+    let provider = Provider::start(|_, _| Reply::Text("I need a directory.".into()));
+    let mut config = workspace.config(&provider.endpoint, "create a folder");
+    config.root = None;
+    run(config);
+    let requests = provider.requests();
+    let names = tool_names(&requests[0]);
+    for tool in EXECUTION_TOOLS {
+        assert!(
+            !names.contains(&(*tool).to_owned()),
+            "{tool} leaked into an unscoped run"
+        );
+    }
+    assert!(names.contains(&"task_memory".to_owned()));
+    assert!(requests[0]
+        .to_string()
+        .contains("not available in this run"));
+}
+
+/// A selected project keeps its full toolset, and named directories only add
+/// scope: absolute paths inside them work, others are refused.
+#[test]
+fn project_scope_keeps_all_tools_and_named_directories_extend_file_scope() {
+    let workspace = Workspace::new(&[("a.txt", "a")]);
+    let extra = workspace.base.join("extra");
+    std::fs::create_dir_all(&extra).unwrap();
+    let extra = extra.canonicalize().unwrap();
+    let written = extra.join("out.txt");
+    let written_arg = written.to_string_lossy().into_owned();
+    let provider = Provider::start(move |_, n| match n {
+        0 => Reply::Tools(vec![(
+            "write_file",
+            json!({"path": written_arg, "content": "hello"}),
+        )]),
+        _ => Reply::Text("done".into()),
+    });
+    let mut config = workspace.config(&provider.endpoint, "write a file");
+    config.workspace_roots = vec![extra.to_string_lossy().into_owned()];
+    run(config);
+    assert_eq!(std::fs::read_to_string(written).unwrap(), "hello");
+    let names = tool_names(&provider.requests()[0]);
+    assert!(names.contains(&"project_knowledge_index".to_owned()));
+    for tool in EXECUTION_TOOLS {
+        assert!(names.contains(&(*tool).to_owned()), "{tool}");
+    }
+}
+
+/// Reasoning mode is a model setting; it must never change which tools the
+/// model is given.
+#[test]
+fn tool_exposure_does_not_depend_on_the_reasoning_mode() {
+    let mut exposed = Vec::new();
+    for mode in ["fast", "deep"] {
+        let workspace = Workspace::new(&[("a.txt", "a")]);
+        let provider = Provider::start(|_, _| Reply::Text("done".into()));
+        let mut config = workspace.config(&provider.endpoint, "do the task");
+        config.reasoning_mode = mode.into();
+        run(config);
+        let mut names = tool_names(&provider.requests()[0]);
+        names.sort();
+        exposed.push(names);
+    }
+    assert_eq!(exposed[0], exposed[1]);
+    assert!(exposed[0].contains(&"run_terminal".to_owned()));
+}
+
+/// A failing command, an invalid path, a path outside the scope, a disallowed
+/// command shape and an unavailable tool must each reach the model as an
+/// honest error (never as a success), and the run must continue to an answer.
+#[test]
+fn failures_and_refusals_are_reported_honestly_and_the_run_still_completes() {
+    let workspace = Workspace::new(&[("a.txt", "a")]);
+    let outside = workspace.base.join("outside.txt");
+    std::fs::write(&outside, "keep").unwrap();
+    let outside_arg = outside.to_string_lossy().into_owned();
+    let provider = Provider::start(move |_, n| match n {
+        0 => Reply::Tools(vec![("run_terminal", json!({"command":"exit 3"}))]),
+        1 => Reply::Tools(vec![("read_file", json!({"path":"missing/none.txt"}))]),
+        2 => Reply::Tools(vec![("delete_file", json!({"path": outside_arg}))]),
+        3 => Reply::Tools(vec![(
+            "run_terminal",
+            json!({"command":"echo a && echo b"}),
+        )]),
+        4 => Reply::Tools(vec![("format_disk", json!({}))]),
+        _ => Reply::Text("reported".into()),
+    });
+    run(workspace.config(&provider.endpoint, "exercise failures"));
+    assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep");
+    assert!(completed(&workspace.journal()));
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 6);
+    let failed_command = tool_result_text(&requests[1]);
+    assert!(
+        failed_command.contains("\"exit_code\":3") || failed_command.contains("exit_code"),
+        "{failed_command}"
+    );
+    assert!(
+        !failed_command.contains("\"status\":\"completed\""),
+        "{failed_command}"
+    );
+    assert!(
+        tool_result_text(&requests[2])
+            .to_lowercase()
+            .contains("no such file")
+            || tool_result_text(&requests[2]).contains("error")
+    );
+    assert!(tool_result_text(&requests[3]).contains("escapes"));
+    assert!(tool_result_text(&requests[4]).contains("approval required"));
+    assert!(
+        tool_result_text(&requests[5])
+            .to_lowercase()
+            .contains("format_disk"),
+        "{}",
+        tool_result_text(&requests[5])
+    );
+}
+
+/// Cancelling while a terminal command runs ends the run promptly and does
+/// not leave the command running.
+#[test]
+fn cancelling_during_a_running_terminal_command_stops_the_run_and_the_process() {
+    let workspace = Workspace::new(&[("a.txt", "a")]);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Tools(vec![("run_terminal", json!({"command":"sleep 47.31"}))]),
+        _ => Reply::Text("unreachable".into()),
+    });
+    let config = workspace.config(&provider.endpoint, "run something slow");
+    let cancelled = config.cancelled.clone();
+    let started = std::time::Instant::now();
+    let worker = std::thread::spawn(move || run(config));
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    cancelled.store(true, Ordering::Relaxed);
+    worker.join().unwrap();
+    assert!(
+        started.elapsed().as_secs() < 20,
+        "cancellation was not prompt"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let leftover = std::process::Command::new("pgrep")
+        .args(["-f", "sleep 47.31"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&leftover.stdout).trim().is_empty(),
+        "the cancelled command is still running"
+    );
+}
+
+/// Tool calls and results of an execution run are journaled as a matched pair,
+/// so a restart or Continue replays the same state.
+#[test]
+fn execution_tool_calls_and_results_are_persisted_as_matched_pairs() {
+    let workspace = Workspace::new(&[("a.txt", "a")]);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Tools(vec![(
+            "create_file",
+            json!({"path":"new/dir/b.txt","content":"b"}),
+        )]),
+        _ => Reply::Text("created".into()),
+    });
+    run(workspace.config(&provider.endpoint, "create a file"));
+    assert_eq!(
+        std::fs::read_to_string(workspace.root.join("new/dir/b.txt")).unwrap(),
+        "b"
+    );
+    let journal = workspace.journal();
+    assert!(completed(&journal));
+    let calls: Vec<String> = journal
+        .iter()
+        .filter_map(|entry| entry.pointer("/Message/tool_calls"))
+        .flat_map(|calls| calls.as_array().cloned().unwrap_or_default())
+        .filter_map(|call| call["id"].as_str().map(str::to_owned))
+        .collect();
+    let results: Vec<String> = journal
+        .iter()
+        .filter(|entry| entry.pointer("/Message/role").and_then(Value::as_str) == Some("tool"))
+        .filter_map(|entry| {
+            entry
+                .pointer("/Message/tool_call_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect();
+    assert_eq!(calls.len(), 1, "{journal:?}");
+    assert_eq!(calls, results, "a tool call has no persisted result");
+}
+
+fn tree(root: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    let mut files = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                files.push((
+                    path.strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    std::fs::read(&path).unwrap(),
+                ));
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+/// Reading a reference project (Project 2) must leave it byte-identical:
+/// passive knowledge caching is limited to the primary project.
+#[test]
+fn reading_the_secondary_project_never_modifies_it_while_writes_land_in_the_primary() {
+    let fixture = Workspace::new(&[("a.txt", "primary")]);
+    let secondary = fixture.base.join("reference");
+    std::fs::create_dir_all(secondary.join("src")).unwrap();
+    std::fs::write(secondary.join("src/theme.css"), ":root{--c:#0a0}").unwrap();
+    std::fs::write(secondary.join("index.html"), "<html></html>").unwrap();
+    let before = tree(&secondary);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Tools(vec![
+            ("list_directory", json!({"path":".","project":2})),
+            ("read_file", json!({"path":"src/theme.css","project":2})),
+            ("project_knowledge_index", json!({"project":2})),
+        ]),
+        1 => Reply::Tools(vec![(
+            "create_file",
+            json!({"path":"theme.css","content":":root{--c:#0a0}","project":1}),
+        )]),
+        _ => Reply::Text("done".into()),
+    });
+    let mut config = fixture.config(&provider.endpoint, "adapt the reference theme");
+    config.secondary_root = Some(secondary.to_string_lossy().into_owned());
+    run(config);
+    assert_eq!(
+        tree(&secondary),
+        before,
+        "the reference project was modified"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("theme.css")).unwrap(),
+        ":root{--c:#0a0}"
+    );
+    assert!(completed(&fixture.journal()));
+}
+
+const TWO_PART_REQUEST: &str =
+    "Do two things: add a bot mode to the game, and add a theme switch to the game.";
+
+fn deliverable(action: &str, fields: Value) -> (&'static str, Value) {
+    let mut arguments = fields;
+    arguments["action"] = json!(action);
+    ("deliverables", arguments)
+}
+
+fn add_both() -> Reply {
+    Reply::Tools(vec![
+        deliverable(
+            "add",
+            json!({"task":"bot","text":"bot opponent is selectable in the UI"}),
+        ),
+        deliverable(
+            "add",
+            json!({"task":"theme","text":"theme switch changes the theme"}),
+        ),
+    ])
+}
+
+/// The failure this guards against: the run recorded two requested deliverables,
+/// finished one, and tried to end. It must be sent back once (Fast) naming
+/// exactly what is unfinished, and the second answer is accepted so the review
+/// can never deadlock a run.
+#[test]
+fn fast_sends_a_run_with_unfinished_deliverables_back_once_then_accepts() {
+    let workspace = Workspace::new(&[("a.txt", "a")]);
+    let provider = Provider::start(|_, n| match n {
+        0 => add_both(),
+        1 => Reply::Tools(vec![deliverable(
+            "done",
+            json!({"id":"d-001","evidence":"saw it work"}),
+        )]),
+        2 => Reply::Text("Everything is finished.".into()),
+        _ => Reply::Text("The theme switch is not done: out of time.".into()),
+    });
+    run(workspace.config(&provider.endpoint, TWO_PART_REQUEST));
+    let journal = workspace.journal();
+    assert!(completed(&journal));
+    assert_eq!(
+        withheld_drafts(&journal),
+        1,
+        "the premature answer must be withheld exactly once"
+    );
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 4);
+    let reminder = last_user_text(&requests[3]);
+    assert!(reminder.contains("not all complete"), "{reminder}");
+    assert!(
+        reminder.contains("d-002 theme switch changes the theme (theme)"),
+        "{reminder}"
+    );
+    let review = reminder
+        .split("Before finishing:")
+        .nth(1)
+        .and_then(|rest| rest.split("Continue with").next())
+        .unwrap_or_default();
+    assert!(
+        !review.contains("d-001"),
+        "finished work must not be listed as pending: {review}"
+    );
+    assert!(requests[3].to_string().contains("<deliverables>"));
+}
+
+/// Marking an item blocked with a concrete reason is an honest way to end: no review is needed.
+#[test]
+fn blocked_with_a_reason_ends_without_a_review() {
+    let workspace = Workspace::new(&[("a.txt", "a")]);
+    let provider = Provider::start(|_, n| match n {
+        0 => add_both(),
+        1 => Reply::Tools(vec![
+            deliverable("done", json!({"id":"d-001","evidence":"verified"})),
+            deliverable(
+                "block",
+                json!({"id":"d-002","reason":"the theme assets cannot be reached from this environment"}),
+            ),
+        ]),
+        _ => Reply::Text("Bot done; theme blocked, see the reason.".into()),
+    });
+    run(workspace.config(&provider.endpoint, TWO_PART_REQUEST));
+    let journal = workspace.journal();
+    assert!(completed(&journal));
+    assert_eq!(withheld_drafts(&journal), 0);
+    assert_eq!(provider.requests().len(), 3);
+}
+
+/// Deep checks completion harder: it may be sent back twice, and `done` needs evidence that cites something observed.
+#[test]
+fn deep_requires_cited_evidence_for_done_and_reviews_twice() {
+    let workspace = Workspace::new(&[("a.txt", "a")]);
+    let provider = Provider::start(|_, n| match n {
+        0 => add_both(),
+        1 => Reply::Tools(vec![deliverable(
+            "done",
+            json!({"id":"d-001","evidence":"I believe it works"}),
+        )]),
+        2 => Reply::Tools(vec![("read_file", json!({"path":"a.txt"}))]),
+        3 => Reply::Tools(vec![deliverable(
+            "done",
+            json!({"id":"d-001","evidence":"obs-00000001 shows it"}),
+        )]),
+        4 | 5 => Reply::Text("Finished everything.".into()),
+        _ => Reply::Text("Theme switch remains unfinished.".into()),
+    });
+    let mut config = workspace.config(&provider.endpoint, TWO_PART_REQUEST);
+    config.reasoning_mode = "deep".into();
+    run(config);
+    let requests = provider.requests();
+    assert!(
+        tool_result_text(&requests[2]).contains("In Deep mode"),
+        "uncited evidence was accepted: {}",
+        tool_result_text(&requests[2])
+    );
+    let journal = workspace.journal();
+    assert!(completed(&journal));
+    assert_eq!(
+        withheld_drafts(&journal),
+        2,
+        "Deep reviews an unfinished list twice"
+    );
+    assert_eq!(requests.len(), 7);
+    assert!(last_user_text(&requests[6]).contains("cite the observation"));
+}
+
+/// Trivial and analysis-only prompts must stay lean: the runtime never creates a list on its own, so nothing is reviewed.
+#[test]
+fn a_run_that_never_records_deliverables_is_never_reviewed() {
+    let workspace = Workspace::new(&[("a.txt", "a")]);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Tools(vec![("read_file", json!({"path":"a.txt"}))]),
+        _ => Reply::Text("It says a.".into()),
+    });
+    run(workspace.config(&provider.endpoint, "what does a.txt say?"));
+    assert_eq!(withheld_drafts(&workspace.journal()), 0);
+    assert_eq!(provider.requests().len(), 2);
+    assert!(!provider.requests()[1]
+        .to_string()
+        .contains("<deliverables>"));
+}
+
+/// The list is persisted with Task Memory: a later run (Continue after an interruption) sees it, and a fresh run
+/// (Regenerate starts without saved memory) does not.
+#[test]
+fn saved_deliverables_return_on_continue_and_a_fresh_run_starts_empty() {
+    let workspace = Workspace::new(&[("a.txt", "a")]);
+    let provider = Provider::start(|_, _| Reply::Text("ok".into()));
+    let mut resumed = workspace.config(&provider.endpoint, "continue");
+    resumed.task_memory = Some(json!({"entries":[],"revision":0,"deliverables":{"items":[
+        {"id":"d-001","task":"bot","text":"bot opponent is selectable in the UI","status":"pending","evidence":"","reason":""}
+    ],"revision":1}}));
+    run(resumed);
+    assert!(provider.requests()[0]
+        .to_string()
+        .contains("bot opponent is selectable in the UI"));
+
+    let fresh_workspace = Workspace::new(&[("a.txt", "a")]);
+    let fresh_provider = Provider::start(|_, _| Reply::Text("ok".into()));
+    run(fresh_workspace.config(&fresh_provider.endpoint, "start over"));
+    assert!(!fresh_provider.requests()[0]
+        .to_string()
+        .contains("<deliverables>"));
+}
+
+/// A read-only request produces nothing to deliver, so the tool is not offered; other runs offer it.
+#[test]
+fn the_deliverables_tool_is_offered_except_for_read_only_requests() {
+    let workspace = Workspace::new(&[("a.txt", "a")]);
+    let provider = Provider::start(|_, _| Reply::Text("ok".into()));
+    run(workspace.config(&provider.endpoint, "do the work"));
+    assert!(tool_names(&provider.requests()[0]).contains(&"deliverables".to_owned()));
+    let read_only_provider = Provider::start(|_, _| Reply::Text("ok".into()));
+    let read_only_workspace = Workspace::new(&[("a.txt", "a")]);
+    run(read_only_workspace.config(&read_only_provider.endpoint, READ_ONLY));
+    assert!(!tool_names(&read_only_provider.requests()[0]).contains(&"deliverables".to_owned()));
+}
+
+/// Files the run created stay visible, and a pending review points at them so scratch files are not forgotten.
+#[test]
+fn files_created_in_the_run_are_listed_and_named_in_the_review() {
+    let workspace = Workspace::new(&[("a.txt", "a")]);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Tools(vec![
+            deliverable("add", json!({"text":"the feature works end to end"})),
+            (
+                "create_file",
+                json!({"path":"scratch-check.js","content":"1"}),
+            ),
+            ("write_file", json!({"path":"a.txt","content":"changed"})),
+        ]),
+        1 => Reply::Tools(vec![(
+            "run_terminal",
+            json!({"command":"echo run test ok"}),
+        )]),
+        2 => Reply::Text("done".into()),
+        3 => Reply::Tools(vec![("delete_file", json!({"path":"scratch-check.js"}))]),
+        _ => Reply::Text("done again".into()),
+    });
+    run(workspace.config(&provider.endpoint, "build the feature"));
+    let requests = provider.requests();
+    assert!(requests[1]
+        .to_string()
+        .contains("<files_created_this_run>scratch-check.js</files_created_this_run>"));
+    assert!(
+        !requests[1]
+            .to_string()
+            .contains("a.txt</files_created_this_run>"),
+        "an existing file is not a created file"
+    );
+    let review = last_user_text(&requests[3]);
+    assert!(
+        review.contains("Files you created in this run: scratch-check.js"),
+        "{review}"
+    );
+    assert!(
+        !requests[4].to_string().contains("<files_created_this_run>"),
+        "a deleted file must leave the list"
+    );
 }

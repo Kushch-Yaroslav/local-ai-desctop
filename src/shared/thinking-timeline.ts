@@ -5,6 +5,35 @@ export type ThinkingTimelineItem =
   | { id: string; kind: 'activity'; activity: ToolActivity; position?: number }
   | { id: string; kind: 'steering'; message: ChatMessage; status: 'accepted' | 'applied'; position: number };
 
+/**
+ * Applies a batch of streamed reasoning fragments to a timeline.
+ *
+ * Fragments are batched until the next animation frame, while tool events are applied at once, so a tool call
+ * normally lands in the timeline *before* the last reasoning fragments of the turn that preceded it. A fragment
+ * therefore has to be merged into the entry that already holds its position, wherever that entry now sits; appending a
+ * new entry whenever the last one is not reasoning split one thought into several entries with the same id (duplicate
+ * React keys, so nodes could not be reused and the DOM kept growing) and broke sentences into separate blocks.
+ *
+ * Entries that did not change keep their identity, which the render-side caches rely on.
+ */
+export function appendReasoningFragments(entries: ThinkingTimelineEvent[], fragments: ReadonlyArray<{ content: string; timelinePosition?: number }>): ThinkingTimelineEvent[] {
+  let next = entries;
+  for (const fragment of fragments) {
+    if (fragment.timelinePosition === undefined) continue;
+    if (next === entries) next = [...entries];
+    let index = -1;
+    // A position's entry is always among the most recent ones; never scan the whole history.
+    for (let candidate = next.length - 1; candidate >= Math.max(0, next.length - 8); candidate -= 1) {
+      const entry = next[candidate]!;
+      if (entry.kind === 'reasoning' && entry.position === fragment.timelinePosition) { index = candidate; break; }
+    }
+    const existing = index >= 0 ? next[index] : undefined;
+    if (existing?.kind === 'reasoning') next[index] = { ...existing, content: existing.content + fragment.content };
+    else next.push({ id: `reasoning-${fragment.timelinePosition}`, kind: 'reasoning', content: fragment.content, position: fragment.timelinePosition });
+  }
+  return next;
+}
+
 export function steeringMessageIds(messages: ChatMessage[]): Set<string> {
   const userMessageIds = new Set(messages.filter((message) => message.role === 'user').map((message) => message.id));
   return new Set(messages.flatMap((message) => message.role === 'assistant'
@@ -12,8 +41,24 @@ export function steeringMessageIds(messages: ChatMessage[]): Set<string> {
     : []));
 }
 
-function reasoningItems(event: Extract<ThinkingTimelineEvent, { kind: 'reasoning' }>, live: boolean): ThinkingTimelineItem[] {
+type ReasoningEvent = Extract<ThinkingTimelineEvent, { kind: 'reasoning' }>;
+function splitReasoning(event: ReasoningEvent, live: boolean): ThinkingTimelineItem[] {
   return event.content.split(/\n\s*\n/).map((content) => content.trim()).filter(Boolean).map((content, index, sections) => ({ id: `${event.id}-${index}`, kind: 'reasoning' as const, content, live: live && index === sections.length - 1, position: event.position, ...(index === 0 ? { startedAt: event.startedAt, completedAt: event.completedAt } : {}) }));
+}
+
+/**
+ * Timeline events are replaced immutably while they stream and are never mutated afterwards, so a finished
+ * event's paragraphs are split once and the same item objects are reused on every later render. Only the live
+ * event is re-split per update; otherwise each frame would re-split the whole history of the run.
+ */
+const completedReasoning = new WeakMap<ReasoningEvent, ThinkingTimelineItem[]>();
+function reasoningItems(event: ReasoningEvent, live: boolean): ThinkingTimelineItem[] {
+  if (live) return splitReasoning(event, true);
+  const cached = completedReasoning.get(event);
+  if (cached) return cached;
+  const items = splitReasoning(event, false);
+  completedReasoning.set(event, items);
+  return items;
 }
 
 /**

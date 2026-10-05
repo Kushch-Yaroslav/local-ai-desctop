@@ -28,7 +28,7 @@ type RuntimeRequest = {
   project_root?: string; secondary_project_root?: string; context_limit: number; reasoning_mode: ReasoningMode;
   supports_reasoning: boolean; reasoning_options?: Record<string, Record<string, unknown>>;
   web_mode: WebMode; policy: 'auto' | 'safe'; history: unknown[]; task_memory?: AgentPlan['taskMemory']; provider_max_output?: number;
-  evidence_dir?: string;
+  evidence_dir?: string; workspace_roots?: string[];
 };
 
 export function statusActivity(runId: string, ordinal: number, content: string): ToolActivity {
@@ -51,7 +51,7 @@ export function runtimeTextEvent(event: Pick<RuntimeEvent, 'type' | 'content'>, 
 /** The latest actual user node owns an Agent run. */
 export function splitAgentRunHistory(history: ChatMessage[]): { user: string; prior: ChatMessage[] } {
   const currentIndex = history.map((message) => message.role).lastIndexOf('user');
-  if (currentIndex < 0 || !history[currentIndex].content.trim()) throw new Error('Agent request has no current user message.');
+  if (currentIndex < 0 || !history[currentIndex].content.trim()) throw new Error('В запросе агента нет текущего сообщения пользователя.');
   return { user: history[currentIndex].content, prior: history.slice(0, currentIndex) };
 }
 
@@ -128,7 +128,7 @@ export class RustAgentRuntime {
     return send(content);
   }
 
-  async *stream(model: string, history: ChatMessage[], projects: AgentProject[], signal: AbortSignal, contextLimit: number, reasoningMode: ReasoningMode, webMode: WebMode, runId: string, persistedTaskMemory?: AgentPlan['taskMemory'], conversationId?: string, supportsReasoning = true, reasoningOptions?: Record<string, Record<string, unknown>>): AsyncIterable<StreamEvent> {
+  async *stream(model: string, history: ChatMessage[], projects: AgentProject[], signal: AbortSignal, contextLimit: number, reasoningMode: ReasoningMode, webMode: WebMode, runId: string, persistedTaskMemory?: AgentPlan['taskMemory'], conversationId?: string, supportsReasoning = true, reasoningOptions?: Record<string, Record<string, unknown>>, workspaceRoots: readonly string[] = []): AsyncIterable<StreamEvent> {
     if (!existsSync(this.binary)) throw new Error(`Rust Agent Runtime V2 не собран: ${this.binary}. Выполните cargo build в rust-agent.`);
     const child = spawn(this.binary, [], { stdio: 'pipe' });
     const pending: Array<{ content: string; resolve: () => void; reject: (error: Error) => void }> = [];
@@ -151,8 +151,8 @@ export class RustAgentRuntime {
     const current = splitAgentRunHistory(history);
     const request: RuntimeRequest = {
       type: 'run', run_id: runId, endpoint: this.endpoint, model,
-      system: `You are Local AI Desktop Agent. Work autonomously inside the selected project scope. Use tools only with complete valid JSON arguments.\n${projects.map((project) => `Project ${project.slot}: ${project.label}; identity=${project.id}; root=${project.root}`).join('\n')}`,
-      user: current.user, project_root: projects[0]?.root, secondary_project_root: projects[1]?.root,
+      system: `You are Local AI Desktop Agent. Work autonomously inside the scope described below. Use tools only with complete valid JSON arguments.\n${projects.map((project) => `Project ${project.slot}: ${project.label}; identity=${project.id}; root=${project.root}`).join('\n')}`,
+      user: current.user, project_root: projects[0]?.root, secondary_project_root: projects[1]?.root, ...(workspaceRoots.length ? { workspace_roots: [...workspaceRoots] } : {}),
       context_limit: contextLimit, reasoning_mode: reasoningMode, supports_reasoning: supportsReasoning, reasoning_options: reasoningOptions, web_mode: webMode, policy: 'auto',
       history: current.prior.filter((message) => !message.agentError && !message.agentCancelled).map((message) => ({ role: message.role, content: message.content })),
       ...(conversationId ? { evidence_dir: agentEvidenceDir(paths.userData, conversationId) } : {}),
@@ -244,15 +244,15 @@ export class RustAgentRuntime {
       if (child.stdin.writable) child.stdin.end();
       if (!child.killed && child.exitCode === null) child.kill('SIGTERM');
     }
-    if (stderr.trim()) throw new Error(`Rust Agent Runtime V2 stderr: ${stderr.trim()}`);
+    if (stderr.trim()) throw new Error(`Ошибка Rust Agent Runtime V2 (stderr): ${stderr.trim()}`);
   }
 }
 
 function activityLabel(name?: string): string {
-  return ({ list_directory: 'Просмотр структуры проекта', read_file: 'Чтение файла', write_file: 'Изменение файла', create_file: 'Создание файла', apply_patch: 'Изменение проекта', delete_file: 'Удаление файла', run_terminal: 'Запуск terminal', task_memory: 'Task Memory', project_knowledge_index: 'Индекс знаний проекта', project_knowledge_read: 'Чтение знаний проекта', project_knowledge_update: 'Обновление знаний проекта' } as Record<string, string>)[name ?? ''] ?? 'Действие агента';
+  return ({ list_directory: 'Просмотр структуры проекта', read_file: 'Чтение файла', write_file: 'Изменение файла', create_file: 'Создание файла', apply_patch: 'Изменение проекта', delete_file: 'Удаление файла', run_terminal: 'Запуск terminal', task_memory: 'Task Memory', deliverables: 'Требуемый результат', project_knowledge_index: 'Индекс знаний проекта', project_knowledge_read: 'Чтение знаний проекта', project_knowledge_update: 'Обновление знаний проекта' } as Record<string, string>)[name ?? ''] ?? 'Действие агента';
 }
 function activityKind(name?: string): NonNullable<import('../../shared/types').ToolActivity['kind']> {
-  return name === 'run_terminal' ? 'terminal' : name === 'task_memory' || name === 'project_knowledge_read' || name === 'project_knowledge_index' ? 'file_read' : name === 'read_file' ? 'file_read' : name === 'list_directory' ? 'directory' : 'mutation';
+  return name === 'run_terminal' ? 'terminal' : name === 'deliverables' ? 'planning' : name === 'task_memory' || name === 'project_knowledge_read' || name === 'project_knowledge_index' ? 'file_read' : name === 'read_file' ? 'file_read' : name === 'list_directory' ? 'directory' : 'mutation';
 }
 function timestamp(value: number | undefined): string | undefined { return typeof value === 'number' && Number.isFinite(value) ? new Date(value).toISOString() : undefined; }
 function terminalResult(raw: string | undefined): TerminalExecution | undefined {

@@ -6,6 +6,7 @@
 //! `docs/architecture/agent-investigation-state.md`.
 
 use crate::agent::{
+    deliverables,
     events::{Event, TailCandidateAttempt},
     evidence::classify_source_read,
     ledger::{Ledger, ProjectIndex},
@@ -31,6 +32,17 @@ use std::sync::{
     Arc, Mutex,
 };
 
+/// What file and terminal tools may act on in this run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolScope {
+    /// No project and no directory named by the user: no execution tools.
+    None,
+    /// Only directories the user named explicitly.
+    Workspace,
+    /// A selected project (optionally plus explicitly named directories).
+    Project,
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub run_id: String,
@@ -40,6 +52,9 @@ pub struct Config {
     pub user: String,
     pub root: Option<String>,
     pub secondary_root: Option<String>,
+    /// Directories the user named explicitly. File tools may use absolute paths
+    /// inside them; without a project the first one is also the terminal's cwd.
+    pub workspace_roots: Vec<String>,
     pub context_limit: usize,
     pub reasoning_mode: String,
     pub supports_reasoning: bool,
@@ -52,6 +67,30 @@ pub struct Config {
     pub cancelled: Arc<AtomicBool>,
     pub steering: Arc<Mutex<Vec<String>>>,
     pub steering_closed: Arc<AtomicBool>,
+}
+
+impl Config {
+    pub fn tool_scope(&self) -> ToolScope {
+        if self.root.is_some() {
+            ToolScope::Project
+        } else if !self.workspace_roots.is_empty() {
+            ToolScope::Workspace
+        } else {
+            ToolScope::None
+        }
+    }
+
+    /// Root of file tools and cwd of the terminal: the selected project, else
+    /// the first directory the user named.
+    fn work_root(&self) -> Option<&str> {
+        self.root
+            .as_deref()
+            .or_else(|| self.workspace_roots.first().map(String::as_str))
+    }
+
+    fn grants(&self) -> Vec<PathBuf> {
+        self.workspace_roots.iter().map(PathBuf::from).collect()
+    }
 }
 
 /// Initial values follow Jan's shape but are deliberately configurable at the
@@ -99,6 +138,7 @@ const AGENT_GUIDANCE: &str = r#"
 - Task Memory = durable semantic continuity for this task. Record meaningful findings, decisions, blockers, and next actions, and cite the observation IDs (obs-…) a finding rests on in its evidence field. After compaction, trust a precise Task Memory finding from an unchanged inspected file; reread only for a missing fact, ambiguity, possible change, exact detail, or targeted verification.
 - Set Task Memory status and evidence as JSON fields, not prose inside finding. Confirmed entries require evidence containing an observation ID or exact inspected source path from this transcript. A valid reference does not prove the claim; use inferred or unknown for unverified conclusions.
 - Investigation state = a mechanical inventory the runtime keeps of this run's tool observations: files read with their observation IDs, listed entries and local files referenced by sources you read that were not opened yet, failed operations, and commands run. It is not a task list and nothing in it is required. Use it to avoid rereading and to notice code you have not seen; follow a reference only when what you are about to claim depends on it. Recover an exact stored body with observation_read.
+- Deliverables: when the request has two or more separate things to produce or change, or one result that must work end to end, record each requested one with the deliverables tool before you start. Mark an item done only after you observed it working, and block it with a concrete reason if it cannot be completed. Record only what the user asked for, never your own ideas. Do not use it for a single-step or analysis-only request. Produce what the user will see or use first and refine afterwards: a part is not finished until it is reachable the way the user will use it, not merely implemented. Files you create only to diagnose something are not part of the result; delete them before you finish.
 - Ground claims in what you observed. Keep observed facts, inferences and unknowns apart, and mark inferences as inferences. Something you did not open is unknown, not absent. State that something does not exist only for a scope you actually covered (a complete directory listing, a complete file read, or a search whose scope you can name) and name that scope; otherwise say it was not found in what you inspected. A failed or approval-blocked operation is a blocker, not evidence.
 - When the request lists areas or questions, answer each from something you inspected or report it as not inspected. Do not spend further tool calls only to re-verify what you have already read.
 - In the final answer, answer the user's sections directly, distinguish facts from hypotheses, prioritize concrete effects over generic advice, state what remained unexamined, and avoid duplicate points or meta-progress narration. Refer to sources by file path (and line or quoted text), never by observation ID: IDs are internal to this run. Treat claims about how the code was produced conservatively; style alone is weak evidence.
@@ -467,6 +507,24 @@ fn stable_prefix(config: &Config) -> String {
     if let Some(root) = &config.secondary_root {
         prefix.push_str(&format!("\nProject 2 root: {root}. Use project=2 for its tools. Roots are distinct identities; attribute findings to the selected project and do not infer one project's content from the other."));
     }
+    match config.tool_scope() {
+        ToolScope::Project if !config.workspace_roots.is_empty() => {
+            prefix.push_str(&format!(
+                "\nThe user also named these directories explicitly; file tools accept absolute paths inside them: {}.",
+                config.workspace_roots.join(", ")
+            ));
+        }
+        ToolScope::Workspace => {
+            prefix.push_str(&format!(
+                "\nNo project is selected. The user named these directories explicitly: {}. File tools accept absolute paths inside them, and a relative path resolves against the first one. run_terminal starts in the first one. Project knowledge tools are not available.",
+                config.workspace_roots.join(", ")
+            ));
+        }
+        ToolScope::None => {
+            prefix.push_str("\nNo project is selected and the user has not named a directory, so file and terminal tools are not available in this run. If the task needs them, say so and ask the user to name a directory or select a project. Do not claim an action was performed that no tool performed.");
+        }
+        ToolScope::Project => {}
+    }
     prefix
 }
 
@@ -494,6 +552,40 @@ fn dynamic_tail(
     if !memory.is_empty() {
         tail.push(format!("<task_memory>\n{memory}\n</task_memory>"));
     }
+    let deliverables = state.task_memory.deliverables.prompt();
+    if !deliverables.is_empty() {
+        tail.push(deliverables);
+    }
+    if !transcript.is_finalizing() && !user_requests_read_only(objective) {
+        if let Some(hint) = contract_hint(state, objective) {
+            tail.push(hint);
+        }
+    }
+    if state.task_memory.deliverables.has_pending() {
+        if transcript.is_finalizing() {
+            tail.push(format!("<unfinished_deliverables>{}</unfinished_deliverables>\nThe run budget ended before these were completed. In the answer, report each of them plainly as not completed: say what exists, what is missing and why the run stopped. Do not present them as done.", state.task_memory.deliverables.pending_summary()));
+        } else if let Some(notice) = run_budget_notice(
+            state.turn,
+            MAX_INVESTIGATION_TURNS,
+            &state.task_memory.deliverables.pending_summary(),
+        ) {
+            tail.push(notice);
+        }
+    }
+    if !transcript.is_finalizing() && !state.created_files.is_empty() {
+        let listed = state
+            .created_files
+            .iter()
+            .rev()
+            .take(12)
+            .rev()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        tail.push(format!(
+            "<files_created_this_run>{listed}</files_created_this_run>"
+        ));
+    }
     if !investigation.is_empty() {
         tail.push(investigation.to_owned());
     }
@@ -513,6 +605,59 @@ fn dynamic_tail(
         }
     }
     tail.join("\n")
+}
+
+/// Number of separate items the user's request itself enumerates (numbered or bulleted lines). Purely structural: it
+/// reads list markers, not words, so it works in any language and for any subject.
+fn enumerated_items(user: &str) -> usize {
+    user.lines()
+        .filter(|line| {
+            let line = line.trim_start();
+            let digits = line.chars().take_while(char::is_ascii_digit).count();
+            let numbered = digits > 0
+                && digits <= 2
+                && line[digits..]
+                    .chars()
+                    .next()
+                    .is_some_and(|marker| marker == '.' || marker == ')')
+                && line[digits + 1..].starts_with(char::is_whitespace);
+            let bulleted = ["- ", "* ", "• "]
+                .iter()
+                .any(|bullet| line.starts_with(bullet));
+            (numbered || bulleted) && line.chars().filter(|c| c.is_alphabetic()).count() >= 6
+        })
+        .count()
+}
+
+/// A short hint, shown only while no deliverables are recorded, that the model is expected to write down what was
+/// asked. It costs no turn and stops after the early part of the run.
+fn contract_hint(state: &AgentState, user: &str) -> Option<String> {
+    const HINT_UNTIL_TURN: usize = 25;
+    if !state.task_memory.deliverables.is_empty() || state.turn >= HINT_UNTIL_TURN {
+        return None;
+    }
+    let items = enumerated_items(user);
+    if items >= 2 {
+        return Some(format!("<deliverables_hint>The request lists {items} separate items. Record each requested one with the deliverables tool (action add) before you start, so none is lost on a long run.</deliverables_hint>"));
+    }
+    (state.mutations > 0).then(|| "<deliverables_hint>You have started changing the project but recorded no deliverables. If the request has two or more separate things to deliver, record them with the deliverables tool now and mark what already works as done. Ignore this for a single-step request.</deliverables_hint>".to_owned())
+}
+
+/// Makes the turn budget visible once it matters, and only while requested
+/// deliverables are still unfinished: the model otherwise has no way to know
+/// that it is spending the last turns on refinements of the first deliverable.
+fn run_budget_notice(turn: usize, budget: usize, pending: &str) -> Option<String> {
+    let used = turn.saturating_add(1);
+    if used * 2 < budget {
+        return None;
+    }
+    let left = budget.saturating_sub(used);
+    let urgency = if used * 100 >= budget * 85 {
+        format!(" Only about {left} turns remain: finish what the user will use, and mark anything you cannot complete as blocked with the reason.")
+    } else {
+        " Put the remaining turns on delivering what the user will see or use first; extra tests and refinements come after it works.".to_owned()
+    };
+    Some(format!("<run_budget>Turn {used} of {budget}. Unfinished deliverables: {pending}.{urgency}</run_budget>"))
 }
 
 fn emit_knowledge_diagnostics(config: &Config, state: &AgentState) {
@@ -554,15 +699,16 @@ fn emit_knowledge_diagnostics(config: &Config, state: &AgentState) {
     );
 }
 
-fn tool_schemas(has_project_root: bool) -> Vec<Value> {
+fn tool_schemas(scope: ToolScope) -> Vec<Value> {
     // Native tool grammars enumerate object-root properties, not union roots.
     // Action-specific requirements are enforced transactionally at dispatch.
     let mut tools = vec![
         json!({"type":"function","function":{"name":"task_memory","description":"Durable semantic memory for the current task across compaction. Record/update meaningful findings, decisions, blockers, or unresolved questions; view reads it; invalidate needs id. Record/update requires finding and may include evidence, implication, next, id, supersedes, status. Trust precise unchanged-file memory; reread only for a concrete missing, ambiguous, changed, exact-detail, or verification need.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["record","update","invalidate","view"]},"id":{"type":"string"},"finding":{"type":"string"},"evidence":{"type":"string"},"implication":{"type":"string"},"next":{"type":"string"},"supersedes":{"type":"string"},"status":{"type":"string","enum":["confirmed","inferred","unknown","contradicted"],"description":"How well established the finding is: confirmed (observed, cited), inferred (reasoned, not observed), unknown (open; put the resolving step in next), contradicted (evidence disagrees)."}},"required":["action"]}}}),
+        json!({"type":"function","function":{"name":"deliverables","description":"The user's requested deliverables for this task (execution contract). Use it only when the request has two or more separate things to produce or change, or one result that must work end to end. add: record each requested deliverable once (text, optional task). done: after you observed it working (id, evidence). block: it cannot be completed (id, concrete reason). drop: the user withdrew it (id, reason). view: list them. Record only what the user asked for, never your own optional ideas.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["add","done","block","drop","view"]},"id":{"type":"string"},"task":{"type":"string"},"text":{"type":"string"},"evidence":{"type":"string"},"reason":{"type":"string"}},"required":["action"]}}}),
         json!({"type":"function","function":{"name":"observation_index","description":"List historical tool observations by stable ID, with source path and outcome metadata. Use source to select the raw observation for the needed file. If more=true, continue at the returned next_offset. Observation IDs start with obs-.","parameters":{"type":"object","properties":{"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":50}}}}}),
         json!({"type":"function","function":{"name":"observation_read","description":"Recover a bounded exact slice of a stored historical tool result by observation ID. The response distinguishes historical evidence from current source and reports whether the source changed.","parameters":{"type":"object","properties":{"id":{"type":"string"},"offset_chars":{"type":"integer","minimum":0},"max_chars":{"type":"integer","minimum":1,"maximum":16000}},"required":["id"]}}}),
     ];
-    if has_project_root {
+    if scope != ToolScope::None {
         tools.extend([
             json!({"type":"function","function":{"name":"apply_patch","description":"Apply a project patch.","parameters":{"type":"object","properties":{"patch":{"type":"string"}},"required":["patch"]}}}),
             json!({"type":"function","function":{"name":"create_file","description":"Create a new project file.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}),
@@ -576,6 +722,10 @@ fn tool_schemas(has_project_root: bool) -> Vec<Value> {
             json!({"type":"function","function":{"name":"write_file","description":"Write a project file.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}),
         ]);
     }
+    if scope == ToolScope::Workspace {
+        // The .ai-framework cache belongs to a selected project.
+        tools.retain(|tool| !tool_name(tool).starts_with("project_knowledge_"));
+    }
     tools.sort_by(|left, right| tool_name(left).cmp(tool_name(right)));
     tools
 }
@@ -583,13 +733,14 @@ fn tool_schemas(has_project_root: bool) -> Vec<Value> {
 /// cannot strand the model behind an approval-only capability. Task Memory and
 /// explicit knowledge reads remain available so analysis has a complete
 /// working contract.
-fn tool_schemas_for_policy(has_project_root: bool, policy: RunPolicy) -> Vec<Value> {
-    let mut tools = tool_schemas(has_project_root);
+fn tool_schemas_for_policy(scope: ToolScope, policy: RunPolicy) -> Vec<Value> {
+    let mut tools = tool_schemas(scope);
     if policy == RunPolicy::Safe {
         tools.retain(|tool| {
             matches!(
                 tool_name(tool),
                 "task_memory"
+                    | "deliverables"
                     | "observation_index"
                     | "observation_read"
                     | "read_file"
@@ -641,10 +792,14 @@ fn user_requests_read_only(user: &str) -> bool {
     .any(|marker| user.contains(marker))
 }
 
-fn tool_schemas_for_request(has_project_root: bool, policy: RunPolicy, user: &str) -> Vec<Value> {
-    let mut tools = tool_schemas_for_policy(has_project_root, policy);
+fn tool_schemas_for_request(scope: ToolScope, policy: RunPolicy, user: &str) -> Vec<Value> {
+    let mut tools = tool_schemas_for_policy(scope, policy);
     if user_requests_read_only(user) {
-        tools.retain(|tool| !is_project_side_effect_tool(tool_name(tool)));
+        // A read-only request produces nothing to deliver, so the execution
+        // contract tool is not offered either.
+        tools.retain(|tool| {
+            !is_project_side_effect_tool(tool_name(tool)) && tool_name(tool) != "deliverables"
+        });
     }
     tools
 }
@@ -844,6 +999,80 @@ fn apply_task_memory(
         json!({"task_memory": state.task_memory, "updated": true}),
         true,
     ))
+}
+
+/// Updates the execution contract. In Deep, completing an item needs evidence
+/// that cites an observation or an inspected source path, like a confirmed
+/// finding; Fast only asks the model to say what it observed.
+fn apply_deliverables(
+    state: &mut AgentState,
+    arguments: &Value,
+    transcript: &Transcript,
+) -> Result<(Value, bool), String> {
+    let action = required_text(arguments, "action")?;
+    let text_of = |key: &str| {
+        arguments
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let id = || required_text(arguments, "id");
+    let mut candidate = state.task_memory.deliverables.clone();
+    match action.as_str() {
+        "view" => {
+            return Ok((
+                json!({"deliverables": state.task_memory.deliverables, "updated": false}),
+                false,
+            ))
+        }
+        "add" => {
+            candidate.add(
+                arguments.get("id").and_then(Value::as_str),
+                &text_of("task"),
+                &text_of("text"),
+            )?;
+        }
+        "done" => {
+            let id = id()?;
+            let evidence = text_of("evidence");
+            if state.strategy.is_deep() {
+                let probe = crate::agent::task_memory::TaskMemoryEntry {
+                    id: id.clone(),
+                    finding: "deliverable".into(),
+                    evidence: evidence.clone(),
+                    status: Some(crate::agent::task_memory::Status::Confirmed),
+                    ..Default::default()
+                };
+                validate_confirmed_memory(&probe, transcript).map_err(|_| {
+                    "In Deep mode a deliverable is marked done only with evidence that cites an observation ID (obs-…) or the exact path of a source you inspected in this run. Check that it works, then retry with that evidence; nothing was changed.".to_owned()
+                })?;
+            }
+            candidate.complete(&id, &evidence)?;
+        }
+        "block" => candidate.block(&id()?, &text_of("reason"))?,
+        "drop" => candidate.drop_item(&id()?, &text_of("reason"))?,
+        _ => {
+            return Err(
+                "unsupported deliverables action: use add, done, block, drop or view".into(),
+            )
+        }
+    }
+    state.task_memory.deliverables = candidate;
+    Ok((
+        json!({"deliverables": state.task_memory.deliverables, "updated": true}),
+        true,
+    ))
+}
+
+/// Paths a patch adds, so files created through `apply_patch` are tracked too.
+fn patch_added_files(patch: &str) -> Vec<String> {
+    patch
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("*** Add File:"))
+        .map(|path| path.trim().to_owned())
+        .filter(|path| !path.is_empty())
+        .collect()
 }
 
 fn mutation_tool(name: &str) -> bool {
@@ -1733,32 +1962,57 @@ fn summarize_span(config: &Config, plan: &CompactionPlan) -> SummaryResult {
             output_tokens: 0,
         };
     }
-    let payload = summary_payload(config, &messages, max_tokens);
-    match stream_call(
-        &config.endpoint,
-        &payload,
-        &config.run_id,
-        0,
-        &config.cancelled,
-        false,
-        false,
-    ) {
-        Ok(turn) if !turn.content.trim().is_empty() => {
-            let text = mark_if_cut_at_output_limit(turn.content.trim(), &turn.finish_reason);
-            SummaryResult {
-                output_tokens: turn
-                    .completion_tokens
-                    .map_or_else(|| estimate_tokens(&json!(text)), |tokens| tokens as usize),
-                text,
-                input_tokens,
+    // A model that is mid-task may answer the summary request with tool-call
+    // markup instead of a handoff. That is not a summary: it carries none of
+    // the state compaction exists to preserve, so it is retried once with an
+    // explicit instruction and otherwise replaced by a neutral note (Task
+    // Memory and the deliverables stay authoritative in the prompt tail).
+    let mut attempt_messages = messages.clone();
+    for attempt in 0..2 {
+        let payload = summary_payload(config, &attempt_messages, max_tokens);
+        if let Ok(turn) = stream_call(
+            &config.endpoint,
+            &payload,
+            &config.run_id,
+            0,
+            &config.cancelled,
+            false,
+            false,
+        ) {
+            if is_usable_summary(&turn.content) {
+                let text = mark_if_cut_at_output_limit(turn.content.trim(), &turn.finish_reason);
+                return SummaryResult {
+                    output_tokens: turn
+                        .completion_tokens
+                        .map_or_else(|| estimate_tokens(&json!(text)), |tokens| tokens as usize),
+                    text,
+                    input_tokens,
+                };
             }
         }
-        _ => SummaryResult {
-            text: "Earlier conversation was compacted; the current prompt contains the usable summary and retained recent transcript.".into(),
-            input_tokens,
-            output_tokens: 0,
-        },
+        if attempt == 0 {
+            attempt_messages.push(json!({"role":"user", "content":"Reply with the plain-text checkpoint only, under the required headings. Do not call tools and do not write tool-call markup."}));
+        }
     }
+    SummaryResult {
+        text: "Earlier conversation was compacted; the current prompt contains the usable summary and retained recent transcript.".into(),
+        input_tokens,
+        output_tokens: 0,
+    }
+}
+
+/// A summary must be prose. Empty text, or text that is (or starts with)
+/// tool-call markup, preserves nothing.
+fn is_usable_summary(content: &str) -> bool {
+    let text = content.trim();
+    if text.is_empty() {
+        return false;
+    }
+    let lowered = text.to_ascii_lowercase();
+    !(lowered.starts_with("<tool_call")
+        || lowered.starts_with("<function=")
+        || lowered.starts_with("<|tool_call")
+        || (lowered.contains("<tool_call>") && lowered.contains("<function=")))
 }
 
 /// A checkpoint that stopped at the output limit is incomplete, and its last
@@ -2240,6 +2494,35 @@ fn request_shape(messages: &[Value]) -> Vec<String> {
         .collect()
 }
 
+/// Project 2 is a reference the user may only want to read. Passive knowledge
+/// caching writes into the project's `.ai-framework`, so it is limited to the
+/// primary project; an explicit `project_knowledge_update` stays the model's choice.
+fn targets_secondary_project(tool: &ValidatedCall) -> bool {
+    tool.arguments.get("project").and_then(Value::as_u64) == Some(2)
+}
+
+/// A reference project without a knowledge cache stays that way: the knowledge
+/// tools would otherwise create `.ai-framework` in it just to answer "nothing here".
+fn absent_reference_knowledge(config: &Config, tool: &ValidatedCall) -> Option<Value> {
+    if !targets_secondary_project(tool)
+        || !matches!(
+            tool.name.as_str(),
+            "project_knowledge_index" | "project_knowledge_read"
+        )
+    {
+        return None;
+    }
+    let root = config.root.as_deref()?;
+    if Path::new(root).join(".ai-framework").exists() {
+        return None;
+    }
+    Some(json!({
+        "exists": false,
+        "entries": [],
+        "message": "Project 2 has no knowledge cache and the runtime does not create one in a reference project. Read its files directly."
+    }))
+}
+
 fn scoped_tool_config(config: &Config, tool: &ValidatedCall) -> Result<Config, String> {
     let slot = match tool.arguments.get("project") {
         None => 1,
@@ -2303,6 +2586,9 @@ fn run_scoped_tool(
 ) -> Result<(Value, Option<String>), String> {
     let scoped = scoped_tool_config(config, tool)?;
     let config = &scoped;
+    if let Some(absent) = absent_reference_knowledge(config, tool) {
+        return Ok((absent, None));
+    }
     match tool.name.as_str() {
         "project_knowledge_index" => {
             let root = config
@@ -2360,6 +2646,19 @@ fn run_scoped_tool(
             emit_knowledge_diagnostics(config, state);
             Ok((value, None))
         }
+        "deliverables" => {
+            let (value, changed) = apply_deliverables(state, &tool.arguments, transcript)?;
+            if changed {
+                emit(
+                    &config.run_id,
+                    Event::TaskMemoryUpdate {
+                        memory: serde_json::to_value(&state.task_memory)
+                            .map_err(|error| error.to_string())?,
+                    },
+                );
+            }
+            Ok((value, None))
+        }
         "task_memory" => {
             let (value, changed) = apply_task_memory(state, &tool.arguments, transcript)?;
             if changed {
@@ -2375,8 +2674,8 @@ fn run_scoped_tool(
         }
         "run_terminal" => {
             let root = config
-                .root
-                .as_ref()
+                .work_root()
+                .map(str::to_owned)
                 .ok_or_else(|| "no project scope".to_owned())?;
             let command = tool
                 .arguments
@@ -2385,7 +2684,7 @@ fn run_scoped_tool(
                 .unwrap_or_default()
                 .to_owned();
             let value = crate::tools::shell::execute(
-                &PathBuf::from(root),
+                &PathBuf::from(&root),
                 &tool.arguments,
                 || config.cancelled.load(Ordering::Relaxed),
                 |pid, pgid, session_id, started_at| {
@@ -2425,12 +2724,45 @@ fn run_scoped_tool(
         }
         name => {
             let root = config
-                .root
-                .as_ref()
+                .work_root()
                 .ok_or_else(|| "no project scope".to_owned())?;
-            let result =
-                crate::tools::filesystem::execute(&PathBuf::from(root), name, &tool.arguments)?;
-            if matches!(name, "read_file" | "list_directory")
+            let grants = config.grants();
+            let target = tool
+                .arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let existed_before = target
+                .as_deref()
+                .is_some_and(|path| Path::new(root).join(path).exists());
+            let result = crate::tools::filesystem::execute_in(
+                &crate::tools::filesystem::Scope {
+                    root: Path::new(root),
+                    grants: &grants,
+                },
+                name,
+                &tool.arguments,
+            )?;
+            match (name, target.as_deref()) {
+                ("create_file" | "write_file", Some(path)) if !existed_before => {
+                    state.record_created_file(path);
+                }
+                ("delete_file", Some(path)) => state.record_deleted_file(path),
+                ("apply_patch", _) => {
+                    let patch = tool
+                        .arguments
+                        .get("patch")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    for path in patch_added_files(patch) {
+                        state.record_created_file(&path);
+                    }
+                }
+                _ => {}
+            }
+            if config.root.is_some()
+                && !targets_secondary_project(tool)
+                && matches!(name, "read_file" | "list_directory")
                 && !user_requests_read_only(&config.user)
             {
                 let _ = crate::tools::knowledge::observe_tool(
@@ -2611,20 +2943,38 @@ fn run_scoped_read_tool(
 ) -> Result<(Value, Option<String>), String> {
     let scoped = scoped_tool_config(config, tool)?;
     let config = &scoped;
+    if let Some(absent) = absent_reference_knowledge(config, tool) {
+        return Ok((absent, None));
+    }
     let root = config
-        .root
-        .as_ref()
+        .work_root()
         .ok_or_else(|| "no project scope".to_owned())?;
     match tool.name.as_str() {
         "project_knowledge_index" => {
+            let root = config
+                .root
+                .as_ref()
+                .ok_or_else(|| "no project scope".to_owned())?;
             crate::tools::knowledge::index(&PathBuf::from(root)).map(|value| (value, None))
         }
         "project_knowledge_read" => {
+            let root = config
+                .root
+                .as_ref()
+                .ok_or_else(|| "no project scope".to_owned())?;
             crate::tools::knowledge::read(&PathBuf::from(root), &tool.arguments)
                 .map(|value| (value, None))
         }
         "read_file" | "list_directory" => {
-            crate::tools::filesystem::execute(&PathBuf::from(root), &tool.name, &tool.arguments)
+            let grants = config.grants();
+            crate::tools::filesystem::execute_in(
+                &crate::tools::filesystem::Scope {
+                    root: Path::new(root),
+                    grants: &grants,
+                },
+                &tool.name,
+                &tool.arguments,
+            )
         }
         _ => Err(format!("{} is not a safe read-only tool", tool.name)),
     }
@@ -2640,6 +2990,9 @@ fn record_safe_read_effect(
         return;
     };
     let config = &scoped;
+    if absent_reference_knowledge(config, tool).is_some() {
+        return;
+    }
     match tool.name.as_str() {
         "project_knowledge_index" | "project_knowledge_read" => {
             if tool.name == "project_knowledge_read" {
@@ -2665,7 +3018,7 @@ fn record_safe_read_effect(
             emit_knowledge_diagnostics(config, state);
         }
         "read_file" | "list_directory" => {
-            if !user_requests_read_only(&config.user) {
+            if !user_requests_read_only(&config.user) && !targets_secondary_project(tool) {
                 if let Some(root) = config.root.as_deref() {
                     let _ = crate::tools::knowledge::observe_tool(
                         &PathBuf::from(root),
@@ -2704,6 +3057,7 @@ fn add_soft_closeout_if_needed(state: &mut AgentState, transcript: &mut Transcri
 }
 
 enum FinalCandidateReview {
+    PendingDeliverables(String),
     Accept,
     ValidationPending,
     /// One bounded reminder naming concrete, mechanically known local files
@@ -2727,6 +3081,18 @@ fn review_tool_free_final(
     }
     if add_soft_closeout_if_needed(state, transcript) {
         return FinalCandidateReview::ValidationPending;
+    }
+    // The model recorded what the user asked for and has not finished it. Deep
+    // may be sent back twice; Fast once. Afterwards the answer is accepted, so
+    // this can never deadlock a run. The answer must then say what is missing.
+    let allowed_reviews = if state.strategy.is_deep() { 2 } else { 1 };
+    if state.task_memory.deliverables.has_pending() && state.deliverable_reviews < allowed_reviews {
+        state.deliverable_reviews += 1;
+        return FinalCandidateReview::PendingDeliverables(deliverables::pending_review(
+            &state.task_memory.deliverables.pending_summary(),
+            &state.created_files,
+            state.strategy.is_deep(),
+        ));
     }
     let requests = ledger.unopened_requests();
     if !state.request_review_given && !requests.is_empty() {
@@ -2813,12 +3179,12 @@ pub fn run(config: Config) {
     };
     let stable = stable_prefix(&config);
     transcript.set_secondary_project_root(config.secondary_root.as_deref().map(Path::new));
-    let mut schemas = tool_schemas_for_request(config.root.is_some(), config.policy, &config.user);
+    let mut schemas = tool_schemas_for_request(config.tool_scope(), config.policy, &config.user);
     if config.secondary_root.is_some() {
         for schema in &mut schemas {
             if !matches!(
                 tool_name(schema),
-                "task_memory" | "observation_read" | "observation_index"
+                "task_memory" | "deliverables" | "observation_read" | "observation_index"
             ) {
                 schema["function"]["parameters"]["properties"]["project"] = json!({"type":"integer","enum":[1,2],"description":"Selected project slot. 1 is the primary root; 2 is the secondary root. Defaults to 1."});
             }
@@ -2881,6 +3247,7 @@ pub fn run(config: Config) {
                 emit(&config.run_id, Event::SteeringApplied { content });
             }
         }
+        state.turn = turn;
         if turn >= MAX_INVESTIGATION_TURNS && !transcript.is_finalizing() {
             transcript.mark_finalizing();
             trace_forensics(
@@ -3418,6 +3785,17 @@ pub fn run(config: Config) {
                     transcript.assistant_withheld_draft(streamed.content, "pending validation");
                     continue;
                 }
+                FinalCandidateReview::PendingDeliverables(nudge) => {
+                    trace_forensics(
+                        &config.run_id,
+                        "completion_review",
+                        json!({"decision":"pending_deliverables","turn":turn+1,"pending":state.task_memory.deliverables.pending_summary()}),
+                    );
+                    transcript
+                        .assistant_withheld_draft(streamed.content, "unfinished deliverables");
+                    transcript.remind(nudge);
+                    continue;
+                }
                 FinalCandidateReview::UnopenedRequests(nudge) => {
                     trace_forensics(
                         &config.run_id,
@@ -3742,7 +4120,7 @@ pub fn run(config: Config) {
                     &tool.name,
                     concise_tool_error(if tool.name == "run_terminal" && tool.arguments.get("command").and_then(Value::as_str).is_some_and(|c| c.contains("git ")) {
                         "approval required for shell composition. For read-only history, retry as one scoped command: git -C <selected-project> log --oneline -30. Do not treat this attempt as evidence of repository history."
-                    } else { "approval required" }),
+                    } else if tool.name == "run_terminal" { "approval required: this command uses shell composition (&&, ||, ;, redirection, substitution, a wrapper) or affects the user session, and it was not run. Run each step as its own simple command; the terminal already starts in the working directory, so cd is not needed. Do not treat this refusal as a result." } else { "approval required" }),
                 );
                 continue;
             }
@@ -4214,6 +4592,7 @@ mod tests {
             user: "audit".into(),
             root: None,
             secondary_root: None,
+            workspace_roots: Vec::new(),
             context_limit: window,
             reasoning_mode: "fast".into(),
             supports_reasoning: true,
@@ -4366,7 +4745,7 @@ mod tests {
 
     #[test]
     fn experimental_toolset_excludes_todo_and_keeps_production_capabilities() {
-        let schemas = tool_schemas(true);
+        let schemas = tool_schemas(ToolScope::Project);
         let names = schemas.iter().map(tool_name).collect::<Vec<_>>();
         assert!(!names.contains(&"todo"));
         for name in [
@@ -4404,7 +4783,7 @@ mod tests {
 
     #[test]
     fn task_memory_schema_exposes_parameters_at_object_root() {
-        let memory = tool_schemas(true)
+        let memory = tool_schemas(ToolScope::Project)
             .into_iter()
             .find(|tool| tool_name(tool) == "task_memory")
             .unwrap();
@@ -4429,7 +4808,7 @@ mod tests {
 
     #[test]
     fn provider_serialization_preserves_declared_tool_parameter_order() {
-        let schemas = tool_schemas(true);
+        let schemas = tool_schemas(ToolScope::Project);
         let payload = json!({"tools": schemas});
         let wire = serde_json::to_string(&payload).unwrap();
         let decoded: Value = serde_json::from_str(&wire).unwrap();
@@ -4536,7 +4915,7 @@ mod tests {
     #[test]
     fn explicit_read_only_request_removes_project_mutations_from_toolset() {
         for prompt in ["Не изменяй файлы.", "Do not modify files."] {
-            let schemas = tool_schemas_for_request(true, RunPolicy::Auto, prompt);
+            let schemas = tool_schemas_for_request(ToolScope::Project, RunPolicy::Auto, prompt);
             let names = schemas.iter().map(tool_name).collect::<Vec<_>>();
             for name in [
                 "apply_patch",
@@ -4560,7 +4939,11 @@ mod tests {
             }
         }
 
-        let writable = tool_schemas_for_request(true, RunPolicy::Auto, "Update the project files.");
+        let writable = tool_schemas_for_request(
+            ToolScope::Project,
+            RunPolicy::Auto,
+            "Update the project files.",
+        );
         assert!(writable.iter().any(|tool| tool_name(tool) == "write_file"));
     }
 
@@ -5156,6 +5539,198 @@ mod tests {
             restored
         );
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    fn state_with_pending() -> AgentState {
+        let mut state = AgentState::default();
+        state
+            .task_memory
+            .deliverables
+            .add(None, "bot", "bot opponent is selectable in the UI")
+            .unwrap();
+        state
+            .task_memory
+            .deliverables
+            .add(None, "theme", "theme switch changes the theme")
+            .unwrap();
+        state
+            .task_memory
+            .deliverables
+            .complete("d-001", "")
+            .unwrap();
+        state
+    }
+
+    #[test]
+    fn unfinished_deliverables_are_in_every_tail_and_survive_what_compaction_discards() {
+        let state = state_with_pending();
+        let tail = dynamic_tail(&state, None, "", &Transcript::default(), "");
+        assert!(tail.contains("[done] d-001 bot opponent is selectable in the UI"));
+        assert!(tail.contains("[pending] d-002 theme switch changes the theme"));
+        // The tail is rebuilt from durable state each turn, so a compaction summary can never be the only place
+        // the requirements live.
+        let mut compacted = Transcript::default();
+        compacted.push_run_user(json!({"role":"user","content":"x"}));
+        compacted.compact("[checkpoint without any deliverables]".into(), 1);
+        assert!(dynamic_tail(&state, None, "", &compacted, "").contains("[pending] d-002"));
+    }
+
+    #[test]
+    fn enumerated_items_are_counted_from_list_markers_not_from_words() {
+        assert_eq!(
+            enumerated_items("Do two things.\n1. Add the bot mode\n2. Add the theme switch"),
+            2
+        );
+        assert_eq!(enumerated_items("У тебя 2 задачи.\n1. Добавить режим бота\n2) Добавить переключатель темы\n3 не пункт"), 2);
+        assert_eq!(
+            enumerated_items(
+                "- first thing to build\n* second thing to build\n• third thing to build"
+            ),
+            3
+        );
+        assert_eq!(
+            enumerated_items("Add a mode and also a theme switch in one go, 2 things in total."),
+            0
+        );
+        assert_eq!(
+            enumerated_items("1. ok"),
+            0,
+            "a marker with no real content is not an item"
+        );
+        assert_eq!(
+            enumerated_items("version 1.2 is out\nsee 3.5 for details"),
+            0
+        );
+    }
+
+    #[test]
+    fn the_contract_hint_is_structural_bounded_and_goes_away_once_a_list_exists() {
+        let request =
+            "Two tasks:\n1. Add the bot mode to the game\n2. Add the theme switch to the game";
+        let mut state = AgentState::default();
+        assert!(contract_hint(&state, request)
+            .unwrap()
+            .contains("lists 2 separate items"));
+        assert!(
+            contract_hint(&state, "Fix the typo in the readme").is_none(),
+            "a single-step request gets no hint"
+        );
+        state.mutations = 1;
+        assert!(contract_hint(&state, "Fix the typo in the readme")
+            .unwrap()
+            .contains("Ignore this for a single-step request"));
+        state.turn = 30;
+        assert!(
+            contract_hint(&state, request).is_none(),
+            "the hint must stop nagging"
+        );
+        state.turn = 3;
+        state
+            .task_memory
+            .deliverables
+            .add(None, "", "the bot mode is selectable")
+            .unwrap();
+        assert!(
+            contract_hint(&state, request).is_none(),
+            "once a list exists the hint is redundant"
+        );
+        let mut fresh = AgentState::default();
+        assert!(
+            dynamic_tail(&fresh, None, request, &Transcript::default(), "")
+                .contains("<deliverables_hint>")
+        );
+        assert!(!dynamic_tail(
+            &fresh,
+            None,
+            "Audit the product. Do not modify files.\n1. Product\n2. Backend",
+            &Transcript::default(),
+            ""
+        )
+        .contains("<deliverables_hint>"));
+        fresh.turn = 1;
+    }
+
+    #[test]
+    fn the_budget_notice_appears_only_while_deliverables_are_pending_and_the_budget_is_half_used() {
+        assert!(run_budget_notice(10, 128, "d-002 x").is_none());
+        let middle = run_budget_notice(70, 128, "d-002 x").unwrap();
+        assert!(middle.contains("Turn 71 of 128") && middle.contains("d-002 x"));
+        assert!(!middle.contains("Only about"));
+        let late = run_budget_notice(120, 128, "d-002 x").unwrap();
+        assert!(late.contains("Only about 7 turns remain") && late.contains("blocked"));
+        let mut state = state_with_pending();
+        state.turn = 100;
+        let tail = dynamic_tail(&state, None, "", &Transcript::default(), "");
+        assert!(tail.contains("<run_budget>"));
+        state
+            .task_memory
+            .deliverables
+            .complete("d-002", "")
+            .unwrap();
+        assert!(
+            !dynamic_tail(&state, None, "", &Transcript::default(), "").contains("<run_budget>")
+        );
+    }
+
+    #[test]
+    fn a_forced_final_names_the_unfinished_deliverables_and_forbids_calling_them_done() {
+        let state = state_with_pending();
+        let mut transcript = Transcript::default();
+        transcript.mark_finalizing();
+        let tail = dynamic_tail(&state, None, "", &transcript, "");
+        assert!(
+            tail.contains("<unfinished_deliverables>d-002 theme switch changes the theme (theme)")
+        );
+        assert!(tail.contains("report each of them plainly as not completed"));
+        assert!(!tail.contains("<run_budget>"));
+    }
+
+    #[test]
+    fn tool_call_markup_is_not_a_usable_compaction_summary() {
+        assert!(!is_usable_summary(""));
+        assert!(!is_usable_summary("   \n"));
+        assert!(!is_usable_summary(
+            "<tool_call>\n<function=read_file>\n<parameter=path>\nx\n</parameter>\n</function>\n</tool_call>"
+        ));
+        assert!(!is_usable_summary(
+            "<function=read_file><parameter=path>x</parameter></function>"
+        ));
+        assert!(is_usable_summary(
+            "Established work:\n- read the rules\nCurrent focus: wiring"
+        ));
+        assert!(is_usable_summary("A summary that mentions <tool_call> markup only in passing is prose, but must start as prose."));
+    }
+
+    #[test]
+    fn guidance_describes_the_execution_contract_without_forcing_it_on_simple_requests() {
+        assert!(AGENT_GUIDANCE.contains("deliverables tool"));
+        assert!(AGENT_GUIDANCE.contains("Do not use it for a single-step or analysis-only request"));
+        assert!(AGENT_GUIDANCE.contains("never your own ideas"));
+        assert!(AGENT_GUIDANCE.contains("delete them before you finish"));
+        assert!(Strategy::Deep
+            .guidance()
+            .contains("what you observed, not what you intended"));
+        assert!(!Strategy::Fast.guidance().contains("deliverable"));
+    }
+
+    #[test]
+    fn the_deliverables_tool_schema_is_flat_and_survives_serialization_in_declaration_order() {
+        let tool = tool_schemas(ToolScope::Project)
+            .into_iter()
+            .find(|tool| tool_name(tool) == "deliverables")
+            .expect("deliverables tool");
+        let parameters = &tool["function"]["parameters"];
+        assert!(parameters.get("oneOf").is_none() && parameters.get("anyOf").is_none());
+        let serialized = serde_json::to_string(parameters).unwrap();
+        let order = ["action", "id", "task", "text", "evidence", "reason"]
+            .iter()
+            .map(|key| serialized.find(&format!("\"{key}\"")).unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            order.windows(2).all(|pair| pair[0] < pair[1]),
+            "{serialized}"
+        );
+        assert_eq!(parameters["required"], json!(["action"]));
     }
 
     #[test]

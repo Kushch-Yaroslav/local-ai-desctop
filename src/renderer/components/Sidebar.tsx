@@ -1,8 +1,9 @@
+import { useShallow } from 'zustand/react/shallow';
 import { MessageSquarePlus, MoreHorizontal, Pencil, Trash2 } from 'lucide-react';
 import { useAppStore } from '../store/app-store';
 
 export function Sidebar() {
-  const { conversations, models, activeId, generationConversationId, createConversation, selectConversation, updateConversation, deleteConversation } = useAppStore();
+  const { conversations, models, activeId, generationConversationId, createConversation, selectConversation, updateConversation, deleteConversation } = useAppStore(useShallow((state) => ({ conversations: state.conversations, models: state.models, activeId: state.activeId, generationConversationId: state.generationConversationId, createConversation: state.createConversation, selectConversation: state.selectConversation, updateConversation: state.updateConversation, deleteConversation: state.deleteConversation })));
   const rename = async (id: string, title: string) => { const value = window.prompt('Название чата', title)?.trim(); if (value) await updateConversation(id, { title: value }); };
   const formatDate = (value: string) => { const date = new Date(value); return Number.isNaN(date.valueOf()) ? null : new Intl.DateTimeFormat('uk-UA', { day: '2-digit', month: '2-digit', year: 'numeric' }).format(date); };
   const groups = new Map<string, typeof conversations>();

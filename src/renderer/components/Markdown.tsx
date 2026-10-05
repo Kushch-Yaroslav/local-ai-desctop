@@ -237,9 +237,29 @@ const MarkdownDocument = memo(function MarkdownDocument({ children }: { children
   }}>{children}</ReactMarkdown>;
 });
 
+/**
+ * Finished text far from the viewport is shown as plain text and parsed into Markdown only when it comes near. Mounting
+ * a long run means parsing and highlighting every paragraph of it; doing that for what nobody is looking at made the
+ * end of a run, and reopening one, cost time proportional to its length. The text is in the DOM either way, so
+ * selection and find-in-page behave the same, and once upgraded it stays upgraded.
+ */
+const NEAR_VIEWPORT = '1500px 0px';
+const LazyMarkdown = memo(function LazyMarkdown({ children }: { children: string }) {
+  const host = useRef<HTMLDivElement>(null);
+  const [near, setNear] = useState(() => typeof IntersectionObserver === 'undefined');
+  useEffect(() => {
+    const element = host.current;
+    if (near || !element) return undefined;
+    const observer = new IntersectionObserver((entries) => { if (entries.some((entry) => entry.isIntersecting)) { setNear(true); observer.disconnect(); } }, { rootMargin: NEAR_VIEWPORT });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [near]);
+  return <div ref={host}>{near ? <MarkdownDocument>{children}</MarkdownDocument> : <div className="lazy-markdown">{children}</div>}</div>;
+});
+
 /** Completed Markdown sections remain mounted; only the live tail is reparsed and revealed. */
-export function Markdown({ children, streaming = false }: { children: string; streaming?: boolean }) {
-  if (!streaming) return <MarkdownDocument>{children}</MarkdownDocument>;
+export function Markdown({ children, streaming = false, lazy = false }: { children: string; streaming?: boolean; lazy?: boolean }) {
+  if (!streaming) return lazy ? <LazyMarkdown>{children}</LazyMarkdown> : <MarkdownDocument>{children}</MarkdownDocument>;
   const sections = streamingSections(children);
   return <div className="markdown-stream">{sections.map((section, index) => {
     const live = index === sections.length - 1;

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import type { ChatMessage } from '../../shared/types';
 import { runtimeTextEvent, splitAgentRunHistory, taskPlan } from './rust-agent-runtime';
-import { displayToolResult, toolResultSummary } from '../../renderer/components/AgentTimeline';
+import { deliverablesChecklist, displayToolResult, toolResultSummary } from '../../renderer/components/AgentTimeline';
 
 const message = (role: ChatMessage['role'], content: string): ChatMessage => ({
   id: `${role}-${content}`, conversationId: 'test', role, content, createdAt: '2026-01-01T00:00:00.000Z',
@@ -32,9 +32,19 @@ export function runRustAgentRuntimeRegression(): void {
   assert.equal(plan.milestones?.[0]?.workPlan.tasks[1]?.id, 'work-2');
   const knowledgeActivity = { id: 'knowledge', label: 'Project knowledge', detail: 'project_knowledge_read', kind: 'file_read' as const, state: 'completed' as const, output: JSON.stringify({ entries: [{ status: 'ok', path: 'sources/App.tsx', content: 'large cached body' }, { status: 'missing', path: 'tasks/audit.md', message: 'not materialized' }] }) };
   assert.equal(displayToolResult(knowledgeActivity), 'sources/App.tsx\ntasks/audit.md · missing · not materialized', 'structured knowledge entries must not render as object coercions or cached bodies');
-  assert.match(toolResultSummary(knowledgeActivity) ?? '', /^2 knowledge entries/);
+  assert.match(toolResultSummary(knowledgeActivity) ?? '', /^2 записи знаний/);
   const partialTerminal = { ...knowledgeActivity, kind: 'terminal' as const, output: JSON.stringify({ command: 'rg api src | head -n 1', exit_code: 141, status: 'partial_success', stdout: 'src/App.tsx:1: api' }) };
-  assert.match(displayToolResult(partialTerminal) ?? '', /partial search result/);
+  assert.match(displayToolResult(partialTerminal) ?? '', /частичный результат поиска/);
+  const deliverables = { id: 'd', label: 'Требуемый результат', detail: 'deliverables', kind: 'planning' as const, state: 'completed' as const, output: JSON.stringify({ updated: true, deliverables: { items: [
+    { id: 'd-001', text: 'режим «с ботом» выбирается в интерфейсе', status: 'done', task: 'бот' },
+    { id: 'd-002', text: 'переключатель темы', status: 'pending' },
+    { id: 'd-003', text: 'тема из чужого проекта', status: 'blocked', reason: 'папка недоступна' },
+    { id: 'd-004', text: 'снято пользователем', status: 'dropped', reason: 'пользователь отказался' },
+  ] } }) };
+  assert.equal(toolResultSummary(deliverables), 'выполнено 1 из 3 · осталось 1', 'the deliverables row must summarize progress');
+  assert.equal(displayToolResult(deliverables), '✓ режим «с ботом» выбирается в интерфейсе\n○ переключатель темы\n⊘ тема из чужого проекта — не выполнено: папка недоступна', 'deliverables must render as a checklist and hide dropped items');
+  assert.equal(deliverablesChecklist('not json'), undefined);
+  assert.equal(deliverablesChecklist(JSON.stringify({ other: 1 })), undefined);
   const legacy = taskPlan({ steps: [{ id: 'legacy-task', label: 'Old item', status: 'completed' }] });
   assert.equal(legacy.milestones?.[0]?.workPlan.tasks[0]?.id, 'legacy-task');
 

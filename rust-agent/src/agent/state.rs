@@ -28,6 +28,15 @@ pub struct AgentState {
     /// The single convergence review for unresolved Task Memory items was
     /// already given for this run; it never repeats.
     pub convergence_review_given: bool,
+    /// Reviews already given for recorded deliverables that were still
+    /// unfinished when the model tried to end the run. Bounded per mode, so a
+    /// review can never deadlock a final answer.
+    pub deliverable_reviews: usize,
+    /// Zero-based provider turn currently being prepared, for budget notices.
+    pub turn: usize,
+    /// Project files this run created and has not deleted since, so scratch
+    /// files stay visible instead of being forgotten.
+    pub created_files: Vec<String>,
     /// Observability for optional `.ai-framework` virtual context access.
     pub knowledge_reads: usize,
     pub knowledge_writes: usize,
@@ -42,8 +51,23 @@ impl AgentState {
         self.verification_nudged = false;
     }
 
+    pub fn record_created_file(&mut self, path: &str) {
+        const LIMIT: usize = 64;
+        if path.is_empty() || self.created_files.iter().any(|known| known == path) {
+            return;
+        }
+        if self.created_files.len() >= LIMIT {
+            self.created_files.remove(0);
+        }
+        self.created_files.push(path.to_owned());
+    }
+
+    pub fn record_deleted_file(&mut self, path: &str) {
+        self.created_files.retain(|known| known != path);
+    }
+
     pub fn record_tool_call(&mut self, tool: &str) {
-        if tool != "task_memory" {
+        if tool != "task_memory" && tool != "deliverables" {
             self.calls_since_memory = self.calls_since_memory.saturating_add(1);
         }
     }
@@ -74,6 +98,30 @@ mod tests {
         assert_eq!(state.calls_since_memory, 2);
         state.record_tool_call("task_memory");
         assert_eq!(state.calls_since_memory, 2);
+    }
+
+    #[test]
+    fn bookkeeping_tools_are_not_work_calls() {
+        let mut state = AgentState::default();
+        state.record_tool_call("deliverables");
+        state.record_tool_call("task_memory");
+        assert_eq!(state.calls_since_memory, 0);
+    }
+
+    #[test]
+    fn created_files_are_listed_once_and_forgotten_when_deleted() {
+        let mut state = AgentState::default();
+        state.record_created_file("a.js");
+        state.record_created_file("a.js");
+        state.record_created_file("b.js");
+        assert_eq!(state.created_files, ["a.js", "b.js"]);
+        state.record_deleted_file("a.js");
+        assert_eq!(state.created_files, ["b.js"]);
+        for index in 0..100 {
+            state.record_created_file(&format!("f{index}.js"));
+        }
+        assert_eq!(state.created_files.len(), 64);
+        assert_eq!(state.created_files.last().unwrap(), "f99.js");
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use crate::process::group::{spawn_owned, Signal};
 use std::{
     io::{BufRead, BufReader},
     process::{Command, Stdio},
@@ -93,9 +94,9 @@ fn is_truncated_search_pipeline(
         && !consumer.trim_start().starts_with('&')
 }
 
-/// Runs each shell turn in a dedicated session. `setsid` makes the bash PID a
-/// process-group leader, allowing cancellation to terminate npm/vite/test
-/// descendants instead of leaving background workers behind.
+/// Runs each shell turn in a dedicated session and process group created by
+/// `process::group`, so cancellation can terminate npm/vite/test descendants
+/// without being able to address anything outside that group.
 pub fn run_streaming(
     command: &str,
     cwd: &str,
@@ -115,27 +116,26 @@ pub fn run_streaming(
     let wrapped_command = format!(
         "{command}\n__local_ai_runner_exit=$? __local_ai_runner_pipeline=(\"${{PIPESTATUS[@]}}\"); printf '\\n{marker}%s|%s\\n' \"$__local_ai_runner_exit\" \"${{__local_ai_runner_pipeline[*]}}\"; exit \"$__local_ai_runner_exit\""
     );
-    let mut child = match Command::new("setsid")
-        .arg("bash")
-        // Preserve the actual failure status for common diagnostic pipelines
-        // such as `npm test | tail`; otherwise the model sees a false success.
+    let mut shell = Command::new("bash");
+    // Preserve the actual failure status for common diagnostic pipelines
+    // such as `npm test | tail`; otherwise the model sees a false success.
+    shell
         .arg("-o")
         .arg("pipefail")
         .arg("-lc")
         .arg(&wrapped_command)
         .current_dir(cwd)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
+        .stderr(Stdio::piped());
+    let (mut child, group) = match spawn_owned(shell) {
+        Ok(owned) => owned,
         Err(error) => {
             return serde_json::json!({"command":command,"cwd":cwd,"error":error.to_string(),"timed_out":false,"cancelled":false,"status":"error","started_at":now_ms(),"finished_at":now_ms()})
         }
     };
     let pid = child.id();
-    // `setsid bash` makes bash both session and process-group leader. The
-    // runner only ever signals this known child group on cancellation.
+    // `spawn_owned` made bash leader of its own session and process group. The
+    // runner only ever signals that group, through `group`, on cancellation.
     let started_at = now_ms();
     started_event(pid, pid, pid, started_at);
     let stdout_handle = child.stdout.take().expect("piped stdout");
@@ -226,13 +226,14 @@ pub fn run_streaming(
             was_cancelled = cancelled();
             timed_out = !was_cancelled;
             terminated = true;
-            // Signal the whole session first; kill is retained as a final local fallback.
-            let _ = Command::new("kill")
-                .arg("-TERM")
-                .arg(format!("-{pid}"))
-                .status();
+            // Terminate the owned group first; escalate only while its leader
+            // is still running. Never signal by a number we did not create.
+            let _ = group.signal(&mut child, Signal::Term);
             std::thread::sleep(Duration::from_millis(120));
-            let _ = child.kill();
+            if matches!(child.try_wait(), Ok(None)) {
+                let _ = group.signal(&mut child, Signal::Kill);
+                let _ = child.kill();
+            }
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -331,5 +332,161 @@ mod tests {
         assert_eq!(value["exit_code"], 7);
         assert_eq!(value["status"], "error");
         assert_eq!(value["stdout"], "useful diagnostic\n");
+    }
+
+    fn process_gone(pid: i32) -> bool {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => true,
+            Ok(stat) => stat
+                .rsplit_once(") ")
+                .is_some_and(|(_, rest)| rest.starts_with('Z')),
+        }
+    }
+
+    fn wait_process_gone(pid: i32) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if process_gone(pid) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        process_gone(pid)
+    }
+
+    /// Disposable bystander in this test's own process group.
+    fn bystander() -> std::process::Child {
+        Command::new("sleep")
+            .arg("20.31")
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    #[test]
+    fn cancelling_terminates_the_command_group_and_nothing_else() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mut sibling = bystander();
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let started = std::time::Instant::now();
+        let value = run_streaming(
+            "sleep 20.32 & echo $!; wait",
+            ".",
+            60_000,
+            move || flag.load(Ordering::Relaxed),
+            |_, _, _, _| {},
+            move |_, line| {
+                if line.trim().parse::<i32>().is_ok() {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            },
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "cancel was not prompt"
+        );
+        assert_eq!(value["status"], "cancelled");
+        assert_eq!(value["cancelled"], true);
+        let pgid = value["pgid"].as_i64().unwrap();
+        assert_eq!(value["pid"].as_i64(), Some(pgid));
+        assert!(pgid > 1);
+        assert!(
+            sibling.try_wait().unwrap().is_none(),
+            "an unrelated process was signalled"
+        );
+        let _ = sibling.kill();
+        let _ = sibling.wait();
+    }
+
+    #[test]
+    fn the_descendants_of_a_cancelled_command_do_not_survive() {
+        use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+        use std::sync::Arc;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let descendant = Arc::new(AtomicI32::new(0));
+        let (flag, seen) = (cancel.clone(), descendant.clone());
+        let value = run_streaming(
+            "sleep 20.33 & echo $!; wait",
+            ".",
+            60_000,
+            move || flag.load(Ordering::Relaxed),
+            |_, _, _, _| {},
+            move |_, line| {
+                if let Ok(pid) = line.trim().parse::<i32>() {
+                    seen.store(pid, Ordering::Relaxed);
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            },
+        );
+        assert_eq!(value["status"], "cancelled");
+        let pid = descendant.load(Ordering::Relaxed);
+        assert!(pid > 1, "descendant pid was not reported");
+        assert!(
+            wait_process_gone(pid),
+            "the cancelled command's background process survived"
+        );
+    }
+
+    #[test]
+    fn a_timeout_terminates_only_the_command_group() {
+        let mut sibling = bystander();
+        let started = std::time::Instant::now();
+        let value = run_streaming(
+            "sleep 20.34",
+            ".",
+            300,
+            || false,
+            |_, _, _, _| {},
+            |_, _| {},
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(value["status"], "timed_out");
+        assert!(
+            sibling.try_wait().unwrap().is_none(),
+            "an unrelated process was signalled"
+        );
+        let _ = sibling.kill();
+        let _ = sibling.wait();
+    }
+
+    #[test]
+    fn two_concurrent_commands_cancel_independently() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let stop_first = Arc::new(AtomicBool::new(false));
+        let stop_second = Arc::new(AtomicBool::new(false));
+        let (flag_first, flag_second) = (stop_first.clone(), stop_second.clone());
+        let second = std::thread::spawn(move || {
+            run_streaming(
+                "sleep 20.35",
+                ".",
+                60_000,
+                move || flag_second.load(Ordering::Relaxed),
+                |_, _, _, _| {},
+                |_, _| {},
+            )
+        });
+        let first = std::thread::spawn(move || {
+            run_streaming(
+                "sleep 20.36",
+                ".",
+                60_000,
+                move || flag_first.load(Ordering::Relaxed),
+                |_, _, _, _| {},
+                |_, _| {},
+            )
+        });
+        std::thread::sleep(Duration::from_millis(400));
+        stop_first.store(true, Ordering::Relaxed);
+        let first = first.join().unwrap();
+        assert_eq!(first["status"], "cancelled");
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(
+            !second.is_finished(),
+            "cancelling one command ended another"
+        );
+        stop_second.store(true, Ordering::Relaxed);
+        assert_eq!(second.join().unwrap()["status"], "cancelled");
     }
 }

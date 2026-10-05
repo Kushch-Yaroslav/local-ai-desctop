@@ -12,6 +12,10 @@ pub enum Request {
         user: String,
         project_root: Option<String>,
         secondary_project_root: Option<String>,
+        /// Directories the user named explicitly (absolute, canonical). They
+        /// extend file-tool scope and, without a project, give the terminal a cwd.
+        #[serde(default)]
+        workspace_roots: Vec<String>,
         context_limit: usize,
         reasoning_mode: String,
         #[serde(default = "default_supports_reasoning")]

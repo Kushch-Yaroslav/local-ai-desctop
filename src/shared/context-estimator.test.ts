@@ -57,8 +57,8 @@ export function runContextEstimatorRegression(): void {
     speculativeSlots: null,
   });
   assert.equal(unknown.hardwareSafeTokens, null, 'missing runtime metadata must produce an unknown estimate');
-  assert(unknown.unknownReasons.some((reason) => reason.includes('KV-cache')));
-  assert(unknown.unknownReasons.some((reason) => reason.includes('speculative')));
+  assert(unknown.unknownReasons.some((reason) => reason.includes('KV-кэша')));
+  assert(unknown.unknownReasons.some((reason) => reason.includes('спекулятивное')));
 
   const discoveredAt = new Date(1_000).toISOString();
   const discovered: ContextDiscoveryOption[] = [

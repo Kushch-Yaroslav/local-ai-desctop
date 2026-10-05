@@ -1,7 +1,8 @@
 import { create } from 'zustand';
-import type { ActionApproval, AgentTelemetry, AnalysisProgress, AnalysisRun, AppSettings, Attachment, AttachmentStatus, ApprovalDecision, ApprovalStatus, ChatMessage, Conversation, FinishReason, GenerationDiagnostics, HardwareStats, ModelInfo, ProjectReference, ThinkingTimelineEvent, ToolActivity } from '../../shared/types';
+import type { ActionApproval, AgentTelemetry, AnalysisProgress, AnalysisRun, AppSettings, Attachment, AttachmentStatus, ApprovalDecision, ApprovalStatus, ChatMessage, Conversation, FinishReason, GenerationDiagnostics, HardwareStats, ModelInfo, ProjectReference, ToolActivity } from '../../shared/types';
 import { isCurrentGenerationEvent } from '../../shared/generation-guard';
 import { revertRefusedPatch, type ModeTransition } from '../../shared/conversation-settings';
+import { appendReasoningFragments } from '../../shared/thinking-timeline';
 
 type State = {
   conversations: Conversation[];
@@ -108,12 +109,7 @@ export const useAppStore = create<State>((rawSet, rawGet) => {
     withView(rawGet().generationConversationId, () => set((state) => ({ messages: state.messages.map((message) => {
       const token = tokens.get(get().generationId ?? '');
       const reasoning = thinking.get(get().generationId ?? '');
-      const timeline = reasoning?.reduce<ThinkingTimelineEvent[]>((entries, fragment) => {
-        if (fragment.timelinePosition === undefined) return entries;
-        const last = entries.at(-1);
-        if (last?.kind === 'reasoning' && last.position === fragment.timelinePosition) return [...entries.slice(0, -1), { ...last, content: last.content + fragment.content }];
-        return [...entries, { id: `reasoning-${fragment.timelinePosition}`, kind: 'reasoning', content: fragment.content, position: fragment.timelinePosition }];
-      }, message.thinkingTimeline ?? []);
+      const timeline = reasoning ? appendReasoningFragments(message.thinkingTimeline ?? [], reasoning) : undefined;
       return (token || reasoning?.length) && message.id === assistantId(get().generationId ?? '') ? { ...message, ...(token ? { content: message.content + token } : {}), ...(reasoning?.length ? { thinking: (message.thinking ?? '') + reasoning.map((fragment) => fragment.content).join(''), ...(timeline?.length ? { thinkingTimeline: timeline } : {}) } : {}) } : message;
     }) })));
     if (!immediate && (pendingTokens.size || pendingThinking.size)) animationFrame = window.requestAnimationFrame(() => drainStream());
@@ -305,7 +301,7 @@ export const useAppStore = create<State>((rawSet, rawGet) => {
     if (event.type === 'thinking') {
       pendingThinking.set(event.generationId, [...(pendingThinking.get(event.generationId) ?? []), { content: event.content ?? '', timelinePosition: event.timelinePosition }]);
       if (animationFrame === null) animationFrame = window.requestAnimationFrame(() => drainStream());
-      set({ generationState: 'thinking' });
+      if (get().generationState !== 'thinking') set({ generationState: 'thinking' });
     }
     if ((event.type === 'tool' || event.type === 'attachment') && event.activity) set((state) => {
       const priorActivity = state.toolActivities.find((activity) => activity.id === event.activity!.id);
@@ -329,7 +325,7 @@ export const useAppStore = create<State>((rawSet, rawGet) => {
     if (event.type === 'analysis' && event.progress) set({ analysisProgress: [event.progress] });
     if (event.type === 'context' && event.active) set({ activeContextWindow: event.active });
     if (event.type === 'diagnostics' && event.diagnostics) set({ performance: { ...event.diagnostics, generationId: event.generationId, conversationId: event.conversationId, createdAt: now() } });
-    if (event.type === 'token') set({ generationState: 'generating' });
+    if (event.type === 'token' && get().generationState !== 'generating') set({ generationState: 'generating' });
     if (event.type === 'error') { drainStream(true); pendingTokens.delete(event.generationId); pendingThinking.delete(event.generationId); const message = event.details ? `${event.message}: ${event.details}` : event.message ?? 'Ошибка генерации'; set((state) => ({ isGenerating: false, generationId: null, generationState: 'error', error: message, messages: finishAgentStream(state.messages, event.generationId, { error: message }), lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false, agentTelemetry: state.agentTelemetry ? { ...state.agentTelemetry, finishedAt: now() } : null })); }
     if (event.type === 'cancelled') { drainStream(true); pendingTokens.delete(event.generationId); pendingThinking.delete(event.generationId); set((state) => ({ isGenerating: false, generationId: null, generationState: 'cancelled', messages: finishAgentStream(state.messages, event.generationId, { cancelled: true }), lastFinishReason: 'cancelled', performance: null, pendingApproval: null, approvalSubmitting: false, agentTelemetry: state.agentTelemetry ? { ...state.agentTelemetry, finishedAt: now() } : null })); }
     if (event.type === 'done') { drainStream(true); set((state) => ({ isGenerating: false, generationId: null, generationState: 'idle', messages: state.messages.flatMap((message) => message.id === assistantId(event.generationId) ? (event.assistant ? [event.assistant] : []) : [message]), lastFinishReason: event.finishReason ?? 'stop', agentTelemetry: state.agentTelemetry ? { ...state.agentTelemetry, finishedAt: now() } : null })); }

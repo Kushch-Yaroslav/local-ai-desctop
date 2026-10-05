@@ -40,8 +40,9 @@ pub fn requires_approval_in_root(
 /// Model-issued commands which can end or reconfigure the desktop/user/system
 /// session never run silently, including in AUTO. This is deliberately parsed
 /// as command words rather than matched as a free-form substring. The runner's
-/// own `kill -TERM -<known child pgid>` bypasses this policy entirely: it is
-/// internal cancellation machinery, not a model shell command.
+/// own cancellation (`process::group`, a direct signal to the isolated group it
+/// created) bypasses this policy entirely: it is internal machinery, not a model
+/// shell command.
 pub fn terminal_requires_explicit_approval(arguments: &serde_json::Value) -> bool {
     terminal_requires_explicit_approval_in_root(arguments, None)
 }
