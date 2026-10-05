@@ -3,6 +3,17 @@ import { contextPresetsFor } from './model-registry';
 import { legacyReasoningSelection, reasoningEffortOrder, resolveReasoningSelection, type ReasoningCapability, type ReasoningEffort, type ReasoningInput, type ReasoningSelection } from '../../shared/reasoning-controls';
 
 export type LlamaSpeculativeMode = 'mtp' | 'eagle3' | 'none';
+/** An authoritative external assistant, pinned independently of the main GGUF. */
+export type LlamaDraftProfile = {
+  path: string;
+  sizeBytes: number;
+  sha256: string;
+  architecture: string;
+  targetArchitecture: string;
+  targetEmbeddingLength: number;
+  kvCache: 'shared' | 'independent';
+  maxDraftTokens: number;
+};
 /**
  * How a model exposes reasoning to llama.cpp. `thinkingKwarg` is the chat-template switch that turns thinking on or off
  * (absent when the model cannot be told not to think); `efforts` maps normalized levels to native `reasoning_effort`
@@ -20,6 +31,7 @@ export type LlamaRuntimeProfile = {
   modelPath?: string;
   mmprojPath?: string;
   speculative: LlamaSpeculativeMode;
+  draft?: LlamaDraftProfile;
   vision: boolean;
   reasoning?: LlamaReasoningProfile;
 };
@@ -34,7 +46,9 @@ export const llamaRuntimeProfiles: readonly LlamaRuntimeProfile[] = [
   // The author advertises 256K even though this GGUF's raw training metadata says 393216.
   { id: 'devstral-small-2:24b-q4_k_m', maxContext: 262_144, modelPath: '/media/yaroslav/DATA/llama-models/Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf', mmprojPath: '/media/yaroslav/DATA/llama-models/devstral-small-2-24b-mmproj-f16.gguf', speculative: 'none', vision: true },
   // Gemma's template has enable_thinking, but no native reasoning_effort levels.
-  { id: 'gemma4:31b-it-q4_k_m', maxContext: 262_144, modelPath: '/media/yaroslav/DATA/llama-models/gemma-4-31B-it-Q4_K_M.gguf', mmprojPath: '/media/yaroslav/DATA/llama-models/gemma-4-31b-mmproj-f16.gguf', speculative: 'none', vision: true, reasoning: { thinkingKwarg: 'enable_thinking', efforts: {}, final: { chat_template_kwargs: { enable_thinking: false } } } },
+  { id: 'gemma4:31b-it-q4_k_m', maxContext: 262_144, modelPath: '/media/yaroslav/DATA/llama-models/gemma-4-31B-it-Q4_K_M.gguf', mmprojPath: '/media/yaroslav/DATA/llama-models/gemma-4-31b-mmproj-f16.gguf', speculative: 'mtp',
+    draft: { path: '/media/yaroslav/DATA/llama-models/mtp-gemma-4-31B-it-Q8_0.gguf', sizeBytes: 514_687_104, sha256: '5ae8b0117bed601e8924c6305bd5b0585de361d51f0e77091bcb4252cf1f27de', architecture: 'gemma4-assistant', targetArchitecture: 'gemma4', targetEmbeddingLength: 5376, kvCache: 'shared', maxDraftTokens: 4 },
+    vision: true, reasoning: { thinkingKwarg: 'enable_thinking', efforts: {}, final: { chat_template_kwargs: { enable_thinking: false } } } },
 ];
 
 /** Generic families have no pinned local files after removal. */

@@ -107,6 +107,8 @@ export interface AgentTelemetry {
 }
 
 export interface ModelInfo {
+  /** A configured, supported mechanism, not a claim that an offline runtime is active. */
+  speculative?: { mechanism: 'mtp' | 'eagle3'; draftSource: 'embedded' | 'external' };
   id: string;
   name: string;
   size?: number;
@@ -202,7 +204,7 @@ export interface AppSettings {
   llamaServerPath: string | null;
   llamaRuntimeModelId?: string;
   /** Live state of the launcher-managed llama-server; the authority on what is running. */
-  llamaRuntime?: { status: 'starting' | 'ready' | 'switching' | 'offline' | 'stopped'; modelId: string | null; contextWindow: number | null; kvCacheType?: LlamaKvCacheType; kvOffload?: boolean; error?: string; rolledBack?: boolean };
+  llamaRuntime?: { status: 'starting' | 'ready' | 'switching' | 'offline' | 'stopped'; modelId: string | null; contextWindow: number | null; kvCacheType?: LlamaKvCacheType; kvOffload?: boolean; speculativeMode?: 'mtp' | 'eagle3' | 'none'; error?: string; rolledBack?: boolean };
   modelsPath: string;
 }
 

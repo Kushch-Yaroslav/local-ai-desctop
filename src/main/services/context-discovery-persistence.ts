@@ -16,6 +16,7 @@ export interface ContextDiscoveryIdentity {
   modelId: string;
   model: string;
   projector: string | null;
+  draft?: string;
   runtime: string;
   arguments: string[];
   speculative: string;
@@ -30,6 +31,7 @@ export function contextDiscoveryKey(identity: ContextDiscoveryIdentity): { key: 
     policy: { version: contextDiscoveryPolicyVersion, nonLlmBudgetBytes, vramEstimatorMarginBytes, vramChangeToleranceBytes, vramProbeGuardBytes },
     modelId: identity.modelId, model: identity.model, projector: identity.projector, runtime: identity.runtime,
     arguments: identity.arguments, speculative: identity.speculative, hardLimit: identity.hardLimit,
+    ...(identity.draft ? { draft: identity.draft } : {}),
     gpuName: identity.gpuName, vramTotalBytes: identity.vramTotalBytes, hostReserveBytes: identity.hostReserveBytes,
   });
   return { key: createHash('sha256').update(serialized).digest('hex'), serialized };
@@ -88,10 +90,11 @@ export function stableRuntimeArguments(args: readonly string[]): string[] {
 }
 
 export function buildContextDiscoveryIdentity(input: {
-  modelId: string; modelFingerprint: string; projectorFingerprint: string | null; runtimeFingerprint: string;
+  modelId: string; modelFingerprint: string; projectorFingerprint: string | null; draftFingerprint?: string; runtimeFingerprint: string;
   arguments: readonly string[]; speculative: string; hardLimit: number; gpu: { name: string; vramTotalBytes: number }; hostReserveBytes: number;
 }): ContextDiscoveryIdentity {
   return { modelId: input.modelId, model: input.modelFingerprint, projector: input.projectorFingerprint, runtime: input.runtimeFingerprint,
     arguments: stableRuntimeArguments(input.arguments), speculative: input.speculative, hardLimit: input.hardLimit,
+    ...(input.draftFingerprint ? { draft: input.draftFingerprint } : {}),
     gpuName: input.gpu.name, vramTotalBytes: input.gpu.vramTotalBytes, hostReserveBytes: input.hostReserveBytes };
 }

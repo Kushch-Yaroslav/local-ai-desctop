@@ -103,7 +103,8 @@ async function runtimeConfigurationIdentity(modelId: string): Promise<string> {
   }
   return JSON.stringify({ args: stableArgs, model: await modelFileIdentity(profile.modelPath),
     projector: profile.mmprojPath ? await modelFileIdentity(profile.mmprojPath) : null,
-    binary: await modelFileIdentity(args[0]), hardLimit: await llamaCapabilityLimit(modelId), speculative: profile.speculative });
+    ...(state.speculativeMode !== 'none' && profile.draft ? { draft: await modelFileIdentity(profile.draft.path) } : {}),
+    binary: await modelFileIdentity(args[0]), hardLimit: await llamaCapabilityLimit(modelId), speculative: state.speculativeMode ?? profile.speculative });
 }
 /** Size and mtime survive restarts and remounts; device/inode numbers may not. */
 async function persistentFileFingerprint(path: string): Promise<string> {
@@ -122,8 +123,9 @@ async function persistentDiscoveryIdentity(modelId: string): Promise<{ key: stri
   const identity = buildContextDiscoveryIdentity({
     modelId, modelFingerprint: await persistentFileFingerprint(profile.modelPath),
     projectorFingerprint: profile.mmprojPath ? await persistentFileFingerprint(profile.mmprojPath) : null,
+    ...(state.speculativeMode !== 'none' && profile.draft ? { draftFingerprint: await persistentFileFingerprint(profile.draft.path) } : {}),
     runtimeFingerprint: `${args[0]}:${await persistentFileFingerprint(args[0])}`,
-    arguments: args, speculative: profile.speculative, hardLimit, gpu: await getGpuIdentity(), hostReserveBytes: hostReserve.bytes,
+    arguments: args, speculative: state.speculativeMode ?? profile.speculative, hardLimit, gpu: await getGpuIdentity(), hostReserveBytes: hostReserve.bytes,
   });
   return { ...contextDiscoveryKey(identity), hardLimit };
 }

@@ -143,6 +143,7 @@ export class LlamaCppBackend implements LlmBackend, ToolCallingBackend {
         backend: 'llama-cpp',
         supportedContextPresets: llamaContextPresets(runtime.id, capability),
         ...(profile.supportsReasoning && reasoningCapability(runtime) ? { reasoning: reasoningCapability(runtime) } : {}),
+        ...(runtime.speculative !== 'none' ? { speculative: { mechanism: runtime.speculative, draftSource: runtime.draft ? 'external' as const : 'embedded' as const } } : {}),
       });
     }
     return result;

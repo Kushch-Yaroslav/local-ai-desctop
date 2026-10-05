@@ -15,6 +15,7 @@ export type LlamaRuntimeState = {
   contextWindow: number | null;
   kvCacheType?: LlamaKvCacheType;
   kvOffload?: boolean;
+  speculativeMode?: 'mtp' | 'eagle3' | 'none';
   error?: string;
   requestId?: string;
   /** The requested runtime failed to start and the previous one was restored. */
@@ -65,6 +66,7 @@ export function parseLlamaRuntimeState(raw: string): LlamaRuntimeState | null {
       status, modelId, contextWindow,
       ...(value.kvCacheType === 'f16' || value.kvCacheType === 'q8_0' ? { kvCacheType: value.kvCacheType } : {}),
       ...(typeof value.kvOffload === 'boolean' ? { kvOffload: value.kvOffload } : {}),
+      ...(value.speculativeMode === 'mtp' || value.speculativeMode === 'eagle3' || value.speculativeMode === 'none' ? { speculativeMode: value.speculativeMode } : {}),
       ...(typeof value.error === 'string' && value.error ? { error: value.error } : {}),
       ...(typeof value.requestId === 'string' && value.requestId ? { requestId: value.requestId } : {}),
       ...(value.rolledBack === true ? { rolledBack: true } : {}),

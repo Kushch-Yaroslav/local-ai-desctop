@@ -76,6 +76,29 @@ export async function runContextEstimateRegression(): Promise<void> {
   assert.equal(parsed.kvTypeV, 'f16');
   assert.equal(parsed.speculativeKvTypeK, 'f16');
   assert.equal(parsed.speculativeKvTypeV, 'f16');
+  const externalLog = allocationLog.replace("I common_speculative_init_result: creating MTP draft context against the target model 'target.gguf'", `I common_speculative_init_result: loading draft model '/models/assistant.gguf'
+I llama_model_loader: loaded meta data with 20 key-value pairs from /models/assistant.gguf (version GGUF V3)
+I load_tensors: offloaded 5/5 layers to GPU
+I load_tensors: CPU_Mapped model buffer size = 3.00 MiB
+I load_tensors: CUDA0 model buffer size = 490.00 MiB`).replace('I srv load_model: initializing', "T spec common_specu: adding speculative implementation 'draft-mtp'\nI srv load_model: initializing");
+  const external = parseLlamaAllocationLog(externalLog);
+  assert.equal(external.modelPath, runtime.modelPath, 'external assistant must not overwrite target identity');
+  assert.equal(external.allocations.weights.device, parsed.allocations.weights.device, 'external offload must not hide main weights');
+  assert.equal(external.allocations.kv.device, parsed.allocations.kv.device, 'external offload must not hide main KV');
+  assert.equal(external.allocations.speculativeWeights.device, 490 * 1024 ** 2);
+  assert.equal(external.allocations.speculativeWeights.host, 3 * 1024 ** 2);
+  assert.equal(external.allocations.speculativeKv.device, parsed.allocations.speculativeKv.device, 'independent assistant KV is still counted');
+  assert.equal(external.speculativeMode, 'mtp');
+  assert.deepEqual(external.unknownReasons, []);
+  const sharedLog = externalLog.replace('I llama_kv_cache: CUDA0 KV buffer size = 128.00 MiB', 'W llama_kv_cache: layer 0: sharing with layer 65. k = 0x100, v = 0x200')
+    + '\nI srv llama_server: model loaded';
+  const shared = parseLlamaAllocationLog(sharedLog);
+  assert.deepEqual(shared.allocations.speculativeKv, { host: 0, device: 0 }, 'verified alias views do not allocate duplicate KV');
+  assert.equal(shared.allocations.kv.device, parsed.allocations.kv.device);
+  assert.deepEqual(shared.unknownReasons, []);
+  assert(parseLlamaAllocationLog(sharedLog.replace('I srv llama_server: model loaded', '')).unknownReasons.length > 0, 'partial startup must not manufacture zero draft memory');
+  assert(parseLlamaAllocationLog(sharedLog.replace('layer 0: sharing with layer 65.', 'layer 0: filtered')).unknownReasons.length > 0, 'missing sharing evidence remains unknown');
+  assert.equal(parseLlamaAllocationLog(sharedLog.replaceAll('(f16)', '(q8_0)')).speculativeKvTypeK, 'q8_0', 'shared KV still verifies its precision');
   assert.ok(Math.abs(parsed.allocations.weights.device! - 15_339.44 * 1024 ** 2) <= 1);
   assert.equal(parsed.allocations.weights.host, Math.ceil(682.03 * 1024 ** 2) + Math.ceil(887.99 * 1024 ** 2));
   assert.equal(parsed.allocations.kv.device, 2048 * 1024 ** 2, 'zero-sized dry-run cache must not replace final allocation');

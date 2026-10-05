@@ -67,7 +67,7 @@ export function Toolbar() {
   const contextEstimate = estimateResponse?.modelId === selectedModelId ? estimateResponse.value : undefined;
   const projectSelector = (slot: 1 | 2, directory: string | null) => <div className={`directory project-selector project-${slot}`}><FolderOpen size={16} /><button title={directory ?? undefined} onClick={() => void chooseDirectory(slot, directory)}>{directory ? projectDirectoryName(directory) : `Проект ${slot}: не выбран`}</button>{directory && <button className="icon-button" aria-label={`Убрать проект ${slot}`} onClick={() => void updateConversation(chat.id, slot === 1 ? { workingDirectory: null } : { secondaryWorkingDirectory: null })}><X size={14} /></button>}</div>;
   const llama = settings?.llamaRuntime;
-  const runtimeLabel = !llama || llama.status === 'ready' ? 'llama.cpp'
+  const runtimeLabel = !llama || llama.status === 'ready' ? `llama.cpp${llama?.speculativeMode === 'mtp' ? ' · MTP' : llama?.speculativeMode === 'eagle3' ? ' · EAGLE3' : ''}`
       : llama.status === 'switching' || llama.status === 'starting' ? 'llama.cpp · запуск модели…'
         : 'llama.cpp · не запущен';
   const missingEstimate = contextEstimate?.unknownReasons.join(', ') ?? '';
