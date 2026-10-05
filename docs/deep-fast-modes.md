@@ -3,13 +3,13 @@
 Fast and Deep select an **investigation strategy**. They share tools, context
 window, evidence rules and output budget. Before this change the only
 difference was the reasoning effort sent to the provider (`xhigh` vs `low`);
-prompt, tools and review gates were identical.
+prompt, tools and review gates were identical. Native thinking and effort are now separate controls; changing strategy preserves the explicit selection. Models without native controls still use either strategy. See [model capability audit](validation/local-model-refresh-2026-10-05.md).
 
 ## What differs
 
 | | Fast | Deep |
 |---|---|---|
-| Reasoning effort | low | xhigh (unchanged) |
+| Native thinking / effort | independent model-capability controls | independent model-capability controls |
 | Strategy guidance (stable prefix) | smallest sufficient evidence, batch independent reads, follow a reference only if the answer would be wrong without it, stop early | frame central questions and rank unknowns by impact, trace behavior across boundaries to the real effect, verify at the source, look for disconfirming evidence, choose by information gain, converge |
 | Task Memory `status` | available | available, and the guidance asks for it |
 | Open-unknowns block in each turn | no | yes (entries marked `unknown`/`contradicted`) |
