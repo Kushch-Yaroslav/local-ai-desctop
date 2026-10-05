@@ -4,7 +4,7 @@ import { effectiveModes, revertRefusedPatch, touchesRuntime, type ConversationPa
 import type { Conversation } from './types';
 import type {} from '../renderer/env';
 
-const chat = (overrides: Partial<Conversation> = {}): Conversation => ({ id: 'A', title: 'A', modelId: 'm', mode: 'agent', workingDirectory: null, primaryProjectId: null, secondaryWorkingDirectory: null, secondaryProjectId: null, contextWindow: 16384, reasoningMode: 'fast', contextTokens: null, contextModelId: null, webMode: 'off', createdAt: '', updatedAt: '', ...overrides });
+const chat = (overrides: Partial<Conversation> = {}): Conversation => ({ id: 'A', title: 'A', modelId: 'm', mode: 'agent', workingDirectory: null, primaryProjectId: null, secondaryWorkingDirectory: null, secondaryProjectId: null, contextWindow: 16384, thinkingEnabled: null, reasoningEffort: null, reasoningMode: 'fast', contextTokens: null, contextModelId: null, webMode: 'off', createdAt: '', updatedAt: '', ...overrides });
 const deferred = <T>() => { let resolve!: (value: T) => void; let reject!: (error: Error) => void; const promise = new Promise<T>((a, b) => { resolve = a; reject = b; }); return { promise, resolve, reject }; };
 
 export async function runConversationSettingsRegression(): Promise<void> {
@@ -62,6 +62,21 @@ export async function runConversationSettingsRegression(): Promise<void> {
   assert.ok(await failing instanceof Error);
   assert.equal(stored().contextWindow, 16384);
   assert.equal(stored().reasoningMode, 'deep', 'a failed runtime switch reverted the unrelated Deep selection to Fast');
+
+  // Thinking and depth are separate settings: changing one must not move the others, and a refused one rolls back alone.
+  reset();
+  useAppStore.setState({ models: [{ id: 'm', name: 'm', supportsReasoning: true, reasoning: { thinkingToggle: true, efforts: ['low', 'medium', 'max'] } } as never] });
+  await state().updateConversation('A', { reasoningMode: 'deep' });
+  assert.equal(stored().thinkingEnabled, true, 'the first strategy change must pin the legacy thinking value');
+  assert.equal(stored().reasoningEffort, 'low', 'the first strategy change must pin the previous (Fast) effort, not jump to the Deep one');
+  await state().updateConversation('A', { reasoningEffort: 'medium' });
+  await state().updateConversation('A', { thinkingEnabled: false });
+  await state().updateConversation('A', { reasoningMode: 'fast' });
+  assert.deepEqual([stored().thinkingEnabled, stored().reasoningEffort, stored().reasoningMode], [false, 'medium', 'fast'], 'strategy changes moved the independent thinking/effort controls');
+  (window as unknown as { localAi: { conversations: { update: unknown } } }).localAi.conversations.update = async () => { throw new Error('model does not support this'); };
+  await assert.rejects(() => state().updateConversation('A', { reasoningEffort: 'max' }), /does not support/);
+  assert.deepEqual([stored().thinkingEnabled, stored().reasoningEffort], [false, 'medium'], 'a refused effort change must roll back only that setting');
+  useAppStore.setState({ models: [] });
 
   // A genuinely refused selection rolls back, reports the reason and leaves nothing pending.
   reset();

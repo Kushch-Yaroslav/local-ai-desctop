@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import type { ChatMessage, ReasoningMode, StreamEvent } from '../../shared/types';
+import type { ChatMessage, StreamEvent } from '../../shared/types';
+import { reasoningModeOf, type ReasoningInput } from '../../shared/reasoning-controls';
 import type { LlmBackend, ToolCall, ToolCallingBackend, ToolMessage } from '../backends/types';
 import { capabilitySystemContext, chatCompletionGuidance, chatMessagesWithSystemPrefix, chatSystemContext } from './capabilities';
 import { WebBrowserService, activityForWebTool, webToolDefinitions } from '../web/web-tools';
@@ -27,20 +28,20 @@ const webDecisionInstruction = 'Сначала реши только, нужны
 export class WebChatService {
   constructor(private readonly backend: ToolCallingBackend & LlmBackend, private readonly web: WebBrowserService) {}
 
-  private async *finalStream(model: string, history: ChatMessage[], toolResults: ToolMessage[], signal: AbortSignal, contextWindow: number, reasoningMode: ReasoningMode): AsyncIterable<StreamEvent> {
+  private async *finalStream(model: string, history: ChatMessage[], toolResults: ToolMessage[], signal: AbortSignal, contextWindow: number, reasoningMode: ReasoningInput): AsyncIterable<StreamEvent> {
     const results = toolResults.filter((message) => message.role === 'tool').map((message) => `Инструмент ${message.tool_name ?? 'web'} вернул:\n${message.content}`).join('\n\n');
     const finalMessages = chatMessagesWithSystemPrefix(history, [
-      chatCompletionGuidance(reasoningMode === 'deep' ? 'deep' : 'fast'),
+      chatCompletionGuidance(reasoningModeOf(reasoningMode) === 'deep' ? 'deep' : 'fast'),
       ...(results ? [`Доступны следующие результаты web-инструментов. Используй их как evidence и сформулируй итоговый ответ без новых вызовов инструментов:\n\n${results}`] : []),
     ], history[0]?.conversationId ?? 'web-final', randomUUID());
     yield* this.backend.streamChat(model, finalMessages, signal, contextWindow, reasoningMode);
   }
 
-  async *stream(model: string, history: ChatMessage[], signal: AbortSignal, contextWindow: number, reasoningMode: ReasoningMode): AsyncIterable<StreamEvent> {
+  async *stream(model: string, history: ChatMessage[], signal: AbortSignal, contextWindow: number, reasoningMode: ReasoningInput): AsyncIterable<StreamEvent> {
     let session;
     try { session = await this.web.openSession(); }
     catch {
-      yield* this.backend.streamChat(model, chatMessagesWithSystemPrefix(history, [chatSystemContext({ webAvailable: false }, reasoningMode === 'deep' ? 'deep' : 'fast')], history[0]?.conversationId ?? 'web-unavailable', randomUUID()), signal, contextWindow, reasoningMode);
+      yield* this.backend.streamChat(model, chatMessagesWithSystemPrefix(history, [chatSystemContext({ webAvailable: false }, reasoningModeOf(reasoningMode) === 'deep' ? 'deep' : 'fast')], history[0]?.conversationId ?? 'web-unavailable', randomUUID()), signal, contextWindow, reasoningMode);
       return;
     }
     const closeOnAbort = () => { void session.close(); };

@@ -6,7 +6,8 @@ import { Hardware } from './Hardware';
 import { projectDirectoryName } from '../../shared/project-references';
 import type { ContextDiscoveryResult, RuntimeContextEstimate } from '../../shared/context-estimator';
 import { buildContextChoices, cacheModeLabel, contextChoiceId } from '../../shared/context-options';
-import { boundaryReasonLabel } from '../../shared/localization';
+import { boundaryReasonLabel, reasoningControlText, reasoningEffortLabel, reasoningModeLabel, thinkingLabel } from '../../shared/localization';
+import { resolveReasoningSelection, type ReasoningEffort } from '../../shared/reasoning-controls';
 
 export function Toolbar() {
   const { conversations, activeId, models, hardware, settings, activeContextWindow, isGenerating, updateConversation, refreshRuntime } = useAppStore(useShallow((state) => ({ conversations: state.conversations, activeId: state.activeId, models: state.models, hardware: state.hardware, settings: state.settings, activeContextWindow: state.activeContextWindow, isGenerating: state.isGenerating, updateConversation: state.updateConversation, refreshRuntime: state.refreshRuntime })));
@@ -22,6 +23,8 @@ export function Toolbar() {
   }, [refreshRuntime]);
   const chat = conversations.find((item) => item.id === activeId);
   const selectedModel = models.find((model) => model.id === chat?.modelId) ?? models[0];
+  const reasoningCapability = selectedModel?.reasoning;
+  const reasoningSelection = resolveReasoningSelection(reasoningCapability, chat?.reasoningMode ?? 'fast', chat ?? {});
   const selectedModelId = chat ? chat.modelId ?? selectedModel?.id ?? null : null;
   useEffect(() => {
     if (!selectedModelId) { setEstimateResponse(null); return undefined; }
@@ -131,7 +134,13 @@ export function Toolbar() {
       <div className="toolbar-controls">
         <label className="control"><span>Модель</span><select disabled={discoveryLoading} value={chat.modelId ?? ''} onChange={(event) => void updateConversation(chat.id, { modelId: event.target.value || null }).catch(() => undefined)}><option value="">Выберите модель</option>{models.map((model) => <option value={model.id} key={model.id} disabled={!model.installed}>{model.name}{model.installed ? '' : ' · не установлена'}</option>)}</select></label>
         <label className="control"><span>Контекст · {contextLabel}</span><select disabled={discoveryLoading} value={selectedContextOption ? contextChoiceId(selectedContextOption) : ''} onChange={(event) => { const option = contextOptions.find((candidate) => contextChoiceId(candidate) === event.target.value); if (option) void updateConversation(chat.id, { contextWindow: option.contextWindow, llamaKvCacheType: option.kvCacheType, llamaKvOffload: option.kvOffload }).catch(() => undefined); }}>{contextOptions.map((option) => <option value={contextChoiceId(option)} key={contextChoiceId(option)}>{option.label}</option>)}</select></label>
-        {selectedModel?.supportsReasoning && <label className="control"><span>Рассуждение</span><select value={chat.reasoningMode === 'deep' ? 'deep' : 'fast'} onChange={(event) => void updateConversation(chat.id, { reasoningMode: event.target.value as 'fast' | 'deep' })}><option value="fast">Быстро</option><option value="deep">Глубоко</option></select></label>}
+        {reasoningCapability && <label className="control" title={reasoningControlText.thinkingHint}><span>{reasoningControlText.thinking}</span>{reasoningCapability.thinkingToggle
+          ? <select value={reasoningSelection.thinking === false ? 'off' : 'on'} onChange={(event) => void updateConversation(chat.id, { thinkingEnabled: event.target.value === 'on' }).catch(() => undefined)}><option value="on">{thinkingLabel.on}</option><option value="off">{thinkingLabel.off}</option></select>
+          : <select disabled title={reasoningControlText.thinkingUnavailable} value="unavailable"><option value="unavailable">{reasoningControlText.unavailable}</option></select>}</label>}
+        {reasoningCapability && <label className="control" title={reasoningSelection.thinking === false ? reasoningControlText.effortInactive : reasoningControlText.effortHint}><span>{reasoningControlText.effort}</span>{reasoningCapability.efforts.length
+          ? <select disabled={reasoningSelection.thinking === false} value={reasoningSelection.effort ?? ''} onChange={(event) => void updateConversation(chat.id, { reasoningEffort: event.target.value as ReasoningEffort }).catch(() => undefined)}>{reasoningCapability.efforts.map((effort) => <option value={effort} key={effort}>{reasoningEffortLabel[effort]}</option>)}</select>
+          : <select disabled title={reasoningControlText.effortUnavailable} value="unavailable"><option value="unavailable">{reasoningControlText.unavailable}</option></select>}</label>}
+        <label className="control" title={reasoningControlText.strategyHint}><span>{reasoningControlText.strategy}</span><select value={chat.reasoningMode === 'deep' ? 'deep' : 'fast'} onChange={(event) => void updateConversation(chat.id, { reasoningMode: event.target.value as 'fast' | 'deep' }).catch(() => undefined)}><option value="fast">{reasoningModeLabel.fast}</option><option value="deep">{reasoningModeLabel.deep}</option></select></label>
         <label className="control"><span>Веб</span><select value={chat.webMode} onChange={(event) => void updateConversation(chat.id, { webMode: event.target.value as 'off' | 'auto' })}><option value="off">Выкл.</option><option value="auto">Авто</option></select></label>
         <label className="control"><span>Режим</span><select value={chat.mode} onChange={(event) => void updateConversation(chat.id, { mode: event.target.value as 'chat' | 'agent' })}><option value="chat">Чат</option><option value="agent">Агент</option></select></label>
         <div className="project-selectors">{projectSelector(1, chat.workingDirectory)}{projectSelector(2, chat.secondaryWorkingDirectory)}</div>

@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import type { ActionApproval, AgentTelemetry, AnalysisProgress, AnalysisRun, AppSettings, Attachment, AttachmentStatus, ApprovalDecision, ApprovalStatus, ChatMessage, Conversation, FinishReason, GenerationDiagnostics, HardwareStats, ModelInfo, ProjectReference, SteeringIntent, ToolActivity } from '../../shared/types';
 import { isCurrentGenerationEvent } from '../../shared/generation-guard';
-import { revertRefusedPatch, type ModeTransition } from '../../shared/conversation-settings';
+import { pinLegacyReasoning, revertRefusedPatch, type ModeTransition } from '../../shared/conversation-settings';
 import { appendPausedMarker, appendReasoningFragments, applySteeringEvent } from '../../shared/thinking-timeline';
 
 type State = {
@@ -152,15 +152,16 @@ export const useAppStore = create<State>((rawSet, rawGet) => {
     const conversation = await window.localAi.conversations.create(activeChat?.modelId ?? get().models[0]?.id);
     set((state) => ({ conversations: [conversation, ...state.conversations] })); await get().selectConversation(conversation.id);
   },
-  updateConversation: async (id, patch) => {
+  updateConversation: async (id, requestedPatch) => {
     const before = get().conversations.find((chat) => chat.id === id);
-    const tracksMode = patch.reasoningMode !== undefined || patch.mode !== undefined;
+    const patch = before ? pinLegacyReasoning(before, get().models.find((model) => model.id === before.modelId)?.reasoning, requestedPatch) : requestedPatch;
+    const tracksMode = patch.reasoningMode !== undefined || patch.mode !== undefined || patch.thinkingEnabled !== undefined || patch.reasoningEffort !== undefined;
     if (tracksMode && before) {
       modeUpdatesInFlight.set(id, (modeUpdatesInFlight.get(id) ?? 0) + 1);
       set((state) => {
         const existing = state.modeTransitions[id];
-        const effective = existing?.effective ?? { reasoningMode: before.reasoningMode === 'deep' ? 'deep' as const : 'fast' as const, mode: before.mode };
-        return { modeTransitions: { ...state.modeTransitions, [id]: { effective, desired: { ...existing?.desired, ...(patch.reasoningMode !== undefined ? { reasoningMode: patch.reasoningMode === 'deep' ? 'deep' : 'fast' } : {}), ...(patch.mode !== undefined ? { mode: patch.mode } : {}) } } } };
+        const effective = existing?.effective ?? { reasoningMode: before.reasoningMode === 'deep' ? 'deep' as const : 'fast' as const, mode: before.mode, thinkingEnabled: before.thinkingEnabled, reasoningEffort: before.reasoningEffort };
+        return { modeTransitions: { ...state.modeTransitions, [id]: { effective, desired: { ...existing?.desired, ...(patch.reasoningMode !== undefined ? { reasoningMode: patch.reasoningMode === 'deep' ? 'deep' : 'fast' } : {}), ...(patch.mode !== undefined ? { mode: patch.mode } : {}), ...(patch.thinkingEnabled !== undefined ? { thinkingEnabled: patch.thinkingEnabled } : {}), ...(patch.reasoningEffort !== undefined ? { reasoningEffort: patch.reasoningEffort } : {}) } } } };
       });
     }
     const settle = () => {

@@ -198,6 +198,9 @@ fn request_reasoning(config: &Config, finalizing: bool) -> Option<Value> {
     if let Some(options) = config.reasoning_options.as_ref().and_then(|options| {
         let key = if finalizing {
             "final"
+        } else if options.get("main").is_some_and(Value::is_object) {
+            // The user's explicit thinking/effort choice, resolved by the host. It is independent of the strategy.
+            "main"
         } else {
             match policy::reasoning(&config.reasoning_mode, "agent") {
                 Reasoning::Off | Reasoning::Low => "fast",
@@ -4661,6 +4664,39 @@ mod tests {
         config.supports_reasoning = false;
         let unsupported = request_payload_for_phase(&config, &messages, &[], 1_024, true);
         assert!(unsupported.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn an_explicit_main_reasoning_selection_is_independent_of_the_strategy() {
+        let mut config = test_config(32_768);
+        config.reasoning_mode = "deep".into();
+        config.reasoning_options = Some(json!({
+            "fast":{"reasoning_effort":"low"},
+            "deep":{"reasoning_effort":"xhigh"},
+            "main":{"reasoning_effort":"medium","chat_template_kwargs":{"enable_thinking":true}},
+            "final":{"chat_template_kwargs":{"enable_thinking":false}}
+        }));
+        let messages = vec![json!({"role":"user","content":"work"})];
+        let working = request_payload_for_phase(&config, &messages, &[], 1_024, false);
+        assert_eq!(
+            working["reasoning_effort"], "medium",
+            "Deep strategy must not override the chosen effort"
+        );
+        let finalizing = request_payload_for_phase(&config, &messages, &[], 1_024, true);
+        assert!(finalizing.get("reasoning_effort").is_none());
+        assert_eq!(
+            finalizing["chat_template_kwargs"]["enable_thinking"],
+            json!(false)
+        );
+
+        config.reasoning_options =
+            Some(json!({"main":{"chat_template_kwargs":{"enable_thinking":false}}}));
+        let off = request_payload_for_phase(&config, &messages, &[], 1_024, false);
+        assert_eq!(off["chat_template_kwargs"]["enable_thinking"], json!(false));
+        assert!(
+            off.get("reasoning_effort").is_none(),
+            "thinking off sends no effort"
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@ import { WebChatService } from './web-chat';
 import { chatMessagesWithSystemPrefix, chatSystemContext } from './capabilities';
 
 export async function runWebChatRegression(): Promise<void> {
-  let decisionCalls = 0; let finalStreamCalls = 0; let closed = false; let decisionReasoningMode: string | undefined; let finalMessages: ChatMessage[] = []; const routingRequests: ToolMessage[][] = [];
+  let decisionCalls = 0; let finalStreamCalls = 0; let closed = false; let decisionReasoningMode: unknown; let finalMessages: ChatMessage[] = []; const routingRequests: ToolMessage[][] = [];
   const backend: ToolCallingBackend & LlmBackend = {
     async chatWithTools(_model, messages, _tools, _signal, _contextWindow, reasoningMode): Promise<ToolMessage> {
       routingRequests.push(messages.map((message) => ({ ...message }))); decisionCalls += 1; decisionReasoningMode = reasoningMode;

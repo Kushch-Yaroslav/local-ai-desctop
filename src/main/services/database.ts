@@ -2,6 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
 import type { AgentPlan, AnalysisRun, Attachment, AttachmentKind, AttachmentStatus, ChatMessage, ChatMode, Conversation, GenerationDiagnostics, GenerationStats, LlamaKvCacheType, ProjectReference, ProjectReferenceKind, ReasoningMode, ThinkingTimelineEvent, ToolActivity, WebMode } from '../../shared/types';
 import { paths } from './paths';
+import { isReasoningEffort } from '../../shared/reasoning-controls';
 import { isPersistableDiscoveryOption, parseStoredDiscoveryOption } from './context-discovery-persistence';
 import type { ContextDiscoveryOption } from '../../shared/context-estimator';
 
@@ -12,6 +13,7 @@ type ConversationRow = {
   llama_kv_cache_type: LlamaKvCacheType;
   llama_kv_offload: number;
   reasoning_mode: ReasoningMode;
+  thinking_enabled: number | null; reasoning_effort: string | null;
   context_tokens: number | null; context_model_id: string | null;
   web_mode: WebMode;
   created_at: string; updated_at: string;
@@ -25,7 +27,7 @@ type AgentPlanRow = { plan: string };
 
 const mapConversation = (row: ConversationRow): Conversation => ({
   id: row.id, title: row.title, modelId: row.model_id, mode: row.mode,
-  workingDirectory: row.working_directory, primaryProjectId: row.primary_project_id ?? null, secondaryWorkingDirectory: row.secondary_working_directory ?? null, secondaryProjectId: row.secondary_project_id ?? null, contextWindow: row.context_window ?? 32_768, llamaKvCacheType: row.llama_kv_cache_type === 'q8_0' ? 'q8_0' : 'f16', llamaKvOffload: row.llama_kv_offload !== 0, reasoningMode: row.reasoning_mode === 'deep' ? 'deep' : 'fast', contextTokens: row.context_tokens ?? null, contextModelId: row.context_model_id ?? null, webMode: row.web_mode ?? 'auto', createdAt: row.created_at, updatedAt: row.updated_at,
+  workingDirectory: row.working_directory, primaryProjectId: row.primary_project_id ?? null, secondaryWorkingDirectory: row.secondary_working_directory ?? null, secondaryProjectId: row.secondary_project_id ?? null, contextWindow: row.context_window ?? 32_768, llamaKvCacheType: row.llama_kv_cache_type === 'q8_0' ? 'q8_0' : 'f16', llamaKvOffload: row.llama_kv_offload !== 0, reasoningMode: row.reasoning_mode === 'deep' ? 'deep' : 'fast', thinkingEnabled: row.thinking_enabled === null || row.thinking_enabled === undefined ? null : row.thinking_enabled !== 0, reasoningEffort: isReasoningEffort(row.reasoning_effort) ? row.reasoning_effort : null, contextTokens: row.context_tokens ?? null, contextModelId: row.context_model_id ?? null, webMode: row.web_mode ?? 'auto', createdAt: row.created_at, updatedAt: row.updated_at,
 });
 const mapAttachment = (row: AttachmentRow): Attachment => ({
   id: row.id, messageId: row.message_id, index: row.position, kind: row.kind, mimeType: row.mime_type, filename: row.filename, size: row.size, storageRef: row.storage_ref, status: row.status,
@@ -143,6 +145,8 @@ export class Database {
     try { this.db.exec("ALTER TABLE conversations ADD COLUMN llama_kv_cache_type TEXT NOT NULL DEFAULT 'f16'"); } catch { /* Existing databases already have this column. */ }
     try { this.db.exec('ALTER TABLE conversations ADD COLUMN llama_kv_offload INTEGER NOT NULL DEFAULT 1'); } catch { /* Existing databases already have this column. */ }
     try { this.db.exec('ALTER TABLE conversations ADD COLUMN reasoning_mode TEXT'); } catch { /* Existing databases already have this column. */ }
+    try { this.db.exec('ALTER TABLE conversations ADD COLUMN thinking_enabled INTEGER'); } catch { /* Existing databases already have this column. */ }
+    try { this.db.exec('ALTER TABLE conversations ADD COLUMN reasoning_effort TEXT'); } catch { /* Existing databases already have this column. */ }
     try { this.db.exec('ALTER TABLE conversations ADD COLUMN context_tokens INTEGER'); } catch { /* Existing databases already have this column. */ }
     try { this.db.exec('ALTER TABLE conversations ADD COLUMN context_model_id TEXT'); } catch { /* Existing databases already have this column. */ }
     try { this.db.exec("ALTER TABLE conversations ADD COLUMN web_mode TEXT NOT NULL DEFAULT 'auto'"); } catch { /* Existing databases already have this column. */ }
@@ -219,10 +223,10 @@ export class Database {
     const id = randomUUID(); const now = new Date().toISOString();
     const title = 'Новый чат';
     this.db.prepare("INSERT INTO conversations (id, title, model_id, mode, working_directory, primary_project_id, secondary_working_directory, secondary_project_id, context_window, llama_kv_cache_type, llama_kv_offload, reasoning_mode, context_tokens, context_model_id, web_mode, created_at, updated_at) VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, 'f16', 1, ?, NULL, NULL, 'auto', ?, ?)").run(id, title, modelId, 'chat', 32_768, 'fast', now, now);
-    return { id, title, modelId, mode: 'chat', workingDirectory: null, primaryProjectId: null, secondaryWorkingDirectory: null, secondaryProjectId: null, contextWindow: 32_768, llamaKvCacheType: 'f16', llamaKvOffload: true, reasoningMode: 'fast', contextTokens: null, contextModelId: null, webMode: 'auto', createdAt: now, updatedAt: now };
+    return { id, title, modelId, mode: 'chat', workingDirectory: null, primaryProjectId: null, secondaryWorkingDirectory: null, secondaryProjectId: null, contextWindow: 32_768, llamaKvCacheType: 'f16', llamaKvOffload: true, reasoningMode: 'fast', thinkingEnabled: null, reasoningEffort: null, contextTokens: null, contextModelId: null, webMode: 'auto', createdAt: now, updatedAt: now };
   }
 
-  updateConversation(id: string, patch: Partial<Pick<Conversation, 'title' | 'modelId' | 'mode' | 'workingDirectory' | 'secondaryWorkingDirectory' | 'contextWindow' | 'llamaKvCacheType' | 'llamaKvOffload' | 'reasoningMode' | 'webMode'>>): Conversation {
+  updateConversation(id: string, patch: Partial<Pick<Conversation, 'title' | 'modelId' | 'mode' | 'workingDirectory' | 'secondaryWorkingDirectory' | 'contextWindow' | 'llamaKvCacheType' | 'llamaKvOffload' | 'reasoningMode' | 'thinkingEnabled' | 'reasoningEffort' | 'webMode'>>): Conversation {
     const current = this.getConversation(id);
     if (!current) throw new Error('Чат не найден');
     const next = { ...current, ...patch, updatedAt: new Date().toISOString() };
@@ -232,13 +236,17 @@ export class Database {
     const llamaKvCacheType: LlamaKvCacheType = next.llamaKvCacheType === 'q8_0' ? 'q8_0' : 'f16';
     const llamaKvOffload = next.llamaKvOffload !== false;
     const reasoningMode: ReasoningMode = next.reasoningMode === 'deep' ? 'deep' : 'fast';
+    const thinkingEnabled = typeof next.thinkingEnabled === 'boolean' ? next.thinkingEnabled : null;
+    const reasoningEffort = isReasoningEffort(next.reasoningEffort) ? next.reasoningEffort : null;
     const webMode: WebMode = next.webMode === 'off' ? 'off' : 'auto';
-    this.db.prepare('UPDATE conversations SET title=?, model_id=?, mode=?, working_directory=?, primary_project_id=?, secondary_working_directory=?, secondary_project_id=?, context_window=?, llama_kv_cache_type=?, llama_kv_offload=?, reasoning_mode=?, web_mode=?, updated_at=? WHERE id=?')
-      .run(next.title, next.modelId, next.mode, next.workingDirectory, next.primaryProjectId, next.secondaryWorkingDirectory, next.secondaryProjectId, contextWindow, llamaKvCacheType, llamaKvOffload ? 1 : 0, reasoningMode, webMode, next.updatedAt, id);
+    this.db.prepare('UPDATE conversations SET title=?, model_id=?, mode=?, working_directory=?, primary_project_id=?, secondary_working_directory=?, secondary_project_id=?, context_window=?, llama_kv_cache_type=?, llama_kv_offload=?, reasoning_mode=?, thinking_enabled=?, reasoning_effort=?, web_mode=?, updated_at=? WHERE id=?')
+      .run(next.title, next.modelId, next.mode, next.workingDirectory, next.primaryProjectId, next.secondaryWorkingDirectory, next.secondaryProjectId, contextWindow, llamaKvCacheType, llamaKvOffload ? 1 : 0, reasoningMode, thinkingEnabled === null ? null : thinkingEnabled ? 1 : 0, reasoningEffort, webMode, next.updatedAt, id);
     next.contextWindow = contextWindow;
     next.llamaKvCacheType = llamaKvCacheType;
     next.llamaKvOffload = llamaKvOffload;
     next.reasoningMode = reasoningMode;
+    next.thinkingEnabled = thinkingEnabled;
+    next.reasoningEffort = reasoningEffort;
     next.webMode = webMode;
     return next;
   }

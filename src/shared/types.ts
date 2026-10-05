@@ -117,6 +117,8 @@ export interface ModelInfo {
   supportedContextPresets: number[];
   supportsTools: boolean;
   supportsReasoning: boolean;
+  /** What the user can control about the model's reasoning; absent when it has no configurable reasoning. */
+  reasoning?: import('./reasoning-controls').ReasoningCapability;
   shortName: string;
 }
 
@@ -134,7 +136,12 @@ export interface Conversation {
   contextWindow: number;
   llamaKvCacheType?: LlamaKvCacheType;
   llamaKvOffload?: boolean;
+  /** Agent strategy (Fast/Deep) and chat guidance. It does not decide whether the model thinks or how hard. */
   reasoningMode: ReasoningMode;
+  /** Explicit thinking toggle. null = never chosen: the model's default applies (legacy conversations). */
+  thinkingEnabled: boolean | null;
+  /** Explicit reasoning depth. null = never chosen: derived from the strategy for legacy conversations. */
+  reasoningEffort: import('./reasoning-controls').ReasoningEffort | null;
   contextTokens: number | null;
   contextModelId: string | null;
   webMode: WebMode;

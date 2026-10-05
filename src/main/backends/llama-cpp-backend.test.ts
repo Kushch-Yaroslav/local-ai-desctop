@@ -3,7 +3,7 @@ import { createServer, type Server } from 'node:http';
 import { once } from 'node:events';
 import { LlamaCppBackend, LlamaCppContextExhaustedError, LlamaCppRequestError, validateLlamaMessageSequence } from './llama-cpp-backend';
 import type { ToolMessage } from './types';
-import { llamaRuntimeProfiles } from '../models/llama-runtime-policy';
+import { llamaReasoningForInput, llamaRuntimeProfiles } from '../models/llama-runtime-policy';
 import type { ChatMessage } from '../../shared/types';
 
 const model = 'qwen3.8:27b-q4_K_M';
@@ -62,18 +62,28 @@ const toolSchema = [{ type: 'function', function: { name: 'read_file', descripti
 const call = (backend: LlamaCppBackend, messages: ToolMessage[], tools: unknown[] | undefined = toolSchema) => backend.chatWithTools(model, messages, tools, new AbortController().signal, 65_536, 'deep');
 
 export async function runLlamaCppBackendRegression(): Promise<void> {
-  // Fast and Deep both keep model thinking on; they differ in effort. Only the final tool-free turn may turn thinking off.
+  // A bare strategy keeps its historical meaning (thinking on; Fast = lowest effort, Deep = highest the model supports);
+  // only the final tool-free turn may turn thinking off.
   for (const profile of llamaRuntimeProfiles) {
-    const options = profile.reasoningOptions;
-    if (!options) continue;
-    for (const mode of ['fast', 'deep'] as const) {
-      const kwargs = options[mode]?.chat_template_kwargs as { enable_thinking?: boolean } | undefined;
-      assert.notEqual(kwargs?.enable_thinking, false, `${profile.id} ${mode} must not disable thinking`);
-      assert.notEqual(options[mode]?.reasoning_effort, 'none', `${profile.id} ${mode} must not use no-reasoning effort`);
+    const reasoning = profile.reasoning;
+    if (!reasoning) continue;
+    const fast = llamaReasoningForInput(profile.id, 'fast');
+    const deep = llamaReasoningForInput(profile.id, 'deep');
+    for (const fragment of [fast, deep]) {
+      assert.notEqual((fragment.chat_template_kwargs as { enable_thinking?: boolean } | undefined)?.enable_thinking, false, `${profile.id} strategies must not disable thinking`);
+      assert.notEqual(fragment.reasoning_effort, 'none', `${profile.id} must not use no-reasoning effort`);
     }
-    assert.equal(options.fast?.reasoning_effort, 'low', `${profile.id} Fast must use low reasoning effort`);
-    assert.notEqual(options.deep?.reasoning_effort, options.fast?.reasoning_effort, `${profile.id} Deep must differ from Fast`);
+    assert.equal(fast.reasoning_effort, 'low', `${profile.id} Fast must use low reasoning effort`);
+    assert.notEqual(deep.reasoning_effort, fast.reasoning_effort, `${profile.id} Deep must differ from Fast`);
+    assert.deepEqual(llamaReasoningForInput(profile.id, 'auto'), {}, `${profile.id} Auto must leave native reasoning at the model default`);
   }
+  // Explicit thinking/effort are independent of the strategy and reach llama.cpp unchanged.
+  assert.deepEqual(llamaReasoningForInput('qwen3.8:27b-q4_K_M', { mode: 'deep', selection: { thinking: true, effort: 'medium' } }), { reasoning_effort: 'medium', chat_template_kwargs: { enable_thinking: true } });
+  assert.deepEqual(llamaReasoningForInput('qwen3.8:27b-q4_K_M', { mode: 'fast', selection: { thinking: true, effort: 'max' } }), { reasoning_effort: 'xhigh', chat_template_kwargs: { enable_thinking: true } });
+  assert.deepEqual(llamaReasoningForInput('qwen3.8:27b-q4_K_M', { mode: 'deep', selection: { thinking: false, effort: 'max' } }), { chat_template_kwargs: { enable_thinking: false } }, 'thinking off must send no effort');
+  assert.deepEqual(llamaReasoningForInput('gpt-oss:20b', { mode: 'deep', selection: { thinking: null, effort: 'medium' } }), { reasoning_effort: 'medium' }, 'a model without a thinking switch gets only its effort');
+  assert.deepEqual(llamaReasoningForInput('gpt-oss:20b', { mode: 'fast', selection: { thinking: false, effort: 'high' } }), { reasoning_effort: 'high' }, 'an unsupported thinking switch must never reach a model that lacks it');
+  assert.deepEqual(llamaReasoningForInput('glm-4.7-flash:q4_k', { mode: 'fast', selection: { thinking: true, effort: 'medium' } }), { reasoning_effort: 'low', chat_template_kwargs: { enable_thinking: true } }, 'an unsupported level must fall back to the nearest supported one');
   {
     const scenario: Scenario = { serverContext: 16_384, trainContext: 262_144, modelSize: 16_799_719_424, requestBodies: [], countBodies: [] }; const { server, url } = await startServer(scenario);
     try {

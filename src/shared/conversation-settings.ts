@@ -1,6 +1,7 @@
 import type { ChatMode, Conversation, ReasoningMode } from './types';
+import { resolveReasoningSelection, type ReasoningCapability, type ReasoningEffort } from './reasoning-controls';
 
-export type ConversationPatch = Partial<Pick<Conversation, 'title' | 'modelId' | 'mode' | 'workingDirectory' | 'secondaryWorkingDirectory' | 'contextWindow' | 'llamaKvCacheType' | 'llamaKvOffload' | 'reasoningMode' | 'webMode'>>;
+export type ConversationPatch = Partial<Pick<Conversation, 'title' | 'modelId' | 'mode' | 'workingDirectory' | 'secondaryWorkingDirectory' | 'contextWindow' | 'llamaKvCacheType' | 'llamaKvOffload' | 'reasoningMode' | 'thinkingEnabled' | 'reasoningEffort' | 'webMode'>>;
 
 const runtimeKeys = ['modelId', 'contextWindow', 'llamaKvCacheType', 'llamaKvOffload'] as const;
 
@@ -21,7 +22,7 @@ export function revertRefusedPatch(current: Conversation, before: Conversation, 
   return next as unknown as Conversation;
 }
 
-export type EffectiveModeState = { reasoningMode: 'fast' | 'deep'; mode: ChatMode };
+export type EffectiveModeState = { reasoningMode: 'fast' | 'deep'; mode: ChatMode; thinkingEnabled?: boolean | null; reasoningEffort?: ReasoningEffort | null };
 export type ModeTransition = { desired: Partial<EffectiveModeState>; effective: EffectiveModeState };
 
 export interface EffectiveModes {
@@ -44,4 +45,51 @@ export function effectiveModes(chat: Pick<Conversation, 'reasoningMode' | 'mode'
   const pendingReasoning = transition?.desired.reasoningMode && transition.desired.reasoningMode !== confirmed.reasoningMode ? transition.desired.reasoningMode : null;
   const pendingMode = transition?.desired.mode && transition.desired.mode !== confirmed.mode ? transition.desired.mode : null;
   return { reasoning: supportsReasoning ? confirmed.reasoningMode : null, mode: confirmed.mode, pendingReasoning: supportsReasoning ? pendingReasoning : null, pendingMode };
+}
+
+/**
+ * A conversation that never chose thinking/effort derived them from the strategy. Changing the strategy must not move
+ * them, so the values it was effectively using are written down together with the first strategy change.
+ */
+export function pinLegacyReasoning(chat: Pick<Conversation, 'reasoningMode' | 'thinkingEnabled' | 'reasoningEffort'>, capability: ReasoningCapability | null | undefined, patch: ConversationPatch): ConversationPatch {
+  if (!capability || patch.reasoningMode === undefined || patch.reasoningMode === chat.reasoningMode) return patch;
+  const legacy = resolveReasoningSelection(capability, chat.reasoningMode, chat);
+  return {
+    ...(chat.thinkingEnabled === null && patch.thinkingEnabled === undefined && legacy.thinking !== null ? { thinkingEnabled: legacy.thinking } : {}),
+    ...(chat.reasoningEffort === null && patch.reasoningEffort === undefined && legacy.effort !== null ? { reasoningEffort: legacy.effort } : {}),
+    ...patch,
+  };
+}
+
+export interface EffectiveReasoning {
+  /** false when the selected model has no configurable reasoning at all. */
+  supported: boolean;
+  /** null = the model has no thinking switch. */
+  thinking: boolean | null;
+  /** null = the model has no effort levels. */
+  effort: ReasoningEffort | null;
+  /** Effort is meaningless while thinking is off. */
+  effortApplies: boolean;
+  pendingThinking: boolean | null;
+  pendingEffort: ReasoningEffort | null;
+}
+
+/** Thinking and effort as the next request will really use them, with an unconfirmed selection reported as pending only. */
+export function effectiveReasoning(chat: Pick<Conversation, 'reasoningMode' | 'thinkingEnabled' | 'reasoningEffort'>, capability: ReasoningCapability | null | undefined, transition?: ModeTransition | null): EffectiveReasoning {
+  if (!capability) return { supported: false, thinking: null, effort: null, effortApplies: false, pendingThinking: null, pendingEffort: null };
+  const confirmedRaw = transition ? transition.effective : { reasoningMode: normalizeReasoning(chat.reasoningMode), thinkingEnabled: chat.thinkingEnabled, reasoningEffort: chat.reasoningEffort };
+  const confirmed = resolveReasoningSelection(capability, confirmedRaw.reasoningMode, { thinkingEnabled: confirmedRaw.thinkingEnabled ?? null, reasoningEffort: confirmedRaw.reasoningEffort ?? null });
+  const desired = transition?.desired;
+  const wanted = desired ? resolveReasoningSelection(capability, confirmedRaw.reasoningMode, {
+    thinkingEnabled: desired.thinkingEnabled !== undefined ? desired.thinkingEnabled : confirmed.thinking,
+    reasoningEffort: desired.reasoningEffort !== undefined ? desired.reasoningEffort : confirmed.effort,
+  }) : confirmed;
+  return {
+    supported: true,
+    thinking: confirmed.thinking,
+    effort: confirmed.effort,
+    effortApplies: confirmed.effort !== null && confirmed.thinking !== false,
+    pendingThinking: wanted.thinking !== confirmed.thinking ? wanted.thinking : null,
+    pendingEffort: wanted.effort !== confirmed.effort ? wanted.effort : null,
+  };
 }

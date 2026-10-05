@@ -4,7 +4,7 @@ import { appendReasoningFragments, thinkingTimeline } from './thinking-timeline'
 import type { ChatMessage, Conversation, ThinkingTimelineEvent } from './types';
 import type {} from '../renderer/env';
 
-const conversation: Conversation = { id: 'A', title: 'A', modelId: 'model', mode: 'agent', workingDirectory: null, primaryProjectId: null, secondaryWorkingDirectory: null, secondaryProjectId: null, contextWindow: 16384, reasoningMode: 'deep', contextTokens: null, contextModelId: null, webMode: 'off', createdAt: '', updatedAt: '' };
+const conversation: Conversation = { id: 'A', title: 'A', modelId: 'model', mode: 'agent', workingDirectory: null, primaryProjectId: null, secondaryWorkingDirectory: null, secondaryProjectId: null, contextWindow: 16384, thinkingEnabled: null, reasoningEffort: null, reasoningMode: 'deep', contextTokens: null, contextModelId: null, webMode: 'off', createdAt: '', updatedAt: '' };
 
 export async function runStreamingLoadRegression(): Promise<void> {
   // --- The race that fragmented the timeline: the tool event is applied at once, the last reasoning fragments wait for the next frame.

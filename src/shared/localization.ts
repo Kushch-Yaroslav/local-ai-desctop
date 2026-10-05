@@ -2,7 +2,23 @@
  * Russian presentation of runtime labels. Internal values (modes, statuses, model ids, protocol fields) are never
  * changed; they are mapped to text only where they are shown.
  */
-export const reasoningModeLabel = { fast: 'Быстро', deep: 'Глубоко' } as const;
+/** The Agent strategy (how the Agent plans and verifies), not how hard the model thinks. */
+export const reasoningModeLabel = { fast: 'Быстрая', deep: 'Глубокая' } as const;
+export const reasoningEffortLabel = { low: 'Низкая', medium: 'Средняя', high: 'Высокая', max: 'Максимальная' } as const;
+export const thinkingLabel = { on: 'Вкл.', off: 'Выкл.' } as const;
+export const reasoningControlText = {
+  thinking: 'Размышления',
+  effort: 'Глубина рассуждений',
+  strategy: 'Стратегия агента',
+  unavailable: 'Недоступно',
+  thinkingHint: 'Включает или отключает размышления модели. Применяется к следующему запросу.',
+  effortHint: 'Сколько усилий модель тратит на размышления. Не зависит от стратегии агента.',
+  strategyHint: 'Как Agent планирует работу и проверяет результат. Не меняет размышления модели.',
+  thinkingUnavailable: 'Эта модель не позволяет отключать размышления.',
+  effortUnavailable: 'Для этой модели глубина рассуждений не настраивается.',
+  effortInactive: 'Размышления выключены — глубина не применяется.',
+  pending: 'Выбрано, ещё не подтверждено runtime',
+} as const;
 export const chatModeLabel = { chat: 'Чат', agent: 'Агент' } as const;
 
 /** Why a Max Context search stopped at its boundary. */

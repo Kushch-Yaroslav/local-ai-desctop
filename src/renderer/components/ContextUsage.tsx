@@ -2,8 +2,8 @@ import { useEffect, useState } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 import { useAppStore } from '../store/app-store';
 import { formatContextTokens } from '../../shared/context-format';
-import { effectiveModes } from '../../shared/conversation-settings';
-import { chatModeLabel, formatCount, formatDuration, reasoningModeLabel, tokensWord } from '../../shared/localization';
+import { effectiveModes, effectiveReasoning } from '../../shared/conversation-settings';
+import { chatModeLabel, formatCount, formatDuration, reasoningControlText, reasoningEffortLabel, reasoningModeLabel, thinkingLabel, tokensWord } from '../../shared/localization';
 
 export { formatContextTokens } from '../../shared/context-format';
 
@@ -39,14 +39,17 @@ export function ContextUsage({ initiallyOpen = false }: { initiallyOpen?: boolea
   const cachedTokens = agentTelemetry?.cachedTokens;
   const cacheRate = typeof cachedTokens === 'number' && (agentTelemetry?.inputTokens ?? 0) > 0 ? Math.min(100, cachedTokens / agentTelemetry!.inputTokens * 100) : null;
   const model = models.find((item) => item.id === chat.modelId);
-  const modes = effectiveModes(chat, Boolean(model?.supportsReasoning), modeTransitions[chat.id]);
+  const modes = effectiveModes(chat, true, modeTransitions[chat.id]);
+  const reasoning = effectiveReasoning(chat, model?.reasoning, modeTransitions[chat.id]);
   const llama = settings?.llamaRuntime;
   const runtimeState = !chat.modelId ? null : llama?.status === 'switching' || llama?.status === 'starting' ? 'llama.cpp запускается…' : llama && llama.status !== 'ready' ? 'llama.cpp не запущен' : llama?.modelId && llama.modelId !== chat.modelId ? 'Загружена другая модель' : null;
   return <div className={`context-usage ${tone}`}><button type="button" title="Контекст и telemetry" onClick={() => setOpen((value) => !value)} aria-expanded={open} aria-label={`Контекст: ${percent.toFixed(1)}%`}><svg viewBox="0 0 36 36" aria-hidden="true"><circle className="context-track" cx="18" cy="18" r="15.5" /><circle className="context-progress" cx="18" cy="18" r="15.5" pathLength="100" strokeDasharray={`${percent} ${100 - percent}`} /></svg><span>{current === null ? '—' : `${Math.round(percent)}%`}</span></button>{open && <section className={`context-usage-popover ${tone}`} aria-label="Контекст">
     <header className="ctx-head"><div><span className="ctx-kicker">Контекст</span><strong className="ctx-percent">{current === null ? '—' : `${percent.toFixed(0)}%`}</strong></div><span className="ctx-amount">{formatContextTokens(used)} / {formatContextTokens(maximum)}</span></header>
     <div className="ctx-meter" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(percent)}><i style={{ width: `${percent}%` }} /></div>
     <div className="ctx-modes">
-      <div className="ctx-mode"><span>Рассуждение</span>{modes.reasoning ? <b className={`ctx-chip reasoning-${modes.reasoning}`}>{reasoningLabel[modes.reasoning]}</b> : <b className="ctx-chip muted" title="Модель не поддерживает настройку рассуждения">—</b>}{modes.pendingReasoning && <em className="ctx-pending" title="Выбрано, ещё не подтверждено runtime">→ {reasoningLabel[modes.pendingReasoning]}</em>}</div>
+      <div className="ctx-mode"><span>{reasoningControlText.thinking}</span>{reasoning.thinking !== null ? <b className={`ctx-chip thinking-${reasoning.thinking ? 'on' : 'off'}`}>{reasoning.thinking ? thinkingLabel.on : thinkingLabel.off}</b> : <b className="ctx-chip muted" title={reasoningControlText.thinkingUnavailable}>{reasoningControlText.unavailable}</b>}{reasoning.pendingThinking !== null && <em className="ctx-pending" title={reasoningControlText.pending}>→ {reasoning.pendingThinking ? thinkingLabel.on : thinkingLabel.off}</em>}</div>
+      <div className="ctx-mode"><span>{reasoningControlText.effort}</span>{reasoning.effort !== null ? <b className={`ctx-chip effort-${reasoning.effort}${reasoning.effortApplies ? '' : ' muted'}`} title={reasoning.effortApplies ? undefined : reasoningControlText.effortInactive}>{reasoningEffortLabel[reasoning.effort]}</b> : <b className="ctx-chip muted" title={reasoningControlText.effortUnavailable}>{reasoningControlText.unavailable}</b>}{reasoning.pendingEffort !== null && <em className="ctx-pending" title={reasoningControlText.pending}>→ {reasoningEffortLabel[reasoning.pendingEffort]}</em>}</div>
+      <div className="ctx-mode"><span>{reasoningControlText.strategy}</span>{modes.reasoning ? <b className={`ctx-chip reasoning-${modes.reasoning}`}>{reasoningLabel[modes.reasoning]}</b> : <b className="ctx-chip muted">—</b>}{modes.pendingReasoning && <em className="ctx-pending" title={reasoningControlText.pending}>→ {reasoningLabel[modes.pendingReasoning]}</em>}</div>
       <div className="ctx-mode"><span>Режим</span><b className={`ctx-chip mode-${modes.mode}`}>{modeLabel[modes.mode]}</b>{modes.pendingMode && <em className="ctx-pending" title="Выбрано, ещё не подтверждено runtime">→ {modeLabel[modes.pendingMode]}</em>}</div>
     </div>
     {runtimeState && <p className="ctx-runtime" role="status">{runtimeState}</p>}

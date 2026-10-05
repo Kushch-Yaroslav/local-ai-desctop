@@ -14,7 +14,8 @@ import { paths } from '../services/paths';
 import { discardAgentEvidence } from '../services/agent-evidence';
 import { log } from '../services/logger';
 import { getModelProfile } from '../models/model-registry';
-import { llamaContextPresets, llamaRuntimeProfile } from '../models/llama-runtime-policy';
+import { agentReasoningOptions, llamaContextPresets, llamaRuntimeProfile, reasoningCapability } from '../models/llama-runtime-policy';
+import { reasoningPatchError, resolveReasoningSelection, type ReasoningInput } from '../../shared/reasoning-controls';
 import { WebBrowserService } from '../web/web-tools';
 import { WebChatService } from '../services/web-chat';
 import { chatMessagesWithSystemPrefix, chatSystemContext } from '../services/capabilities';
@@ -27,7 +28,7 @@ import { projectDirectoryName } from '../../shared/project-references';
 import { executionMode } from '../../shared/generation-mode';
 import { enabledAgentTools, explicitWorkspaceRoots } from '../services/agent-workspace';
 import { homedir } from 'node:os';
-import { touchesRuntime } from '../../shared/conversation-settings';
+import { pinLegacyReasoning, touchesRuntime } from '../../shared/conversation-settings';
 import { existingProjectDirectory } from '../services/project-picker';
 import { collectRuntimeContextEstimate, defaultContextDeviceReserveBytes, defaultContextHostReserveBytes, resolveContextReserve } from '../services/context-estimate';
 import { join } from 'node:path';
@@ -423,14 +424,16 @@ export function registerIpc(): void {
     if (!getModelProfile(modelId)) throw new Error('Выбранная модель отсутствует в реестре приложения');
     return database.createConversation(modelId);
   });
-  ipcMain.handle('conversations:update', async (_event, id: string, patch: Partial<Pick<Conversation, 'title' | 'modelId' | 'mode' | 'workingDirectory' | 'secondaryWorkingDirectory' | 'contextWindow' | 'llamaKvCacheType' | 'llamaKvOffload' | 'reasoningMode' | 'webMode'>>) => {
+  ipcMain.handle('conversations:update', async (_event, id: string, patch: Partial<Pick<Conversation, 'title' | 'modelId' | 'mode' | 'workingDirectory' | 'secondaryWorkingDirectory' | 'contextWindow' | 'llamaKvCacheType' | 'llamaKvOffload' | 'reasoningMode' | 'thinkingEnabled' | 'reasoningEffort' | 'webMode'>>) => {
     // Reasoning/mode/web/project/title changes never touch llama.cpp, so they must not queue behind
     // (or be refused by) a runtime switch: a refusal made the UI roll the user's choice back.
     if (!touchesRuntime(patch)) {
       if (activeGenerations.size && Object.keys(patch).some((key) => key !== 'title')) throw new Error('Дождитесь завершения активной генерации перед изменением настроек.');
       const existing = database.getConversation(id);
       if (!existing) throw new Error('Чат не найден');
-      const stored = database.updateConversation(id, patch);
+      const reasoningError = reasoningPatchError(patch, reasoningCapability(llamaRuntimeProfile(existing.modelId ?? '')));
+      if (reasoningError) throw new Error(reasoningError);
+      const stored = database.updateConversation(id, pinLegacyReasoning(existing, reasoningCapability(llamaRuntimeProfile(existing.modelId ?? '')), patch));
       if ((patch.workingDirectory !== undefined && patch.workingDirectory !== existing.workingDirectory) || (patch.secondaryWorkingDirectory !== undefined && patch.secondaryWorkingDirectory !== existing.secondaryWorkingDirectory)) sessionApprovals.delete(id);
       return database.getConversation(id) ?? stored;
     }
@@ -649,11 +652,14 @@ export function registerIpc(): void {
       if (nativeVision) history = await attachmentPipeline.prepareNativeImages(history, abort.signal);
       const persistedTaskMemory = mode === 'agent' ? taskPlan(database.getAgentPlan(request.conversationId) ?? {}).taskMemory : undefined;
       const agentSupportsReasoning = mode === 'agent' && llamaCpp.supportsReasoning(request.model);
+      const reasoningCapabilityForModel = reasoningCapability(llamaRuntimeProfile(request.model));
+      const reasoningSelection = resolveReasoningSelection(reasoningCapabilityForModel, conversation.reasoningMode, conversation);
+      const reasoningInput: ReasoningInput = reasoningCapabilityForModel ? { mode: conversation.reasoningMode, selection: reasoningSelection } : conversation.reasoningMode;
       const stream = mode === 'agent'
-        ? rustAgent.stream(request.model, history, agentProjects, abort.signal, context.active, conversation.reasoningMode, conversation.webMode, generation.id, persistedTaskMemory, request.conversationId, agentSupportsReasoning, llamaRuntimeProfile(request.model)?.reasoningOptions, workspaceRoots)
+        ? rustAgent.stream(request.model, history, agentProjects, abort.signal, context.active, conversation.reasoningMode, conversation.webMode, generation.id, persistedTaskMemory, request.conversationId, agentSupportsReasoning, agentReasoningOptions(request.model, reasoningSelection), workspaceRoots)
         : conversation.webMode === 'auto'
-          ? webChat.stream(request.model, history, abort.signal, context.active, conversation.reasoningMode)
-          : backend.streamChat(request.model, chatMessagesWithSystemPrefix(history, [chatSystemContext({ webAvailable: false }, conversation.reasoningMode === 'deep' ? 'deep' : 'fast')], request.conversationId, `capability-${request.conversationId}`), abort.signal, context.active, conversation.reasoningMode);
+          ? webChat.stream(request.model, history, abort.signal, context.active, reasoningInput)
+          : backend.streamChat(request.model, chatMessagesWithSystemPrefix(history, [chatSystemContext({ webAvailable: false }, conversation.reasoningMode === 'deep' ? 'deep' : 'fast')], request.conversationId, `capability-${request.conversationId}`), abort.signal, context.active, reasoningInput);
       for await (let chunk of stream) {
         if (!current()) break;
         if (chunk.type === 'steering') {
