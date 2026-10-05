@@ -1,5 +1,7 @@
 # Local model refresh — 2026-10-05
 
+Follow-up on the same date: baseline Qwen was subsequently [migrated to standalone files and Ollama removed](qwen-standalone-migration-2026-10-05.md). The [Max Context regression report](max-context-regression-2026-10-05.md) records later real runtime validation. The audit and no-inference statements below describe the original refresh task's state.
+
 Baseline: clean `v2-migration`, commit `65666cda0d5d6477cd2cd3a9c0b3a12049dc8dcd`. Implementation branch: `feat/local-model-refresh`. No merge or push. No model inference, benchmark, VRAM loading, or Max Context discovery was performed. Application tests use mocks and fixtures.
 
 ## Ollama audit and preservation
