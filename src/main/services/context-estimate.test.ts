@@ -141,6 +141,44 @@ I srv llama_server: model loaded
   assert.equal(kvOnly.visionPresent, false, 'actual no-projector arguments must establish text-only runtime');
   assert.deepEqual(kvOnly.allocations.ssm, { host: 0, device: 0 });
   assert.deepEqual(kvOnly.unknownReasons, [], 'complete non-recurrent/non-vision allocation evidence was rejected');
+  // A backend can split one context into independent full/SWA caches. Do not
+  // treat the smaller allocation as a repeated summary of the larger one.
+  const partitionedLog = kvOnlyLog.replace(
+    'I llama_kv_cache: CUDA0 KV buffer size = 1692.00 MiB\nI llama_kv_cache: size = 1692.00 MiB (32768 cells, 47 layers, 1/1 seqs), K (f16): 1692.00 MiB, V (f16): 0.00 MiB',
+    `I llama_kv_cache_iswa: creating full KV cache, size = 32768 cells
+I llama_kv_cache: CUDA0 KV buffer size = 2560.00 MiB
+I llama_kv_cache: size = 2560.00 MiB (32768 cells, 10 layers, 1/1 seqs), K (f16): 1280 MiB, V (f16): 1280 MiB
+I llama_kv_cache_iswa: creating SWA KV cache, size = 1536 cells
+I llama_kv_cache: CUDA0 KV buffer size = 1200.00 MiB
+I llama_kv_cache: size = 1200.00 MiB (1536 cells, 50 layers, 1/1 seqs), K (f16): 600 MiB, V (f16): 600 MiB`,
+  ).replace('I srv load_model: initializing', `I clip_model_loader: has vision encoder
+I load_hparams: model size: 1143.39 MiB
+I reserve_compute_meta: CPU compute buffer size = 248.10 MiB
+I srv load_model: initializing`);
+  const partitioned = parseLlamaAllocationLog(partitionedLog, ['llama-server', '-m', '/models/target.gguf', '--mmproj', '/models/projector.gguf']);
+  assert.equal(partitioned.allocations.kv.device, 3760 * 1024 ** 2, 'independent caches must be summed');
+  assert.equal(partitioned.allocations.kv.host, 0, 'matching aggregate summaries establish absent host KV');
+  assert.deepEqual(partitioned.unknownReasons, []);
+  const partitionedEstimate = await collectRuntimeContextEstimate({ backend: 'llama-cpp', modelId: runtime.modelId,
+    configuredMaxTokens: 262_144, contextPresets: [16_384, 32_768], hardware, runtime,
+    runtimeArguments: ['llama-server', '--mmproj', '/models/projector.gguf'],
+    hostReserveBytes: defaultContextHostReserveBytes, deviceReserveBytes: defaultContextDeviceReserveBytes }, async () => ({ text: partitionedLog }));
+  assert.equal(partitionedEstimate.status, 'estimated', 'a projector and partitioned KV must not disable discovery');
+  const missingVisionCompute = await collectRuntimeContextEstimate({ backend: 'llama-cpp', modelId: runtime.modelId,
+    configuredMaxTokens: 262_144, contextPresets: [16_384, 32_768], hardware, runtime,
+    runtimeArguments: ['llama-server', '--mmproj', '/models/projector.gguf'],
+    hostReserveBytes: defaultContextHostReserveBytes, deviceReserveBytes: defaultContextDeviceReserveBytes },
+  async () => ({ text: partitionedLog.replace('I reserve_compute_meta: CPU compute buffer size = 248.10 MiB', '') }));
+  assert.equal(missingVisionCompute.status, 'observed', 'missing projector allocation must remain unsafe, not invented');
+  assert(missingVisionCompute.unknownReasons.some((reason) => reason.includes('проектора')));
+  const repeatedPartitions = partitionedLog.replace('I srv load_model: initializing',
+    partitionedLog.slice(partitionedLog.indexOf('I llama_kv_cache_iswa:'), partitionedLog.indexOf('I sched_reserve:')) + '\nI srv load_model: initializing');
+  assert.equal(parseLlamaAllocationLog(repeatedPartitions).allocations.kv.device, 3760 * 1024 ** 2, 'repeat summaries must not double count');
+  const mixedCacheTypes = partitionedLog.replace('K (f16): 600 MiB', 'K (q8_0): 600 MiB');
+  const mixedEstimate = await collectRuntimeContextEstimate({ backend: 'llama-cpp', modelId: runtime.modelId,
+    configuredMaxTokens: 262_144, contextPresets: [16_384, 32_768], hardware, runtime,
+    hostReserveBytes: defaultContextHostReserveBytes, deviceReserveBytes: defaultContextDeviceReserveBytes }, async () => ({ text: mixedCacheTypes }));
+  assert.equal(mixedEstimate.status, 'observed', 'conflicting partition precision cannot validate one KV mode');
   const partialKvOnly = parseLlamaAllocationLog(kvOnlyLog.replace('I srv llama_server: model loaded', ''), ['llama-server']);
   assert(partialKvOnly.unknownReasons.some((reason) => reason.includes('рекуррентному состоянию')), 'partial startup must not manufacture an absent recurrent allocation');
   const q8Response = await collectRuntimeContextEstimate({

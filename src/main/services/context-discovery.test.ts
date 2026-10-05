@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { discoverContextBoundary, predictContextHeadroom, type DiscoveryProbe } from './context-discovery';
 import type { RuntimeContextEstimate } from '../../shared/context-estimator';
+import { llamaRuntimeProfiles } from '../models/llama-runtime-policy';
 import { createVramBudget } from '../../shared/vram-budget';
 
 const GiB = 1024 ** 3;
@@ -48,6 +49,32 @@ export async function runContextDiscoveryRegression() {
     probe: async (context, mode, phase) => { const probe = fixture(context, mode, phase); probe.estimate!.observedContextTokens = 4096; return probe; },
     restore: async () => undefined, progress: () => undefined });
   assert.equal(mismatch.options.length, 0, 'a different effective n_ctx must not establish a maximum');
+  // Registration names, reasoning controls and speculative/projector presence
+  // do not participate in discovery eligibility. Future runtimes inherit it.
+  for (const profile of [...llamaRuntimeProfiles, { id: 'future-runtime:no-reasoning', maxContext: 65_536, speculative: 'none', vision: false }]) {
+    const generic = await discoverContextBoundary({ modelId: profile.id, hardLimit: profile.maxContext,
+      kvOffload: true, hostReserveBytes: 8 * GiB, deviceReserveBytes: 0,
+      probe: async (context, mode, phase) => {
+        const probe = fixture(context, mode, phase);
+        const sample = probe.estimate!;
+        sample.modelId = profile.id;
+        sample.configuredMaxTokens = profile.maxContext;
+        sample.modelTrainContextTokens = profile.maxContext;
+        if (profile.speculative === 'none') {
+          sample.allocationEvidence!.speculativeMode = 'none';
+          sample.allocationEvidence!.speculativeSlots = 0;
+          sample.allocationEvidence!.allocations.speculativeKv = { host: 0, device: 0 };
+          sample.allocationEvidence!.allocations.speculativeCompute = { host: 0, device: 0 };
+        }
+        return probe;
+      }, restore: async () => undefined, progress: () => undefined });
+    assert(generic.options.length, `${profile.id} must inherit generic discovery`);
+    assert(generic.probes!.some((probe) => probe.phase === 'search'), `${profile.id} must probe candidates`);
+    for (const option of generic.options) {
+      assert.equal(option.modelId, profile.id);
+      assert(option.contextWindow <= profile.maxContext);
+    }
+  }
   const first = fixture(16384, 'f16', 'base').estimate!;
   const second = fixture(32768, 'f16', 'search').estimate!;
   first.allocationEvidence!.allocations.ssm.device = GiB;

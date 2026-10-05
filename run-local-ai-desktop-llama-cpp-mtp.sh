@@ -145,6 +145,20 @@ server_failure_reason() {
   printf '%s' "$detail"
 }
 
+# Pure argument construction, also exercised by the launcher regression tests.
+build_server_args() {
+  local context="$1" gpu_layers="$2"
+  server_args=(--log-verbosity 5 -m "$MODEL" --alias "$RUNTIME_MODEL_ID" --host 127.0.0.1 --port "$PORT" --ctx-size "$context" --gpu-layers "$gpu_layers" --flash-attn on "${context_args[@]}" --parallel 1 --jinja --reasoning on --reasoning-format auto)
+  # A projector must reserve its compute buffers at startup: Max Context
+  # requires measured vision allocations before it can safely probe candidates.
+  if [[ -n "$MMPROJ" ]]; then
+    server_args+=(--mmproj "$MMPROJ" --no-mmproj-offload)
+  else
+    server_args+=(--no-warmup)
+  fi
+  if [[ "$VARIANT" == "qwen-mtp" ]]; then server_args+=(--spec-type draft-mtp); else server_args+=(--spec-type none); fi
+}
+
 # launch_server <model_id> <context> <kv_type> <kv_offload>
 # Success means: the process is alive, /health is ok, /v1/models reports the
 # requested alias with exactly the requested n_ctx, and (for MTP) the draft
@@ -169,9 +183,7 @@ launch_server() {
   : > "$SERVER_LOG"
   log "llama-server.start variant=$VARIANT runtime_model_id=$RUNTIME_MODEL_ID ctx_size=$context kv_type=$kv_type kv_offload=$kv_offload model=$MODEL mmproj=${MMPROJ:-none}"
   local server_args=() printed_command
-  server_args=(--log-verbosity 5 -m "$MODEL" --alias "$RUNTIME_MODEL_ID" --host 127.0.0.1 --port "$PORT" --ctx-size "$context" --gpu-layers "$gpu_layers" --flash-attn on "${context_args[@]}" --parallel 1 --jinja --reasoning on --reasoning-format auto --no-warmup)
-  if [[ -n "$MMPROJ" ]]; then server_args+=(--mmproj "$MMPROJ" --no-mmproj-offload); fi
-  if [[ "$VARIANT" == "qwen-mtp" ]]; then server_args+=(--spec-type draft-mtp); else server_args+=(--spec-type none); fi
+  build_server_args "$context" "$gpu_layers"
   printf -v printed_command '%q ' "$LLAMA_BIN" "${server_args[@]}"
   log "llama-server.command=${printed_command% }"
   "$LLAMA_BIN" "${server_args[@]}" >> "$SERVER_LOG" 2>&1 &
