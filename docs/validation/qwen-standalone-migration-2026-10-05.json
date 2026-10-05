@@ -1,0 +1,41 @@
+{
+  "files": [
+    {
+      "old_path": "/media/yaroslav/DATA/ollama/blobs/sha256-f5f1dd8920d417aac2718b0bda3403da274301efdd6760b4f0f4b864ff2ad57d",
+      "new_path": "/media/yaroslav/DATA/llama-models/qwen3.8-27b-q4_K_M.gguf",
+      "size": 16810714464,
+      "sha256": "f5f1dd8920d417aac2718b0bda3403da274301efdd6760b4f0f4b864ff2ad57d",
+      "mtime_ns": 1789311281474077908
+    },
+    {
+      "old_path": "/media/yaroslav/DATA/ollama/blobs/sha256-ac3714bfdddeca31351f2752bf1a63f266f4df87c0b68c895e44945ca704448e",
+      "new_path": "/media/yaroslav/DATA/llama-models/qwen3.8-27b-mmproj.gguf",
+      "size": 931146016,
+      "sha256": "ac3714bfdddeca31351f2752bf1a63f266f4df87c0b68c895e44945ca704448e",
+      "mtime_ns": 1789311123868973082
+    }
+  ],
+  "removed": [
+    {
+      "path": "/media/yaroslav/DATA/ollama",
+      "bytes": 49779509991
+    },
+    {
+      "path": "/usr/local/lib/ollama",
+      "bytes": 2222655915
+    },
+    {
+      "path": "/usr/local/bin/ollama",
+      "bytes": 40014640
+    },
+    {
+      "path": "/etc/systemd/system/ollama.service.d",
+      "bytes": 1888
+    },
+    {
+      "path": "/etc/systemd/system/ollama.service",
+      "bytes": 289
+    }
+  ],
+  "all_verified": true
+}
