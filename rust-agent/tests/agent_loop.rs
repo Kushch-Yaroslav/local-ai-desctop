@@ -357,8 +357,9 @@ fn a_structured_pause_checkpoints_and_ends_without_resuming_guidance() {
         }
         3 => {
             let names = tool_names(request);
-            assert_eq!(names.len(), 2, "{names:?}");
+            assert_eq!(names.len(), 3, "{names:?}");
             assert!(names.contains(&"task_memory".to_owned()));
+            assert!(names.contains(&"plan".to_owned()));
             assert!(names.contains(&"deliverables".to_owned()));
             let text = request.to_string();
             assert!(text.contains("<run_paused>"));
@@ -1852,4 +1853,75 @@ fn write_file_to_an_unread_file_is_allowed() {
         std::fs::read_to_string(workspace.root.join("a.txt")).unwrap(),
         "new"
     );
+}
+
+fn plan(arguments: Value) -> (&'static str, Value) {
+    ("plan", arguments)
+}
+
+/// The plan is its own state: it is shown back every turn, never mistaken for the deliverables, and its result is compact.
+#[test]
+fn the_plan_is_set_shown_back_and_kept_apart_from_deliverables() {
+    let workspace = Workspace::new(&[("a.txt", "a")]);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Tools(vec![plan(
+            json!({"action":"set","steps":["inspect a.txt","change it","check it"]}),
+        )]),
+        1 => Reply::Tools(vec![plan(
+            json!({"action":"update","id":"s1","status":"completed"}),
+        )]),
+        _ => Reply::Text("done".into()),
+    });
+    run(workspace.config(&provider.endpoint, "change a.txt"));
+    let requests = provider.requests();
+    assert!(tool_names(&requests[0]).contains(&"plan".to_owned()));
+    assert!(!requests[0].to_string().contains("<plan>"));
+    let second = last_user_text(&requests[1]);
+    assert!(second.contains("<plan>"), "{second}");
+    assert!(second.contains("[>] s1 inspect a.txt"), "{second}");
+    let third = last_user_text(&requests[2]);
+    assert!(third.contains("[x] s1 inspect a.txt"), "{third}");
+    assert!(third.contains("[>] s2 change it"), "{third}");
+    assert!(
+        !third.contains("<deliverables>"),
+        "a plan is not a deliverable list: {third}"
+    );
+    assert!(completed(&workspace.journal()));
+}
+
+/// A malformed plan call is a recoverable tool error, not a failed run.
+#[test]
+fn a_bad_plan_call_is_a_tool_error_and_the_run_continues() {
+    let workspace = Workspace::new(&[("a.txt", "a")]);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Tools(vec![plan(json!({"action":"set"}))]),
+        1 => Reply::Tools(vec![plan(
+            json!({"action":"update","id":"s9","status":"completed"}),
+        )]),
+        _ => Reply::Text("done".into()),
+    });
+    run(workspace.config(&provider.endpoint, "change a.txt"));
+    assert!(completed(&workspace.journal()));
+    let result = tool_result_text(&provider.requests()[2]);
+    assert!(result.contains("s9"), "{result}");
+}
+
+/// Saved plans come back on Continue, in a pause tail too; a fresh run starts empty.
+#[test]
+fn a_saved_plan_returns_on_continue_and_a_fresh_run_starts_empty() {
+    let workspace = Workspace::new(&[("a.txt", "a")]);
+    let provider = Provider::start(|_, _| Reply::Text("ok".into()));
+    let mut resumed = workspace.config(&provider.endpoint, "continue");
+    resumed.task_memory = Some(json!({"entries":[],"revision":0,"plan":{"steps":[
+        {"id":"s1","text":"wire the bot","status":"completed"},
+        {"id":"s2","text":"add the theme switch","status":"in_progress"}
+    ],"revision":2}}));
+    run(resumed);
+    let first = provider.requests()[0].to_string();
+    assert!(first.contains("add the theme switch"), "{first}");
+
+    let fresh_workspace = Workspace::new(&[("a.txt", "a")]);
+    let fresh_provider = Provider::start(|_, _| Reply::Text("ok".into()));
+    run(fresh_workspace.config(&fresh_provider.endpoint, "start over"));
+    assert!(!fresh_provider.requests()[0].to_string().contains("<plan>"));
 }

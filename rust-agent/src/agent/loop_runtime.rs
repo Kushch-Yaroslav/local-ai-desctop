@@ -10,6 +10,7 @@ use crate::agent::{
     events::{Event, TailCandidateAttempt},
     evidence::classify_source_read,
     ledger::{Ledger, ProjectIndex},
+    plan::StepStatus,
     policy::{self, Reasoning, RunPolicy},
     reads::repeated_file_read_decision,
     state::{AgentState, PauseState},
@@ -555,6 +556,10 @@ fn dynamic_tail(
         if !memory.is_empty() {
             tail.push(format!("<task_memory>\n{memory}\n</task_memory>"));
         }
+        let plan = state.task_memory.plan.prompt();
+        if !plan.is_empty() {
+            tail.push(plan);
+        }
         let deliverables = state.task_memory.deliverables.prompt();
         if !deliverables.is_empty() {
             tail.push(deliverables);
@@ -572,6 +577,10 @@ fn dynamic_tail(
     };
     if !memory.is_empty() {
         tail.push(format!("<task_memory>\n{memory}\n</task_memory>"));
+    }
+    let plan = state.task_memory.plan.prompt();
+    if !plan.is_empty() {
+        tail.push(plan);
     }
     let deliverables = state.task_memory.deliverables.prompt();
     if !deliverables.is_empty() {
@@ -726,6 +735,7 @@ fn tool_schemas(scope: ToolScope) -> Vec<Value> {
     let mut tools = vec![
         json!({"type":"function","function":{"name":"task_memory","description":"Durable semantic memory for the current task across compaction. Record/update meaningful findings, decisions, blockers, or unresolved questions; view reads it; invalidate needs id. Record requires finding; update needs the id of an existing entry and changes only the fields you pass (an empty string clears one). Both may include evidence, implication, next, supersedes, status. Cite observations by exact id (obs-00000012), one per item in observations or comma-separated in evidence. Trust precise unchanged-file memory; reread only for a concrete missing, ambiguous, changed, exact-detail, or verification need.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["record","update","invalidate","view"]},"id":{"type":"string"},"finding":{"type":"string"},"evidence":{"type":"string"},"implication":{"type":"string"},"next":{"type":"string"},"supersedes":{"type":"string"},"status":{"type":"string","enum":["confirmed","inferred","unknown","contradicted"],"description":"How well established the finding is: confirmed (observed, cited), inferred (reasoned, not observed), unknown (open; put the resolving step in next), contradicted (evidence disagrees)."},"observations":{"type":"array","items":{"type":"string"},"description":"Observation IDs (obs-…) that support the finding; same as evidence, one id per item."}},"required":["action"]}}}),
         json!({"type":"function","function":{"name":"deliverables","description":"The user's requested deliverables for this task (execution contract). Use it only when the request has two or more separate things to produce or change, or one result that must work end to end. add: record each requested deliverable once (text, optional task). done: after you observed it working (id, evidence). block: it cannot be completed (id, concrete reason). drop: the user withdrew it (id, reason). view: list them. Record only what the user asked for, never your own optional ideas.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["add","done","block","drop","view"]},"id":{"type":"string"},"task":{"type":"string"},"text":{"type":"string"},"evidence":{"type":"string"},"reason":{"type":"string"}},"required":["action"]}}}),
+        json!({"type":"function","function":{"name":"plan","description":"Your own short execution plan: how you will get the work done. Optional: skip it for a trivial or single-step request. set: replace the unfinished steps with a short ordered list of one-line steps (steps); the first becomes active. update: change a step (id; status pending|in_progress|completed|blocked, optional text or note; blocked needs a note); completing the active step activates the next. add: insert a step (text, optional after). view: list. Change the plan only when your approach changes; do not narrate it or update it after every call. A plan is not proof: finishing steps does not complete the user's deliverables.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["set","update","add","view"]},"steps":{"type":"array","items":{"type":"string"}},"id":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","completed","blocked"]},"text":{"type":"string"},"note":{"type":"string"},"after":{"type":"string"}},"required":["action"]}}}),
         json!({"type":"function","function":{"name":"observation_index","description":"List historical tool observations by stable ID, with source path and outcome metadata. Use source to select the raw observation for the needed file. If more=true, continue at the returned next_offset. Observation IDs start with obs-.","parameters":{"type":"object","properties":{"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":50}}}}}),
         json!({"type":"function","function":{"name":"observation_read","description":"Recover a bounded exact slice of a stored historical tool result by observation ID. The response distinguishes historical evidence from current source and reports whether the source changed.","parameters":{"type":"object","properties":{"id":{"type":"string"},"offset_chars":{"type":"integer","minimum":0},"max_chars":{"type":"integer","minimum":1,"maximum":16000}},"required":["id"]}}}),
     ];
@@ -762,6 +772,7 @@ fn tool_schemas_for_policy(scope: ToolScope, policy: RunPolicy) -> Vec<Value> {
                 tool_name(tool),
                 "task_memory"
                     | "deliverables"
+                    | "plan"
                     | "observation_index"
                     | "observation_read"
                     | "read_file"
@@ -825,7 +836,7 @@ fn tool_schemas_for_request(scope: ToolScope, policy: RunPolicy, user: &str) -> 
     tools
 }
 
-const CHECKPOINT_TOOLS: [&str; 2] = ["task_memory", "deliverables"];
+const CHECKPOINT_TOOLS: [&str; 3] = ["task_memory", "deliverables", "plan"];
 
 fn pause_run_schema() -> Value {
     json!({"type":"function","function":{
@@ -1237,6 +1248,62 @@ fn apply_task_memory(
         result["notes"] = json!(notes);
     }
     Ok((result, true))
+}
+
+/// Updates the execution plan. The result is the compact plan itself: the plan
+/// is short by construction, and the model needs nothing else back.
+fn apply_plan(state: &mut AgentState, arguments: &Value) -> Result<(Value, bool), String> {
+    let action = required_text(arguments, "action")?;
+    let text_arg = |key: &str| arguments.get(key).and_then(Value::as_str);
+    let mut candidate = state.task_memory.plan.clone();
+    match action.trim().to_lowercase().as_str() {
+        "view" | "get" | "list" | "show" => {
+            return Ok((
+                json!({"plan": state.task_memory.plan, "updated": false}),
+                false,
+            ));
+        }
+        "set" | "create" | "replace" => {
+            let steps = arguments
+                .get("steps")
+                .and_then(Value::as_array)
+                .map(|steps| {
+                    steps
+                        .iter()
+                        .filter_map(|step| {
+                            step.as_str().map(str::to_owned).or_else(|| {
+                                step.get("text").and_then(Value::as_str).map(str::to_owned)
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .ok_or_else(|| "steps is required: an array of short one-line steps".to_owned())?;
+            candidate.set(&steps)?;
+        }
+        "add" => candidate.add(&required_text(arguments, "text")?, text_arg("after"))?,
+        "update" | "complete" | "done" => {
+            let status = match text_arg("status") {
+                Some(value) => Some(StepStatus::parse(value).ok_or_else(|| {
+                    "status must be pending, in_progress, completed or blocked".to_owned()
+                })?),
+                None if action.trim().eq_ignore_ascii_case("update") => None,
+                None => Some(StepStatus::Completed),
+            };
+            candidate.update(
+                &required_text(arguments, "id")?,
+                status,
+                text_arg("text"),
+                text_arg("note"),
+            )?;
+        }
+        _ => return Err("unsupported plan action: use set, update, add or view".into()),
+    }
+    let unchanged = candidate == state.task_memory.plan;
+    state.task_memory.plan = candidate;
+    Ok((
+        json!({"plan": state.task_memory.plan, "updated": !unchanged}),
+        !unchanged,
+    ))
 }
 
 /// Updates the execution contract. In Deep, completing an item needs evidence
@@ -2890,6 +2957,19 @@ fn run_scoped_tool(
             }
             Ok((value, None))
         }
+        "plan" => {
+            let (value, changed) = apply_plan(state, &tool.arguments)?;
+            if changed {
+                emit(
+                    &config.run_id,
+                    Event::TaskMemoryUpdate {
+                        memory: serde_json::to_value(&state.task_memory)
+                            .map_err(|error| error.to_string())?,
+                    },
+                );
+            }
+            Ok((value, None))
+        }
         "task_memory" => {
             let (value, changed) = apply_task_memory(state, &tool.arguments, transcript)?;
             if changed {
@@ -3462,7 +3542,7 @@ pub fn run(config: Config) {
         for schema in &mut schemas {
             if !matches!(
                 tool_name(schema),
-                "task_memory" | "deliverables" | "observation_read" | "observation_index"
+                "task_memory" | "deliverables" | "plan" | "observation_read" | "observation_index"
             ) {
                 schema["function"]["parameters"]["properties"]["project"] = json!({"type":"integer","enum":[1,2],"description":"Selected project slot. 1 is the primary root; 2 is the secondary root. Defaults to 1."});
             }
@@ -4627,7 +4707,7 @@ mod tests {
         });
         assert_eq!(
             names(&turn_schemas(&schemas, &state, false)),
-            ["deliverables", "task_memory"]
+            ["deliverables", "plan", "task_memory"]
                 .iter()
                 .map(|s| (*s).to_owned())
                 .collect::<Vec<_>>()

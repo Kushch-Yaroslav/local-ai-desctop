@@ -3,6 +3,7 @@ pub mod events;
 pub mod evidence;
 pub mod ledger;
 pub mod loop_runtime;
+pub mod plan;
 pub mod policy;
 pub mod presentation;
 pub mod reads;

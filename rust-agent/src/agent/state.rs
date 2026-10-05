@@ -98,7 +98,7 @@ impl AgentState {
     }
 
     pub fn record_tool_call(&mut self, tool: &str) {
-        if tool != "task_memory" && tool != "deliverables" {
+        if !matches!(tool, "task_memory" | "deliverables" | "plan") {
             self.calls_since_memory = self.calls_since_memory.saturating_add(1);
         }
     }
