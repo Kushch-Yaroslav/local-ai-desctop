@@ -12,7 +12,7 @@ use crate::agent::{
     ledger::{Ledger, ProjectIndex},
     policy::{self, Reasoning, RunPolicy},
     reads::repeated_file_read_decision,
-    state::AgentState,
+    state::{AgentState, PauseState},
     strategy::{self, Strategy},
     transcript::{validate_calls, CompactionPlan, ToolResultPolicy, Transcript, ValidatedCall},
 };
@@ -67,6 +67,9 @@ pub struct Config {
     pub cancelled: Arc<AtomicBool>,
     pub steering: Arc<Mutex<Vec<String>>>,
     pub steering_closed: Arc<AtomicBool>,
+    /// Set together with a queued steering message that the user marked as a
+    /// pause request (a structured control, not parsed from text).
+    pub pause_requested: Arc<AtomicBool>,
 }
 
 impl Config {
@@ -544,6 +547,21 @@ fn dynamic_tail(
     investigation: &str,
 ) -> String {
     let mut tail = Vec::new();
+    if state.pause.is_some() {
+        let memory = state.task_memory.prompt_for_closeout(objective);
+        if !memory.is_empty() {
+            tail.push(format!("<task_memory>\n{memory}\n</task_memory>"));
+        }
+        let deliverables = state.task_memory.deliverables.prompt();
+        if !deliverables.is_empty() {
+            tail.push(deliverables);
+        }
+        tail.push(PAUSE_DIRECTIVE.to_owned());
+        return tail.join("\n");
+    }
+    if state.pause_offered {
+        tail.push("<steering_options>The user just sent a message while you were working. If, and only if, it clearly asks you to pause or stop at this point, call pause_run. If it asks to continue, check, change or add anything, do not call it: follow the message and keep working.</steering_options>".to_owned());
+    }
     let memory = if transcript.is_finalizing() {
         state.task_memory.prompt_for_closeout(objective)
     } else {
@@ -803,6 +821,65 @@ fn tool_schemas_for_request(scope: ToolScope, policy: RunPolicy, user: &str) -> 
     }
     tools
 }
+
+const CHECKPOINT_TOOLS: [&str; 2] = ["task_memory", "deliverables"];
+
+fn pause_run_schema() -> Value {
+    json!({"type":"function","function":{
+        "name":"pause_run",
+        "description":"Call this only if the user's latest message clearly asks you to pause or stop working at this point. It does not delete anything: you get a short checkpoint to save state, then the run ends and the user can continue later. Do not call it for any other message.",
+        "parameters":{"type":"object","properties":{},"additionalProperties":false}
+    }})
+}
+
+/// Schemas offered for one provider request. A paused run may only write its
+/// checkpoint; right after a steering message the model may also classify it
+/// as a pause request.
+fn turn_schemas(schemas: &[Value], state: &AgentState, finalizing: bool) -> Vec<Value> {
+    if finalizing {
+        Vec::new()
+    } else if state.pause.is_some() {
+        schemas
+            .iter()
+            .filter(|schema| CHECKPOINT_TOOLS.contains(&tool_name(schema)))
+            .cloned()
+            .collect()
+    } else if state.pause_offered {
+        let mut offered = schemas.to_vec();
+        offered.push(pause_run_schema());
+        offered
+    } else {
+        schemas.to_vec()
+    }
+}
+
+fn begin_pause(config: &Config, state: &mut AgentState, source: &str) -> bool {
+    if state.pause.is_some() {
+        return false;
+    }
+    state.pause = Some(PauseState {
+        checkpoint_turns_left: PauseState::CHECKPOINT_TURNS,
+    });
+    state.pause_offered = false;
+    emit(
+        &config.run_id,
+        Event::PauseStarted {
+            source: source.into(),
+        },
+    );
+    trace_forensics(
+        &config.run_id,
+        "pause_started",
+        json!({"source":source,"checkpoint_turns":PauseState::CHECKPOINT_TURNS}),
+    );
+    true
+}
+
+const PAUSE_DIRECTIVE: &str = "<run_paused>The user paused this run. Do not start new investigation or work. With the checkpoint tools only: record in task_memory what is established and what is still unknown, with the next step, and set each deliverable to its true status. Then write a short answer for the user: what is done, what is not, and that the work continues when they ask to continue. Do not claim unfinished work as done.</run_paused>";
+
+const PAUSED_TOOL_MESSAGE: &str = "The run is paused: only the checkpoint tools (task_memory, deliverables) are available. Save the checkpoint and write the short pause summary.";
+
+const PAUSE_FALLBACK: &str = "Работа поставлена на паузу. Состояние и список невыполненного сохранены; чтобы продолжить, напишите «Продолжить».";
 
 fn tool_name(tool: &Value) -> &str {
     tool.pointer("/function/name")
@@ -3076,7 +3153,7 @@ fn review_tool_free_final(
     transcript: &mut Transcript,
     ledger: &Ledger,
 ) -> FinalCandidateReview {
-    if transcript.is_finalizing() {
+    if transcript.is_finalizing() || state.pause.is_some() {
         return FinalCandidateReview::Accept;
     }
     if add_soft_closeout_if_needed(state, transcript) {
@@ -3211,7 +3288,6 @@ pub fn run(config: Config) {
         .as_deref()
         .map_or_else(ProjectIndex::empty, ProjectIndex::scan);
     let mut indexed_mutations = state.mutations;
-    let empty_schemas: Vec<Value> = Vec::new();
     let mut consecutive_empty_turns = 0_usize;
 
     emit(
@@ -3241,10 +3317,26 @@ pub fn run(config: Config) {
             );
             return;
         }
+        state.pause_offered = false;
+        let mut steering_applied = false;
         if let Ok(mut steering) = config.steering.lock() {
             for content in steering.drain(..) {
                 transcript.push_steering(content.clone());
                 emit(&config.run_id, Event::SteeringApplied { content });
+                steering_applied = true;
+            }
+            if config.pause_requested.swap(false, Ordering::Relaxed) {
+                begin_pause(&config, &mut state, "user_control");
+            }
+        }
+        state.pause_offered = steering_applied && state.pause.is_none();
+        if let Some(pause) = state.pause.as_mut() {
+            if pause.checkpoint_turns_left == 0 {
+                if !transcript.is_finalizing() {
+                    transcript.mark_finalizing();
+                }
+            } else {
+                pause.checkpoint_turns_left -= 1;
             }
         }
         state.turn = turn;
@@ -3256,11 +3348,8 @@ pub fn run(config: Config) {
                 json!({"state":"finalizing","reason":"turn_budget_exhausted","turn":turn+1}),
             );
         }
-        let request_schemas = if transcript.is_finalizing() {
-            &empty_schemas
-        } else {
-            &schemas
-        };
+        let offered_schemas = turn_schemas(&schemas, &state, transcript.is_finalizing());
+        let request_schemas = &offered_schemas;
         if state.mutations != indexed_mutations {
             if let Some(root) = project_root.as_deref() {
                 project_index = ProjectIndex::scan(root);
@@ -3651,6 +3740,14 @@ pub fn run(config: Config) {
         if !calls.is_empty() || !streamed.content.trim().is_empty() {
             consecutive_empty_turns = 0;
         }
+        if state.pause.is_some()
+            && calls.is_empty()
+            && streamed.content.trim().is_empty()
+            && !was_continuation
+            && consecutive_empty_turns >= 1
+        {
+            streamed.content = PAUSE_FALLBACK.into();
+        }
         if calls.is_empty() && streamed.content.trim().is_empty() && !was_continuation {
             // Nothing was said and nothing was called (for example a tool call
             // written inside the reasoning stream, which is never executed).
@@ -3871,6 +3968,17 @@ pub fn run(config: Config) {
                 );
                 return;
             }
+            if let Some(pause) = state.pause {
+                emit(
+                    &config.run_id,
+                    Event::RunPaused {
+                        checkpoint_turns: PauseState::CHECKPOINT_TURNS
+                            - pause
+                                .checkpoint_turns_left
+                                .min(PauseState::CHECKPOINT_TURNS),
+                    },
+                );
+            }
             emit(
                 &config.run_id,
                 Event::Final {
@@ -3898,6 +4006,7 @@ pub fn run(config: Config) {
         let mut call_index = 0_usize;
         while call_index < calls.len() {
             if !transcript.is_finalizing()
+                && state.pause.is_none()
                 && can_parallelize_safe_read(
                     &calls[call_index],
                     &[],
@@ -4049,11 +4158,29 @@ pub fn run(config: Config) {
                 .iter()
                 .any(|schema| tool_name(schema) == tool.name)
             {
-                let message = if transcript.is_finalizing() {
+                let message = if state.pause.is_some() && !transcript.is_finalizing() {
+                    PAUSED_TOOL_MESSAGE.to_owned()
+                } else if transcript.is_finalizing() {
                     format!("Tool '{}' is unavailable: the investigation budget for this run is exhausted. Write the final answer now from the findings already in context.", tool.name)
                 } else {
                     format!("tool '{}' is unavailable", tool.name)
                 };
+                emit(
+                    &config.run_id,
+                    Event::ToolError {
+                        id: tool.id.clone(),
+                        name: tool.name.clone(),
+                        message: message.clone(),
+                    },
+                );
+                transcript.tool_result(&tool.id, &tool.name, concise_tool_error(&message));
+                continue;
+            }
+            if state.pause.is_some()
+                && !CHECKPOINT_TOOLS.contains(&tool.name.as_str())
+                && tool.name != "pause_run"
+            {
+                let message = PAUSED_TOOL_MESSAGE.to_owned();
                 emit(
                     &config.run_id,
                     Event::ToolError {
@@ -4162,6 +4289,16 @@ pub fn run(config: Config) {
                             .unwrap_or(8_000) as usize,
                     )
                     .map(|value| (value, None)),
+                "pause_run" if state.pause_offered && state.pause.is_none() => {
+                    begin_pause(&config, &mut state, "model_classified");
+                    Ok((
+                        json!({"status":"pausing","next":"Save the checkpoint with task_memory and deliverables, then write the short pause summary."}),
+                        None,
+                    ))
+                }
+                "pause_run" => Err(
+                    "pause_run is available only right after the user sent a new message".into(),
+                ),
                 "task_memory"
                     if matches!(
                         tool.arguments.get("action").and_then(Value::as_str),
@@ -4267,6 +4404,91 @@ fn is_context_overflow(error: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pause_restricts_schemas_to_the_checkpoint_and_offers_pause_run_only_after_steering() {
+        let schemas = tool_schemas_for_request(ToolScope::Project, RunPolicy::Auto, "build it");
+        let names = |offered: &[Value]| {
+            offered
+                .iter()
+                .map(|s| tool_name(s).to_owned())
+                .collect::<Vec<_>>()
+        };
+        let mut state = AgentState::default();
+        assert!(!names(&turn_schemas(&schemas, &state, false)).contains(&"pause_run".to_owned()));
+        state.pause_offered = true;
+        assert!(names(&turn_schemas(&schemas, &state, false)).contains(&"pause_run".to_owned()));
+        state.pause_offered = false;
+        state.pause = Some(PauseState {
+            checkpoint_turns_left: 2,
+        });
+        assert_eq!(
+            names(&turn_schemas(&schemas, &state, false)),
+            ["deliverables", "task_memory"]
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect::<Vec<_>>()
+                .into_iter()
+                .filter(|n| names(&schemas).contains(n))
+                .collect::<Vec<_>>()
+        );
+        assert!(turn_schemas(&schemas, &state, true).is_empty());
+    }
+
+    #[test]
+    fn a_paused_tail_carries_state_but_none_of_the_guidance_that_resumes_work() {
+        let mut state = AgentState::default();
+        state.turn = 5;
+        state.mutations = 3;
+        state.created_files.push("a.txt".into());
+        let transcript = Transcript::default();
+        let request = "Do two things:\n1. add a bot mode\n2. add a theme switch";
+        let running = dynamic_tail(
+            &state,
+            None,
+            request,
+            &transcript,
+            "<investigation>x</investigation>",
+        );
+        assert!(running.contains("<deliverables_hint>") && running.contains("<investigation>"));
+        state.pause = Some(PauseState {
+            checkpoint_turns_left: 2,
+        });
+        let paused = dynamic_tail(
+            &state,
+            None,
+            request,
+            &transcript,
+            "<investigation>x</investigation>",
+        );
+        assert!(paused.contains("<run_paused>"));
+        for resumed in [
+            "deliverables_hint",
+            "run_budget",
+            "files_created_this_run",
+            "<investigation>",
+            "checkpoint_due",
+        ] {
+            assert!(!paused.contains(resumed), "{resumed}");
+        }
+        assert!(!paused.to_lowercase().contains("todo"));
+    }
+
+    #[test]
+    fn a_paused_final_is_accepted_without_any_completion_review() {
+        let mut state = AgentState::default();
+        state.workspace_mutated_since_validation = true;
+        state.strategy = Strategy::Deep;
+        state.pause = Some(PauseState {
+            checkpoint_turns_left: 1,
+        });
+        let mut transcript = Transcript::default();
+        assert!(matches!(
+            review_tool_free_final(&mut state, &mut transcript, &Ledger::default()),
+            FinalCandidateReview::Accept
+        ));
+        assert!(!state.verification_nudged);
+    }
 
     #[test]
     fn parallel_reads_route_repeated_successes_and_missing_paths_through_the_guard() {
@@ -4605,6 +4827,7 @@ mod tests {
             cancelled: Arc::new(AtomicBool::new(false)),
             steering: Arc::new(Mutex::new(Vec::new())),
             steering_closed: Arc::new(AtomicBool::new(false)),
+            pause_requested: Arc::new(AtomicBool::new(false)),
         }
     }
 

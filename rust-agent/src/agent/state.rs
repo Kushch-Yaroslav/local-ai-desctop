@@ -42,6 +42,23 @@ pub struct AgentState {
     pub knowledge_writes: usize,
     pub knowledge_cache_hits: usize,
     pub knowledge_missing_paths: BTreeMap<String, u64>,
+    /// Graceful pause lifecycle (`None` while the run is simply running).
+    pub pause: Option<PauseState>,
+    /// A steering message was applied this turn, so the model may classify it
+    /// as a pause request by calling `pause_run`.
+    pub pause_offered: bool,
+}
+
+/// Bounded checkpoint that follows a pause request. Tools other than the
+/// checkpoint tools are withdrawn, runtime guidance that would resume work is
+/// suppressed, and the run ends with a short summary instead of completing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PauseState {
+    pub checkpoint_turns_left: usize,
+}
+
+impl PauseState {
+    pub const CHECKPOINT_TURNS: usize = 3;
 }
 
 impl AgentState {

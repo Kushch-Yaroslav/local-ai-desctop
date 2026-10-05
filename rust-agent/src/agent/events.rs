@@ -29,6 +29,15 @@ pub enum Event {
     SteeringRejected {
         message: String,
     },
+    /// The run entered the graceful pause lifecycle.
+    PauseStarted {
+        source: String,
+    },
+    /// The run ended in a paused state: durable state was saved, unfinished
+    /// work stays unfinished and an explicit Continue resumes it.
+    RunPaused {
+        checkpoint_turns: usize,
+    },
     TurnStarted {
         index: usize,
     },

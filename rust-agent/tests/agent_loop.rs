@@ -219,6 +219,203 @@ fn steering_at_completion_is_applied_before_final_and_replays() {
     assert_eq!(restored.observations().len(), 1);
 }
 
+/// Graceful pause: the user control (structured, not parsed from text) arrives
+/// while a run has unfinished deliverables and an unvalidated mutation. The run
+/// keeps only its checkpoint tools, none of the completion guidance can resume
+/// work, the checkpoint is written, and the run ends paused with the unfinished
+/// deliverable still pending.
+#[test]
+fn a_structured_pause_checkpoints_and_ends_without_resuming_guidance() {
+    let workspace = Workspace::new(&[("a.txt", "a")]);
+    let queue = Arc::new(Mutex::new(Vec::new()));
+    let pause = Arc::new(AtomicBool::new(false));
+    let (incoming, flag) = (queue.clone(), pause.clone());
+    let provider = Provider::start(move |request, n| match n {
+        0 => add_both(),
+        1 => Reply::Tools(vec![(
+            "write_file",
+            json!({"path":"a.txt","content":"changed"}),
+        )]),
+        2 => {
+            incoming.lock().unwrap().push("Пауза".into());
+            flag.store(true, Ordering::Relaxed);
+            Reply::Tools(vec![("read_file", json!({"path":"a.txt"}))])
+        }
+        3 => {
+            let names = tool_names(request);
+            assert_eq!(names.len(), 2, "{names:?}");
+            assert!(names.contains(&"task_memory".to_owned()));
+            assert!(names.contains(&"deliverables".to_owned()));
+            let text = request.to_string();
+            assert!(text.contains("<run_paused>"));
+            assert!(!text.contains("<run_budget>") && !text.contains("deliverables_hint"));
+            Reply::Tools(vec![("read_file", json!({"path":"a.txt"}))])
+        }
+        4 => {
+            let blocked = request["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|m| m["role"] == "tool")
+                .unwrap();
+            assert!(blocked["content"]
+                .as_str()
+                .unwrap()
+                .contains("run is paused"));
+            Reply::Tools(vec![
+                (
+                    "task_memory",
+                    json!({"action":"record","id":"state","finding":"bot mode is not started; a.txt was changed","status":"inferred","next":"add the bot mode, then validate"}),
+                ),
+                deliverable("done", json!({"id":"d-001","evidence":"saw it work"})),
+            ])
+        }
+        _ => Reply::Text("Paused: the theme switch is not done yet.".into()),
+    });
+    let mut config = workspace.config(&provider.endpoint, TWO_PART_REQUEST);
+    config.steering = queue;
+    config.pause_requested = pause;
+    run(config);
+    let journal = workspace.journal();
+    assert!(completed(&journal));
+    assert_eq!(
+        withheld_drafts(&journal),
+        0,
+        "no completion guidance may hold the pause summary back"
+    );
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 6);
+    let last = requests[5].to_string();
+    assert!(
+        last.contains("state [inferred]") || last.contains("bot mode is not started"),
+        "{last}"
+    );
+    assert!(
+        last.contains("d-002 theme switch changes the theme"),
+        "pending deliverable survives the pause"
+    );
+}
+
+/// The checkpoint is bounded: a model that keeps writing checkpoints loses its tools, and a model that never
+/// answers still ends with a visible paused summary.
+#[test]
+fn a_pause_is_bounded_even_if_the_model_keeps_calling_tools_or_stays_silent() {
+    let workspace = Workspace::new(&[("a.txt", "a")]);
+    let queue = Arc::new(Mutex::new(vec!["Пауза".to_owned()]));
+    let pause = Arc::new(AtomicBool::new(true));
+    let provider = Provider::start(|request, n| {
+        if n < 3 {
+            assert!(!tool_names(request).is_empty());
+            Reply::Tools(vec![("task_memory", json!({"action":"view"}))])
+        } else {
+            assert!(
+                tool_names(request).is_empty(),
+                "tools are withdrawn after the checkpoint turns"
+            );
+            Reply::Reasoning("thinking without an answer".into())
+        }
+    });
+    let mut config = workspace.config(&provider.endpoint, "Do a long task");
+    config.steering = queue;
+    config.pause_requested = pause;
+    run(config);
+    let journal = workspace.journal();
+    assert!(completed(&journal));
+    assert_eq!(provider.requests().len(), 5);
+}
+
+/// Natural-language classification belongs to the model: the pause tool is offered only right after a steering
+/// message, an ordinary clarification keeps the run going, and a call outside that window is refused.
+#[test]
+fn the_pause_tool_is_offered_only_after_steering_and_a_clarification_does_not_pause() {
+    let workspace = Workspace::new(&[("a.txt", "a")]);
+    let queue = Arc::new(Mutex::new(Vec::new()));
+    let incoming = queue.clone();
+    let provider = Provider::start(move |request, n| match n {
+        0 => {
+            assert!(!tool_names(request).contains(&"pause_run".to_owned()));
+            incoming
+                .lock()
+                .unwrap()
+                .push("Не останавливайся, проверь ещё b.txt".into());
+            Reply::Tools(vec![("read_file", json!({"path":"a.txt"}))])
+        }
+        1 => {
+            assert!(tool_names(request).contains(&"pause_run".to_owned()));
+            assert!(last_user_text(request).contains("pause_run"));
+            Reply::Tools(vec![("read_file", json!({"path":"a.txt"}))])
+        }
+        2 => {
+            assert!(!tool_names(request).contains(&"pause_run".to_owned()));
+            Reply::Tools(vec![("pause_run", json!({}))])
+        }
+        3 => {
+            let refused = request["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|m| m["role"] == "tool")
+                .unwrap();
+            assert!(refused["content"].as_str().unwrap().contains("unavailable"));
+            assert!(
+                tool_names(request).contains(&"read_file".to_owned()),
+                "a refused pause_run must not restrict the run"
+            );
+            Reply::Text("Checked, continuing normally.".into())
+        }
+        _ => unreachable!(),
+    });
+    let mut config = workspace.config(&provider.endpoint, "Inspect a.txt");
+    config.steering = queue;
+    run(config);
+    assert!(completed(&workspace.journal()));
+    assert_eq!(provider.requests().len(), 4);
+}
+
+#[test]
+fn a_model_classified_pause_restricts_tools_and_ends_the_run() {
+    let workspace = Workspace::new(&[("a.txt", "a")]);
+    let queue = Arc::new(Mutex::new(Vec::new()));
+    let incoming = queue.clone();
+    let provider = Provider::start(move |request, n| match n {
+        0 => {
+            incoming
+                .lock()
+                .unwrap()
+                .push("Хватит, остановись на этом месте".into());
+            Reply::Tools(vec![("read_file", json!({"path":"a.txt"}))])
+        }
+        1 => Reply::Tools(vec![("pause_run", json!({}))]),
+        2 => {
+            assert!(!tool_names(request).contains(&"read_file".to_owned()));
+            assert!(request.to_string().contains("<run_paused>"));
+            Reply::Text("Paused after reading a.txt.".into())
+        }
+        _ => unreachable!(),
+    });
+    let mut config = workspace.config(&provider.endpoint, "Inspect a.txt thoroughly");
+    config.steering = queue;
+    run(config);
+    assert!(completed(&workspace.journal()));
+    assert_eq!(provider.requests().len(), 3);
+}
+
+/// A hard cancel keeps priority over the graceful lifecycle.
+#[test]
+fn hard_cancel_still_stops_a_pausing_run_without_another_request() {
+    let workspace = Workspace::new(&[("a.txt", "a")]);
+    let provider = Provider::start(|_, _| Reply::Text("never requested".into()));
+    let mut config = workspace.config(&provider.endpoint, "task");
+    config.steering = Arc::new(Mutex::new(vec!["Пауза".to_owned()]));
+    config.pause_requested = Arc::new(AtomicBool::new(true));
+    config.cancelled = Arc::new(AtomicBool::new(true));
+    run(config);
+    assert!(provider.requests().is_empty());
+    assert!(!completed(&workspace.journal_or_empty()));
+}
+
 enum Reply {
     Text(String),
     /// Only reasoning, no content and no structured call.
@@ -391,6 +588,15 @@ impl Workspace {
             cancelled: Arc::new(AtomicBool::new(false)),
             steering: Arc::new(Mutex::new(Vec::new())),
             steering_closed: Arc::new(AtomicBool::new(false)),
+            pause_requested: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn journal_or_empty(&self) -> Vec<Value> {
+        if self.base.join("evidence").join("active.json").exists() {
+            self.journal()
+        } else {
+            Vec::new()
         }
     }
 

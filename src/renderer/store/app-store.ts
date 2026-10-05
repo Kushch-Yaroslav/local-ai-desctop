@@ -1,8 +1,8 @@
 import { create } from 'zustand';
-import type { ActionApproval, AgentTelemetry, AnalysisProgress, AnalysisRun, AppSettings, Attachment, AttachmentStatus, ApprovalDecision, ApprovalStatus, ChatMessage, Conversation, FinishReason, GenerationDiagnostics, HardwareStats, ModelInfo, ProjectReference, ToolActivity } from '../../shared/types';
+import type { ActionApproval, AgentTelemetry, AnalysisProgress, AnalysisRun, AppSettings, Attachment, AttachmentStatus, ApprovalDecision, ApprovalStatus, ChatMessage, Conversation, FinishReason, GenerationDiagnostics, HardwareStats, ModelInfo, ProjectReference, SteeringIntent, ToolActivity } from '../../shared/types';
 import { isCurrentGenerationEvent } from '../../shared/generation-guard';
 import { revertRefusedPatch, type ModeTransition } from '../../shared/conversation-settings';
-import { appendReasoningFragments } from '../../shared/thinking-timeline';
+import { appendPausedMarker, appendReasoningFragments, applySteeringEvent } from '../../shared/thinking-timeline';
 
 type State = {
   conversations: Conversation[];
@@ -36,7 +36,7 @@ type State = {
   deleteConversation: (id: string) => Promise<void>;
   refreshHardware: () => Promise<void>;
   sendMessage: (content: string, files?: File[], projectReferences?: ProjectReference[]) => Promise<void>;
-  steer: (content: string) => Promise<boolean>;
+  steer: (content: string, intent?: SteeringIntent) => Promise<boolean>;
   steeringStatus: 'accepted' | 'applied' | null;
   approveAction: (decision: ApprovalDecision) => Promise<void>;
   editMessage: (message: ChatMessage, content: string) => Promise<boolean>;
@@ -233,10 +233,10 @@ export const useAppStore = create<State>((rawSet, rawGet) => {
     catch (error) { set({ error: error instanceof Error ? error.message : 'Не удалось сохранить изменение' }); return false; }
     finally { branchRegenerationPending = false; }
   },
-  steer: async (content) => {
+  steer: async (content, intent) => {
     const { activeId, generationId } = get();
     if (!activeId || !generationId) return false;
-    try { await window.localAi.chat.steer(activeId, generationId, content); return true; }
+    try { await window.localAi.chat.steer(activeId, generationId, content, intent); return true; }
     catch (error) { withView(activeId, () => set({ error: error instanceof Error ? error.message : String(error) })); return false; }
   },
   regenerateMessage: async (message) => {
@@ -266,19 +266,24 @@ export const useAppStore = create<State>((rawSet, rawGet) => {
     if (!isCurrentGenerationEvent(event.conversationId, event.generationId, get().activeId, get().generationId)) return;
     if (event.type === 'steering' && event.userMessage) {
       const message = event.userMessage;
+      const incomingStatus: 'accepted' | 'applied' = event.status === 'applied' ? 'applied' : 'accepted';
       set((state) => {
         const assistantMessageId = assistantId(event.generationId);
         const assistant = state.messages.find((entry) => entry.id === assistantMessageId);
         const timeline = assistant?.thinkingTimeline ?? [];
-        const existing = timeline.find((entry) => entry.kind === 'steering' && entry.messageId === message.id);
-        const status: 'accepted' | 'applied' = event.status === 'applied' || (existing?.kind === 'steering' && existing.status === 'applied') ? 'applied' : 'accepted';
-        const nextTimeline = existing?.kind === 'steering'
-          ? timeline.map((entry) => entry === existing ? { ...existing, status } : entry)
-          : event.timelinePosition === undefined ? timeline : [...timeline, { id: `steering-${message.id}`, kind: 'steering' as const, messageId: message.id, position: event.timelinePosition, status }];
+        const nextTimeline = applySteeringEvent(timeline, message.id, incomingStatus, event.timelinePosition);
+        const entry = nextTimeline.find((candidate) => candidate.kind === 'steering' && candidate.messageId === message.id);
+        const status: 'accepted' | 'applied' = entry?.kind === 'steering' ? entry.status : incomingStatus;
         const messages = state.messages.some((entry) => entry.id === message.id)
           ? state.messages.map((entry) => entry.id === assistantMessageId && nextTimeline !== timeline ? { ...entry, thinkingTimeline: nextTimeline } : entry)
           : [...state.messages.filter((entry) => entry.id !== assistantMessageId), message, ...state.messages.filter((entry) => entry.id === assistantMessageId).map((entry) => ({ ...entry, ...(nextTimeline !== timeline ? { thinkingTimeline: nextTimeline } : {}) }))];
         return { steeringStatus: status, messages };
+      });
+    }
+    if (event.type === 'paused') {
+      set((state) => {
+        const assistantMessageId = assistantId(event.generationId);
+        return { messages: state.messages.map((entry) => entry.id === assistantMessageId ? { ...entry, thinkingTimeline: appendPausedMarker(entry.thinkingTimeline ?? [], event.timelinePosition) } : entry) };
       });
     }
     if (event.type === 'token') {

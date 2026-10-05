@@ -4,7 +4,7 @@ import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { paths } from './paths';
 import { agentEvidenceDir } from './agent-evidence';
-import type { AgentPlan, AgentPlanStepStatus, ChatMessage, ModelTodo, ReasoningMode, StreamEvent, TerminalExecution, ToolActivity, WebMode } from '../../shared/types';
+import type { AgentPlan, AgentPlanStepStatus, ChatMessage, ModelTodo, ReasoningMode, StreamEvent, SteeringIntent, TerminalExecution, ToolActivity, WebMode } from '../../shared/types';
 import { maxOutputTokens } from '../models/model-registry';
 
 /** Project identity is a transport value, not an orchestration subsystem. */
@@ -119,25 +119,25 @@ export function taskPlan(value: unknown): AgentPlan {
 /** Electron bridge for the Rust runtime. It passes each content delta through
  * immediately; `final` is metadata, not a delayed text transport. */
 export class RustAgentRuntime {
-  private readonly steering = new Map<string, (content: string) => Promise<void>>();
+  private readonly steering = new Map<string, (content: string, intent?: SteeringIntent) => Promise<void>>();
   constructor(private readonly endpoint: string, private readonly binary = process.env.LOCAL_AI_AGENT_RUNTIME ?? resolve(process.cwd(), 'rust-agent', 'target', 'debug', 'local-ai-agent-runtime')) {}
 
-  steer(runId: string, content: string): Promise<void> {
+  steer(runId: string, content: string, intent?: SteeringIntent): Promise<void> {
     const send = this.steering.get(runId);
     if (!send) return Promise.reject(new Error('Agent ещё не готов к уточнению или уже завершён.'));
-    return send(content);
+    return send(content, intent);
   }
 
   async *stream(model: string, history: ChatMessage[], projects: AgentProject[], signal: AbortSignal, contextLimit: number, reasoningMode: ReasoningMode, webMode: WebMode, runId: string, persistedTaskMemory?: AgentPlan['taskMemory'], conversationId?: string, supportsReasoning = true, reasoningOptions?: Record<string, Record<string, unknown>>, workspaceRoots: readonly string[] = []): AsyncIterable<StreamEvent> {
     if (!existsSync(this.binary)) throw new Error(`Rust Agent Runtime V2 не собран: ${this.binary}. Выполните cargo build в rust-agent.`);
     const child = spawn(this.binary, [], { stdio: 'pipe' });
     const pending: Array<{ content: string; resolve: () => void; reject: (error: Error) => void }> = [];
-    this.steering.set(runId, (content) => {
+    this.steering.set(runId, (content, intent) => {
       if (!child.stdin.writable || signal.aborted) return Promise.reject(new Error('Agent уже завершён.'));
       if (pending.length >= 4) return Promise.reject(new Error('Слишком много ожидающих уточнений.'));
       return new Promise<void>((resolve, reject) => {
         pending.push({ content, resolve, reject });
-        child.stdin.write(`${JSON.stringify({ type: 'steer', run_id: runId, content })}\n`);
+        child.stdin.write(`${JSON.stringify({ type: 'steer', run_id: runId, content, ...(intent ? { intent } : {}) })}\n`);
       });
     });
     let stopped = false;
@@ -180,6 +180,7 @@ export class RustAgentRuntime {
         else if (event.type === 'steering_applied') {
           yield { type: 'steering', userMessage: { id: '', conversationId: conversationId ?? '', role: 'user', content: event.content ?? '', createdAt: new Date().toISOString() }, status: 'applied' };
         }
+        else if (event.type === 'run_paused') yield { type: 'paused' };
         else if (event.type === 'thinking_delta') yield { type: 'thinking', content: event.content ?? '' };
         else if (event.type === 'turn_started') yield { type: 'agent-telemetry', telemetry: { turn: event.index ?? 0 } };
         else if (event.type === 'content_delta' || event.type === 'final_delta' || event.type === 'agent_status') {

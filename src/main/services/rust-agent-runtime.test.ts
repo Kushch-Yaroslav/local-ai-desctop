@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import type { ChatMessage } from '../../shared/types';
-import { runtimeTextEvent, splitAgentRunHistory, taskPlan } from './rust-agent-runtime';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, chmodSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { RustAgentRuntime, runtimeTextEvent, splitAgentRunHistory, taskPlan } from './rust-agent-runtime';
 import { deliverablesChecklist, displayToolResult, toolResultSummary } from '../../renderer/components/AgentTimeline';
 
 const message = (role: ChatMessage['role'], content: string): ChatMessage => ({
@@ -61,4 +64,42 @@ export function runRustAgentRuntimeRegression(): void {
 
 }
 
-if (require.main === module) runRustAgentRuntimeRegression();
+/** A stand-in runtime that speaks the stdin/stdout protocol: it checks that the structured pause intent reaches the
+ * runtime and that its `run_paused` event surfaces as a distinct stream event before completion. */
+export async function runSteeringBridgeRegression(): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-bridge-'));
+  try {
+    const script = join(dir, 'fake-runtime.js');
+    const received = join(dir, 'received.json');
+    writeFileSync(script, `#!/usr/bin/env node
+const fs = require('node:fs');
+const readline = require('node:readline');
+const out = (event) => process.stdout.write(JSON.stringify(event) + '\\n');
+const rl = readline.createInterface({ input: process.stdin });
+const seen = [];
+rl.on('line', (line) => {
+  const request = JSON.parse(line); seen.push(request);
+  if (request.type === 'run') out({ type: 'thinking_delta', content: 'думаю' });
+  if (request.type === 'steer') {
+    fs.writeFileSync(${JSON.stringify(received)}, JSON.stringify(seen));
+    out({ type: 'steering_accepted' }); out({ type: 'steering_applied', content: request.content });
+    out({ type: 'pause_started', source: 'user_control' }); out({ type: 'run_paused', checkpoint_turns: 1 });
+    out({ type: 'final', content: 'Работа поставлена на паузу.' });
+  }
+});
+`);
+    chmodSync(script, 0o755);
+    const runtime = new RustAgentRuntime('http://127.0.0.1:1', script);
+    const controller = new AbortController();
+    const events: string[] = [];
+    for await (const event of runtime.stream('model', [message('user', 'task')], [], controller.signal, 4096, 'fast', 'off', 'run-1', undefined, 'conversation')) {
+      events.push(event.type);
+      if (event.type === 'thinking') void runtime.steer('run-1', 'Пауза', 'pause');
+    }
+    assert.deepEqual(events.filter((type) => type !== 'token'), ['thinking', 'steering', 'paused', 'done']);
+    const requests = JSON.parse(readFileSync(received, 'utf8')) as Array<{ type: string; intent?: string }>;
+    assert.equal(requests.find((request) => request.type === 'steer')?.intent, 'pause', 'the pause intent was not forwarded to the runtime');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+
+if (require.main === module) { runRustAgentRuntimeRegression(); void runSteeringBridgeRegression(); }

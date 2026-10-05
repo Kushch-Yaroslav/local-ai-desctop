@@ -36,3 +36,6 @@ export function formatDuration(totalSeconds: number): string {
 
 /** Project identity labels are built for the model ("Project 1 — name"); the UI shows them in Russian. */
 export const localizeProjectLabel = (label: string): string => label.replace(/^Project (\d)\b/, 'Проект $1');
+
+/** Text of the steering message sent by the «Пауза» control; the pause itself is a structured intent, not parsed from this text. */
+export const pauseRequestText = 'Поставь работу на паузу: сохрани контрольную точку и остановись.';

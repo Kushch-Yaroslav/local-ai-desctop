@@ -110,7 +110,8 @@ export const AgentTimeline = memo(function AgentTimeline({ timeline, activities,
       const live = streaming && item.live;
       return <Thought key={item.id} content={item.content} live={live} title={live ? 'Размышляет' : duration ? `Размышлял ${duration}` : 'Размышление'} duration={live ? duration : null} />;
     }
-    if (item.kind === 'steering') return <section className={`agent-timeline-steering ${item.status}`} key={item.id}><header><b>{item.status === 'applied' ? 'Уточнение передано модели' : 'Уточнение принято'}</b></header><p>{item.message.content}</p></section>;
+    if (item.kind === 'steering') return <section className={`agent-timeline-steering ${item.status}`} key={item.id}><header><b>{item.status === 'applied' ? 'Уточнение передано модели' : 'Уточнение в очереди'}</b>{item.status === 'accepted' && <span> — будет передано модели на следующем шаге</span>}</header><p>{item.message.content}</p></section>;
+    if (item.kind === 'paused') return <section className="agent-timeline-steering paused" key={item.id}><header><b>Работа на паузе</b></header><p>Состояние и список невыполненного сохранены. Напишите «Продолжить», чтобы возобновить работу.</p></section>;
     return <Action key={item.id} activity={item.activity} />;
   })}{error && <section className="agent-timeline-terminal error" role="status"><b>Агент остановлен из-за ошибки</b><span>{error}</span></section>}{cancelled && <section className="agent-timeline-terminal cancelled" role="status"><b>Агент остановлен</b></section>}</div>;
 });

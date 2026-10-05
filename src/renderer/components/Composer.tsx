@@ -1,4 +1,4 @@
-import { localizeProjectLabel } from '../../shared/localization';
+import { localizeProjectLabel, pauseRequestText } from '../../shared/localization';
 import { useShallow } from 'zustand/react/shallow';
 import { ChevronDown, File, Folder, Paperclip, Send, Square, X } from 'lucide-react';
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
@@ -24,6 +24,12 @@ export function Composer() {
     setFiles(next);
   }, [files]);
   const [steeringSubmitting, setSteeringSubmitting] = useState(false);
+  const [pauseRequested, setPauseRequested] = useState(false);
+  useEffect(() => { if (!isGenerating) setPauseRequested(false); }, [isGenerating]);
+  const requestPause = () => {
+    setPauseRequested(true);
+    void steer(pauseRequestText, 'pause').then((accepted) => { if (!accepted) setPauseRequested(false); });
+  };
   const submit = () => {
     if (isGenerating && chat?.mode === 'agent' && value.trim() && !files.length && !projectReferences.length && !steeringSubmitting) {
       const instruction = value;
@@ -80,6 +86,7 @@ export function Composer() {
     {(files.length > 0 || projectReferences.length > 0) && <div className="attachment-draft">{projectReferences.map((reference) => <ProjectReferenceChip key={reference.id} reference={reference} onRemove={() => setProjectReferences((items) => items.filter((item) => item.id !== reference.id))} />)}{files.map((file, index) => <DraftAttachment key={`${file.name}-${index}`} file={file} index={isImageFile(file) ? files.slice(0, index + 1).filter(isImageFile).length - 1 : index} onRemove={() => { setFiles((items) => items.filter((_, itemIndex) => itemIndex !== index)); setAttachmentError(null); }} />)}</div>}
     <input ref={inputRef} className="attachment-input" type="file" multiple accept=".png,.jpg,.jpeg,.webp,.txt,.md,.json,.csv,.log,.js,.ts,.jsx,.tsx,.html,.css,.yaml,.yml,.xml,.docx,.xlsx,.xls,.pdf" onChange={(event) => { addFiles([...(event.target.files ?? [])]); event.currentTarget.value = ''; }} />
     {isGenerating && chat?.mode === 'agent' && <button className="steering-button" type="button" disabled={!value.trim() || files.length > 0 || projectReferences.length > 0 || steeringSubmitting} onClick={submit} title={steeringStatus === 'applied' ? 'Предыдущее уточнение передано модели' : steeringStatus === 'accepted' ? 'Предыдущее уточнение принято; ожидает границы хода' : 'Отправить уточнение без остановки Agent'}>Уточнить</button>}
+    {isGenerating && chat?.mode === 'agent' && <button className="steering-button pause-button" type="button" disabled={pauseRequested} onClick={requestPause} title={pauseRequested ? 'Пауза запрошена: Agent сохранит контрольную точку и остановится' : 'Поставить на паузу: Agent сохранит контрольную точку и остановится; продолжить можно сообщением. «Стоп» прерывает сразу'}>{pauseRequested ? 'Пауза запрошена' : 'Пауза'}</button>}
     <button className="attach-button" type="button" disabled={isGenerating} title="Прикрепить файлы" onClick={() => inputRef.current?.click()}><Paperclip size={18} /></button>
     <textarea ref={ref} value={value} placeholder="Напишите сообщение…" rows={1} onPointerDown={startResize} onPointerUp={finishResize} onChange={(event) => updateValue(event.target.value, event.target.selectionStart)} onKeyDown={(event) => { if (suggestions.length) { if (event.key === 'ArrowDown' || event.key === 'ArrowUp') { event.preventDefault(); setActiveSuggestion((index) => (index + (event.key === 'ArrowDown' ? 1 : suggestions.length - 1)) % suggestions.length); return; } if ((event.key === 'Enter' || event.key === 'Tab') && suggestions[activeSuggestion]) { event.preventDefault(); selectSuggestion(suggestions[activeSuggestion]); return; } if (event.key === 'Escape') { event.preventDefault(); setReferenceQuery(null); setSuggestions([]); return; } } if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); submit(); } }} />
     {suggestions.length > 0 && <div className="project-reference-menu" role="listbox" aria-label="Файлы проекта">{suggestions.map((suggestion, index) => <button type="button" role="option" aria-selected={index === activeSuggestion} className={index === activeSuggestion ? 'active' : ''} key={suggestion.id} onMouseDown={(event) => { event.preventDefault(); selectSuggestion(suggestion); }} onMouseEnter={() => setActiveSuggestion(index)}>{suggestion.kind === 'folder' ? <Folder size={15} /> : <File size={15} />}<span>{suggestion.relativePath}</span><small className={`project-badge project-${suggestion.projectSlot}`}>{localizeProjectLabel(suggestion.projectLabel)}</small></button>)}</div>}

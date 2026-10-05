@@ -17,6 +17,7 @@ use std::{
 struct Control {
     cancelled: Arc<AtomicBool>,
     steering: Arc<Mutex<Vec<String>>>,
+    pause_requested: Arc<AtomicBool>,
     finished: Arc<AtomicBool>,
     steering_closed: Arc<AtomicBool>,
 }
@@ -81,6 +82,7 @@ fn main() {
                 let control = Control {
                     cancelled: Arc::new(AtomicBool::new(false)),
                     steering: Arc::new(Mutex::new(Vec::new())),
+                    pause_requested: Arc::new(AtomicBool::new(false)),
                     finished: Arc::new(AtomicBool::new(false)),
                     steering_closed: Arc::new(AtomicBool::new(false)),
                 };
@@ -110,6 +112,7 @@ fn main() {
                         provider_max_output,
                         cancelled: control.cancelled,
                         steering: control.steering,
+                        pause_requested: control.pause_requested,
                         steering_closed: control.steering_closed,
                     });
                     control.finished.store(true, Ordering::Relaxed);
@@ -120,7 +123,11 @@ fn main() {
                     control.cancelled.store(true, Ordering::Relaxed);
                 }
             }
-            Request::Steer { run_id, content } => {
+            Request::Steer {
+                run_id,
+                content,
+                intent,
+            } => {
                 if let Some(control) = controls.get(&run_id) {
                     let mut queue = control.steering.lock().expect("steering lock");
                     if control.steering_closed.load(Ordering::Relaxed)
@@ -139,6 +146,9 @@ fn main() {
                         );
                     } else {
                         queue.push(content.clone());
+                        if intent.as_deref() == Some("pause") {
+                            control.pause_requested.store(true, Ordering::Relaxed);
+                        }
                         local_ai_agent_runtime::protocol::emit(
                             &run_id,
                             local_ai_agent_runtime::agent::events::Event::SteeringAccepted {

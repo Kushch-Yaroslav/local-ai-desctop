@@ -254,10 +254,14 @@ export interface TerminalExecution {
   stderr?: string;
 }
 
+/** `pause` is chosen by an explicit UI control; a free-text clarification never pauses the run by itself. */
+export type SteeringIntent = 'pause';
+
 export type ThinkingTimelineEvent =
   | { id: string; kind: 'reasoning'; content: string; position: number; startedAt?: string; completedAt?: string }
   | { id: string; kind: 'activity'; activityId: string; position: number }
-  | { id: string; kind: 'steering'; messageId: string; position: number; status: 'accepted' | 'applied' };
+  | { id: string; kind: 'steering'; messageId: string; position: number; status: 'accepted' | 'applied' }
+  | { id: string; kind: 'paused'; position: number };
 
 export type AgentPlanStepStatus = 'pending' | 'in_progress' | 'completed' | 'abandoned';
 /** Kept optional for reading messages saved by the pre-milestone renderer. */
@@ -312,6 +316,7 @@ export type StreamEvent =
   | { type: 'thinking'; content: string; timelinePosition?: number }
   | { type: 'task-memory'; memory: NonNullable<AgentPlan['taskMemory']> }
   | { type: 'steering'; userMessage: ChatMessage; status: 'accepted' | 'applied'; timelinePosition?: number }
+  | { type: 'paused'; timelinePosition?: number }
   | { type: 'tool'; activity: ToolActivity; runId?: string }
   | { type: 'attachment'; activity: ToolActivity }
   | { type: 'approval-request'; actionId: string; approval: ActionApproval }
@@ -351,7 +356,7 @@ export interface LocalAiApi {
   dialog: { chooseDirectory(initialDirectory?: string | null): Promise<string | null> };
   chat: {
     send(request: ChatRequest): Promise<void>;
-    steer(conversationId: string, generationId: string, content: string): Promise<ChatMessage>;
+    steer(conversationId: string, generationId: string, content: string, intent?: SteeringIntent): Promise<ChatMessage>;
     stop(conversationId: string, generationId?: string): Promise<void>;
     approve(request: { conversationId: string; generationId: string; approvalId: string; decision: ApprovalDecision }): Promise<boolean>;
     onStream(listener: (event: StreamEvent & { conversationId: string; generationId: string; modelId?: string }) => void): () => void;

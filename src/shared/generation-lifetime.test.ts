@@ -31,7 +31,8 @@ async function run(): Promise<void> {
   event('thinking', 'First thought');
   await useAppStore.getState().selectConversation('B');
   const followup: ChatMessage = { id: 'followup', conversationId: 'A', role: 'user', content: 'additional instruction', createdAt: '' };
-  useAppStore.getState().handleStream({ type: 'steering', conversationId: 'A', generationId, userMessage: followup, status: 'accepted', timelinePosition: 2 });
+  useAppStore.getState().handleStream({ type: 'steering', conversationId: 'A', generationId, userMessage: followup, status: 'accepted' });
+  assert.equal(useAppStore.getState().messages.length, 0, 'a background accepted steering must not leak into the visible chat');
   useAppStore.getState().handleStream({ type: 'steering', conversationId: 'A', generationId, userMessage: followup, status: 'applied', timelinePosition: 2 });
   event('token', 'Background answer');
   while (frames.length) frames.shift()!();

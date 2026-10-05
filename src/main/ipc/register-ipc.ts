@@ -1,6 +1,6 @@
 import { BrowserWindow, dialog, ipcMain } from 'electron';
 import { randomUUID } from 'node:crypto';
-import type { AnalysisRun, ApprovalDecision, ApprovalStatus, ChatRequest, Conversation, ProjectReference, ProjectSuggestion, RiskCategory, ThinkingTimelineEvent } from '../../shared/types';
+import type { AnalysisRun, ApprovalDecision, ApprovalStatus, ChatRequest, Conversation, ProjectReference, ProjectSuggestion, RiskCategory, SteeringIntent, ThinkingTimelineEvent } from '../../shared/types';
 import { findFreshContextDiscoveryOption, type ContextDiscoveryOption, type ContextDiscoveryResult, type ContextDiscoveryProgress, type RuntimeContextEstimate } from '../../shared/context-estimator';
 import { defaultLlamaKv, normalContextForModel, resolveLlamaKvSelection } from '../../shared/context-options';
 import { Database } from '../services/database';
@@ -56,7 +56,7 @@ type ActiveGeneration = {
   settled: Promise<void>;
   finish: () => void;
   mode?: 'chat' | 'agent';
-  followups?: Array<{ message: import('../../shared/types').ChatMessage; timelinePosition: number; applied: boolean }>;
+  followups?: Array<{ message: import('../../shared/types').ChatMessage; applied: boolean }>;
   thinkingTimeline: ThinkingTimelineEvent[];
   activityTimelinePositions: Map<string, number>;
   timelinePosition: number;
@@ -557,22 +557,18 @@ export function registerIpc(): void {
     return result.canceled ? null : result.filePaths[0] ?? null;
   });
   ipcMain.handle('chat:stop', async (_event, conversationId: string, generationId?: string) => { await cancelGeneration(conversationId, generationId, 'user_stop'); });
-  ipcMain.handle('chat:steer', async (event, conversationId: string, generationId: string, content: string) => {
+  ipcMain.handle('chat:steer', async (event, conversationId: string, generationId: string, content: string, intent?: SteeringIntent) => {
     const generation = activeGenerations.get(conversationId);
     if (!generation || generation.id !== generationId || generation.abort.signal.aborted || generation.mode !== 'agent') throw new Error('Уточнения доступны только во время активного Agent run.');
     if (typeof content !== 'string' || !content.trim() || content.length > 16_000) throw new Error('Уточнение должно содержать от 1 до 16000 символов.');
-    await rustAgent.steer(generation.id, content.trim());
+    if (intent !== undefined && intent !== 'pause') throw new Error('Неизвестный тип уточнения.');
+    await rustAgent.steer(generation.id, content.trim(), intent);
     const message = database.addMessage(conversationId, 'user', content.trim());
-    if (generation.lastTimelineKind === 'reasoning') {
-      const prior = generation.thinkingTimeline.at(-1);
-      if (prior?.kind === 'reasoning') prior.completedAt = new Date().toISOString();
-    }
-    const timelinePosition = ++generation.timelinePosition;
-    generation.thinkingTimeline.push({ id: randomUUID(), kind: 'steering', messageId: message.id, position: timelinePosition, status: 'accepted' });
-    generation.lastTimelineKind = 'steering';
-    (generation.followups ??= []).push({ message, timelinePosition, applied: false });
-    log('generation.steering.accepted', { conversationId, generationId, messageId: message.id });
-    event.sender.send('chat:stream', { type: 'steering', conversationId, generationId, userMessage: message, status: 'accepted', timelinePosition });
+    // The model has not seen this message yet and its current turn is still streaming, so nothing is added to the
+    // chronological timeline now: the entry is placed when the runtime applies it at a turn boundary.
+    (generation.followups ??= []).push({ message, applied: false });
+    log('generation.steering.accepted', { conversationId, generationId, messageId: message.id, intent: intent ?? null });
+    event.sender.send('chat:stream', { type: 'steering', conversationId, generationId, userMessage: message, status: 'accepted' });
     return message;
   });
   ipcMain.handle('chat:approve', (_event, request: { conversationId: string; generationId: string; approvalId: string; decision: ApprovalDecision }) => {
@@ -665,11 +661,21 @@ export function registerIpc(): void {
           const followup = generation.followups?.find((entry) => !entry.applied && entry.message.content === content);
           if (followup) {
             followup.applied = true;
-            const timelineEvent = thinkingTimeline.find((entry) => entry.kind === 'steering' && entry.messageId === followup.message.id);
-            if (timelineEvent?.kind === 'steering') timelineEvent.status = 'applied';
-            event.sender.send('chat:stream', { ...chunk, userMessage: followup.message, timelinePosition: followup.timelinePosition, conversationId: request.conversationId, generationId: generation.id });
-            log('generation.steering.applied', { conversationId: request.conversationId, generationId: generation.id, messageId: followup.message.id });
+            if (generation.lastTimelineKind === 'reasoning') { const prior = thinkingTimeline.at(-1); if (prior?.kind === 'reasoning') prior.completedAt = new Date().toISOString(); }
+            const timelinePosition = ++generation.timelinePosition;
+            thinkingTimeline.push({ id: `steering-${followup.message.id}`, kind: 'steering', messageId: followup.message.id, position: timelinePosition, status: 'applied' });
+            generation.lastTimelineKind = 'steering';
+            event.sender.send('chat:stream', { ...chunk, userMessage: followup.message, timelinePosition, conversationId: request.conversationId, generationId: generation.id });
+            log('generation.steering.applied', { conversationId: request.conversationId, generationId: generation.id, messageId: followup.message.id, timelinePosition });
           }
+          continue;
+        }
+        if (chunk.type === 'paused') {
+          if (generation.lastTimelineKind === 'reasoning') { const prior = thinkingTimeline.at(-1); if (prior?.kind === 'reasoning') prior.completedAt = new Date().toISOString(); }
+          const timelinePosition = ++generation.timelinePosition;
+          thinkingTimeline.push({ id: `paused-${timelinePosition}`, kind: 'paused', position: timelinePosition });
+          generation.lastTimelineKind = 'paused';
+          event.sender.send('chat:stream', { type: 'paused', timelinePosition, conversationId: request.conversationId, generationId: generation.id });
           continue;
         }
         if (chunk.type === 'token') output += chunk.content;

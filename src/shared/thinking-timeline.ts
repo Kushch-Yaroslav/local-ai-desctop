@@ -3,7 +3,31 @@ import type { ChatMessage, ThinkingTimelineEvent, ToolActivity } from './types';
 export type ThinkingTimelineItem =
   | { id: string; kind: 'reasoning'; content: string; live: boolean; position?: number; startedAt?: string; completedAt?: string }
   | { id: string; kind: 'activity'; activity: ToolActivity; position?: number }
-  | { id: string; kind: 'steering'; message: ChatMessage; status: 'accepted' | 'applied'; position: number };
+  | { id: string; kind: 'steering'; message: ChatMessage; status: 'accepted' | 'applied'; position: number }
+  | { id: string; kind: 'paused'; position: number };
+
+/**
+ * A steering message that is only accepted has not been seen by the model yet: the turn that is streaming right now was
+ * requested without it. It must therefore not take a chronological place among that turn's reasoning. Until the runtime
+ * applies it at a turn boundary it sorts after everything else, and application moves it to the position where the model
+ * actually received it.
+ */
+export const PENDING_STEERING_POSITION = Number.MAX_SAFE_INTEGER;
+
+export function applySteeringEvent(entries: ThinkingTimelineEvent[], messageId: string, status: 'accepted' | 'applied', position?: number): ThinkingTimelineEvent[] {
+  const existing = entries.find((entry) => entry.kind === 'steering' && entry.messageId === messageId);
+  if (existing?.kind === 'steering') {
+    if (existing.status === 'applied' || status === 'accepted') return entries;
+    return entries.map((entry) => entry === existing ? { ...existing, status: 'applied', position: position ?? existing.position } : entry);
+  }
+  if (status === 'applied' && position === undefined) return entries;
+  return [...entries, { id: `steering-${messageId}`, kind: 'steering', messageId, position: status === 'applied' ? position! : PENDING_STEERING_POSITION, status }];
+}
+
+export function appendPausedMarker(entries: ThinkingTimelineEvent[], position: number | undefined): ThinkingTimelineEvent[] {
+  if (position === undefined || entries.some((entry) => entry.kind === 'paused')) return entries;
+  return [...entries, { id: `paused-${position}`, kind: 'paused', position }];
+}
 
 /**
  * Applies a batch of streamed reasoning fragments to a timeline.
@@ -71,7 +95,11 @@ export function thinkingTimeline(reasoning: string | undefined, activities: Tool
     const activityById = new Map(activities.map((activity) => [activity.id, activity]));
     const messageById = new Map(messages.filter((message) => message.role === 'user').map((message) => [message.id, message]));
     const ordered = [...events].sort((left, right) => left.position - right.position);
-    const last = ordered.at(-1);
+    let last: ThinkingTimelineEvent | undefined;
+    for (let index = ordered.length - 1; index >= 0 && !last; index -= 1) {
+      const candidate = ordered[index]!;
+      if (!(candidate.kind === 'steering' && candidate.status === 'accepted')) last = candidate;
+    }
     const renderedActivities = new Set<string>();
     const renderedSteeringMessages = new Set<string>();
     return ordered.flatMap((event) => {
@@ -82,6 +110,7 @@ export function thinkingTimeline(reasoning: string | undefined, activities: Tool
         renderedSteeringMessages.add(event.messageId);
         return [{ id: event.id, kind: 'steering' as const, message, status: event.status, position: event.position }];
       }
+      if (event.kind === 'paused') return [{ id: event.id, kind: 'paused' as const, position: event.position }];
       if (!activityById.has(event.activityId) || renderedActivities.has(event.activityId)) return [];
       renderedActivities.add(event.activityId);
       return [{ id: event.id, kind: 'activity' as const, activity: activityById.get(event.activityId)!, position: event.position }];

@@ -43,6 +43,10 @@ pub enum Request {
     Steer {
         run_id: String,
         content: String,
+        /// Structured intent chosen by a UI control. `"pause"` asks for a
+        /// graceful pause; absent means an ordinary clarification.
+        #[serde(default)]
+        intent: Option<String>,
     },
     Shutdown,
 }
