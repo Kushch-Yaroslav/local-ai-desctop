@@ -175,28 +175,55 @@ reused for a different model, build, flags or hardware.
 - Nothing is probed automatically. The Max button remains a manual
   recalibration, and selecting a restored value remains a manual action.
 
-## Fast reasoning
+## Reasoning controls (thinking, depth, strategy)
 
-Reasoning is a model setting; Fast and Deep are agent strategies. Both modes keep
-model thinking on:
+Three independent per-conversation settings replace the old single «Рассуждение» selector:
 
-| Mode | Model reasoning (`llama-runtime-policy.ts` profile) | Agent strategy |
+| Control | Stored as | Meaning |
 |---|---|---|
-| Fast | thinking on, `reasoning_effort: low` | Fast guidance |
-| Deep | thinking on, strongest effort the model supports | Deep guidance + checkpoints |
+| «Размышления» Вкл./Выкл. | `conversations.thinking_enabled` (nullable) | whether the model thinks (`enable_thinking`) |
+| «Глубина рассуждений» Низкая/Средняя/Высокая/Максимальная | `conversations.reasoning_effort` (nullable) | how much the model thinks (`reasoning_effort`) |
+| «Стратегия агента» Быстрая/Глубокая | `conversations.reasoning_mode` (`fast`/`deep`, unchanged) | how the Agent plans, verifies and closes out; Chat guidance |
 
-Only the final tool-free turn (`final`) disables thinking. A regression test
-iterates every runtime profile and fails if Fast or Deep disable thinking or use a
+The old selector mixed the first two into the strategy: Fast silently meant low effort and Deep silently meant the
+strongest effort. Those mappings no longer exist for explicit choices: changing the strategy never moves thinking or
+depth, and changing depth never changes the strategy.
+
+**Capabilities are per model** (`llama-runtime-policy.ts`, `reasoning` profile), exposed to the renderer as
+`ModelInfo.reasoning = {thinkingToggle, efforts[]}` with normalized ids. Native values stay in the main process:
+
+| Model | Thinking switch | Depth levels → native `reasoning_effort` |
+|---|---|---|
+| Qwen3.8 27B | yes | low→`low`, medium→`medium`, max→`xhigh` |
+| GLM-4.7-Flash | yes | low→`low`, max→`xhigh` |
+| gpt-oss 20B | no (always thinks) | low, medium, high |
+
+A control a model lacks is shown as «Недоступно», never as «Выкл.». The depth control is disabled while thinking is
+off, and thinking off sends **no** effort. An unsupported stored depth (after switching model) is clamped to the nearest
+supported level, ties going lower, so it never silently costs more than the user chose.
+
+**Migration.** The two new columns are added lazily; `NULL` means "legacy". A legacy conversation resolves to what it
+effectively had before: thinking on, Fast → lowest supported depth, Deep → highest supported depth (never a level the
+model lacks). The first time the strategy is changed, both the renderer and the main process write down the
+legacy-derived thinking/depth first, so the strategy change cannot move them. Existing conversations therefore behave
+exactly as before until the user touches the new controls.
+
+**Wire format.** The main process resolves the selection for every request. Chat/web-chat receive it as a
+`ReasoningInput`; Agent runs get `reasoning_options = {main, final}`. The Rust loop prefers `main` for working turns and
+`final` for the tool-free closing turn (which still disables thinking), and falls back to the historical `fast`/`deep`
+keys when `main` is absent. Changing a control while a generation is running is refused with the existing «Дождитесь
+завершения…» message; it applies to the next request, and a refused change rolls back only its own key.
+
+A regression test iterates every runtime profile and fails if a bare strategy disables thinking or uses a
 no-reasoning effort. Models without a profile entry send no reasoning options.
 
 ## Effective modes in the Context panel
 
-The Context popover shows the **effective** Reasoning (Fast/Deep) and Mode
+The Context popover shows the **effective** Размышления, Глубина рассуждений, Стратегия агента and Mode
 (Chat/Agent), not the raw selector value. Effective means the last value the main
 process confirmed in the stored conversation, which is what the next request
 uses. A selection that has been sent but not confirmed is shown separately as
-`→ Deep` and is never presented as active. For a model without configurable
-reasoning the panel shows `—`. If llama.cpp is starting or serving a different
+`→ Глубокая` and is never presented as active. A control the model does not offer shows «Недоступно». If llama.cpp is starting or serving a different
 model the panel adds a runtime line.
 
 Switching Reasoning, Mode, Web or Project does not touch llama.cpp. These
@@ -205,3 +232,48 @@ switch, and a refused patch rolls back only its own keys. Previously a selection
 made while a runtime switch was in flight was refused with "wait for runtime
 switching" and the renderer restored an older whole-conversation snapshot, which
 showed as Deep jumping back to Fast.
+
+## Graceful pause
+
+A pause asks the Agent to stop *working* without discarding what it knows. It is different from Stop, which hard-cancels.
+
+- **Request.** The «Пауза» button in the composer sends a steering message with the structured intent `pause`; the model
+  may also classify a just-applied clarification as a pause request through the `pause_run` tool (offered only
+  right after steering was applied). The button turns into «Пауза запрошена».
+- **Lifecycle.** The Rust loop applies it at the next turn boundary (a tool already running finishes first). It then
+  allows only the checkpoint tools (`task_memory`, `deliverables`) for at most three bounded turns, with no
+  resume/continue guidance, and asks for a short summary: what is done, what is not, that work continues on request.
+  The final answer is accepted without a completion review, `RunPaused` is emitted before `Final`, and the timeline
+  shows «Работа на паузе».
+- **Continue** is an ordinary new user message in the same conversation: the plan is restored from the saved Task Memory
+  and deliverables. **Stop** keeps its hard-cancel semantics and has priority over a pending pause.
+
+## Steering chronology
+
+Accepting a clarification no longer inserts a timeline entry. Previously the entry was placed when the user pressed
+send, although Rust only applies steering at the top of the next turn, so more reasoning from the *old* turn landed
+after the clarification ("thinking… [clarification] …more old thinking"). Now the entry is renderer-only and shown last
+as «Уточнение в очереди — будет передано модели на следующем шаге» until Rust emits `steering_applied`; the main
+process then closes the open reasoning entry, assigns the next position and the same entry (`steering-<messageId>`)
+becomes applied in place. Only applied entries are persisted in the thinking timeline.
+
+## Task Memory contract
+
+- **Actions.** `record` (needs `finding`), `update` (needs an existing `id`), `invalidate`, `view`. Common aliases are accepted
+  (add/create→record, revise/edit→update, delete/remove→invalidate, get/list→view), as are status words (open, unresolved,
+  refuted, assumed, verified).
+- **Updates merge.** Fields that are not passed keep their value; an empty string clears one. A status-only or
+  next-only update no longer needs `finding` and no longer wipes the other fields. Recording an id that already exists
+  updates it (with a note) instead of failing or duplicating.
+- **No silent creation.** An unknown id on `update`/`invalidate`, or an unknown `supersedes`, is an error that lists the
+  existing ids. Auto ids (`tm-NNN`) skip numbers already used. `supersedes` now also retires the old entry when it is
+  given on an update.
+- **Evidence.** `evidence` may be a string or a list; `observations` is an equivalent string-array parameter. References
+  are normalized to exact ids before validation: `obs-15`, `OBS-15`, `obs-00000015/0016` and `obs-15, 16` become real
+  ids. A reference that names no observation is never repaired — a `confirmed` write names the bad reference and lists
+  valid ones (`Valid references include: obs-… (path)`), and nothing is changed. Deep deliverable completion uses the
+  same validation and message.
+- **Conflicts.** The "evidence conflict" guard only triggers when a finding or evidence is being replaced, not when only
+  status/next/implication change.
+- **Prompt.** The handoff still shows the four most relevant entries; remaining entries are listed by id in one line
+  («also stored, not shown») so the model can find and revise them.

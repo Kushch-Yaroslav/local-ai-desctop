@@ -6,7 +6,7 @@ the wording.
 
 ## Presentation layer
 
-- Labels: Reasoning/Mode chips (`Быстро`/`Глубоко`, `Чат`/`Агент`, the same words as the toolbar selectors), Context popover
+- Labels: Reasoning/Mode chips (`Размышления` Вкл./Выкл., `Глубина рассуждений` Низкая/Средняя/Высокая/Максимальная, `Стратегия агента` Быстрая/Глубокая, `Чат`/`Агент`, the same words as the toolbar selectors; `Недоступно` for a control the model lacks; `Пауза`/`Пауза запрошена`/`Работа на паузе`), Context popover
   (`Контекст`, `Входные токены`, `Выходные токены`, `Всего за запуск`, `Кэш промпта`, `Запись в кэш`, `Скорость` in
   `ток/с`, `Прошло`, `Ход`, `Действия`, `Сжатия`), timeline headings (`Размышляет`, `Размышлял 12 с`, `Чтение`,
   `Просмотр структуры проекта`, `$ Терминал`, `Контекст сжат`, `Агент остановлен`), terminal diagnostics

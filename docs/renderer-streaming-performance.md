@@ -85,3 +85,10 @@ not Electron on a GPU.
 - `scripts/renderer-replay/` replays any persisted run in headless Chrome and prints per-25 K-character checkpoints
   (`node export-run.mjs copy-of.db > run.json`; `RUN_JSON=run.json node replay.mjs`; `FINISH=1` adds the `done` swap and
   repaint probes; `node load.mjs` measures a cold load).
+
+## Steering and pause entries
+
+Pending steering is a renderer-only timeline entry with position `MAX_SAFE_INTEGER` (so it sorts last and never counts as
+the "live" reasoning row); when `steering_applied` arrives the entry is updated in place with its real position. The
+`paused` marker is a normal timeline entry appended at `++position`. Neither adds per-delta work: both go through the
+same coalesced stream path, and `thinking-timeline.test.ts` covers ordering with interleaved reasoning.

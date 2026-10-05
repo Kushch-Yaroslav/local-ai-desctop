@@ -82,3 +82,10 @@ The `deliverables` calls appear in the timeline as "Требуемый резу�
 
 No turn or tool limit was raised, and nothing forces a plan on a trivial prompt. The 32 K-token reasoning turn is a
 separate model-behaviour issue that already has a "think less" reminder.
+
+## Task Memory and pause interaction
+
+Deliverables are saved with Task Memory, so a graceful pause (see `deep-fast-modes.md`) records each deliverable's true
+status through the checkpoint tools and Continue restores it. In Deep, marking a deliverable done is validated with the
+same evidence normalization as a `confirmed` Task Memory entry: unpadded or compact references (`obs-15`,
+`obs-00000015/0016`) resolve to real ids, and a bad reference is named in the error together with valid ones.
