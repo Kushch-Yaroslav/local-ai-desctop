@@ -111,7 +111,7 @@ export class LlamaCppBackend implements LlmBackend, ToolCallingBackend {
   private url(path: string): string { return `${this.baseUrl.replace(/\/$/, '')}${path}`; }
   supportsReasoning(model: string): boolean { return getModelProfile(model)?.supportsReasoning === true; }
   updateRuntimeSelection(model: string, contextLimit: number, kvCacheType: LlamaKvCacheType = 'f16', kvOffload = true): void {
-    const runtime = llamaRuntimeProfiles.find((candidate) => candidate.id === model);
+    const runtime = llamaRuntimeProfile(model);
     if (!runtime || !Number.isSafeInteger(contextLimit) || contextLimit < 4_096 || contextLimit > runtime.maxContext || contextLimit % 4_096 !== 0) throw new Error('Выбранная конфигурация llama.cpp не поддерживается');
     if (kvCacheType !== 'f16' && kvCacheType !== 'q8_0') throw new Error('Выбранный тип KV-кэша llama.cpp не поддерживается');
     this.runtimeModelId = model;
