@@ -17,6 +17,9 @@ pub struct AgentState {
     /// Completion reviews already sent because the work was changed but not
     /// shown to work. Bounded per mode, so they can never deadlock a final.
     pub verification_reviews: usize,
+    /// The failing check the gate already sent the model back for: one failure
+    /// is reviewed once, so repeating the same answer cannot loop.
+    pub reviewed_failure: Option<String>,
     /// Evidence-producing commands run since the first such review.
     pub checks_since_review: usize,
     /// The verification budget is spent: the final answer is accepted and

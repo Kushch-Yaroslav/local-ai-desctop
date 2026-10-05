@@ -475,6 +475,9 @@ impl Transcript {
             .rev()
             .find_map(|entry| match entry {
                 Entry::PromptTail(existing) => Some(existing == content),
+                // A message after the tail means the request would end on it;
+                // the tail must be sent again or the request ends on assistant turns.
+                Entry::Message(_) => Some(false),
                 _ => None,
             })
             .unwrap_or(false)
@@ -1072,6 +1075,19 @@ mod tests {
         assert!(second.covers > first_boundary);
         assert!(second.render(10_000).contains("verified first handoff"));
         assert!(!second.render(10_000).contains("old finding 0"));
+    }
+
+    #[test]
+    fn an_identical_tail_is_sent_again_once_an_assistant_turn_follows_it() {
+        let mut t = Transcript::default();
+        t.push_run_user(json!({"role":"user","content":"task"}));
+        t.record_prompt_tail("same tail");
+        assert!(t.has_active_prompt_tail("same tail"));
+        t.assistant_withheld_draft("draft".into(), "unverified changes");
+        assert!(
+            !t.has_active_prompt_tail("same tail"),
+            "the request would end on the assistant draft"
+        );
     }
 
     #[test]

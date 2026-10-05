@@ -2324,3 +2324,33 @@ fn deep_wants_the_project_test_suite_and_verifies_with_a_cited_evidence_id() {
         .to_string()
         .contains("[verified] d-001"));
 }
+
+/// Real chat templates reject a request that ends on assistant turns. Repeating
+/// the same answer against the same failing check must neither produce one nor
+/// loop: the failure is reviewed once and the answer is then accepted.
+#[test]
+fn repeating_the_same_answer_against_one_failure_ends_and_always_ends_on_a_user_turn() {
+    let workspace = Workspace::new(APP);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Tools(vec![
+            deliverable("add", json!({"text":"add keeps adding"})),
+            edit_app(BAD),
+            deliverable(
+                "implemented",
+                json!({"id":"d-001","evidence":"wrote app.js"}),
+            ),
+        ]),
+        1 => Reply::Tools(vec![run_check()]),
+        _ => Reply::Text("The check fails and I cannot fix it here.".into()),
+    });
+    run(workspace.config(&provider.endpoint, "make add work"));
+    let journal = workspace.journal();
+    assert!(completed(&journal));
+    assert!(withheld_drafts(&journal) <= 2);
+    let requests = provider.requests();
+    assert!(requests.len() <= 6, "{} requests", requests.len());
+    for request in &requests {
+        let last = request["messages"].as_array().unwrap().last().unwrap();
+        assert_ne!(last["role"], "assistant", "{last}");
+    }
+}

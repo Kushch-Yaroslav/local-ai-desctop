@@ -3662,17 +3662,22 @@ fn review_tool_free_final(
         ));
     }
     if let Some(gap) = verification_gap(state) {
-        let failing = state
+        let failure = state
             .task_memory
             .verification
             .active_failure_at_least(Class::Static)
-            .is_some();
-        // A failing check keeps the gate open until the verification budget
-        // is spent; otherwise the number of reviews is fixed per mode.
-        if failing || state.verification_reviews < allowed_reviews {
+            .map(|record| record.id.clone());
+        // A new failing check earns one review of its own; the same failure is
+        // never sent back twice, and otherwise reviews are fixed per mode.
+        let new_failure = failure.is_some() && failure != state.reviewed_failure;
+        if new_failure || state.verification_reviews < allowed_reviews {
             state.verification_reviews += 1;
+            if new_failure {
+                state.reviewed_failure = failure.clone();
+            }
             return FinalCandidateReview::VerificationPending(verification_review_text(
-                &gap, failing,
+                &gap,
+                failure.is_some(),
             ));
         }
     }
