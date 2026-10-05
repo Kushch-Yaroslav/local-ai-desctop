@@ -127,6 +127,11 @@ export function parseLlamaAllocationLog(text: string, runtimeArguments?: readonl
   let inVisionSection = false;
   let currentPhase: AllocationPhase = 'target';
   const measurements: AllocationMeasurement[] = [];
+  // Backends may partition one context into several caches (e.g. full and SWA).
+  // Keep maxima within a named partition, then sum independent partitions.
+  let kvPartition = 'default';
+  const kvPartitions: Record<AllocationPhase, Map<string, Partial<Record<AllocationLocation, number>>>> = { target: new Map(), speculative: new Map() };
+  const kvSummaries: Record<AllocationPhase, Map<string, number>> = { target: new Map(), speculative: new Map() };
   let latestContextFromServer: number | null = null;
   for (let index = 0; index < start; index += 1) {
     const line = lines[index];
@@ -149,6 +154,7 @@ export function parseLlamaAllocationLog(text: string, runtimeArguments?: readonl
     }
     if (/common_speculative_init_result: creating (MTP|EAGLE|draft)\b/i.test(line)) {
       currentPhase = 'speculative';
+      kvPartition = 'default';
       speculativeMode = /EAGLE/i.test(line) ? 'eagle3' : /MTP/i.test(line) ? 'mtp' : 'draft';
       if (/against the target model/i.test(line)) speculativeUsesTargetModel = true;
     }
@@ -163,16 +169,19 @@ export function parseLlamaAllocationLog(text: string, runtimeArguments?: readonl
     const context = line.match(/\bn_ctx(?:_slot|_seq)?\s*=\s*(\d+)\b/i)?.[1];
     if (context && currentPhase === 'target') contextTokens = Number(context);
 
+    const partition = line.match(/llama_kv_cache_iswa:\s*creating\s+(.+?)\s+KV cache/i)?.[1];
+    if (partition) kvPartition = partition.trim();
     const types = kvTypesFromLine(line);
     if (types) {
       if (/llama_kv_cache/i.test(line)) {
-        if (currentPhase === 'speculative') { speculativeKvTypeK = types.key; speculativeKvTypeV = types.value; speculativeKvTypesSeen = true; }
-        else { kvTypeK = types.key; kvTypeV = types.value; targetKvTypesSeen = true; }
+        if (currentPhase === 'speculative') { speculativeKvTypeK = speculativeKvTypeK && speculativeKvTypeK !== types.key ? 'mixed' : types.key; speculativeKvTypeV = speculativeKvTypeV && speculativeKvTypeV !== types.value ? 'mixed' : types.value; speculativeKvTypesSeen = true; }
+        else { kvTypeK = kvTypeK && kvTypeK !== types.key ? 'mixed' : types.key; kvTypeV = kvTypeV && kvTypeV !== types.value ? 'mixed' : types.value; targetKvTypesSeen = true; }
       }
     }
 
     const totalSize = sizeFromLine(line);
     if (/llama_kv_cache: size\s*=/i.test(line) && totalSize !== null) {
+      kvSummaries[currentPhase].set(kvPartition, Math.max(kvSummaries[currentPhase].get(kvPartition) ?? 0, totalSize));
       if (currentPhase === 'speculative') { speculativeKvSummaryBytes = totalSize; sawSpeculativeKvSummary = true; }
       else { targetKvSummaryBytes = totalSize; sawTargetKvSummary = true; }
     }
@@ -193,7 +202,11 @@ export function parseLlamaAllocationLog(text: string, runtimeArguments?: readonl
     if (!kind || totalSize === null || totalSize <= 0) continue;
     const location = locationOf(line);
     if (!location) continue;
-    measurements.push({ value: totalSize, phase: currentPhase, kind, location });
+    if (kind === 'kv' || kind === 'speculativeKv') {
+      const partition = kvPartitions[currentPhase].get(kvPartition) ?? {};
+      setTier(partition, location, totalSize);
+      kvPartitions[currentPhase].set(kvPartition, partition);
+    } else measurements.push({ value: totalSize, phase: currentPhase, kind, location });
   }
   contextTokens = latestContextFromServer ?? contextTokens;
   const loadedIndex = lines.findIndex((line, index) => index >= start && /\bsrv\s+llama_server: model loaded/.test(line));
@@ -206,6 +219,16 @@ export function parseLlamaAllocationLog(text: string, runtimeArguments?: readonl
     const target = phaseTotals[measurement.phase][measurement.kind];
     setTier(target, measurement.location, measurement.value);
   }
+  for (const phase of ['target', 'speculative'] as const) {
+    const kind = phase === 'target' ? 'kv' : 'speculativeKv';
+    for (const partition of kvPartitions[phase].values()) {
+      for (const location of ['host', 'device'] as const) {
+        if (partition[location] !== undefined) phaseTotals[phase][kind][location] = (phaseTotals[phase][kind][location] ?? 0) + partition[location]!;
+      }
+    }
+  }
+  targetKvSummaryBytes = kvSummaries.target.size ? [...kvSummaries.target.values()].reduce((sum, value) => sum + value, 0) : null;
+  speculativeKvSummaryBytes = kvSummaries.speculative.size ? [...kvSummaries.speculative.values()].reduce((sum, value) => sum + value, 0) : null;
   allocations.weights = { ...phaseTotals.target.weights };
   allocations.compute = { ...phaseTotals.target.compute };
   allocations.output = { ...phaseTotals.target.output };

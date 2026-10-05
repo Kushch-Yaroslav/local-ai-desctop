@@ -1,0 +1,1289 @@
+{
+  "date": "2026-10-05",
+  "initialBranch": "feat/local-model-refresh",
+  "initialHead": "20a2eeb6b502bc46b74fd790227ecf91aac71309",
+  "preRefreshReference": "65666cda0d5d6477cd2cd3a9c0b3a12049dc8dcd",
+  "branch": "fix/max-context-standalone-qwen",
+  "regressionCommit": "df8b068ae1fa25116e8cc7b0dbe8cc1097f3cfbb",
+  "existingSinglePartitionParserCommit": "dc6be77b7b90867e9cd6260fbeaee9b7fead5e27",
+  "runtime": {
+    "gpu": "NVIDIA GeForce RTX 3090",
+    "gpuTotalMiB": 24576,
+    "port": 8083,
+    "llamaSourceHead": "d1d3c3396aa13a5f239109a822666c4870490ad5",
+    "sequential": true,
+    "isolatedDatabase": true
+  },
+  "unchangedVramPolicyMiB": {
+    "nonLlmAbsoluteCap": 1550,
+    "discoveryMargin": 384,
+    "invalidationTolerance": 256,
+    "startupEmergencyFreeFloor": 150
+  },
+  "before": [
+    {
+      "id": "qwen3.8:27b-q4_K_M",
+      "startOk": true,
+      "estimateStatus": "observed",
+      "unknownReasons": [
+        "в журнале запуска нет резерва вычислений визуального проектора"
+      ],
+      "discoveryError": "Нет полной allocation evidence для безопасного базового запуска.",
+      "probesStarted": 0
+    },
+    {
+      "id": "huihui-qwen3.8:27b-ud-dw-q4_k_m",
+      "startOk": true,
+      "estimateStatus": "observed",
+      "unknownReasons": [
+        "в журнале запуска нет резерва вычислений визуального проектора"
+      ],
+      "discoveryError": "Нет полной allocation evidence для безопасного базового запуска.",
+      "probesStarted": 0
+    },
+    {
+      "id": "devstral-small-2:24b-q4_k_m",
+      "startOk": true,
+      "estimateStatus": "observed",
+      "unknownReasons": [
+        "в журнале запуска нет резерва вычислений визуального проектора"
+      ],
+      "discoveryError": "Нет полной allocation evidence для безопасного базового запуска.",
+      "probesStarted": 0
+    },
+    {
+      "id": "gemma4:31b-it-q4_k_m",
+      "startOk": true,
+      "estimateStatus": "observed",
+      "unknownReasons": [
+        "в журнале запуска нет резерва вычислений визуального проектора",
+        "журнал запуска не содержит всех категорий выделения памяти в RAM"
+      ],
+      "discoveryError": "Нет полной allocation evidence для безопасного базового запуска.",
+      "probesStarted": 0
+    }
+  ],
+  "after": [
+    {
+      "id": "qwen3.8:27b-q4_K_M",
+      "startOk": true,
+      "estimateStatus": "estimated",
+      "unknownReasons": [],
+      "hardLimit": 262144,
+      "candidateCount": 15,
+      "originalRuntimeRestored": true,
+      "options": [
+        {
+          "kv": "f16",
+          "offeredTokens": 90112,
+          "boundaryTokens": 90112,
+          "boundaryReason": "budget-guard",
+          "highestInferenceTokens": 90112,
+          "successfulInferenceProbes": 4,
+          "llmMiB": 22600.0,
+          "availableLlmBudgetMiB": 22642.0,
+          "freeMiB": 571.0,
+          "nonLlmMiB": 948.0
+        },
+        {
+          "kv": "q8_0",
+          "offeredTokens": 135168,
+          "boundaryTokens": 139264,
+          "boundaryReason": "budget-guard",
+          "highestInferenceTokens": 139264,
+          "successfulInferenceProbes": 6,
+          "llmMiB": 22500.0,
+          "availableLlmBudgetMiB": 22642.0,
+          "freeMiB": 671.0,
+          "nonLlmMiB": 948.0
+        }
+      ],
+      "probes": [
+        {
+          "contextWindow": 16384,
+          "kvCacheType": "f16",
+          "phase": "base",
+          "startup": true,
+          "health": true,
+          "inference": true,
+          "fits": false,
+          "elapsedMs": 7571
+        },
+        {
+          "contextWindow": 61440,
+          "kvCacheType": "f16",
+          "phase": "search",
+          "startup": true,
+          "health": true,
+          "inference": true,
+          "fits": true,
+          "elapsedMs": 7432
+        },
+        {
+          "contextWindow": 163840,
+          "kvCacheType": "f16",
+          "phase": "search",
+          "startup": false,
+          "health": false,
+          "inference": false,
+          "fits": false,
+          "reason": "Пропущено до запуска: расчётная память выходит за общий бюджет VRAM или за защитный порог фактически свободной памяти.",
+          "elapsedMs": 0
+        },
+        {
+          "contextWindow": 110592,
+          "kvCacheType": "f16",
+          "phase": "search",
+          "startup": false,
+          "health": false,
+          "inference": false,
+          "fits": false,
+          "reason": "Пропущено до запуска: расчётная память выходит за общий бюджет VRAM или за защитный порог фактически свободной памяти.",
+          "elapsedMs": 0
+        },
+        {
+          "contextWindow": 86016,
+          "kvCacheType": "f16",
+          "phase": "search",
+          "startup": true,
+          "health": true,
+          "inference": true,
+          "fits": true,
+          "elapsedMs": 7435
+        },
+        {
+          "contextWindow": 98304,
+          "kvCacheType": "f16",
+          "phase": "search",
+          "startup": false,
+          "health": false,
+          "inference": false,
+          "fits": false,
+          "reason": "Пропущено до запуска: расчётная память выходит за общий бюджет VRAM или за защитный порог фактически свободной памяти.",
+          "elapsedMs": 0
+        },
+        {
+          "contextWindow": 90112,
+          "kvCacheType": "f16",
+          "phase": "search",
+          "startup": true,
+          "health": true,
+          "inference": true,
+          "fits": true,
+          "elapsedMs": 7447
+        },
+        {
+          "contextWindow": 16384,
+          "kvCacheType": "q8_0",
+          "phase": "base",
+          "startup": true,
+          "health": true,
+          "inference": true,
+          "fits": false,
+          "elapsedMs": 6948
+        },
+        {
+          "contextWindow": 77824,
+          "kvCacheType": "q8_0",
+          "phase": "search",
+          "startup": true,
+          "health": true,
+          "inference": true,
+          "fits": true,
+          "elapsedMs": 6956
+        },
+        {
+          "contextWindow": 172032,
+          "kvCacheType": "q8_0",
+          "phase": "search",
+          "startup": false,
+          "health": false,
+          "inference": false,
+          "fits": false,
+          "reason": "Пропущено до запуска: расчётная память выходит за общий бюджет VRAM или за защитный порог фактически свободной памяти.",
+          "elapsedMs": 0
+        },
+        {
+          "contextWindow": 122880,
+          "kvCacheType": "q8_0",
+          "phase": "search",
+          "startup": true,
+          "health": true,
+          "inference": true,
+          "fits": true,
+          "elapsedMs": 7937
+        },
+        {
+          "contextWindow": 147456,
+          "kvCacheType": "q8_0",
+          "phase": "search",
+          "startup": false,
+          "health": false,
+          "inference": false,
+          "fits": false,
+          "reason": "Пропущено до запуска: расчётная память выходит за общий бюджет VRAM или за защитный порог фактически свободной памяти.",
+          "elapsedMs": 0
+        },
+        {
+          "contextWindow": 135168,
+          "kvCacheType": "q8_0",
+          "phase": "search",
+          "startup": true,
+          "health": true,
+          "inference": true,
+          "fits": true,
+          "elapsedMs": 6931
+        },
+        {
+          "contextWindow": 139264,
+          "kvCacheType": "q8_0",
+          "phase": "search",
+          "startup": true,
+          "health": true,
+          "inference": true,
+          "fits": true,
+          "elapsedMs": 6932
+        },
+        {
+          "contextWindow": 135168,
+          "kvCacheType": "q8_0",
+          "phase": "final",
+          "startup": true,
+          "health": true,
+          "inference": true,
+          "fits": true,
+          "elapsedMs": 6939
+        }
+      ]
+    },
+    {
+      "id": "huihui-qwen3.8:27b-ud-dw-q4_k_m",
+      "startOk": true,
+      "estimateStatus": "estimated",
+      "unknownReasons": [],
+      "hardLimit": 262144,
+      "candidateCount": 17,
+      "originalRuntimeRestored": true,
+      "options": [
+        {
+          "kv": "f16",
+          "offeredTokens": 94208,
+          "boundaryTokens": 98304,
+          "boundaryReason": "budget-guard",
+          "highestInferenceTokens": 98304,
+          "successfulInferenceProbes": 5,
+          "llmMiB": 22636.0,
+          "availableLlmBudgetMiB": 22642.0,
+          "freeMiB": 531.0,
+          "nonLlmMiB": 953.0
+        },
+        {
+          "kv": "q8_0",
+          "offeredTokens": 139264,
+          "boundaryTokens": 147456,
+          "boundaryReason": "budget-guard",
+          "highestInferenceTokens": 147456,
+          "successfulInferenceProbes": 6,
+          "llmMiB": 22440.0,
+          "availableLlmBudgetMiB": 22642.0,
+          "freeMiB": 604.0,
+          "nonLlmMiB": 1075.0
+        }
+      ],
+      "probes": [
+        {
+          "contextWindow": 16384,
+          "kvCacheType": "f16",
+          "phase": "base",
+          "startup": true,
+          "health": true,
+          "inference": true,
+          "fits": false,
+          "elapsedMs": 10528
+        },
+        {
+          "contextWindow": 61440,
+          "kvCacheType": "f16",
+          "phase": "search",
+          "startup": true,
+          "health": true,
+          "inference": true,
+          "fits": true,
+          "elapsedMs": 6939
+        },
+        {
+          "contextWindow": 163840,
+          "kvCacheType": "f16",
+          "phase": "search",
+          "startup": false,
+          "health": false,
+          "inference": false,
+          "fits": false,
+          "reason": "Пропущено до запуска: расчётная память выходит за общий бюджет VRAM или за защитный порог фактически свободной памяти.",
+          "elapsedMs": 0
+        },
+        {
+          "contextWindow": 110592,
+          "kvCacheType": "f16",
+          "phase": "search",
+          "startup": false,
+          "health": false,
+          "inference": false,
+          "fits": false,
+          "reason": "Пропущено до запуска: расчётная память выходит за общий бюджет VRAM или за защитный порог фактически свободной памяти.",
+          "elapsedMs": 0
+        },
+        {
+          "contextWindow": 86016,
+          "kvCacheType": "f16",
+          "phase": "search",
+          "startup": true,
+          "health": true,
+          "inference": true,
+          "fits": true,
+          "elapsedMs": 7947
+        },
+        {
+          "contextWindow": 98304,
+          "kvCacheType": "f16",
+          "phase": "search",
+          "startup": true,
+          "health": true,
+          "inference": true,
+          "fits": true,
+          "elapsedMs": 6935
+        },
+        {
+          "contextWindow": 102400,
+          "kvCacheType": "f16",
+          "phase": "search",
+          "startup": false,
+          "health": false,
+          "inference": false,
+          "fits": false,
+          "reason": "Пропущено до запуска: расчётная память выходит за общий бюджет VRAM или за защитный порог фактически свободной памяти.",
+          "elapsedMs": 0
+        },
+        {
+          "contextWindow": 94208,
+          "kvCacheType": "f16",
+          "phase": "final",
+          "startup": true,
+          "health": true,
+          "inference": true,
+          "fits": true,
+          "elapsedMs": 8944
+        },
+        {
+          "contextWindow": 16384,
+          "kvCacheType": "q8_0",
+          "phase": "base",
+          "startup": true,
+          "health": true,
+          "inference": true,
+          "fits": false,
+          "elapsedMs": 11954
+        },
+        {
+          "contextWindow": 81920,
+          "kvCacheType": "q8_0",
+          "phase": "search",
+          "startup": true,
+          "health": true,
+          "inference": true,
+          "fits": true,
+          "elapsedMs": 7938
+        },
+        {
+          "contextWindow": 172032,
+          "kvCacheType": "q8_0",
+          "phase": "search",
+          "startup": false,
+          "health": false,
+          "inference": false,
+          "fits": false,
+          "reason": "Пропущено до запуска: расчётная память выходит за общий бюджет VRAM или за защитный порог фактически свободной памяти.",
+          "elapsedMs": 0
+        },
+        {
+          "contextWindow": 126976,
+          "kvCacheType": "q8_0",
+          "phase": "search",
+          "startup": true,
+          "health": true,
+          "inference": true,
+          "fits": true,
+          "elapsedMs": 10444
+        },
+        {
+          "contextWindow": 147456,
+          "kvCacheType": "q8_0",
+          "phase": "search",
+          "startup": true,
+          "health": true,
+          "inference": true,
+          "fits": true,
+          "elapsedMs": 8952
+        },
+        {
+          "contextWindow": 159744,
+          "kvCacheType": "q8_0",
+          "phase": "search",
+          "startup": false,
+          "health": false,
+          "inference": false,
+          "fits": false,
+          "reason": "Пропущено до запуска: расчётная память выходит за общий бюджет VRAM или за защитный порог фактически свободной памяти.",
+          "elapsedMs": 0
+        },
+        {
+          "contextWindow": 151552,
+          "kvCacheType": "q8_0",
+          "phase": "search",
+          "startup": false,
+          "health": false,
+          "inference": false,
+          "fits": false,
+          "reason": "Пропущено до запуска: расчётная память выходит за общий бюджет VRAM или за защитный порог фактически свободной памяти.",
+          "elapsedMs": 0
+        },
+        {
+          "contextWindow": 143360,
+          "kvCacheType": "q8_0",
+          "phase": "final",
+          "startup": true,
+          "health": true,
+          "inference": true,
+          "fits": false,
+          "reason": "Финальная проверка не сохранила бюджет VRAM для LLM и измеренный запас свободной памяти.",
+          "elapsedMs": 7462
+        },
+        {
+          "contextWindow": 139264,
+          "kvCacheType": "q8_0",
+          "phase": "final",
+          "startup": true,
+          "health": true,
+          "inference": true,
+          "fits": true,
+          "elapsedMs": 7448
+        }
+      ]
+    },
+    {
+      "id": "devstral-small-2:24b-q4_k_m",
+      "startOk": true,
+      "estimateStatus": "estimated",
+      "unknownReasons": [],
+      "hardLimit": 262144,
+      "candidateCount": 16,
+      "originalRuntimeRestored": true,
+      "options": [
+        {
+          "kv": "f16",
+          "offeredTokens": 53248,
+          "boundaryTokens": 57344,
+          "boundaryReason": "budget-guard",
+          "highestInferenceTokens": 57344,
+          "successfulInferenceProbes": 4,
+          "llmMiB": 22212.0,
+          "availableLlmBudgetMiB": 22642.0,
+          "freeMiB": 899.0,
+          "nonLlmMiB": 1008.0
+        },
+        {
+          "kv": "q8_0",
+          "offeredTokens": 98304,
+          "boundaryTokens": 102400,
+          "boundaryReason": "budget-guard",
+          "highestInferenceTokens": 102400,
+          "successfulInferenceProbes": 4,
+          "llmMiB": 22298.0,
+          "availableLlmBudgetMiB": 22642.0,
+          "freeMiB": 765.0,
+          "nonLlmMiB": 1056.0
+        }
+      ],
+      "probes": [
+        {
+          "contextWindow": 16384,
+          "kvCacheType": "f16",
+          "phase": "base",
+          "startup": true,
+          "health": true,
+          "inference": true,
+          "fits": false,
+          "elapsedMs": 6011
+        },
+        {
+          "contextWindow": 53248,
+          "kvCacheType": "f16",
+          "phase": "search",
+          "startup": true,
+          "health": true,
+          "inference": true,
+          "fits": true,
+          "elapsedMs": 7519
+        },
+        {
+          "contextWindow": 159744,
+          "kvCacheType": "f16",
+          "phase": "search",
+          "startup": false,
+          "health": false,
+          "inference": false,
+          "fits": false,
+          "reason": "Пропущено до запуска: расчётная память выходит за общий бюджет VRAM или за защитный порог фактически свободной памяти.",
+          "elapsedMs": 0
+        },
+        {
+          "contextWindow": 106496,
+          "kvCacheType": "f16",
+          "phase": "search",
+          "startup": false,
+          "health": false,
+          "inference": false,
+          "fits": false,
+          "reason": "Пропущено до запуска: расчётная память выходит за общий бюджет VRAM или за защитный порог фактически свободной памяти.",
+          "elapsedMs": 0
+        },
+        {
+          "contextWindow": 77824,
+          "kvCacheType": "f16",
+          "phase": "search",
+          "startup": false,
+          "health": false,
+          "inference": false,
+          "fits": false,
+          "reason": "Пропущено до запуска: расчётная память выходит за общий бюджет VRAM или за защитный порог фактически свободной памяти.",
+          "elapsedMs": 0
+        },
+        {
+          "contextWindow": 65536,
+          "kvCacheType": "f16",
+          "phase": "search",
+          "startup": false,
+          "health": false,
+          "inference": false,
+          "fits": false,
+          "reason": "Пропущено до запуска: расчётная память выходит за общий бюджет VRAM или за защитный порог фактически свободной памяти.",
+          "elapsedMs": 0
+        },
+        {
+          "contextWindow": 57344,
+          "kvCacheType": "f16",
+          "phase": "search",
+          "startup": true,
+          "health": true,
+          "inference": true,
+          "fits": true,
+          "elapsedMs": 7530
+        },
+        {
+          "contextWindow": 53248,
+          "kvCacheType": "f16",
+          "phase": "final",
+          "startup": true,
+          "health": true,
+          "inference": true,
+          "fits": true,
+          "elapsedMs": 6518
+        },
+        {
+          "contextWindow": 16384,
+          "kvCacheType": "q8_0",
+          "phase": "base",
+          "startup": true,
+          "health": true,
+          "inference": true,
+          "fits": false,
+          "elapsedMs": 7036
+        },
+        {
+          "contextWindow": 94208,
+          "kvCacheType": "q8_0",
+          "phase": "search",
+          "startup": true,
+          "health": true,
+          "inference": true,
+          "fits": true,
+          "elapsedMs": 5529
+        },
+        {
+          "contextWindow": 180224,
+          "kvCacheType": "q8_0",
+          "phase": "search",
+          "startup": false,
+          "health": false,
+          "inference": false,
+          "fits": false,
+          "reason": "Пропущено до запуска: расчётная память выходит за общий бюджет VRAM или за защитный порог фактически свободной памяти.",
+          "elapsedMs": 0
+        },
+        {
+          "contextWindow": 135168,
+          "kvCacheType": "q8_0",
+          "phase": "search",
+          "startup": false,
+          "health": false,
+          "inference": false,
+          "fits": false,
+          "reason": "Пропущено до запуска: расчётная память выходит за общий бюджет VRAM или за защитный порог фактически свободной памяти.",
+          "elapsedMs": 0
+        },
+        {
+          "contextWindow": 114688,
+          "kvCacheType": "q8_0",
+          "phase": "search",
+          "startup": false,
+          "health": false,
+          "inference": false,
+          "fits": false,
+          "reason": "Пропущено до запуска: расчётная память выходит за общий бюджет VRAM или за защитный порог фактически свободной памяти.",
+          "elapsedMs": 0
+        },
+        {
+          "contextWindow": 102400,
+          "kvCacheType": "q8_0",
+          "phase": "search",
+          "startup": true,
+          "health": true,
+          "inference": true,
+          "fits": true,
+          "elapsedMs": 6030
+        },
+        {
+          "contextWindow": 106496,
+          "kvCacheType": "q8_0",
+          "phase": "search",
+          "startup": false,
+          "health": false,
+          "inference": false,
+          "fits": false,
+          "reason": "Пропущено до запуска: расчётная память выходит за общий бюджет VRAM или за защитный порог фактически свободной памяти.",
+          "elapsedMs": 0
+        },
+        {
+          "contextWindow": 98304,
+          "kvCacheType": "q8_0",
+          "phase": "final",
+          "startup": true,
+          "health": true,
+          "inference": true,
+          "fits": true,
+          "elapsedMs": 6528
+        }
+      ]
+    },
+    {
+      "id": "gemma4:31b-it-q4_k_m",
+      "startOk": true,
+      "estimateStatus": "estimated",
+      "unknownReasons": [],
+      "hardLimit": 262144,
+      "candidateCount": 14,
+      "originalRuntimeRestored": true,
+      "options": [
+        {
+          "kv": "f16",
+          "offeredTokens": 40960,
+          "boundaryTokens": 40960,
+          "boundaryReason": "budget-guard",
+          "highestInferenceTokens": 40960,
+          "successfulInferenceProbes": 3,
+          "llmMiB": 22392.0,
+          "availableLlmBudgetMiB": 22642.0,
+          "freeMiB": 791.0,
+          "nonLlmMiB": 936.0
+        },
+        {
+          "kv": "q8_0",
+          "offeredTokens": 81920,
+          "boundaryTokens": 81920,
+          "boundaryReason": "budget-guard",
+          "highestInferenceTokens": 81920,
+          "successfulInferenceProbes": 4,
+          "llmMiB": 22618.0,
+          "availableLlmBudgetMiB": 22642.0,
+          "freeMiB": 586.0,
+          "nonLlmMiB": 915.0
+        }
+      ],
+      "probes": [
+        {
+          "contextWindow": 16384,
+          "kvCacheType": "f16",
+          "phase": "base",
+          "startup": true,
+          "health": true,
+          "inference": true,
+          "fits": false,
+          "elapsedMs": 14876
+        },
+        {
+          "contextWindow": 28672,
+          "kvCacheType": "f16",
+          "phase": "search",
+          "startup": true,
+          "health": true,
+          "inference": true,
+          "fits": true,
+          "elapsedMs": 7299
+        },
+        {
+          "contextWindow": 147456,
+          "kvCacheType": "f16",
+          "phase": "search",
+          "startup": false,
+          "health": false,
+          "inference": false,
+          "fits": false,
+          "reason": "Пропущено до запуска: расчётная память выходит за общий бюджет VRAM или за защитный порог фактически свободной памяти.",
+          "elapsedMs": 0
+        },
+        {
+          "contextWindow": 86016,
+          "kvCacheType": "f16",
+          "phase": "search",
+          "startup": false,
+          "health": false,
+          "inference": false,
+          "fits": false,
+          "reason": "Пропущено до запуска: расчётная память выходит за общий бюджет VRAM или за защитный порог фактически свободной памяти.",
+          "elapsedMs": 0
+        },
+        {
+          "contextWindow": 57344,
+          "kvCacheType": "f16",
+          "phase": "search",
+          "startup": false,
+          "health": false,
+          "inference": false,
+          "fits": false,
+          "reason": "Пропущено до запуска: расчётная память выходит за общий бюджет VRAM или за защитный порог фактически свободной памяти.",
+          "elapsedMs": 0
+        },
+        {
+          "contextWindow": 40960,
+          "kvCacheType": "f16",
+          "phase": "search",
+          "startup": true,
+          "health": true,
+          "inference": true,
+          "fits": true,
+          "elapsedMs": 6792
+        },
+        {
+          "contextWindow": 49152,
+          "kvCacheType": "f16",
+          "phase": "search",
+          "startup": false,
+          "health": false,
+          "inference": false,
+          "fits": false,
+          "reason": "Пропущено до запуска: расчётная память выходит за общий бюджет VRAM или за защитный порог фактически свободной памяти.",
+          "elapsedMs": 0
+        },
+        {
+          "contextWindow": 16384,
+          "kvCacheType": "q8_0",
+          "phase": "base",
+          "startup": true,
+          "health": true,
+          "inference": true,
+          "fits": false,
+          "elapsedMs": 6805
+        },
+        {
+          "contextWindow": 53248,
+          "kvCacheType": "q8_0",
+          "phase": "search",
+          "startup": true,
+          "health": true,
+          "inference": true,
+          "fits": true,
+          "elapsedMs": 6802
+        },
+        {
+          "contextWindow": 159744,
+          "kvCacheType": "q8_0",
+          "phase": "search",
+          "startup": false,
+          "health": false,
+          "inference": false,
+          "fits": false,
+          "reason": "Пропущено до запуска: расчётная память выходит за общий бюджет VRAM или за защитный порог фактически свободной памяти.",
+          "elapsedMs": 0
+        },
+        {
+          "contextWindow": 106496,
+          "kvCacheType": "q8_0",
+          "phase": "search",
+          "startup": false,
+          "health": false,
+          "inference": false,
+          "fits": false,
+          "reason": "Пропущено до запуска: расчётная память выходит за общий бюджет VRAM или за защитный порог фактически свободной памяти.",
+          "elapsedMs": 0
+        },
+        {
+          "contextWindow": 77824,
+          "kvCacheType": "q8_0",
+          "phase": "search",
+          "startup": true,
+          "health": true,
+          "inference": true,
+          "fits": true,
+          "elapsedMs": 7312
+        },
+        {
+          "contextWindow": 90112,
+          "kvCacheType": "q8_0",
+          "phase": "search",
+          "startup": false,
+          "health": false,
+          "inference": false,
+          "fits": false,
+          "reason": "Пропущено до запуска: расчётная память выходит за общий бюджет VRAM или за защитный порог фактически свободной памяти.",
+          "elapsedMs": 0
+        },
+        {
+          "contextWindow": 81920,
+          "kvCacheType": "q8_0",
+          "phase": "search",
+          "startup": true,
+          "health": true,
+          "inference": true,
+          "fits": true,
+          "elapsedMs": 6806
+        }
+      ]
+    }
+  ],
+  "tests": {
+    "rust": {
+      "unitPassed": 164,
+      "integrationPassed": 39,
+      "failed": 0
+    },
+    "nodeTestFiles": [
+      {
+        "file": "src/main/backends/llama-cpp-backend.test.ts",
+        "command": "node dist/main/backends/llama-cpp-backend.test.js",
+        "exit": 0
+      },
+      {
+        "file": "src/main/models/model-capabilities.test.ts",
+        "command": "node dist/main/models/model-capabilities.test.js",
+        "exit": 0
+      },
+      {
+        "file": "src/main/services/agent-workspace.test.ts",
+        "command": "node dist/main/services/agent-workspace.test.js",
+        "exit": 0
+      },
+      {
+        "file": "src/main/services/attachment-pipeline.test.ts",
+        "command": "node dist/main/services/attachment-pipeline.test.js",
+        "exit": 0
+      },
+      {
+        "file": "src/main/services/context-discovery-persistence.test.ts",
+        "command": "node dist/main/services/context-discovery-persistence.test.js",
+        "exit": 0
+      },
+      {
+        "file": "src/main/services/context-discovery.test.ts",
+        "command": "node dist/main/services/context-discovery.test.js",
+        "exit": 0
+      },
+      {
+        "file": "src/main/services/context-estimate.test.ts",
+        "command": "node dist/main/services/context-estimate.test.js",
+        "exit": 0
+      },
+      {
+        "file": "src/main/services/database.test.ts",
+        "command": "node dist/main/services/database.test.js",
+        "exit": 0
+      },
+      {
+        "file": "src/main/services/generation-diagnostics.test.ts",
+        "command": "node dist/main/services/generation-diagnostics.test.js",
+        "exit": 0
+      },
+      {
+        "file": "src/main/services/gguf-context.test.ts",
+        "command": "node dist/main/services/gguf-context.test.js",
+        "exit": 0
+      },
+      {
+        "file": "src/main/services/hardware.test.ts",
+        "command": "node dist/main/services/hardware.test.js",
+        "exit": 0
+      },
+      {
+        "file": "src/main/services/llama-runtime-controller.test.ts",
+        "command": "node dist/main/services/llama-runtime-controller.test.js",
+        "exit": 0
+      },
+      {
+        "file": "src/main/services/run-recovery.test.ts",
+        "command": "node dist/main/services/run-recovery.test.js",
+        "exit": 0
+      },
+      {
+        "file": "src/main/services/rust-agent-runtime.test.ts",
+        "command": "node dist/main/services/rust-agent-runtime.test.js",
+        "exit": 0
+      },
+      {
+        "file": "src/main/services/web-chat.test.ts",
+        "command": "node dist/main/services/web-chat.test.js",
+        "exit": 0
+      },
+      {
+        "file": "src/main/tools/process-group.test.ts",
+        "command": "node dist/main/tools/process-group.test.js",
+        "exit": 0
+      },
+      {
+        "file": "src/shared/context-estimator.test.ts",
+        "command": "node dist/shared/context-estimator.test.js",
+        "exit": 0
+      },
+      {
+        "file": "src/shared/context-format.test.ts",
+        "command": "node dist/shared/context-format.test.js",
+        "exit": 0
+      },
+      {
+        "file": "src/shared/context-options.test.ts",
+        "command": "node dist/shared/context-options.test.js",
+        "exit": 0
+      },
+      {
+        "file": "src/shared/conversation-settings.test.ts",
+        "command": "node dist/shared/conversation-settings.test.js",
+        "exit": 0
+      },
+      {
+        "file": "src/shared/generation-guard.test.ts",
+        "command": "node dist/shared/generation-guard.test.js",
+        "exit": 0
+      },
+      {
+        "file": "src/shared/generation-lifetime.test.ts",
+        "command": "node dist/shared/generation-lifetime.test.js",
+        "exit": 0
+      },
+      {
+        "file": "src/shared/localization-coverage.test.ts",
+        "command": "node dist/shared/localization-coverage.test.js",
+        "exit": 0
+      },
+      {
+        "file": "src/shared/localization.test.ts",
+        "command": "node dist/shared/localization.test.js",
+        "exit": 0
+      },
+      {
+        "file": "src/shared/mermaid-theme.test.ts",
+        "command": "node dist/shared/mermaid-theme.test.js",
+        "exit": 0
+      },
+      {
+        "file": "src/shared/reasoning-controls.test.ts",
+        "command": "node dist/shared/reasoning-controls.test.js",
+        "exit": 0
+      },
+      {
+        "file": "src/shared/streaming-load.test.ts",
+        "command": "node dist/shared/streaming-load.test.js",
+        "exit": 0
+      },
+      {
+        "file": "src/shared/thinking-timeline.test.ts",
+        "command": "node dist/shared/thinking-timeline.test.js",
+        "exit": 0
+      },
+      {
+        "file": "src/shared/vram-budget.test.ts",
+        "command": "node dist/shared/vram-budget.test.js",
+        "exit": 0
+      }
+    ],
+    "maxContextGate": {
+      "nodeSuites": 11,
+      "shellSuites": 3,
+      "failed": 0
+    },
+    "oldImplementationRegressionProof": {
+      "launcher": {
+        "expectedFailure": true,
+        "exit": 1,
+        "reason": "projector runtime has --no-warmup"
+      },
+      "partitionParser": "EXPECTED PRE-FIX FAILURE: independent caches must be summed\n+ actual - expected\n\n+ 2684354560\n- 3942645760"
+    },
+    "staticChecks": [
+      "cargo fmt --manifest-path rust-agent/Cargo.toml --check",
+      "npm run lint",
+      "npm run typecheck (within npm run build)",
+      "npx tsc -p tsconfig.electron.json --noEmit",
+      "bash -n run-local-ai-desktop-llama-cpp-mtp.sh scripts/llama-launch-config.test.sh",
+      "git diff --check"
+    ],
+    "buildCommand": "npm run build",
+    "staticChecksPassed": true,
+    "buildPassed": true
+  },
+  "rendererRestoration": [
+    {
+      "id": "qwen3.8:27b-q4_K_M",
+      "restoredProbeCount": 0,
+      "restoredOptions": [
+        {
+          "kv": "f16",
+          "tokens": 90112,
+          "restored": true
+        },
+        {
+          "kv": "q8_0",
+          "tokens": 135168,
+          "restored": true
+        }
+      ],
+      "summary": "Максимальный контекст: FP16 88K (сохранено) · Q8 132K (сохранено)",
+      "contextOptions": [
+        {
+          "label": "16K",
+          "value": "16384:f16:gpu"
+        },
+        {
+          "label": "32K",
+          "value": "32768:f16:gpu"
+        },
+        {
+          "label": "64K",
+          "value": "65536:f16:gpu"
+        },
+        {
+          "label": "88K (FP16)",
+          "value": "90112:f16:gpu"
+        },
+        {
+          "label": "128K",
+          "value": "131072:f16:gpu"
+        },
+        {
+          "label": "132K (Q8)",
+          "value": "135168:q8_0:gpu"
+        },
+        {
+          "label": "256K",
+          "value": "262144:f16:gpu"
+        }
+      ],
+      "manualDefault": 32768,
+      "selected": {
+        "model": "qwen3.8:27b-q4_K_M",
+        "context": "132K (Q8)",
+        "errors": []
+      }
+    },
+    {
+      "id": "huihui-qwen3.8:27b-ud-dw-q4_k_m",
+      "restoredProbeCount": 0,
+      "restoredOptions": [
+        {
+          "kv": "f16",
+          "tokens": 94208,
+          "restored": true
+        },
+        {
+          "kv": "q8_0",
+          "tokens": 139264,
+          "restored": true
+        }
+      ],
+      "summary": "Максимальный контекст: FP16 92K (сохранено) · Q8 136K (сохранено)",
+      "contextOptions": [
+        {
+          "label": "16K",
+          "value": "16384:f16:gpu"
+        },
+        {
+          "label": "32K",
+          "value": "32768:f16:gpu"
+        },
+        {
+          "label": "64K",
+          "value": "65536:f16:gpu"
+        },
+        {
+          "label": "92K (FP16)",
+          "value": "94208:f16:gpu"
+        },
+        {
+          "label": "128K",
+          "value": "131072:f16:gpu"
+        },
+        {
+          "label": "136K (Q8)",
+          "value": "139264:q8_0:gpu"
+        },
+        {
+          "label": "256K",
+          "value": "262144:f16:gpu"
+        }
+      ],
+      "manualDefault": 32768,
+      "selected": {
+        "model": "huihui-qwen3.8:27b-ud-dw-q4_k_m",
+        "context": "136K (Q8)",
+        "errors": []
+      }
+    },
+    {
+      "id": "devstral-small-2:24b-q4_k_m",
+      "restoredProbeCount": 0,
+      "restoredOptions": [
+        {
+          "kv": "f16",
+          "tokens": 53248,
+          "restored": true
+        },
+        {
+          "kv": "q8_0",
+          "tokens": 98304,
+          "restored": true
+        }
+      ],
+      "summary": "Максимальный контекст: FP16 52K (сохранено) · Q8 96K (сохранено)",
+      "contextOptions": [
+        {
+          "label": "16K",
+          "value": "16384:f16:gpu"
+        },
+        {
+          "label": "32K",
+          "value": "32768:f16:gpu"
+        },
+        {
+          "label": "52K (FP16)",
+          "value": "53248:f16:gpu"
+        },
+        {
+          "label": "64K",
+          "value": "65536:f16:gpu"
+        },
+        {
+          "label": "96K (Q8)",
+          "value": "98304:q8_0:gpu"
+        },
+        {
+          "label": "128K",
+          "value": "131072:f16:gpu"
+        },
+        {
+          "label": "256K",
+          "value": "262144:f16:gpu"
+        }
+      ],
+      "manualDefault": 32768,
+      "selected": {
+        "model": "devstral-small-2:24b-q4_k_m",
+        "context": "96K (Q8)",
+        "errors": []
+      }
+    },
+    {
+      "id": "gemma4:31b-it-q4_k_m",
+      "restoredProbeCount": 0,
+      "restoredOptions": [
+        {
+          "kv": "f16",
+          "tokens": 40960,
+          "restored": true
+        },
+        {
+          "kv": "q8_0",
+          "tokens": 81920,
+          "restored": true
+        }
+      ],
+      "summary": "Максимальный контекст: FP16 40K (сохранено) · Q8 80K (сохранено)",
+      "contextOptions": [
+        {
+          "label": "16K",
+          "value": "16384:f16:gpu"
+        },
+        {
+          "label": "32K",
+          "value": "32768:f16:gpu"
+        },
+        {
+          "label": "40K (FP16)",
+          "value": "40960:f16:gpu"
+        },
+        {
+          "label": "64K",
+          "value": "65536:f16:gpu"
+        },
+        {
+          "label": "80K (Q8)",
+          "value": "81920:q8_0:gpu"
+        },
+        {
+          "label": "128K",
+          "value": "131072:f16:gpu"
+        },
+        {
+          "label": "256K",
+          "value": "262144:f16:gpu"
+        }
+      ],
+      "manualDefault": 32768,
+      "selected": {
+        "model": "gemma4:31b-it-q4_k_m",
+        "context": "80K (Q8)",
+        "errors": []
+      }
+    }
+  ],
+  "stoppedRuntime": {
+    "stopped": {
+      "busy": false,
+      "modelId": "gemma4:31b-it-q4_k_m",
+      "stage": "",
+      "probeCount": 0
+    },
+    "stoppedUi": {
+      "summary": "Максимальный контекст: не измерен",
+      "model": "gemma4:31b-it-q4_k_m",
+      "options": [
+        "16K",
+        "32K",
+        "64K",
+        "128K",
+        "256K",
+        "80K · текущий"
+      ]
+    }
+  },
+  "additionalStartupFailure": {
+    "model": "devstral-small-2:24b-q4_k_m",
+    "context": 32768,
+    "kv": "f16",
+    "timeoutSeconds": 150,
+    "rolledBackTo": "huihui-qwen3.8:27b-ud-dw-q4_k_m",
+    "retryWithSameConfigurationPassed": true,
+    "exactCause": "not established; first server log overwritten by rollback",
+    "policyChanged": false
+  },
+  "commits": {
+    "migration": "070ea9de689578988119d7fa654bb0ec6ec7a201",
+    "fix": "329e87c7733ae421d8afa4fef034394f7d14d2a0"
+  }
+}

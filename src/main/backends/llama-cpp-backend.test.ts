@@ -73,8 +73,13 @@ export async function runLlamaCppBackendRegression(): Promise<void> {
       assert.notEqual((fragment.chat_template_kwargs as { enable_thinking?: boolean } | undefined)?.enable_thinking, false, `${profile.id} strategies must not disable thinking`);
       assert.notEqual(fragment.reasoning_effort, 'none', `${profile.id} must not use no-reasoning effort`);
     }
-    assert.equal(fast.reasoning_effort, 'low', `${profile.id} Fast must use low reasoning effort`);
-    assert.notEqual(deep.reasoning_effort, fast.reasoning_effort, `${profile.id} Deep must differ from Fast`);
+    if (Object.keys(reasoning.efforts).length) {
+      assert.equal(fast.reasoning_effort, 'low', `${profile.id} Fast must use low reasoning effort`);
+      assert.notEqual(deep.reasoning_effort, fast.reasoning_effort, `${profile.id} Deep must differ from Fast`);
+    } else {
+      assert.equal(fast.reasoning_effort, undefined, `${profile.id} must not fabricate effort`);
+      assert.equal(deep.reasoning_effort, undefined, `${profile.id} must not fabricate effort`);
+    }
     assert.deepEqual(llamaReasoningForInput(profile.id, 'auto'), {}, `${profile.id} Auto must leave native reasoning at the model default`);
   }
   // Explicit thinking/effort are independent of the strategy and reach llama.cpp unchanged.
@@ -103,13 +108,9 @@ export async function runLlamaCppBackendRegression(): Promise<void> {
       assert.equal(await backend.getRuntimeContextEvidence('other-model'), null, 'llama.cpp reported evidence for a model that is not loaded');
       const models = await backend.getModels();
       assert.deepEqual(models.find((item) => item.id === model)?.supportedContextPresets, [16384, 32768, 65536, 131072, 262144], 'loaded 16K must not redefine model capability');
-      assert.deepEqual(models.find((item) => item.id === 'glm-4.7-flash:q4_k')?.supportedContextPresets, [16384, 32768, 65536, 131072], 'GLM normal options were truncated by an active runtime or another model');
-      const gptOss = models.find((item) => item.id === 'gpt-oss:20b');
-      assert(gptOss, 'GPT-OSS was not included in the llama.cpp model registry');
-      assert.equal(gptOss.backend, 'llama-cpp');
-      assert.equal(gptOss.supportsTools, true);
-      assert.equal(gptOss.supportsReasoning, true);
-      assert.deepEqual(gptOss.supportedContextPresets, [16384, 32768, 65536, 131072]);
+      assert.deepEqual(models.map((item) => item.id), llamaRuntimeProfiles.map((profile) => profile.id));
+      assert(!models.some((item) => ['glm-4.7-flash:q4_k', 'gpt-oss:20b'].includes(item.id)), 'removed local entries must not appear');
+      for (const item of models) assert.deepEqual(item.supportedContextPresets, [16384, 32768, 65536, 131072, 262144], 'active context must not truncate another model capability');
     } finally { await stop(server); }
   }
   {

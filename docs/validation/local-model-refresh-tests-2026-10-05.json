@@ -1,0 +1,126 @@
+[
+  {
+    "file": "dist/main/backends/llama-cpp-backend.test.js",
+    "exit": 0
+  },
+  {
+    "file": "dist/main/models/model-capabilities.test.js",
+    "exit": 0
+  },
+  {
+    "file": "dist/main/services/agent-workspace.test.js",
+    "exit": 0
+  },
+  {
+    "file": "dist/main/services/attachment-pipeline.test.js",
+    "exit": 0
+  },
+  {
+    "file": "dist/main/services/context-discovery-persistence.test.js",
+    "exit": 0
+  },
+  {
+    "file": "dist/main/services/context-discovery.test.js",
+    "exit": 0
+  },
+  {
+    "file": "dist/main/services/context-estimate.test.js",
+    "exit": 0
+  },
+  {
+    "file": "dist/main/services/database.test.js",
+    "exit": 0
+  },
+  {
+    "file": "dist/main/services/generation-diagnostics.test.js",
+    "exit": 0
+  },
+  {
+    "file": "dist/main/services/gguf-context.test.js",
+    "exit": 0
+  },
+  {
+    "file": "dist/main/services/hardware.test.js",
+    "exit": 0
+  },
+  {
+    "file": "dist/main/services/llama-runtime-controller.test.js",
+    "exit": 0
+  },
+  {
+    "file": "dist/main/services/run-recovery.test.js",
+    "exit": 0
+  },
+  {
+    "file": "dist/main/services/rust-agent-runtime.test.js",
+    "exit": 0
+  },
+  {
+    "file": "dist/main/services/web-chat.test.js",
+    "exit": 0
+  },
+  {
+    "file": "dist/main/tools/process-group.test.js",
+    "exit": 0
+  },
+  {
+    "file": "dist/shared/context-estimator.test.js",
+    "exit": 0
+  },
+  {
+    "file": "dist/shared/context-format.test.js",
+    "exit": 0
+  },
+  {
+    "file": "dist/shared/context-options.test.js",
+    "exit": 0
+  },
+  {
+    "file": "dist/shared/conversation-settings.test.js",
+    "exit": 0
+  },
+  {
+    "file": "dist/shared/generation-guard.test.js",
+    "exit": 0
+  },
+  {
+    "file": "dist/shared/generation-lifetime.test.js",
+    "exit": 0
+  },
+  {
+    "file": "dist/shared/localization-coverage.test.js",
+    "exit": 0
+  },
+  {
+    "file": "dist/shared/localization.test.js",
+    "exit": 0
+  },
+  {
+    "file": "dist/shared/mermaid-theme.test.js",
+    "exit": 0
+  },
+  {
+    "file": "dist/shared/reasoning-controls.test.js",
+    "exit": 0
+  },
+  {
+    "file": "dist/shared/streaming-load.test.js",
+    "exit": 0
+  },
+  {
+    "file": "dist/shared/thinking-timeline.test.js",
+    "exit": 0
+  },
+  {
+    "file": "dist/shared/vram-budget.test.js",
+    "exit": 0
+  },
+  {
+    "file": "scripts/electron-sandbox.test.sh",
+    "exit": 0
+  },
+  {
+    "file": "scripts/llama-launcher-failure.test.sh",
+    "exit": 0
+  }
+]

@@ -50,22 +50,28 @@ log() { printf '%s %s\n' "$(timestamp)" "$*" >> "$LOG_FILE"; }
 saved_llama_selection() {
   local database="$STATE_DIR/sqlite/local-ai-desktop.db"
   [[ -r "$database" && -x "$ELECTRON_BIN" ]] || return 0
-  ELECTRON_RUN_AS_NODE=1 "$ELECTRON_BIN" -e "const { DatabaseSync } = require('node:sqlite'); const db = new DatabaseSync(process.argv[1], { readOnly: true }); const names = new Set(db.prepare('PRAGMA table_info(conversations)').all().map(x => x.name)); const type = names.has('llama_kv_cache_type') ? 'llama_kv_cache_type' : \"'f16'\"; const offload = names.has('llama_kv_offload') ? 'llama_kv_offload' : '1'; const row = db.prepare(\"SELECT model_id, context_window, \" + type + \" AS kv_type, \" + offload + \" AS kv_offload FROM conversations WHERE model_id IN ('qwen3.8:27b-q4_K_M', 'glm-4.7-flash:q4_k', 'gpt-oss:20b') ORDER BY updated_at DESC LIMIT 1\").get(); if (row) process.stdout.write([row.model_id, row.context_window, row.kv_type, row.kv_offload].join('\\t')); db.close();" "$database" 2>/dev/null || true
+  ELECTRON_RUN_AS_NODE=1 "$ELECTRON_BIN" -e "const { DatabaseSync } = require('node:sqlite'); const db = new DatabaseSync(process.argv[1], { readOnly: true }); const names = new Set(db.prepare('PRAGMA table_info(conversations)').all().map(x => x.name)); const type = names.has('llama_kv_cache_type') ? 'llama_kv_cache_type' : \"'f16'\"; const offload = names.has('llama_kv_offload') ? 'llama_kv_offload' : '1'; const row = db.prepare(\"SELECT model_id, context_window, \" + type + \" AS kv_type, \" + offload + \" AS kv_offload FROM conversations WHERE model_id IN ('qwen3.8:27b-q4_K_M', 'huihui-qwen3.8:27b-ud-dw-q4_k_m', 'devstral-small-2:24b-q4_k_m', 'gemma4:31b-it-q4_k_m') ORDER BY updated_at DESC LIMIT 1\").get(); if (row) process.stdout.write([row.model_id, row.context_window, row.kv_type, row.kv_offload].join('\\t')); db.close();" "$database" 2>/dev/null || true
 }
 
 # Sets the launch variables for a model id. Fails for a model without a runtime.
 select_variant() {
   case "$1" in
-    glm-4.7-flash:q4_k)
-      VARIANT="glm-4.7-flash"; MODEL="/media/yaroslav/DATA/llama-models/GLM-4.7-Flash-Q4_K.gguf"; MMPROJ=""
-      RUNTIME_MODEL_ID="glm-4.7-flash:q4_k"; RUNTIME_LABEL="GLM-4.7-Flash"; DEFAULT_LLAMA_CONTEXT=32768; MAX_LLAMA_CONTEXT=131072 ;;
     qwen3.8:27b-q4_K_M)
       VARIANT="qwen-mtp"; MODEL="/media/yaroslav/DATA/llama-models/qwen3.8-27b-q4_K_M.gguf"
       MMPROJ="/media/yaroslav/DATA/llama-models/qwen3.8-27b-mmproj.gguf"
       RUNTIME_MODEL_ID="qwen3.8:27b-q4_K_M"; RUNTIME_LABEL="Qwen3.8 MTP"; DEFAULT_LLAMA_CONTEXT=32768; MAX_LLAMA_CONTEXT=262144 ;;
-    gpt-oss:20b)
-      VARIANT="gpt-oss"; MODEL="/media/yaroslav/DATA/llama-models/gpt-oss-20b-MXFP4.gguf"; MMPROJ=""
-      RUNTIME_MODEL_ID="gpt-oss:20b"; RUNTIME_LABEL="GPT-OSS-20B"; DEFAULT_LLAMA_CONTEXT=32768; MAX_LLAMA_CONTEXT=131072 ;;
+    huihui-qwen3.8:27b-ud-dw-q4_k_m)
+      VARIANT="qwen-mtp"; MODEL="/media/yaroslav/DATA/llama-models/Huihui-Qwen3.8-27B-abliterated-UD-DW-Q4_K_M.gguf"
+      MMPROJ="/media/yaroslav/DATA/llama-models/huihui-qwen3.8-27b-mmproj-bf16.gguf"
+      RUNTIME_MODEL_ID="$1"; RUNTIME_LABEL="Huihui Qwen3.8 MTP"; DEFAULT_LLAMA_CONTEXT=32768; MAX_LLAMA_CONTEXT=262144 ;;
+    devstral-small-2:24b-q4_k_m)
+      VARIANT="devstral-small-2"; MODEL="/media/yaroslav/DATA/llama-models/Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf"
+      MMPROJ="/media/yaroslav/DATA/llama-models/devstral-small-2-24b-mmproj-f16.gguf"
+      RUNTIME_MODEL_ID="$1"; RUNTIME_LABEL="Devstral Small 2 24B"; DEFAULT_LLAMA_CONTEXT=32768; MAX_LLAMA_CONTEXT=262144 ;;
+    gemma4:31b-it-q4_k_m)
+      VARIANT="gemma4"; MODEL="/media/yaroslav/DATA/llama-models/gemma-4-31B-it-Q4_K_M.gguf"
+      MMPROJ="/media/yaroslav/DATA/llama-models/gemma-4-31b-mmproj-f16.gguf"
+      RUNTIME_MODEL_ID="$1"; RUNTIME_LABEL="Gemma 4 31B IT"; DEFAULT_LLAMA_CONTEXT=32768; MAX_LLAMA_CONTEXT=262144 ;;
     *)
       LAUNCH_ERROR="Unknown Local AI llama.cpp model: $1"; return 1 ;;
   esac
@@ -139,6 +145,20 @@ server_failure_reason() {
   printf '%s' "$detail"
 }
 
+# Pure argument construction, also exercised by the launcher regression tests.
+build_server_args() {
+  local context="$1" gpu_layers="$2"
+  server_args=(--log-verbosity 5 -m "$MODEL" --alias "$RUNTIME_MODEL_ID" --host 127.0.0.1 --port "$PORT" --ctx-size "$context" --gpu-layers "$gpu_layers" --flash-attn on "${context_args[@]}" --parallel 1 --jinja --reasoning on --reasoning-format auto)
+  # A projector must reserve its compute buffers at startup: Max Context
+  # requires measured vision allocations before it can safely probe candidates.
+  if [[ -n "$MMPROJ" ]]; then
+    server_args+=(--mmproj "$MMPROJ" --no-mmproj-offload)
+  else
+    server_args+=(--no-warmup)
+  fi
+  if [[ "$VARIANT" == "qwen-mtp" ]]; then server_args+=(--spec-type draft-mtp); else server_args+=(--spec-type none); fi
+}
+
 # launch_server <model_id> <context> <kv_type> <kv_offload>
 # Success means: the process is alive, /health is ok, /v1/models reports the
 # requested alias with exactly the requested n_ctx, and (for MTP) the draft
@@ -163,13 +183,7 @@ launch_server() {
   : > "$SERVER_LOG"
   log "llama-server.start variant=$VARIANT runtime_model_id=$RUNTIME_MODEL_ID ctx_size=$context kv_type=$kv_type kv_offload=$kv_offload model=$MODEL mmproj=${MMPROJ:-none}"
   local server_args=() printed_command
-  if [[ "$VARIANT" == "glm-4.7-flash" ]]; then
-    server_args=(--log-verbosity 5 -m "$MODEL" --alias "$RUNTIME_MODEL_ID" --host 127.0.0.1 --port "$PORT" --ctx-size "$context" --gpu-layers "$gpu_layers" --flash-attn on "${context_args[@]}" --batch-size 512 --ubatch-size 512 --parallel 1 --jinja --reasoning on --no-warmup)
-  elif [[ "$VARIANT" == "qwen-mtp" ]]; then
-    server_args=(--log-verbosity 5 -m "$MODEL" --alias "$RUNTIME_MODEL_ID" --mmproj "$MMPROJ" --no-mmproj-offload --host 127.0.0.1 --port "$PORT" --ctx-size "$context" --gpu-layers "$gpu_layers" --flash-attn on --parallel 1 --spec-type draft-mtp "${context_args[@]}")
-  else
-    server_args=(--log-verbosity 5 -m "$MODEL" --alias "$RUNTIME_MODEL_ID" --host 127.0.0.1 --port "$PORT" --ctx-size "$context" --gpu-layers "$gpu_layers" --flash-attn on "${context_args[@]}" --parallel 1 --spec-type none --jinja --reasoning on --reasoning-format auto --no-warmup)
-  fi
+  build_server_args "$context" "$gpu_layers"
   printf -v printed_command '%q ' "$LLAMA_BIN" "${server_args[@]}"
   log "llama-server.command=${printed_command% }"
   "$LLAMA_BIN" "${server_args[@]}" >> "$SERVER_LOG" 2>&1 &
@@ -347,7 +361,7 @@ export LOCAL_AI_LLAMA_MODEL_ID="$ACTIVE_MODEL"
 export LOCAL_AI_LLAMA_CONTEXT="$ACTIVE_CONTEXT"
 export LOCAL_AI_LLAMA_KV_TYPE="$ACTIVE_KV_TYPE"
 export LOCAL_AI_LLAMA_KV_OFFLOAD="$ACTIVE_KV_OFFLOAD"
-export LOCAL_AI_LLAMA_CPP_VISION=$([[ "$VARIANT" == "qwen-mtp" ]] && echo 1 || echo 0)
+export LOCAL_AI_LLAMA_CPP_VISION=$([[ -n "$MMPROJ" ]] && echo 1 || echo 0)
 
 if [[ "${LOCAL_AI_LAUNCHER_HEADLESS:-}" == "1" ]]; then
   # Test seam: supervise the server and answer runtime-switch requests without

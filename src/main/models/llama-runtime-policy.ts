@@ -24,16 +24,27 @@ export type LlamaRuntimeProfile = {
   reasoning?: LlamaReasoningProfile;
 };
 
+/** Verified in both embedded Qwen templates: the Huihui high alias adds no separate effort level. */
+const qwen38Reasoning: LlamaReasoningProfile = { thinkingKwarg: 'enable_thinking', efforts: { low: 'low', medium: 'medium', max: 'xhigh' }, final: { chat_template_kwargs: { enable_thinking: false } } };
+
 /** Model capability is separate from the currently loaded server context. */
 export const llamaRuntimeProfiles: readonly LlamaRuntimeProfile[] = [
-  { id: 'qwen3.8:27b-q4_K_M', maxContext: 262_144, modelPath: '/media/yaroslav/DATA/llama-models/qwen3.8-27b-q4_K_M.gguf', mmprojPath: '/media/yaroslav/DATA/llama-models/qwen3.8-27b-mmproj.gguf', speculative: 'mtp', vision: true, reasoning: { thinkingKwarg: 'enable_thinking', efforts: { low: 'low', medium: 'medium', max: 'xhigh' }, final: { chat_template_kwargs: { enable_thinking: false } } } },
-  // The installed DeepSeek2 GGUF has no MTP layers. It must not be presented
-  // as MTP until a compatible MTP/draft artifact is installed.
-  { id: 'glm-4.7-flash:q4_k', maxContext: 131_072, modelPath: '/media/yaroslav/DATA/llama-models/GLM-4.7-Flash-Q4_K.gguf', speculative: 'none', vision: false, reasoning: { thinkingKwarg: 'enable_thinking', efforts: { low: 'low', max: 'xhigh' }, final: { chat_template_kwargs: { enable_thinking: false } } } },
-  { id: 'gpt-oss:20b', maxContext: 131_072, modelPath: '/media/yaroslav/DATA/llama-models/gpt-oss-20b-MXFP4.gguf', speculative: 'none', vision: false, reasoning: { efforts: { low: 'low', medium: 'medium', high: 'high' }, final: { reasoning_effort: 'low' } } },
+  { id: 'qwen3.8:27b-q4_K_M', maxContext: 262_144, modelPath: '/media/yaroslav/DATA/llama-models/qwen3.8-27b-q4_K_M.gguf', mmprojPath: '/media/yaroslav/DATA/llama-models/qwen3.8-27b-mmproj.gguf', speculative: 'mtp', vision: true, reasoning: qwen38Reasoning },
+  { id: 'huihui-qwen3.8:27b-ud-dw-q4_k_m', maxContext: 262_144, modelPath: '/media/yaroslav/DATA/llama-models/Huihui-Qwen3.8-27B-abliterated-UD-DW-Q4_K_M.gguf', mmprojPath: '/media/yaroslav/DATA/llama-models/huihui-qwen3.8-27b-mmproj-bf16.gguf', speculative: 'mtp', vision: true, reasoning: qwen38Reasoning },
+  // The author advertises 256K even though this GGUF's raw training metadata says 393216.
+  { id: 'devstral-small-2:24b-q4_k_m', maxContext: 262_144, modelPath: '/media/yaroslav/DATA/llama-models/Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf', mmprojPath: '/media/yaroslav/DATA/llama-models/devstral-small-2-24b-mmproj-f16.gguf', speculative: 'none', vision: true },
+  // Gemma's template has enable_thinking, but no native reasoning_effort levels.
+  { id: 'gemma4:31b-it-q4_k_m', maxContext: 262_144, modelPath: '/media/yaroslav/DATA/llama-models/gemma-4-31B-it-Q4_K_M.gguf', mmprojPath: '/media/yaroslav/DATA/llama-models/gemma-4-31b-mmproj-f16.gguf', speculative: 'none', vision: true, reasoning: { thinkingKwarg: 'enable_thinking', efforts: {}, final: { chat_template_kwargs: { enable_thinking: false } } } },
 ];
 
-export function llamaRuntimeProfile(id: string): LlamaRuntimeProfile | undefined { return llamaRuntimeProfiles.find((profile) => profile.id === id); }
+/** Generic families have no pinned local files after removal. */
+const genericRuntimeProfiles: readonly LlamaRuntimeProfile[] = [
+  // Generic GLM support does not assume an installed MTP/draft artifact.
+  { id: 'glm-4.7-flash:q4_k', maxContext: 131_072, speculative: 'none', vision: false, reasoning: { thinkingKwarg: 'enable_thinking', efforts: { low: 'low', max: 'xhigh' }, final: { chat_template_kwargs: { enable_thinking: false } } } },
+  { id: 'gpt-oss:20b', maxContext: 131_072, speculative: 'none', vision: false, reasoning: { efforts: { low: 'low', medium: 'medium', high: 'high' }, final: { reasoning_effort: 'low' } } },
+];
+
+export function llamaRuntimeProfile(id: string): LlamaRuntimeProfile | undefined { return [...llamaRuntimeProfiles, ...genericRuntimeProfiles].find((profile) => profile.id === id); }
 export function llamaRuntimeInstalled(profile: LlamaRuntimeProfile): boolean { return Boolean(profile.modelPath && existsSync(profile.modelPath)); }
 export function llamaContextPresets(id: string, trainedContext?: number): number[] {
   const profile = llamaRuntimeProfile(id);

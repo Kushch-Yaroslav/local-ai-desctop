@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { link, mkdir, mkdtemp, readFile, rename, rm, stat, symlink, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -32,6 +32,34 @@ export async function runContextDiscoveryPersistenceRegression() {
   try {
     const kA = contextDiscoveryKey(identity());
     const model = 'qwen3.8:27b-q4_K_M';
+
+    // Replacing the baseline symlinks with the same standalone files must not
+    // invalidate a persisted Max key: launcher paths and size/mtime stay stable.
+    const oldStorage = join(directory, 'ollama', 'blobs');
+    const localModels = join(directory, 'llama-models');
+    await mkdir(oldStorage, { recursive: true });
+    await mkdir(localModels);
+    const migrationFiles = ['baseline.gguf', 'projector.gguf'];
+    const fingerprint = async (path: string) => { const file = await stat(path); return `${file.size}:${file.mtimeMs}`; };
+    for (const name of migrationFiles) {
+      await writeFile(join(oldStorage, name), `GGUF fixture ${name}`);
+      await symlink(join(oldStorage, name), join(localModels, name));
+    }
+    const relocationIdentity = async () => key({
+      modelFingerprint: await fingerprint(join(localModels, migrationFiles[0])),
+      projectorFingerprint: await fingerprint(join(localModels, migrationFiles[1])),
+      arguments: ['/opt/llama-server', '-m', join(localModels, migrationFiles[0]), '--mmproj', join(localModels, migrationFiles[1])],
+    });
+    const beforeRelocation = await relocationIdentity();
+    for (const name of migrationFiles) {
+      const destination = join(localModels, name);
+      await link(join(oldStorage, name), destination + '.migration');
+      await rename(destination + '.migration', destination);
+      await unlink(join(oldStorage, name));
+      assert.equal((await stat(destination)).isFile(), true);
+      assert.equal((await readFile(destination, 'utf8')), `GGUF fixture ${name}`);
+    }
+    assert.equal(await relocationIdentity(), beforeRelocation, 'verified same-content relocation must retain the saved key');
 
     // Nothing is fabricated when nothing was discovered.
     let database = new Database(file);
