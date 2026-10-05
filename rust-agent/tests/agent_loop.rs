@@ -1925,3 +1925,402 @@ fn a_saved_plan_returns_on_continue_and_a_fresh_run_starts_empty() {
     run(fresh_workspace.config(&fresh_provider.endpoint, "start over"));
     assert!(!fresh_provider.requests()[0].to_string().contains("<plan>"));
 }
+
+const APP: &[(&str, &str)] = &[
+    ("app.js", "module.exports = (a, b) => a + b;\n"),
+    (
+        "check.js",
+        "const add = require('./app.js');\nif (add(1, 2) !== 3) { console.error('add is wrong'); process.exit(1); }\nconsole.log('ok');\n",
+    ),
+];
+
+fn edit_app(content: &str) -> (&'static str, Value) {
+    ("write_file", json!({"path":"app.js","content":content}))
+}
+
+fn run_check() -> (&'static str, Value) {
+    ("run_terminal", json!({"command":"node check.js"}))
+}
+
+fn verify(id: &str, proof: Option<&str>) -> (&'static str, Value) {
+    let mut fields = json!({"id": id});
+    if let Some(proof) = proof {
+        fields["evidence"] = json!(proof);
+    }
+    deliverable("verify", fields)
+}
+
+const GOOD: &str = "module.exports = (a, b) => a + b;\n// edited\n";
+const BAD: &str = "module.exports = (a, b) => a - b;\n";
+
+/// Editing code and ending without any check is the core failure: the claim is
+/// sent back once, naming what is unverified; the second answer is accepted so
+/// the gate can never deadlock a run.
+#[test]
+fn an_edit_with_no_check_is_sent_back_once_and_then_accepted() {
+    let workspace = Workspace::new(APP);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Tools(vec![
+            deliverable("add", json!({"text":"add keeps adding"})),
+            edit_app(GOOD),
+            deliverable(
+                "implemented",
+                json!({"id":"d-001","evidence":"edited app.js"}),
+            ),
+        ]),
+        1 => Reply::Text("It works.".into()),
+        _ => Reply::Text("Implemented, but I did not run it.".into()),
+    });
+    run(workspace.config(&provider.endpoint, "make add work"));
+    let journal = workspace.journal();
+    assert!(completed(&journal));
+    assert_eq!(withheld_drafts(&journal), 1);
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3);
+    let reminder = last_user_text(&requests[2]);
+    assert!(
+        reminder.contains("not seen your work verified"),
+        "{reminder}"
+    );
+    assert!(reminder.contains("d-001"), "{reminder}");
+    let text = requests[1].to_string();
+    assert!(text.contains("[implemented] d-001"), "{text}");
+    assert!(text.contains("<verification_state>"), "{text}");
+}
+
+/// A passing check after the last edit, cited by the model, verifies the item
+/// and ends the run with no review.
+#[test]
+fn a_passing_check_after_the_edit_verifies_and_ends_without_a_review() {
+    let workspace = Workspace::new(APP);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Tools(vec![
+            deliverable("add", json!({"text":"add keeps adding"})),
+            edit_app(GOOD),
+            deliverable(
+                "implemented",
+                json!({"id":"d-001","evidence":"edited app.js"}),
+            ),
+        ]),
+        1 => Reply::Tools(vec![run_check()]),
+        2 => Reply::Tools(vec![verify("d-001", None)]),
+        _ => Reply::Text("Verified by node check.js.".into()),
+    });
+    run(workspace.config(&provider.endpoint, "make add work"));
+    let journal = workspace.journal();
+    assert!(completed(&journal));
+    assert_eq!(withheld_drafts(&journal), 0);
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 4);
+    assert!(requests[2].to_string().contains("[run pass]"));
+    let last = requests[3].to_string();
+    assert!(last.contains("[verified] d-001"), "{last}");
+    assert!(last.contains("proof: ev-"), "{last}");
+}
+
+/// Verify is refused without evidence: the model's own claim changes nothing.
+#[test]
+fn verify_is_refused_without_a_passing_check_and_a_claim_changes_nothing() {
+    let workspace = Workspace::new(APP);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Tools(vec![
+            deliverable("add", json!({"text":"add keeps adding"})),
+            edit_app(GOOD),
+            deliverable(
+                "implemented",
+                json!({"id":"d-001","evidence":"edited app.js"}),
+            ),
+        ]),
+        1 => Reply::Tools(vec![verify(
+            "d-001",
+            Some("I read it and it clearly works"),
+        )]),
+        _ => Reply::Text("Not verified.".into()),
+    });
+    run(workspace.config(&provider.endpoint, "make add work"));
+    let requests = provider.requests();
+    let refusal = last_tool_result(&requests[2]);
+    assert!(refusal.contains("No fresh passing"), "{refusal}");
+    let tail = requests[2].to_string();
+    assert!(tail.contains("[implemented] d-001"), "{tail}");
+    assert!(!tail.contains("[verified]"), "{tail}");
+}
+
+/// A failing check is recorded by the runtime, shown back, annotated on the
+/// deliverable and cannot verify anything; fixing the code and re-running does.
+#[test]
+fn a_failing_check_blocks_verification_until_fixed_and_rechecked() {
+    let workspace = Workspace::new(APP);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Tools(vec![
+            deliverable("add", json!({"text":"add keeps adding"})),
+            edit_app(BAD),
+            deliverable(
+                "implemented",
+                json!({"id":"d-001","evidence":"edited app.js"}),
+            ),
+        ]),
+        1 => Reply::Tools(vec![run_check()]),
+        2 => Reply::Tools(vec![verify("d-001", None)]),
+        3 => Reply::Tools(vec![edit_app(GOOD)]),
+        4 => Reply::Tools(vec![run_check()]),
+        5 => Reply::Tools(vec![verify("d-001", None)]),
+        _ => Reply::Text("Fixed and verified.".into()),
+    });
+    run(workspace.config(&provider.endpoint, "make add work"));
+    let requests = provider.requests();
+    let after_failure = requests[2].to_string();
+    assert!(after_failure.contains("FAIL"), "{after_failure}");
+    assert!(after_failure.contains("a check failed"), "{after_failure}");
+    let refused = last_tool_result(&requests[3]);
+    assert!(refused.contains("failed"), "{refused}");
+    assert!(
+        requests[4].to_string().contains("[implemented] d-001"),
+        "a fix makes the old failure stale but nothing is verified yet"
+    );
+    assert!(requests[6].to_string().contains("[verified] d-001"));
+    let journal = workspace.journal();
+    assert!(completed(&journal));
+    assert_eq!(withheld_drafts(&journal), 0);
+}
+
+/// Any later edit invalidates what was verified, and the status says so.
+#[test]
+fn a_later_edit_demotes_a_verified_deliverable() {
+    let workspace = Workspace::new(APP);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Tools(vec![
+            deliverable("add", json!({"text":"add keeps adding"})),
+            edit_app(GOOD),
+            deliverable(
+                "implemented",
+                json!({"id":"d-001","evidence":"edited app.js"}),
+            ),
+        ]),
+        1 => Reply::Tools(vec![run_check()]),
+        2 => Reply::Tools(vec![verify("d-001", None)]),
+        3 => Reply::Tools(vec![edit_app("module.exports = (a, b) => b + a;\n")]),
+        _ => Reply::Text("done".into()),
+    });
+    run(workspace.config(&provider.endpoint, "make add work"));
+    let requests = provider.requests();
+    assert!(requests[3].to_string().contains("[verified] d-001"));
+    let after_edit = requests[4].to_string();
+    assert!(after_edit.contains("[implemented] d-001"), "{after_edit}");
+    assert!(!after_edit.contains("[verified] d-001"), "{after_edit}");
+}
+
+/// A change that is not code (a document) needs no behavioural check: the
+/// runtime reads back every write itself, so there is no gate and no review.
+#[test]
+fn a_documentation_only_change_is_never_gated() {
+    let workspace = Workspace::new(&[("notes.md", "old")]);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Tools(vec![
+            deliverable("add", json!({"text":"notes are updated"})),
+            ("write_file", json!({"path":"notes.md","content":"new"})),
+            deliverable(
+                "implemented",
+                json!({"id":"d-001","evidence":"wrote notes.md"}),
+            ),
+            deliverable("verify", json!({"id":"d-001"})),
+        ]),
+        _ => Reply::Text("Updated the notes.".into()),
+    });
+    run(workspace.config(&provider.endpoint, "update the notes"));
+    let journal = workspace.journal();
+    assert!(completed(&journal));
+    assert_eq!(withheld_drafts(&journal), 0);
+    assert_eq!(provider.requests().len(), 2);
+}
+
+/// Deep may send an unverified change back twice and then accepts; both modes end.
+#[test]
+fn deep_sends_unverified_changes_back_twice_and_still_ends() {
+    let workspace = Workspace::new(APP);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Tools(vec![
+            deliverable("add", json!({"text":"add keeps adding"})),
+            edit_app(GOOD),
+            (
+                "deliverables",
+                json!({"action":"implemented","id":"d-001","evidence":"wrote app.js"}),
+            ),
+        ]),
+        _ => Reply::Text("It works.".into()),
+    });
+    let mut config = workspace.config(&provider.endpoint, "make add work");
+    config.reasoning_mode = "deep".into();
+    run(config);
+    let journal = workspace.journal();
+    assert!(completed(&journal));
+    assert_eq!(withheld_drafts(&journal), 2);
+}
+
+/// A bad claim never loops forever: with checks running and failing every time,
+/// the budget closes the gate and the run ends with the state still honest.
+#[test]
+fn an_endless_fail_and_retry_cycle_is_bounded_by_the_budget() {
+    let workspace = Workspace::new(APP);
+    let provider = Provider::start(|_, n| {
+        if n == 0 {
+            Reply::Tools(vec![
+                deliverable("add", json!({"text":"add keeps adding"})),
+                edit_app(BAD),
+                deliverable(
+                    "implemented",
+                    json!({"id":"d-001","evidence":"wrote app.js"}),
+                ),
+            ])
+        } else if n % 2 == 1 {
+            Reply::Text("It works now.".into())
+        } else {
+            Reply::Tools(vec![run_check()])
+        }
+    });
+    run(workspace.config(&provider.endpoint, "make add work"));
+    let requests = provider.requests();
+    assert!(completed(&workspace.journal()));
+    assert!(
+        requests.len() < 20,
+        "the cycle was not bounded: {} requests",
+        requests.len()
+    );
+    let tail = requests.last().unwrap().to_string();
+    assert!(tail.contains("[implemented] d-001"), "{tail}");
+    assert!(!tail.contains("[verified]"), "{tail}");
+}
+
+/// The ledger and statuses are runtime state: a resumed run sees the recorded
+/// deliverable and proof, with old checks marked stale; a fresh run starts empty.
+#[test]
+fn verification_state_returns_on_continue_with_old_checks_stale_and_a_fresh_run_is_empty() {
+    let workspace = Workspace::new(APP);
+    let resumed_provider = Provider::start(|_, _| Reply::Text("ok".into()));
+    let mut resumed = workspace.config(&resumed_provider.endpoint, "continue");
+    resumed.task_memory = Some(json!({
+        "entries": [], "revision": 0,
+        "deliverables": {"items": [{"id":"d-001","text":"add keeps adding","status":"verified","proof":["ev-002"]}], "revision": 3},
+        "verification": {"epoch": 1, "next": 3, "code_changed": true,
+            "changed": {"app.js": 1},
+            "records": [
+                {"id":"ev-001","kind":"readback","class":"readback","subject":"app.js","pass":true,"epoch":1,"turn":0,"detail":""},
+                {"id":"ev-002","kind":"run","class":"functional","subject":"node check.js","pass":true,"epoch":1,"turn":1,"detail":"exit 0"}
+            ]}
+    }));
+    run(resumed);
+    let first = resumed_provider.requests()[0].to_string();
+    assert!(
+        first.contains("[verified] d-001"),
+        "the recorded status returns: {first}"
+    );
+    assert!(
+        first.contains("stale"),
+        "old checks must be stale after a restart: {first}"
+    );
+
+    let fresh_workspace = Workspace::new(APP);
+    let fresh_provider = Provider::start(|_, _| Reply::Text("ok".into()));
+    run(fresh_workspace.config(&fresh_provider.endpoint, "start over"));
+    assert!(!fresh_provider.requests()[0]
+        .to_string()
+        .contains("Files changed in this task"));
+}
+
+/// Regression fixture modelled on a real failure: a model edited a game page,
+/// recorded every deliverable as finished, only re-read the file, and reported
+/// that everything works although nothing had ever been run. Whatever the model
+/// claims, the runtime must keep the items "implemented", send the claim back
+/// once, and accept an honest second answer. No project or model name is used.
+#[test]
+fn regression_a_page_edited_and_only_reread_is_never_reported_as_verified() {
+    let workspace = Workspace::new(&[
+        ("index.html", "<script src=\"game.js\"></script>"),
+        ("game.js", "function move() { return 0; }\n"),
+    ]);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Tools(vec![
+            deliverable("add", json!({"text":"a bot opponent can be selected"})),
+            deliverable("add", json!({"text":"the board highlights legal moves"})),
+        ]),
+        1 => Reply::Tools(vec![(
+            "write_file",
+            json!({"path":"game.js","content":"function move() { return bot(); }\nfunction bot() { return 1; }\n"}),
+        )]),
+        2 => Reply::Tools(vec![("read_file", json!({"path":"game.js"}))]),
+        3 => Reply::Tools(vec![
+            deliverable(
+                "implemented",
+                json!({"id":"d-001","evidence":"edited game.js"}),
+            ),
+            deliverable(
+                "implemented",
+                json!({"id":"d-002","evidence":"edited game.js"}),
+            ),
+            deliverable(
+                "verify",
+                json!({"id":"d-001","evidence":"re-read the file, looks right"}),
+            ),
+        ]),
+        4 => Reply::Text("Both features are complete and working.".into()),
+        _ => Reply::Text(
+            "Both are implemented but I could not run them, so neither is verified.".into(),
+        ),
+    });
+    run(workspace.config(&provider.endpoint, "add a bot and legal-move highlighting"));
+    let journal = workspace.journal();
+    assert!(completed(&journal));
+    assert_eq!(withheld_drafts(&journal), 1);
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 6);
+    assert!(last_tool_result(&requests[4]).contains("No fresh passing"));
+    let state = requests[4].to_string();
+    assert!(!state.contains("[verified]"), "{state}");
+    assert!(state.contains("[implemented] d-001") && state.contains("[implemented] d-002"));
+    let review = last_user_text(&requests[5]);
+    assert!(
+        review.contains("d-001") && review.contains("d-002"),
+        "{review}"
+    );
+    assert!(
+        review.contains("implemented but not verified")
+            || review.contains("not seen your work verified")
+    );
+}
+
+/// Deep names the project's own test command and wants it to pass after the last
+/// change; citing the runtime-issued evidence id is how an item is verified.
+#[test]
+fn deep_wants_the_project_test_suite_and_verifies_with_a_cited_evidence_id() {
+    let mut files = APP.to_vec();
+    files.push(("package.json", r#"{"scripts":{"test":"node check.js"}}"#));
+    let workspace = Workspace::new(&files);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Tools(vec![
+            deliverable("add", json!({"text":"add keeps adding"})),
+            edit_app(GOOD),
+            deliverable(
+                "implemented",
+                json!({"id":"d-001","evidence":"obs-00000001 wrote app.js"}),
+            ),
+        ]),
+        1 => Reply::Text("Done.".into()),
+        2 => Reply::Tools(vec![("run_terminal", json!({"command":"npm test"}))]),
+        3 => Reply::Tools(vec![verify("d-001", Some("ev-002"))]),
+        _ => Reply::Text("Verified with npm test.".into()),
+    });
+    let mut config = workspace.config(&provider.endpoint, "make add work");
+    config.reasoning_mode = "deep".into();
+    run(config);
+    let requests = provider.requests();
+    let review = last_user_text(&requests[2]);
+    assert!(review.contains("npm test"), "{review}");
+    let journal = workspace.journal();
+    assert!(completed(&journal));
+    assert_eq!(withheld_drafts(&journal), 1);
+    assert!(requests
+        .last()
+        .unwrap()
+        .to_string()
+        .contains("[verified] d-001"));
+}

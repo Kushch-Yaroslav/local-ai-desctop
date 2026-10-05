@@ -12,10 +12,20 @@ use std::collections::BTreeMap;
 pub struct AgentState {
     /// Durable semantic findings for the current task. This is not a plan.
     pub task_memory: TaskMemory,
-    pub workspace_mutated_since_validation: bool,
     /// Count of successful project mutations, used to refresh derived views.
     pub mutations: usize,
-    pub verification_nudged: bool,
+    /// Completion reviews already sent because the work was changed but not
+    /// shown to work. Bounded per mode, so they can never deadlock a final.
+    pub verification_reviews: usize,
+    /// Evidence-producing commands run since the first such review.
+    pub checks_since_review: usize,
+    /// The verification budget is spent: the final answer is accepted and
+    /// must say what was not verified.
+    pub verification_closed: bool,
+    /// The run can execute commands, so "run something to check it" is possible.
+    pub can_verify: bool,
+    /// The project's own test command, looked up in Deep runs only.
+    pub project_test_command: Option<String>,
     /// The single reminder about unopened requested local files was already
     /// given for this run; it never repeats.
     pub request_review_given: bool,
@@ -67,8 +77,6 @@ impl PauseState {
 impl AgentState {
     pub fn record_mutation(&mut self) {
         self.mutations = self.mutations.saturating_add(1);
-        self.workspace_mutated_since_validation = true;
-        self.verification_nudged = false;
     }
 
     pub fn note_file_revision(&mut self, path: std::path::PathBuf, revision: String) {
@@ -101,10 +109,6 @@ impl AgentState {
         if !matches!(tool, "task_memory" | "deliverables" | "plan") {
             self.calls_since_memory = self.calls_since_memory.saturating_add(1);
         }
-    }
-
-    pub fn record_validation(&mut self) {
-        self.workspace_mutated_since_validation = false;
     }
 
     pub fn record_knowledge_read(&mut self) {
@@ -169,13 +173,12 @@ mod tests {
     }
 
     #[test]
-    fn validation_only_tracks_the_latest_mutation() {
+    fn mutations_are_counted_and_verification_starts_unreviewed() {
         let mut state = AgentState::default();
         state.record_mutation();
-        assert!(state.workspace_mutated_since_validation);
-        state.record_validation();
-        assert!(!state.workspace_mutated_since_validation);
         state.record_mutation();
-        assert!(state.workspace_mutated_since_validation);
+        assert_eq!(state.mutations, 2);
+        assert_eq!(state.verification_reviews, 0);
+        assert!(!state.verification_closed);
     }
 }
