@@ -29,9 +29,9 @@ list pass silently. The runtime never invents entries and never decides what the
 
 `rust-agent/src/agent/deliverables.rs`:
 
-- Item: `id`, optional `task` (the user's task it belongs to), `text`, `status` (`pending | done | blocked | dropped`),
+- Item: `id`, optional `task` (the user's task it belongs to), `text`, `status` (`pending | implemented | verified | blocked | dropped`; the legacy `done` is read as `implemented`),
   `evidence`, `reason`. At most 24 items, one short line each; re-adding the same wording returns the existing item.
-- Tool actions: `add`, `done` (after it was observed working), `block` (concrete reason required), `drop` (the user
+- Tool actions: `add` (optional `check`: readback | static | build | test | runtime | browser; `functional` is an old alias of `runtime`), `implemented` (the work was written; `done` is accepted as an alias), `verify` (only with fresh runtime-recorded evidence, see [planning and verification](agent-planning-verification.md)), `block` (concrete reason required), `drop` (the user
   withdrew it; reason required), `view`. The schema is flat, in declaration order, like the other tools.
 - Stored inside the Task Memory JSON, so it is persisted with it (`agent_plans`), restored on Continue after an
   interruption, discarded with it on Regenerate or Edit, and survives restarts. Saved memory without the field still loads.
@@ -62,8 +62,8 @@ for read-only requests.
 
 - Neither mode creates a list on its own, so trivial and analysis-only prompts cost nothing extra; a run that never
   records deliverables is never reviewed.
-- Fast: evidence for `done` is free text, one completion review.
-- Deep: `done` needs evidence that cites an observation ID or an exact source path inspected in this run (the same
+- Fast: evidence for `implemented` is free text, one completion review.
+- Deep: `implemented` needs evidence that cites an observation ID or an exact source path inspected in this run (the same
   rule as a confirmed Task Memory finding), two completion reviews, and the Deep guidance asks it to compare each
   deliverable with what it observed rather than what it intended to build.
 
@@ -76,7 +76,7 @@ the prompt.
 ## What the user sees
 
 The `deliverables` calls appear in the timeline as "Требуемый результат", with a one-line progress summary
-(`выполнено 1 из 3 · осталось 1`) and, when expanded, the checklist (`✓ done`, `○ pending`, `⊘ blocked — reason`).
+(`проверено 1 из 3 · реализовано, не проверено 1 · осталось 1`) and, when expanded, the checklist (`✓ verified`, `◐ implemented, not verified`, `○ pending`, `⊘ blocked — reason`). Only `verified` ever shows as checked.
 
 ## Not done on purpose
 
@@ -86,6 +86,6 @@ separate model-behaviour issue that already has a "think less" reminder.
 ## Task Memory and pause interaction
 
 Deliverables are saved with Task Memory, so a graceful pause (see `deep-fast-modes.md`) records each deliverable's true
-status through the checkpoint tools and Continue restores it. In Deep, marking a deliverable done is validated with the
+status through the checkpoint tools and Continue restores it. In Deep, marking a deliverable implemented is validated with the
 same evidence normalization as a `confirmed` Task Memory entry: unpadded or compact references (`obs-15`,
 `obs-00000015/0016`) resolve to real ids, and a bad reference is named in the error together with valid ones.

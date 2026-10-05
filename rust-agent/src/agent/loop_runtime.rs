@@ -10,11 +10,13 @@ use crate::agent::{
     events::{Event, TailCandidateAttempt},
     evidence::classify_source_read,
     ledger::{Ledger, ProjectIndex},
+    plan::StepStatus,
     policy::{self, Reasoning, RunPolicy},
     reads::repeated_file_read_decision,
     state::{AgentState, PauseState},
     strategy::{self, Strategy},
     transcript::{validate_calls, CompactionPlan, ToolResultPolicy, Transcript, ValidatedCall},
+    verification::{self, Class, Need},
 };
 use crate::context::evidence_projection::{
     apply_folds, attach_historical_index, fold_to_budget, folded_ids,
@@ -64,6 +66,9 @@ pub struct Config {
     pub evidence_dir: Option<String>,
     pub task_memory: Option<Value>,
     pub provider_max_output: Option<usize>,
+    /// Whether a real browser can be used for checks. `None` looks for one;
+    /// the host or a test may state it.
+    pub browser_capability: Option<bool>,
     pub cancelled: Arc<AtomicBool>,
     pub steering: Arc<Mutex<Vec<String>>>,
     pub steering_closed: Arc<AtomicBool>,
@@ -134,15 +139,17 @@ const TOOL_RESULT_TRUNCATION_MARKER: &str =
 const AGENT_GUIDANCE: &str = r#"
 # Local AI Desktop Agent
 - Work directly from the conversation and tool results. A tool-free response completes the run; there is no separate step to request before answering.
-- For code changes, read before writing, make targeted changes, and run the most relevant practical validation or readback. Adapt after errors; do not invent checks.
+- For code changes, read before writing, make targeted changes, then check them: after you change files, run the cheapest check that shows the change works (the project's own tests, or a short script that runs the changed code; for a page, a real browser run, such as a headless browser or a Playwright or Puppeteer script; jsdom or a hand-written DOM stand-in does not count as a browser check). A check must go through the same entry path the user will use (for a page: the real HTML with its script order and load timing, not only the script run against a stand-in); if it only covers part of that path or uses a stand-in, say so. A claim is only as strong as the check behind it: a command that exits 0 shows what it ran, not more. If the check the claim needs cannot be run here (for example, no browser), leave it implemented and say so plainly instead of substituting a weaker check. Verification is part of the work, not an extra step to announce. Reading a file back shows only that it exists, not that it works. When a check fails, fix the cause and run it again; do not invent checks or skip a failure.
 - For substantial tasks, reason about an approach before acting, adapt as you learn, use tools for concrete evidence, avoid broad rereads, and continue until the user's task is complete.
+- Plan = your own short list of steps for non-trivial work (plan tool: set, then update only when the approach changes; skip it for a trivial request). It is not the user's deliverables and finishing its steps proves nothing. Do not narrate plan updates or restate the plan in prose.
 - Use the latest user's language for all user-visible natural-language text: streamed reasoning/progress, tool preambles, brief status updates, and the final answer. Follow an explicit language request if present. Keep code, paths, identifiers, commands, API/tool syntax, and literal source quotations in their original form. Do not translate protocol fields.
 - For non-trivial architecture relationships, use a compact multiline Mermaid flowchart when it improves readability, or a properly indented multiline tree. Do not compress a diagram into one long arrow chain; avoid decorative box art.
 - Task Memory = durable semantic continuity for this task. Record meaningful findings, decisions, blockers, and next actions, and cite the observation IDs (obs-…) a finding rests on in its evidence field. After compaction, trust a precise Task Memory finding from an unchanged inspected file; reread only for a missing fact, ambiguity, possible change, exact detail, or targeted verification.
 - Set Task Memory status and evidence as JSON fields, not prose inside finding. Confirmed entries require evidence containing an observation ID or exact inspected source path from this transcript. A valid reference does not prove the claim; use inferred or unknown for unverified conclusions.
 - Investigation state = a mechanical inventory the runtime keeps of this run's tool observations: files read with their observation IDs, listed entries and local files referenced by sources you read that were not opened yet, failed operations, and commands run. It is not a task list and nothing in it is required. Use it to avoid rereading and to notice code you have not seen; follow a reference only when what you are about to claim depends on it. Recover an exact stored body with observation_read.
-- Deliverables: when the request has two or more separate things to produce or change, or one result that must work end to end, record each requested one with the deliverables tool before you start. Mark an item done only after you observed it working, and block it with a concrete reason if it cannot be completed. Record only what the user asked for, never your own ideas. Do not use it for a single-step or analysis-only request. Produce what the user will see or use first and refine afterwards: a part is not finished until it is reachable the way the user will use it, not merely implemented. Files you create only to diagnose something are not part of the result; delete them before you finish.
+- Deliverables: when the request has two or more separate things to produce or change, or one result that must work end to end, record each requested one with the deliverables tool before you start. Mark an item implemented when you built it; that is your claim. It becomes verified only when the runtime has recorded a passing check of it made after your last change (action verify), and any later change takes the verification back. Block an item with a concrete reason if it cannot be completed. Record only what the user asked for, never your own ideas. Do not use it for a single-step or analysis-only request. Produce what the user will see or use first and refine afterwards: a part is not finished until it is reachable the way the user will use it, not merely implemented. Files you create only to diagnose something are not part of the result; delete them before you finish.
 - Ground claims in what you observed. Keep observed facts, inferences and unknowns apart, and mark inferences as inferences. Something you did not open is unknown, not absent. State that something does not exist only for a scope you actually covered (a complete directory listing, a complete file read, or a search whose scope you can name) and name that scope; otherwise say it was not found in what you inspected. A failed or approval-blocked operation is a blocker, not evidence.
+- Report outcomes from the recorded state, not from intent. Say a deliverable works only if it is verified; otherwise say it is implemented and not verified, and say what failed or was not checked. Never state a count, result or behaviour you did not see in a tool result or check.
 - When the request lists areas or questions, answer each from something you inspected or report it as not inspected. Do not spend further tool calls only to re-verify what you have already read.
 - In the final answer, answer the user's sections directly, distinguish facts from hypotheses, prioritize concrete effects over generic advice, state what remained unexamined, and avoid duplicate points or meta-progress narration. Refer to sources by file path (and line or quoted text), never by observation ID: IDs are internal to this run. Treat claims about how the code was produced conservatively; style alone is weak evidence.
 - For project archaeology with run_terminal, prefer one scoped read-only command such as git -C <project> log --oneline; avoid compound shell wrappers and unsafe pipelines that require approval.
@@ -555,9 +562,21 @@ fn dynamic_tail(
         if !memory.is_empty() {
             tail.push(format!("<task_memory>\n{memory}\n</task_memory>"));
         }
+        let plan = state.task_memory.plan.prompt();
+        if !plan.is_empty() {
+            tail.push(plan);
+        }
         let deliverables = state.task_memory.deliverables.prompt();
         if !deliverables.is_empty() {
             tail.push(deliverables);
+        }
+        let verification = state.task_memory.verification.prompt(
+            &state.task_memory.deliverables,
+            state.verification_closed,
+            state.browser_available,
+        );
+        if !verification.is_empty() {
+            tail.push(verification);
         }
         tail.push(PAUSE_DIRECTIVE.to_owned());
         return tail.join("\n");
@@ -573,9 +592,21 @@ fn dynamic_tail(
     if !memory.is_empty() {
         tail.push(format!("<task_memory>\n{memory}\n</task_memory>"));
     }
+    let plan = state.task_memory.plan.prompt();
+    if !plan.is_empty() {
+        tail.push(plan);
+    }
     let deliverables = state.task_memory.deliverables.prompt();
     if !deliverables.is_empty() {
         tail.push(deliverables);
+    }
+    let verification = state.task_memory.verification.prompt(
+        &state.task_memory.deliverables,
+        state.verification_closed,
+        state.browser_available,
+    );
+    if !verification.is_empty() {
+        tail.push(verification);
     }
     if !transcript.is_finalizing() && !user_requests_read_only(objective) {
         if let Some(hint) = contract_hint(state, objective) {
@@ -661,7 +692,7 @@ fn contract_hint(state: &AgentState, user: &str) -> Option<String> {
     if items >= 2 {
         return Some(format!("<deliverables_hint>The request lists {items} separate items. Record each requested one with the deliverables tool (action add) before you start, so none is lost on a long run.</deliverables_hint>"));
     }
-    (state.mutations > 0).then(|| "<deliverables_hint>You have started changing the project but recorded no deliverables. If the request has two or more separate things to deliver, record them with the deliverables tool now and mark what already works as done. Ignore this for a single-step request.</deliverables_hint>".to_owned())
+    (state.mutations > 0).then(|| "<deliverables_hint>You have started changing the project but recorded no deliverables. If the request has two or more separate things to deliver, record them with the deliverables tool now and mark what you have built as implemented. Ignore this for a single-step request.</deliverables_hint>".to_owned())
 }
 
 /// Makes the turn budget visible once it matters, and only while requested
@@ -725,13 +756,14 @@ fn tool_schemas(scope: ToolScope) -> Vec<Value> {
     // Action-specific requirements are enforced transactionally at dispatch.
     let mut tools = vec![
         json!({"type":"function","function":{"name":"task_memory","description":"Durable semantic memory for the current task across compaction. Record/update meaningful findings, decisions, blockers, or unresolved questions; view reads it; invalidate needs id. Record requires finding; update needs the id of an existing entry and changes only the fields you pass (an empty string clears one). Both may include evidence, implication, next, supersedes, status. Cite observations by exact id (obs-00000012), one per item in observations or comma-separated in evidence. Trust precise unchanged-file memory; reread only for a concrete missing, ambiguous, changed, exact-detail, or verification need.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["record","update","invalidate","view"]},"id":{"type":"string"},"finding":{"type":"string"},"evidence":{"type":"string"},"implication":{"type":"string"},"next":{"type":"string"},"supersedes":{"type":"string"},"status":{"type":"string","enum":["confirmed","inferred","unknown","contradicted"],"description":"How well established the finding is: confirmed (observed, cited), inferred (reasoned, not observed), unknown (open; put the resolving step in next), contradicted (evidence disagrees)."},"observations":{"type":"array","items":{"type":"string"},"description":"Observation IDs (obs-…) that support the finding; same as evidence, one id per item."}},"required":["action"]}}}),
-        json!({"type":"function","function":{"name":"deliverables","description":"The user's requested deliverables for this task (execution contract). Use it only when the request has two or more separate things to produce or change, or one result that must work end to end. add: record each requested deliverable once (text, optional task). done: after you observed it working (id, evidence). block: it cannot be completed (id, concrete reason). drop: the user withdrew it (id, reason). view: list them. Record only what the user asked for, never your own optional ideas.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["add","done","block","drop","view"]},"id":{"type":"string"},"task":{"type":"string"},"text":{"type":"string"},"evidence":{"type":"string"},"reason":{"type":"string"}},"required":["action"]}}}),
+        json!({"type":"function","function":{"name":"deliverables","description":"The user's requested deliverables for this task (execution contract). Use it only when the request has two or more separate things to produce or change, or one result that must work end to end. add: record each requested deliverable once (text, optional task, optional check: the weakest evidence that proves the claim: readback = it exists, static = lint/typecheck, build = it builds, test = the tests pass, runtime = running the code works, browser = it works in a real browser; a changed page is always held to browser). implemented: you built it (id, evidence): this is your claim and is not proof. verify: the runtime has a passing check of it (id; evidence = ev-… ids from <verification_state>; Fast may omit them): only checks the runtime saw run after your last change count, and any later change to the project takes the verification back. block: it cannot be completed (id, concrete reason). drop: the user withdrew it (id, reason). view: list them. Record only what the user asked for, never your own optional ideas.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["add","implemented","verify","block","drop","view"]},"id":{"type":"string"},"task":{"type":"string"},"text":{"type":"string"},"evidence":{"type":"string"},"reason":{"type":"string"},"check":{"type":"string","enum":["readback","static","build","test","runtime","browser"]}},"required":["action"]}}}),
+        json!({"type":"function","function":{"name":"plan","description":"Your own short execution plan: how you will get the work done. Optional: skip it for a trivial or single-step request. set: replace the unfinished steps with a short ordered list of one-line steps (steps); the first becomes active. update: change a step (id; status pending|in_progress|completed|blocked, optional text or note; blocked needs a note); completing the active step activates the next. add: insert a step (text, optional after). view: list. Change the plan only when your approach changes; do not narrate it or update it after every call. A plan is not proof: finishing steps does not complete the user's deliverables.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["set","update","add","view"]},"steps":{"type":"array","items":{"type":"string"}},"id":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","completed","blocked"]},"text":{"type":"string"},"note":{"type":"string"},"after":{"type":"string"}},"required":["action"]}}}),
         json!({"type":"function","function":{"name":"observation_index","description":"List historical tool observations by stable ID, with source path and outcome metadata. Use source to select the raw observation for the needed file. If more=true, continue at the returned next_offset. Observation IDs start with obs-.","parameters":{"type":"object","properties":{"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":50}}}}}),
         json!({"type":"function","function":{"name":"observation_read","description":"Recover a bounded exact slice of a stored historical tool result by observation ID. The response distinguishes historical evidence from current source and reports whether the source changed.","parameters":{"type":"object","properties":{"id":{"type":"string"},"offset_chars":{"type":"integer","minimum":0},"max_chars":{"type":"integer","minimum":1,"maximum":16000}},"required":["id"]}}}),
     ];
     if scope != ToolScope::None {
         tools.extend([
-            json!({"type":"function","function":{"name":"apply_patch","description":"Apply a project patch.","parameters":{"type":"object","properties":{"patch":{"type":"string"}},"required":["patch"]}}}),
+            json!({"type":"function","function":{"name":"apply_patch","description":"Edit files. Patch format: *** Begin Patch, then per file `*** Update File: path` with hunks of ` unchanged context`, `-old` and `+new` lines (separate hunks with a line `@@`; add enough context to match exactly one place), `*** Add File: path` with every line prefixed `+`, or `*** Delete File: path`, then *** End Patch. The whole patch applies or none of it does.","parameters":{"type":"object","properties":{"patch":{"type":"string"}},"required":["patch"]}}}),
             json!({"type":"function","function":{"name":"create_file","description":"Create a new project file.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}),
             json!({"type":"function","function":{"name":"delete_file","description":"Delete a project file when allowed.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}),
             json!({"type":"function","function":{"name":"list_directory","description":"List a project directory. complete=true means all directory entries are represented; false means internal runtime entries were omitted.","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}),
@@ -740,7 +772,7 @@ fn tool_schemas(scope: ToolScope) -> Vec<Value> {
             json!({"type":"function","function":{"name":"project_knowledge_read","description":"Read selected reusable project observations from .ai-framework: paths is required. Prefer relevant fresh knowledge before broad rereads; do not reread unchanged source only to reconstruct context. Read source for exact current code or a concrete unresolved/verification detail.","parameters":{"type":"object","properties":{"paths":{"type":"array","items":{"type":"string"}}},"required":["paths"]}}}),
             json!({"type":"function","function":{"name":"project_knowledge_update","description":"Optionally persist durable, reusable semantic project knowledge in .ai-framework. This is never required for normal work. Only use project/, modules/, sources/, or tasks/ markdown paths.","parameters":{"type":"object","properties":{"updates":{"type":"array","items":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["replace","merge"]}},"required":["path","content"]}},"source_paths":{"type":"array","items":{"type":"string"}}},"required":["updates"]}}}),
             json!({"type":"function","function":{"name":"run_terminal","description":"Run an existing relevant project command. After code changes, prefer a focused test, typecheck, lint, build, or check when available.","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1}},"required":["command"]}}}),
-            json!({"type":"function","function":{"name":"write_file","description":"Write a project file.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}),
+            json!({"type":"function","function":{"name":"write_file","description":"Write the full content of a project file, replacing it. To change part of a file, prefer apply_patch.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}),
         ]);
     }
     if scope == ToolScope::Workspace {
@@ -762,6 +794,7 @@ fn tool_schemas_for_policy(scope: ToolScope, policy: RunPolicy) -> Vec<Value> {
                 tool_name(tool),
                 "task_memory"
                     | "deliverables"
+                    | "plan"
                     | "observation_index"
                     | "observation_read"
                     | "read_file"
@@ -825,7 +858,7 @@ fn tool_schemas_for_request(scope: ToolScope, policy: RunPolicy, user: &str) -> 
     tools
 }
 
-const CHECKPOINT_TOOLS: [&str; 2] = ["task_memory", "deliverables"];
+const CHECKPOINT_TOOLS: [&str; 3] = ["task_memory", "deliverables", "plan"];
 
 fn pause_run_schema() -> Value {
     json!({"type":"function","function":{
@@ -878,9 +911,9 @@ fn begin_pause(config: &Config, state: &mut AgentState, source: &str) -> bool {
     true
 }
 
-const PAUSE_DIRECTIVE: &str = "<run_paused>The user paused this run. Do not start new investigation or work. With the checkpoint tools only: record in task_memory what is established and what is still unknown, with the next step, and set each deliverable to its true status. Then write a short answer for the user: what is done, what is not, and that the work continues when they ask to continue. Do not claim unfinished work as done.</run_paused>";
+const PAUSE_DIRECTIVE: &str = "<run_paused>The user paused this run. Do not start new investigation or work. With the checkpoint tools only: record in task_memory what is established and what is still unknown, with the next step, and set each deliverable to its true status (implemented is not verified), and keep the plan current. Then write a short answer for the user: what is done, what is not, and that the work continues when they ask to continue. Do not claim unfinished work as done.</run_paused>";
 
-const PAUSED_TOOL_MESSAGE: &str = "The run is paused: only the checkpoint tools (task_memory, deliverables) are available. Save the checkpoint and write the short pause summary.";
+const PAUSED_TOOL_MESSAGE: &str = "The run is paused: only the checkpoint tools (task_memory, deliverables, plan) are available. Save the checkpoint and write the short pause summary.";
 
 const PAUSE_FALLBACK: &str = "Работа поставлена на паузу. Состояние и список невыполненного сохранены; чтобы продолжить, напишите «Продолжить».";
 
@@ -1239,6 +1272,62 @@ fn apply_task_memory(
     Ok((result, true))
 }
 
+/// Updates the execution plan. The result is the compact plan itself: the plan
+/// is short by construction, and the model needs nothing else back.
+fn apply_plan(state: &mut AgentState, arguments: &Value) -> Result<(Value, bool), String> {
+    let action = required_text(arguments, "action")?;
+    let text_arg = |key: &str| arguments.get(key).and_then(Value::as_str);
+    let mut candidate = state.task_memory.plan.clone();
+    match action.trim().to_lowercase().as_str() {
+        "view" | "get" | "list" | "show" => {
+            return Ok((
+                json!({"plan": state.task_memory.plan, "updated": false}),
+                false,
+            ));
+        }
+        "set" | "create" | "replace" => {
+            let steps = arguments
+                .get("steps")
+                .and_then(Value::as_array)
+                .map(|steps| {
+                    steps
+                        .iter()
+                        .filter_map(|step| {
+                            step.as_str().map(str::to_owned).or_else(|| {
+                                step.get("text").and_then(Value::as_str).map(str::to_owned)
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .ok_or_else(|| "steps is required: an array of short one-line steps".to_owned())?;
+            candidate.set(&steps)?;
+        }
+        "add" => candidate.add(&required_text(arguments, "text")?, text_arg("after"))?,
+        "update" | "complete" | "done" => {
+            let status = match text_arg("status") {
+                Some(value) => Some(StepStatus::parse(value).ok_or_else(|| {
+                    "status must be pending, in_progress, completed or blocked".to_owned()
+                })?),
+                None if action.trim().eq_ignore_ascii_case("update") => None,
+                None => Some(StepStatus::Completed),
+            };
+            candidate.update(
+                &required_text(arguments, "id")?,
+                status,
+                text_arg("text"),
+                text_arg("note"),
+            )?;
+        }
+        _ => return Err("unsupported plan action: use set, update, add or view".into()),
+    }
+    let unchanged = candidate == state.task_memory.plan;
+    state.task_memory.plan = candidate;
+    Ok((
+        json!({"plan": state.task_memory.plan, "updated": !unchanged}),
+        !unchanged,
+    ))
+}
+
 /// Updates the execution contract. In Deep, completing an item needs evidence
 /// that cites an observation or an inspected source path, like a confirmed
 /// finding; Fast only asks the model to say what it observed.
@@ -1265,35 +1354,277 @@ fn apply_deliverables(
             ))
         }
         "add" => {
-            candidate.add(
+            let check = match arguments.get("check").and_then(Value::as_str) {
+                Some(value) if !value.trim().is_empty() => {
+                    Some(Need::parse(value).ok_or_else(|| {
+                        "check must be readback, static, build, test, runtime or browser".to_owned()
+                    })?)
+                }
+                _ => None,
+            };
+            candidate.add_checked(
                 arguments.get("id").and_then(Value::as_str),
                 &text_of("task"),
                 &text_of("text"),
+                check,
             )?;
         }
-        "done" => {
+        "implemented" | "done" => {
             let id = id()?;
             let evidence = normalize_evidence_refs(&text_of("evidence"), transcript);
             if state.strategy.is_deep() {
                 if let Some(problem) = evidence_problem(&evidence, transcript) {
-                    return Err(format!("In Deep mode a deliverable is marked done only with evidence that cites an observation ID (obs-…) or the exact path of a source you inspected in this run: {problem} Check that it works, then retry with that evidence; nothing was changed."));
+                    return Err(format!("In Deep mode a deliverable is marked implemented only with evidence that cites an observation ID (obs-…) or the exact path of a source you inspected in this run: {problem} Check it, then retry with that evidence; nothing was changed."));
                 }
             }
-            candidate.complete(&id, &evidence)?;
+            candidate.implement(&id, &evidence)?;
+        }
+        "verify" => {
+            let id = id()?;
+            let declared = candidate
+                .items
+                .iter()
+                .find(|item| item.id == id)
+                .and_then(|item| item.check);
+            let need = state.task_memory.verification.effective_need(declared);
+            let cited = evidence_ids(arguments);
+            let proof = state.task_memory.verification.proof_for(
+                &cited,
+                need,
+                state.strategy.is_deep(),
+                state.browser_available,
+            )?;
+            candidate.verify(&id, proof)?;
         }
         "block" => candidate.block(&id()?, &text_of("reason"))?,
         "drop" => candidate.drop_item(&id()?, &text_of("reason"))?,
-        _ => {
-            return Err(
-                "unsupported deliverables action: use add, done, block, drop or view".into(),
-            )
-        }
+        _ => return Err(
+            "unsupported deliverables action: use add, implemented, verify, block, drop or view"
+                .into(),
+        ),
     }
     state.task_memory.deliverables = candidate;
     Ok((
         json!({"deliverables": state.task_memory.deliverables, "updated": true}),
         true,
     ))
+}
+
+/// Evidence ids (ev-…) named in a `verify` call, whether given as a list or
+/// as free text.
+fn evidence_ids(arguments: &Value) -> Vec<String> {
+    let mut text = String::new();
+    for key in ["evidence", "proof", "evidence_ids"] {
+        match arguments.get(key) {
+            Some(Value::String(value)) => {
+                text.push(' ');
+                text.push_str(value);
+            }
+            Some(Value::Array(values)) => {
+                for value in values.iter().filter_map(Value::as_str) {
+                    text.push(' ');
+                    text.push_str(value);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut ids: Vec<String> = text
+        .split(|character: char| !(character.is_ascii_alphanumeric() || character == '-'))
+        .filter(|word| word.len() > 3 && word[..3].eq_ignore_ascii_case("ev-"))
+        .map(str::to_ascii_lowercase)
+        .collect();
+    ids.dedup();
+    ids
+}
+
+fn emit_task_memory(config: &Config, state: &AgentState) {
+    if let Ok(memory) = serde_json::to_value(&state.task_memory) {
+        emit(&config.run_id, Event::TaskMemoryUpdate { memory });
+    }
+}
+
+/// Keeps the deliverables honest about the checks the runtime saw fail. Returns
+/// whether anything changed.
+fn sync_verification_failure(state: &mut AgentState) -> bool {
+    let failure = state
+        .task_memory
+        .verification
+        .active_failure_at_least(Class::Static)
+        .map(|record| format!("{} ({})", record.subject, record.detail));
+    state
+        .task_memory
+        .deliverables
+        .sync_failure(failure.as_deref())
+}
+
+/// Applies what a terminal command may have done to the project, so a command
+/// that edits files (sed -i, mv, a redirect) invalidates earlier checks the way
+/// a file tool would. Returns whether the project is known or assumed changed.
+///
+/// A read-only command changes nothing. Any command not recognised as a check
+/// or as read-only is assumed to change the project: the epoch advances, so all
+/// run, test and static evidence goes stale, and the code files it names are
+/// marked changed. Before a check is trusted, tracked files are compared with
+/// what the runtime last saw, so an edit made by the check itself (for example
+/// `--fix`) is noticed too. Files a check changes that the task never touched
+/// are not detected.
+fn record_terminal_effect(
+    state: &mut AgentState,
+    scope: &crate::tools::filesystem::Scope,
+    command: &str,
+    effect: verification::Effect,
+) -> bool {
+    if effect == verification::Effect::ReadOnly {
+        return false;
+    }
+    let mut changed = false;
+    let tracked = state
+        .task_memory
+        .verification
+        .revisions
+        .iter()
+        .map(|(path, revision)| (path.clone(), revision.clone()))
+        .collect::<Vec<_>>();
+    for (path, known) in tracked {
+        match crate::tools::filesystem::file_revision(scope, &path) {
+            Some((_, current)) if current == known => {}
+            Some((_, current)) => {
+                state.task_memory.verification.note_change(Some(&path));
+                state
+                    .task_memory
+                    .verification
+                    .revisions
+                    .insert(path, current);
+                changed = true;
+            }
+            None => {
+                state.task_memory.verification.note_deletion(&path);
+                changed = true;
+            }
+        }
+    }
+    if effect == verification::Effect::Mutating {
+        let ledger = &mut state.task_memory.verification;
+        ledger.note_change(None);
+        for token in verification::mentioned_code_paths(command) {
+            let path = token.strip_prefix("./").unwrap_or(&token).to_owned();
+            match crate::tools::filesystem::file_revision(scope, &path) {
+                Some((_, revision)) => {
+                    ledger.note_change(Some(&path));
+                    ledger.revisions.insert(path, revision);
+                }
+                None => ledger.note_deletion(&path),
+            }
+        }
+        state.record_mutation();
+        changed = true;
+    }
+    if changed {
+        state.task_memory.deliverables.demote_verified();
+        sync_verification_failure(state);
+    }
+    changed
+}
+
+/// Records what a finished terminal command shows. Only a command with an exit
+/// code that the runtime can classify as a check becomes evidence; timeouts and
+/// cancellations are inconclusive.
+fn record_terminal_evidence(
+    state: &mut AgentState,
+    root: &Path,
+    command: &str,
+    value: &Value,
+) -> bool {
+    let completed = value.get("status").and_then(Value::as_str);
+    let Some(exit_code) = value.get("exit_code").and_then(Value::as_i64) else {
+        return false;
+    };
+    if value.get("timed_out").and_then(Value::as_bool) == Some(true)
+        || value.get("cancelled").and_then(Value::as_bool) == Some(true)
+        || !matches!(completed, Some("completed" | "error"))
+    {
+        return false;
+    }
+    let changed = state
+        .task_memory
+        .verification
+        .changed
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let Some(mut kind) = verification::classify_command(command, &changed) else {
+        return false;
+    };
+    if kind == verification::Kind::Run && verification::script_drives_browser(root, command) {
+        kind = verification::Kind::Browser;
+    }
+    let pass = exit_code == 0 && completed == Some("completed");
+    let detail = if pass {
+        "exit 0".to_owned()
+    } else {
+        let text = |key: &str| value.get(key).and_then(Value::as_str).unwrap_or_default();
+        let output = if text("stderr").trim().is_empty() {
+            text("stdout")
+        } else {
+            text("stderr")
+        };
+        let tail = output
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or_default();
+        format!("exit {exit_code}: {tail}")
+    };
+    let turn = state.turn;
+    state
+        .task_memory
+        .verification
+        .record(kind, command, pass, &detail, turn);
+    if state.verification_reviews > 0 {
+        state.checks_since_review += 1;
+    }
+    sync_verification_failure(state);
+    true
+}
+
+/// A successful write, patch or delete changes what any earlier check saw. The
+/// runtime reads each written file back itself, so "it was written" never
+/// depends on the model's word.
+fn record_project_change(
+    state: &mut AgentState,
+    scope: &crate::tools::filesystem::Scope,
+    name: &str,
+    paths: &[String],
+) {
+    let turn = state.turn;
+    for path in paths {
+        if name == "delete_file" {
+            state.task_memory.verification.note_deletion(path);
+            continue;
+        }
+        state.task_memory.verification.note_change(Some(path));
+        if let Some((file, revision)) = crate::tools::filesystem::file_revision(scope, path) {
+            state
+                .task_memory
+                .verification
+                .revisions
+                .insert(path.clone(), revision);
+            let size = std::fs::metadata(&file).map(|meta| meta.len()).unwrap_or(0);
+            state.task_memory.verification.record(
+                verification::Kind::Readback,
+                path,
+                true,
+                &format!("{size} bytes on disk"),
+                turn,
+            );
+        }
+    }
+    if paths.is_empty() {
+        state.task_memory.verification.note_change(None);
+    }
+    state.task_memory.deliverables.demote_verified();
+    sync_verification_failure(state);
 }
 
 /// Paths a patch adds, so files created through `apply_patch` are tracked too.
@@ -1311,29 +1642,6 @@ fn mutation_tool(name: &str) -> bool {
         name,
         "write_file" | "create_file" | "apply_patch" | "delete_file"
     )
-}
-
-fn validation_command(command: &str) -> bool {
-    let command = command.to_ascii_lowercase();
-    [
-        " test",
-        "test ",
-        "cargo test",
-        "cargo check",
-        "typecheck",
-        "type-check",
-        " lint",
-        "lint ",
-        " build",
-        "build ",
-        " compile",
-        "compile ",
-        "clippy",
-        "vitest",
-        "jest",
-    ]
-    .iter()
-    .any(|needle| command.contains(needle))
 }
 
 fn continuation_tail(content: &str) -> String {
@@ -2890,6 +3198,19 @@ fn run_scoped_tool(
             }
             Ok((value, None))
         }
+        "plan" => {
+            let (value, changed) = apply_plan(state, &tool.arguments)?;
+            if changed {
+                emit(
+                    &config.run_id,
+                    Event::TaskMemoryUpdate {
+                        memory: serde_json::to_value(&state.task_memory)
+                            .map_err(|error| error.to_string())?,
+                    },
+                );
+            }
+            Ok((value, None))
+        }
         "task_memory" => {
             let (value, changed) = apply_task_memory(state, &tool.arguments, transcript)?;
             if changed {
@@ -2943,13 +3264,32 @@ fn run_scoped_tool(
                     )
                 },
             )?;
+            let grants = config.grants();
+            let scope = crate::tools::filesystem::Scope {
+                root: Path::new(&root),
+                grants: &grants,
+            };
+            let tracked = state
+                .task_memory
+                .verification
+                .changed
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            let effect = verification::terminal_effect(&command, &tracked);
+            let mut changed = record_terminal_effect(state, &scope, &command, effect);
+            // A check that rewrote tracked files did not check the files the
+            // runtime knows about, so its exit code is not recorded.
+            let inconclusive = changed && matches!(effect, verification::Effect::Check(_));
+            if !inconclusive && record_terminal_evidence(state, Path::new(&root), &command, &value)
+            {
+                changed = true;
+            }
+            if changed {
+                emit_task_memory(config, state);
+            }
             if terminal_execution_failed(&value) {
                 return Err(value.to_string());
-            }
-            if value.get("status").and_then(Value::as_str) == Some("completed")
-                && validation_command(&command)
-            {
-                state.record_validation();
             }
             Ok((value, None))
         }
@@ -2966,14 +3306,44 @@ fn run_scoped_tool(
             let existed_before = target
                 .as_deref()
                 .is_some_and(|path| Path::new(root).join(path).exists());
-            let result = crate::tools::filesystem::execute_in(
-                &crate::tools::filesystem::Scope {
-                    root: Path::new(root),
-                    grants: &grants,
-                },
-                name,
-                &tool.arguments,
-            )?;
+            let file_scope = crate::tools::filesystem::Scope {
+                root: Path::new(root),
+                grants: &grants,
+            };
+            if name == "write_file" {
+                if let Some((file, revision)) = target
+                    .as_deref()
+                    .and_then(|path| crate::tools::filesystem::file_revision(&file_scope, path))
+                {
+                    if state.file_changed_since_seen(&file, &revision) {
+                        return Err("File changed since your last read. Read the latest version before writing.".to_owned());
+                    }
+                }
+            }
+            let result = crate::tools::filesystem::execute_in(&file_scope, name, &tool.arguments)?;
+            let touched = match name {
+                "read_file" | "write_file" | "create_file" => target.iter().cloned().collect(),
+                "apply_patch" => result
+                    .0
+                    .get("files")
+                    .and_then(Value::as_array)
+                    .map(|files| {
+                        files
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                _ => Vec::<String>::new(),
+            };
+            for path in touched {
+                if let Some((file, revision)) =
+                    crate::tools::filesystem::file_revision(&file_scope, &path)
+                {
+                    state.note_file_revision(file, revision);
+                }
+            }
             match (name, target.as_deref()) {
                 ("create_file" | "write_file", Some(path)) if !existed_before => {
                     state.record_created_file(path);
@@ -3009,6 +3379,23 @@ fn run_scoped_tool(
             }
             if mutation_tool(name) {
                 state.record_mutation();
+                let changed = match name {
+                    "apply_patch" => result
+                        .0
+                        .get("files")
+                        .and_then(Value::as_array)
+                        .map(|files| {
+                            files
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_owned)
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    _ => target.iter().cloned().collect::<Vec<_>>(),
+                };
+                record_project_change(state, &file_scope, name, &changed);
+                emit_task_memory(config, state);
             }
             Ok(result)
         }
@@ -3249,6 +3636,23 @@ fn record_safe_read_effect(
             emit_knowledge_diagnostics(config, state);
         }
         "read_file" | "list_directory" => {
+            if tool.name == "read_file" {
+                if let (Some(root), Some(path)) = (
+                    config.work_root(),
+                    tool.arguments.get("path").and_then(Value::as_str),
+                ) {
+                    let grants = config.grants();
+                    let scope = crate::tools::filesystem::Scope {
+                        root: Path::new(root),
+                        grants: &grants,
+                    };
+                    if let Some((file, revision)) =
+                        crate::tools::filesystem::file_revision(&scope, path)
+                    {
+                        state.note_file_revision(file, revision);
+                    }
+                }
+            }
             if !user_requests_read_only(&config.user) && !targets_secondary_project(tool) {
                 if let Some(root) = config.root.as_deref() {
                     let _ = crate::tools::knowledge::observe_tool(
@@ -3275,22 +3679,89 @@ fn concise_tool_error(message: &str) -> String {
     json!({"error":bounded}).to_string()
 }
 
-fn add_soft_closeout_if_needed(state: &mut AgentState, transcript: &mut Transcript) -> bool {
-    let needs_validation = state.workspace_mutated_since_validation && !state.verification_nudged;
-    if !needs_validation {
-        return false;
+/// Commands that produce evidence a run may spend after the first
+/// verification review before the gate stops asking.
+fn verification_budget(strategy: Strategy) -> usize {
+    if strategy.is_deep() {
+        12
+    } else {
+        6
     }
-    if needs_validation {
-        state.verification_nudged = true;
-        transcript.remind("You changed project files but no meaningful validation has been observed since the latest mutation. Run the most relevant available check, or state why validation is unavailable. Inspect the diff when practical.".into());
+}
+
+/// What a finished modification run has not shown yet, or `None`. The gate
+/// applies only to runs that changed the project and can execute commands, and
+/// it asks for the cheapest check that settles it, not for exhaustive testing.
+fn verification_gap(state: &AgentState) -> Option<String> {
+    if state.mutations == 0 || !state.can_verify || state.verification_closed {
+        return None;
     }
-    true
+    let ledger = &state.task_memory.verification;
+    let mut lines = Vec::new();
+    if let Some(failure) = ledger.active_failure_at_least(Class::Static) {
+        lines.push(format!(
+            "{} failed after your last change: {} ({})",
+            failure.id, failure.subject, failure.detail
+        ));
+    }
+    let deliverables = &state.task_memory.deliverables;
+    let unreachable = ledger.unreachable(deliverables, state.browser_available);
+    let reachable = deliverables
+        .unverified()
+        .into_iter()
+        .filter(|item| !unreachable.iter().any(|other| other.id == item.id))
+        .collect::<Vec<_>>();
+    if !reachable.is_empty() {
+        let mut line = format!(
+            "implemented but not verified: {}",
+            deliverables::Deliverables::summarize(&reachable)
+        );
+        if reachable.iter().any(|item| {
+            ledger.effective_need(item.check) == Need::Browser
+                && ledger.best_passing(Need::Browser).is_none()
+        }) {
+            line.push_str(" (needs a run in a real browser, e.g. a headless browser or a Playwright or Puppeteer script; a jsdom or node script is not one)");
+        }
+        lines.push(line);
+    } else if deliverables.is_empty() {
+        let need = ledger.effective_need(None);
+        if need != Need::Readback
+            && ledger.reachable(need, state.browser_available)
+            && ledger.best_passing(need).is_none()
+        {
+            lines.push(match need {
+                Need::Browser => "you changed a page, and no run in a real browser (a headless browser, Playwright or Puppeteer script) has passed since your last change; a jsdom or node script is not one".to_owned(),
+                _ => "you changed code, and no test or script that runs it has passed since your last change".to_owned(),
+            });
+        }
+    }
+    if state.strategy.is_deep()
+        && ledger.code_changed
+        && !ledger.has_fresh_pass_of(verification::Kind::Test)
+    {
+        if let Some(command) = &state.project_test_command {
+            lines.push(format!(
+                "the project has a test command ({command}) that has not passed since your last change"
+            ));
+        }
+    }
+    (!lines.is_empty()).then(|| lines.join("; "))
+}
+
+fn verification_review_text(gap: &str, failing: bool) -> String {
+    let fix = if failing {
+        " A check failed: fix the cause and run it again."
+    } else {
+        ""
+    };
+    format!("Before finishing: the runtime has not seen your work verified: {gap}.{fix} Run the most relevant check now: the project's tests, or a short script that runs the changed code (for a page, a real headless browser; jsdom is only a stand-in and does not prove page behaviour). Reading the file back does not show it works. Then call deliverables verify for what the check covers. If it cannot be checked here, finish and say plainly that it is implemented but not verified. Do not call it working without a passing check.")
 }
 
 enum FinalCandidateReview {
     PendingDeliverables(String),
     Accept,
-    ValidationPending,
+    /// The work changed and was not shown to work; one bounded review.
+    VerificationPending(String),
     /// One bounded reminder naming concrete, mechanically known local files
     /// that sources actually request but that were never opened.
     UnopenedRequests(String),
@@ -3310,9 +3781,6 @@ fn review_tool_free_final(
     if transcript.is_finalizing() || state.pause.is_some() {
         return FinalCandidateReview::Accept;
     }
-    if add_soft_closeout_if_needed(state, transcript) {
-        return FinalCandidateReview::ValidationPending;
-    }
     // The model recorded what the user asked for and has not finished it. Deep
     // may be sent back twice; Fast once. Afterwards the answer is accepted, so
     // this can never deadlock a run. The answer must then say what is missing.
@@ -3324,6 +3792,26 @@ fn review_tool_free_final(
             &state.created_files,
             state.strategy.is_deep(),
         ));
+    }
+    if let Some(gap) = verification_gap(state) {
+        let failure = state
+            .task_memory
+            .verification
+            .active_failure_at_least(Class::Static)
+            .map(|record| record.id.clone());
+        // A new failing check earns one review of its own; the same failure is
+        // never sent back twice, and otherwise reviews are fixed per mode.
+        let new_failure = failure.is_some() && failure != state.reviewed_failure;
+        if new_failure || state.verification_reviews < allowed_reviews {
+            state.verification_reviews += 1;
+            if new_failure {
+                state.reviewed_failure = failure.clone();
+            }
+            return FinalCandidateReview::VerificationPending(verification_review_text(
+                &gap,
+                failure.is_some(),
+            ));
+        }
     }
     let requests = ledger.unopened_requests();
     if !state.request_review_given && !requests.is_empty() {
@@ -3398,6 +3886,7 @@ pub fn run(config: Config) {
             return;
         }
     };
+    state.task_memory.verification.start_run();
     if !user_requests_read_only(&config.user) {
         if let Some(root) = config.root.as_deref() {
             let _ = crate::tools::knowledge::bootstrap(&PathBuf::from(root));
@@ -3415,11 +3904,27 @@ pub fn run(config: Config) {
         for schema in &mut schemas {
             if !matches!(
                 tool_name(schema),
-                "task_memory" | "deliverables" | "observation_read" | "observation_index"
+                "task_memory" | "deliverables" | "plan" | "observation_read" | "observation_index"
             ) {
                 schema["function"]["parameters"]["properties"]["project"] = json!({"type":"integer","enum":[1,2],"description":"Selected project slot. 1 is the primary root; 2 is the secondary root. Defaults to 1."});
             }
         }
+    }
+    state.can_verify = schemas
+        .iter()
+        .any(|schema| tool_name(schema) == "run_terminal");
+    state.browser_available = state.can_verify
+        && config.browser_capability.unwrap_or_else(|| {
+            config
+                .root
+                .as_deref()
+                .is_some_and(|root| verification::browser_available(Path::new(root)))
+        });
+    if state.can_verify && state.strategy.is_deep() {
+        state.project_test_command = config
+            .root
+            .as_deref()
+            .and_then(|root| verification::detect_test_command(Path::new(root)));
     }
     let mut final_content = String::new();
     let mut visible_final_content = String::new();
@@ -3494,6 +3999,12 @@ pub fn run(config: Config) {
             }
         }
         state.turn = turn;
+        if !state.verification_closed
+            && state.verification_reviews > 0
+            && state.checks_since_review >= verification_budget(state.strategy)
+        {
+            state.verification_closed = true;
+        }
         if turn >= MAX_INVESTIGATION_TURNS && !transcript.is_finalizing() {
             transcript.mark_finalizing();
             trace_forensics(
@@ -4032,8 +4543,14 @@ pub fn run(config: Config) {
                 continue;
             }
             match review_tool_free_final(&mut state, &mut transcript, &ledger) {
-                FinalCandidateReview::ValidationPending => {
-                    transcript.assistant_withheld_draft(streamed.content, "pending validation");
+                FinalCandidateReview::VerificationPending(nudge) => {
+                    trace_forensics(
+                        &config.run_id,
+                        "completion_review",
+                        json!({"decision":"verification_pending","turn":turn+1,"reviews":state.verification_reviews}),
+                    );
+                    transcript.assistant_withheld_draft(streamed.content, "unverified changes");
+                    transcript.remind(nudge);
                     continue;
                 }
                 FinalCandidateReview::PendingDeliverables(nudge) => {
@@ -4580,7 +5097,7 @@ mod tests {
         });
         assert_eq!(
             names(&turn_schemas(&schemas, &state, false)),
-            ["deliverables", "task_memory"]
+            ["deliverables", "plan", "task_memory"]
                 .iter()
                 .map(|s| (*s).to_owned())
                 .collect::<Vec<_>>()
@@ -4633,7 +5150,8 @@ mod tests {
     #[test]
     fn a_paused_final_is_accepted_without_any_completion_review() {
         let mut state = AgentState::default();
-        state.workspace_mutated_since_validation = true;
+        state.mutations = 3;
+        state.can_verify = true;
         state.strategy = Strategy::Deep;
         state.pause = Some(PauseState {
             checkpoint_turns_left: 1,
@@ -4643,7 +5161,7 @@ mod tests {
             review_tool_free_final(&mut state, &mut transcript, &Ledger::default()),
             FinalCandidateReview::Accept
         ));
-        assert!(!state.verification_nudged);
+        assert_eq!(state.verification_reviews, 0);
     }
 
     #[test]
@@ -5013,6 +5531,7 @@ mod tests {
             evidence_dir: None,
             task_memory: None,
             provider_max_output: None,
+            browser_capability: None,
             cancelled: Arc::new(AtomicBool::new(false)),
             steering: Arc::new(Mutex::new(Vec::new())),
             steering_closed: Arc::new(AtomicBool::new(false)),
@@ -6084,7 +6603,7 @@ mod tests {
         state
             .task_memory
             .deliverables
-            .complete("d-001", "")
+            .implement("d-001", "")
             .unwrap();
         state
     }
@@ -6093,7 +6612,7 @@ mod tests {
     fn unfinished_deliverables_are_in_every_tail_and_survive_what_compaction_discards() {
         let state = state_with_pending();
         let tail = dynamic_tail(&state, None, "", &Transcript::default(), "");
-        assert!(tail.contains("[done] d-001 bot opponent is selectable in the UI"));
+        assert!(tail.contains("[implemented] d-001 bot opponent is selectable in the UI"));
         assert!(tail.contains("[pending] d-002 theme switch changes the theme"));
         // The tail is rebuilt from durable state each turn, so a compaction summary can never be the only place
         // the requirements live.
@@ -6193,7 +6712,7 @@ mod tests {
         state
             .task_memory
             .deliverables
-            .complete("d-002", "")
+            .implement("d-002", "")
             .unwrap();
         assert!(
             !dynamic_tail(&state, None, "", &Transcript::default(), "").contains("<run_budget>")

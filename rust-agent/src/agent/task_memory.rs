@@ -1,5 +1,7 @@
 //! Small per-run working memory. This is a handoff list, not project knowledge.
 use super::deliverables::Deliverables;
+use super::plan::Plan;
+use super::verification::Verification;
 use serde::{Deserialize, Serialize};
 
 /// How well an entry is established. Optional: entries without a status keep
@@ -92,6 +94,12 @@ pub struct TaskMemory {
     /// both persist, restart and survive compaction together.
     #[serde(default, skip_serializing_if = "Deliverables::is_empty")]
     pub deliverables: Deliverables,
+    /// How the run intends to do the work. Not evidence of anything.
+    #[serde(default, skip_serializing_if = "Plan::is_empty")]
+    pub plan: Plan,
+    /// What the runtime observed about whether the work behaves as claimed.
+    #[serde(default, skip_serializing_if = "Verification::is_empty")]
+    pub verification: Verification,
 }
 impl TaskMemory {
     pub fn upsert(

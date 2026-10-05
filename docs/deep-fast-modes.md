@@ -277,3 +277,11 @@ becomes applied in place. Only applied entries are persisted in the thinking tim
   status/next/implication change.
 - **Prompt.** The handoff still shows the four most relevant entries; remaining entries are listed by id in one line
   («also stored, not shown») so the model can find and revise them.
+
+## Planning and verification (Fast vs Deep)
+
+Both modes get the `plan` tool, runtime-recorded evidence and the completion gate; only the budgets differ. Fast: one
+completion review for pending deliverables and one for unverified changes, at most 6 checks after the review. Deep: two
+of each, at most 12 checks, `verify` must name runtime evidence ids (`ev-…`), and a plainly detectable project test
+command (`npm test`, `cargo test`, pytest) must pass after the last change. Details in
+[agent-planning-verification.md](agent-planning-verification.md).

@@ -13,6 +13,10 @@ pub fn repeated_file_read_decision(
     transcript: &Transcript,
     project_root: Option<&Path>,
 ) -> Result<(), String> {
+    // Only a read can be a repeated read; a write to a path that was read earlier is not one.
+    if call.name != "read_file" {
+        return Ok(());
+    }
     let Some(id) = repeated_file_read_observation(call, transcript, project_root) else {
         return Ok(());
     };
@@ -206,6 +210,45 @@ mod tests {
             Some(&root)
         )
         .is_ok());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn writes_to_a_path_that_was_read_are_never_treated_as_repeated_reads() {
+        let base = std::env::temp_dir().join(format!(
+            "write-after-read-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let root = base.join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "content").unwrap();
+        let mut transcript =
+            Transcript::durable(&base.join("store"), "run", &[], root.to_str()).unwrap();
+        transcript.push_run_user(json!({"role":"user","content":"edit a.txt"}));
+        let read = ValidatedCall {
+            id: "r1".into(),
+            name: "read_file".into(),
+            arguments: json!({"path":"a.txt"}),
+        };
+        transcript.assistant_tool_turn(String::new(), std::slice::from_ref(&read));
+        transcript.tool_result(
+            "r1",
+            "read_file",
+            json!({"path":"a.txt","content":"content"}).to_string(),
+        );
+        assert!(repeated_file_read_decision(&read, &transcript, Some(&root)).is_err());
+        for tool in ["write_file", "create_file", "delete_file"] {
+            assert!(
+                repeated_file_read_decision(
+                    &call(tool, json!({"path":"a.txt","content":"new"})),
+                    &transcript,
+                    Some(&root)
+                )
+                .is_ok(),
+                "{tool} must not be redirected to an earlier read"
+            );
+        }
         std::fs::remove_dir_all(base).unwrap();
     }
 }

@@ -357,8 +357,9 @@ fn a_structured_pause_checkpoints_and_ends_without_resuming_guidance() {
         }
         3 => {
             let names = tool_names(request);
-            assert_eq!(names.len(), 2, "{names:?}");
+            assert_eq!(names.len(), 3, "{names:?}");
             assert!(names.contains(&"task_memory".to_owned()));
+            assert!(names.contains(&"plan".to_owned()));
             assert!(names.contains(&"deliverables".to_owned()));
             let text = request.to_string();
             assert!(text.contains("<run_paused>"));
@@ -699,6 +700,7 @@ impl Workspace {
             evidence_dir: Some(self.base.join("evidence").to_string_lossy().into_owned()),
             task_memory: None,
             provider_max_output: None,
+            browser_capability: Some(false),
             cancelled: Arc::new(AtomicBool::new(false)),
             steering: Arc::new(Mutex::new(Vec::new())),
             steering_closed: Arc::new(AtomicBool::new(false)),
@@ -1761,4 +1763,842 @@ fn files_created_in_the_run_are_listed_and_named_in_the_review() {
         !requests[4].to_string().contains("<files_created_this_run>"),
         "a deleted file must leave the list"
     );
+}
+
+/// A file the model just read must be writable: the write is not a repeated read.
+#[test]
+fn write_file_after_reading_the_same_path_really_writes() {
+    let workspace = Workspace::new(&[("a.txt", "old")]);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Tools(vec![("read_file", json!({"path":"a.txt"}))]),
+        1 => Reply::Tools(vec![(
+            "write_file",
+            json!({"path":"a.txt","content":"new"}),
+        )]),
+        2 => Reply::Tools(vec![(
+            "write_file",
+            json!({"path":"a.txt","content":"newer"}),
+        )]),
+        _ => Reply::Text("done".into()),
+    });
+    run(workspace.config(&provider.endpoint, "rewrite a.txt"));
+    assert_eq!(
+        std::fs::read_to_string(workspace.root.join("a.txt")).unwrap(),
+        "newer"
+    );
+    let requests = provider.requests();
+    assert!(
+        !tool_result_text(&requests[2]).contains("already stored"),
+        "{}",
+        tool_result_text(&requests[2])
+    );
+}
+
+/// A write over a file that changed after the model's last read is refused with
+/// one concise instruction; reading again makes it writable.
+#[test]
+fn write_file_over_a_file_changed_since_the_read_is_refused_until_read_again() {
+    let workspace = Workspace::new(&[("a.txt", "old")]);
+    let file = workspace.root.join("a.txt");
+    let provider = Provider::start(move |_, n| match n {
+        0 => Reply::Tools(vec![("read_file", json!({"path":"a.txt"}))]),
+        1 => {
+            // Another process (the user, a build) edits the file between the read and the write.
+            std::fs::write(&file, "changed-elsewhere").unwrap();
+            Reply::Tools(vec![("list_directory", json!({"path":"."}))])
+        }
+        2 => Reply::Tools(vec![(
+            "write_file",
+            json!({"path":"a.txt","content":"mine"}),
+        )]),
+        3 => Reply::Tools(vec![("read_file", json!({"path":"a.txt"}))]),
+        4 => Reply::Tools(vec![(
+            "write_file",
+            json!({"path":"a.txt","content":"mine"}),
+        )]),
+        _ => Reply::Text("done".into()),
+    });
+    run(workspace.config(&provider.endpoint, "rewrite a.txt"));
+    let requests = provider.requests();
+    let refusal = tool_result_text(&requests[3]);
+    assert!(
+        refusal
+            .contains("File changed since your last read. Read the latest version before writing."),
+        "{refusal}"
+    );
+    assert!(
+        refusal.contains(
+            r#"{"error":"File changed since your last read. Read the latest version before writing."}"#
+        ),
+        "the error must be exactly the concise instruction: {refusal}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.root.join("a.txt")).unwrap(),
+        "mine"
+    );
+}
+
+/// A write to a file the model never read is not blocked just for ceremony.
+#[test]
+fn write_file_to_an_unread_file_is_allowed() {
+    let workspace = Workspace::new(&[("a.txt", "old")]);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Tools(vec![(
+            "write_file",
+            json!({"path":"a.txt","content":"new"}),
+        )]),
+        _ => Reply::Text("done".into()),
+    });
+    run(workspace.config(&provider.endpoint, "rewrite a.txt"));
+    assert_eq!(
+        std::fs::read_to_string(workspace.root.join("a.txt")).unwrap(),
+        "new"
+    );
+}
+
+fn plan(arguments: Value) -> (&'static str, Value) {
+    ("plan", arguments)
+}
+
+/// The plan is its own state: it is shown back every turn, never mistaken for the deliverables, and its result is compact.
+#[test]
+fn the_plan_is_set_shown_back_and_kept_apart_from_deliverables() {
+    let workspace = Workspace::new(&[("a.txt", "a")]);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Tools(vec![plan(
+            json!({"action":"set","steps":["inspect a.txt","change it","check it"]}),
+        )]),
+        1 => Reply::Tools(vec![plan(
+            json!({"action":"update","id":"s1","status":"completed"}),
+        )]),
+        _ => Reply::Text("done".into()),
+    });
+    run(workspace.config(&provider.endpoint, "change a.txt"));
+    let requests = provider.requests();
+    assert!(tool_names(&requests[0]).contains(&"plan".to_owned()));
+    assert!(!requests[0].to_string().contains("<plan>"));
+    let second = last_user_text(&requests[1]);
+    assert!(second.contains("<plan>"), "{second}");
+    assert!(second.contains("[>] s1 inspect a.txt"), "{second}");
+    let third = last_user_text(&requests[2]);
+    assert!(third.contains("[x] s1 inspect a.txt"), "{third}");
+    assert!(third.contains("[>] s2 change it"), "{third}");
+    assert!(
+        !third.contains("<deliverables>"),
+        "a plan is not a deliverable list: {third}"
+    );
+    assert!(completed(&workspace.journal()));
+}
+
+/// A malformed plan call is a recoverable tool error, not a failed run.
+#[test]
+fn a_bad_plan_call_is_a_tool_error_and_the_run_continues() {
+    let workspace = Workspace::new(&[("a.txt", "a")]);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Tools(vec![plan(json!({"action":"set"}))]),
+        1 => Reply::Tools(vec![plan(
+            json!({"action":"update","id":"s9","status":"completed"}),
+        )]),
+        _ => Reply::Text("done".into()),
+    });
+    run(workspace.config(&provider.endpoint, "change a.txt"));
+    assert!(completed(&workspace.journal()));
+    let result = tool_result_text(&provider.requests()[2]);
+    assert!(result.contains("s9"), "{result}");
+}
+
+/// Saved plans come back on Continue, in a pause tail too; a fresh run starts empty.
+#[test]
+fn a_saved_plan_returns_on_continue_and_a_fresh_run_starts_empty() {
+    let workspace = Workspace::new(&[("a.txt", "a")]);
+    let provider = Provider::start(|_, _| Reply::Text("ok".into()));
+    let mut resumed = workspace.config(&provider.endpoint, "continue");
+    resumed.task_memory = Some(json!({"entries":[],"revision":0,"plan":{"steps":[
+        {"id":"s1","text":"wire the bot","status":"completed"},
+        {"id":"s2","text":"add the theme switch","status":"in_progress"}
+    ],"revision":2}}));
+    run(resumed);
+    let first = provider.requests()[0].to_string();
+    assert!(first.contains("add the theme switch"), "{first}");
+
+    let fresh_workspace = Workspace::new(&[("a.txt", "a")]);
+    let fresh_provider = Provider::start(|_, _| Reply::Text("ok".into()));
+    run(fresh_workspace.config(&fresh_provider.endpoint, "start over"));
+    assert!(!fresh_provider.requests()[0].to_string().contains("<plan>"));
+}
+
+const APP: &[(&str, &str)] = &[
+    ("app.js", "module.exports = (a, b) => a + b;\n"),
+    (
+        "check.js",
+        "const add = require('./app.js');\nif (add(1, 2) !== 3) { console.error('add is wrong'); process.exit(1); }\nconsole.log('ok');\n",
+    ),
+];
+
+fn edit_app(content: &str) -> (&'static str, Value) {
+    ("write_file", json!({"path":"app.js","content":content}))
+}
+
+fn run_check() -> (&'static str, Value) {
+    ("run_terminal", json!({"command":"node check.js"}))
+}
+
+fn verify(id: &str, proof: Option<&str>) -> (&'static str, Value) {
+    let mut fields = json!({"id": id});
+    if let Some(proof) = proof {
+        fields["evidence"] = json!(proof);
+    }
+    deliverable("verify", fields)
+}
+
+const GOOD: &str = "module.exports = (a, b) => a + b;\n// edited\n";
+const BAD: &str = "module.exports = (a, b) => a - b;\n";
+
+/// Editing code and ending without any check is the core failure: the claim is
+/// sent back once, naming what is unverified; the second answer is accepted so
+/// the gate can never deadlock a run.
+#[test]
+fn an_edit_with_no_check_is_sent_back_once_and_then_accepted() {
+    let workspace = Workspace::new(APP);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Tools(vec![
+            deliverable("add", json!({"text":"add keeps adding"})),
+            edit_app(GOOD),
+            deliverable(
+                "implemented",
+                json!({"id":"d-001","evidence":"edited app.js"}),
+            ),
+        ]),
+        1 => Reply::Text("It works.".into()),
+        _ => Reply::Text("Implemented, but I did not run it.".into()),
+    });
+    run(workspace.config(&provider.endpoint, "make add work"));
+    let journal = workspace.journal();
+    assert!(completed(&journal));
+    assert_eq!(withheld_drafts(&journal), 1);
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3);
+    let reminder = last_user_text(&requests[2]);
+    assert!(
+        reminder.contains("not seen your work verified"),
+        "{reminder}"
+    );
+    assert!(reminder.contains("d-001"), "{reminder}");
+    let text = requests[1].to_string();
+    assert!(text.contains("[implemented] d-001"), "{text}");
+    assert!(text.contains("<verification_state>"), "{text}");
+}
+
+/// A passing check after the last edit, cited by the model, verifies the item
+/// and ends the run with no review.
+#[test]
+fn a_passing_check_after_the_edit_verifies_and_ends_without_a_review() {
+    let workspace = Workspace::new(APP);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Tools(vec![
+            deliverable("add", json!({"text":"add keeps adding"})),
+            edit_app(GOOD),
+            deliverable(
+                "implemented",
+                json!({"id":"d-001","evidence":"edited app.js"}),
+            ),
+        ]),
+        1 => Reply::Tools(vec![run_check()]),
+        2 => Reply::Tools(vec![verify("d-001", None)]),
+        _ => Reply::Text("Verified by node check.js.".into()),
+    });
+    run(workspace.config(&provider.endpoint, "make add work"));
+    let journal = workspace.journal();
+    assert!(completed(&journal));
+    assert_eq!(withheld_drafts(&journal), 0);
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 4);
+    assert!(requests[2].to_string().contains("[run pass]"));
+    let last = requests[3].to_string();
+    assert!(last.contains("[verified] d-001"), "{last}");
+    assert!(last.contains("proof: ev-"), "{last}");
+}
+
+/// Verify is refused without evidence: the model's own claim changes nothing.
+#[test]
+fn verify_is_refused_without_a_passing_check_and_a_claim_changes_nothing() {
+    let workspace = Workspace::new(APP);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Tools(vec![
+            deliverable("add", json!({"text":"add keeps adding"})),
+            edit_app(GOOD),
+            deliverable(
+                "implemented",
+                json!({"id":"d-001","evidence":"edited app.js"}),
+            ),
+        ]),
+        1 => Reply::Tools(vec![verify(
+            "d-001",
+            Some("I read it and it clearly works"),
+        )]),
+        _ => Reply::Text("Not verified.".into()),
+    });
+    run(workspace.config(&provider.endpoint, "make add work"));
+    let requests = provider.requests();
+    let refusal = last_tool_result(&requests[2]);
+    assert!(refusal.contains("No fresh passing"), "{refusal}");
+    let tail = requests[2].to_string();
+    assert!(tail.contains("[implemented] d-001"), "{tail}");
+    assert!(!tail.contains("[verified]"), "{tail}");
+}
+
+/// A failing check is recorded by the runtime, shown back, annotated on the
+/// deliverable and cannot verify anything; fixing the code and re-running does.
+#[test]
+fn a_failing_check_blocks_verification_until_fixed_and_rechecked() {
+    let workspace = Workspace::new(APP);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Tools(vec![
+            deliverable("add", json!({"text":"add keeps adding"})),
+            edit_app(BAD),
+            deliverable(
+                "implemented",
+                json!({"id":"d-001","evidence":"edited app.js"}),
+            ),
+        ]),
+        1 => Reply::Tools(vec![run_check()]),
+        2 => Reply::Tools(vec![verify("d-001", None)]),
+        3 => Reply::Tools(vec![edit_app(GOOD)]),
+        4 => Reply::Tools(vec![run_check()]),
+        5 => Reply::Tools(vec![verify("d-001", None)]),
+        _ => Reply::Text("Fixed and verified.".into()),
+    });
+    run(workspace.config(&provider.endpoint, "make add work"));
+    let requests = provider.requests();
+    let after_failure = requests[2].to_string();
+    assert!(after_failure.contains("FAIL"), "{after_failure}");
+    assert!(after_failure.contains("a check failed"), "{after_failure}");
+    let refused = last_tool_result(&requests[3]);
+    assert!(refused.contains("failed"), "{refused}");
+    assert!(
+        requests[4].to_string().contains("[implemented] d-001"),
+        "a fix makes the old failure stale but nothing is verified yet"
+    );
+    assert!(requests[6].to_string().contains("[verified] d-001"));
+    let journal = workspace.journal();
+    assert!(completed(&journal));
+    assert_eq!(withheld_drafts(&journal), 0);
+}
+
+/// Any later edit invalidates what was verified, and the status says so.
+#[test]
+fn a_later_edit_demotes_a_verified_deliverable() {
+    let workspace = Workspace::new(APP);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Tools(vec![
+            deliverable("add", json!({"text":"add keeps adding"})),
+            edit_app(GOOD),
+            deliverable(
+                "implemented",
+                json!({"id":"d-001","evidence":"edited app.js"}),
+            ),
+        ]),
+        1 => Reply::Tools(vec![run_check()]),
+        2 => Reply::Tools(vec![verify("d-001", None)]),
+        3 => Reply::Tools(vec![edit_app("module.exports = (a, b) => b + a;\n")]),
+        _ => Reply::Text("done".into()),
+    });
+    run(workspace.config(&provider.endpoint, "make add work"));
+    let requests = provider.requests();
+    assert!(requests[3].to_string().contains("[verified] d-001"));
+    let after_edit = requests[4].to_string();
+    assert!(after_edit.contains("[implemented] d-001"), "{after_edit}");
+    assert!(!after_edit.contains("[verified] d-001"), "{after_edit}");
+}
+
+/// A change that is not code (a document) needs no behavioural check: the
+/// runtime reads back every write itself, so there is no gate and no review.
+#[test]
+fn a_documentation_only_change_is_never_gated() {
+    let workspace = Workspace::new(&[("notes.md", "old")]);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Tools(vec![
+            deliverable("add", json!({"text":"notes are updated"})),
+            ("write_file", json!({"path":"notes.md","content":"new"})),
+            deliverable(
+                "implemented",
+                json!({"id":"d-001","evidence":"wrote notes.md"}),
+            ),
+            deliverable("verify", json!({"id":"d-001"})),
+        ]),
+        _ => Reply::Text("Updated the notes.".into()),
+    });
+    run(workspace.config(&provider.endpoint, "update the notes"));
+    let journal = workspace.journal();
+    assert!(completed(&journal));
+    assert_eq!(withheld_drafts(&journal), 0);
+    assert_eq!(provider.requests().len(), 2);
+}
+
+/// Deep may send an unverified change back twice and then accepts; both modes end.
+#[test]
+fn deep_sends_unverified_changes_back_twice_and_still_ends() {
+    let workspace = Workspace::new(APP);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Tools(vec![
+            deliverable("add", json!({"text":"add keeps adding"})),
+            edit_app(GOOD),
+            (
+                "deliverables",
+                json!({"action":"implemented","id":"d-001","evidence":"wrote app.js"}),
+            ),
+        ]),
+        _ => Reply::Text("It works.".into()),
+    });
+    let mut config = workspace.config(&provider.endpoint, "make add work");
+    config.reasoning_mode = "deep".into();
+    run(config);
+    let journal = workspace.journal();
+    assert!(completed(&journal));
+    assert_eq!(withheld_drafts(&journal), 2);
+}
+
+/// A bad claim never loops forever: with checks running and failing every time,
+/// the budget closes the gate and the run ends with the state still honest.
+#[test]
+fn an_endless_fail_and_retry_cycle_is_bounded_by_the_budget() {
+    let workspace = Workspace::new(APP);
+    let provider = Provider::start(|_, n| {
+        if n == 0 {
+            Reply::Tools(vec![
+                deliverable("add", json!({"text":"add keeps adding"})),
+                edit_app(BAD),
+                deliverable(
+                    "implemented",
+                    json!({"id":"d-001","evidence":"wrote app.js"}),
+                ),
+            ])
+        } else if n % 2 == 1 {
+            Reply::Text("It works now.".into())
+        } else {
+            Reply::Tools(vec![run_check()])
+        }
+    });
+    run(workspace.config(&provider.endpoint, "make add work"));
+    let requests = provider.requests();
+    assert!(completed(&workspace.journal()));
+    assert!(
+        requests.len() < 20,
+        "the cycle was not bounded: {} requests",
+        requests.len()
+    );
+    let tail = requests.last().unwrap().to_string();
+    assert!(tail.contains("[implemented] d-001"), "{tail}");
+    assert!(!tail.contains("[verified]"), "{tail}");
+}
+
+/// The ledger and statuses are runtime state: a resumed run sees the recorded
+/// deliverable and proof, with old checks marked stale; a fresh run starts empty.
+#[test]
+fn verification_state_returns_on_continue_with_old_checks_stale_and_a_fresh_run_is_empty() {
+    let workspace = Workspace::new(APP);
+    let resumed_provider = Provider::start(|_, _| Reply::Text("ok".into()));
+    let mut resumed = workspace.config(&resumed_provider.endpoint, "continue");
+    resumed.task_memory = Some(json!({
+        "entries": [], "revision": 0,
+        "deliverables": {"items": [{"id":"d-001","text":"add keeps adding","status":"verified","proof":["ev-002"]}], "revision": 3},
+        "verification": {"epoch": 1, "next": 3, "code_changed": true,
+            "changed": {"app.js": 1},
+            "records": [
+                {"id":"ev-001","kind":"readback","class":"readback","subject":"app.js","pass":true,"epoch":1,"turn":0,"detail":""},
+                {"id":"ev-002","kind":"run","class":"functional","subject":"node check.js","pass":true,"epoch":1,"turn":1,"detail":"exit 0"}
+            ]}
+    }));
+    run(resumed);
+    let first = resumed_provider.requests()[0].to_string();
+    assert!(
+        first.contains("[verified] d-001"),
+        "the recorded status returns: {first}"
+    );
+    assert!(
+        first.contains("stale"),
+        "old checks must be stale after a restart: {first}"
+    );
+
+    let fresh_workspace = Workspace::new(APP);
+    let fresh_provider = Provider::start(|_, _| Reply::Text("ok".into()));
+    run(fresh_workspace.config(&fresh_provider.endpoint, "start over"));
+    assert!(!fresh_provider.requests()[0]
+        .to_string()
+        .contains("Files changed in this task"));
+}
+
+/// Regression fixture modelled on a real failure: a model edited a game page,
+/// recorded every deliverable as finished, only re-read the file, and reported
+/// that everything works although nothing had ever been run. Whatever the model
+/// claims, the runtime must keep the items "implemented", send the claim back
+/// once, and accept an honest second answer. No project or model name is used.
+#[test]
+fn regression_a_page_edited_and_only_reread_is_never_reported_as_verified() {
+    let workspace = Workspace::new(&[
+        ("index.html", "<script src=\"game.js\"></script>"),
+        ("game.js", "function move() { return 0; }\n"),
+    ]);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Tools(vec![
+            deliverable("add", json!({"text":"a bot opponent can be selected"})),
+            deliverable("add", json!({"text":"the board highlights legal moves"})),
+        ]),
+        1 => Reply::Tools(vec![(
+            "write_file",
+            json!({"path":"game.js","content":"function move() { return bot(); }\nfunction bot() { return 1; }\n"}),
+        )]),
+        2 => Reply::Tools(vec![("read_file", json!({"path":"game.js"}))]),
+        3 => Reply::Tools(vec![
+            deliverable(
+                "implemented",
+                json!({"id":"d-001","evidence":"edited game.js"}),
+            ),
+            deliverable(
+                "implemented",
+                json!({"id":"d-002","evidence":"edited game.js"}),
+            ),
+            deliverable(
+                "verify",
+                json!({"id":"d-001","evidence":"re-read the file, looks right"}),
+            ),
+        ]),
+        4 => Reply::Text("Both features are complete and working.".into()),
+        _ => Reply::Text(
+            "Both are implemented but I could not run them, so neither is verified.".into(),
+        ),
+    });
+    run(workspace.config(&provider.endpoint, "add a bot and legal-move highlighting"));
+    let journal = workspace.journal();
+    assert!(completed(&journal));
+    assert_eq!(withheld_drafts(&journal), 1);
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 6);
+    assert!(last_tool_result(&requests[4]).contains("No fresh passing"));
+    let state = requests[4].to_string();
+    assert!(!state.contains("[verified]"), "{state}");
+    assert!(state.contains("[implemented] d-001") && state.contains("[implemented] d-002"));
+    let review = last_user_text(&requests[5]);
+    assert!(
+        review.contains("d-001") && review.contains("d-002"),
+        "{review}"
+    );
+    assert!(
+        review.contains("implemented but not verified")
+            || review.contains("not seen your work verified")
+    );
+}
+
+/// Deep names the project's own test command and wants it to pass after the last
+/// change; citing the runtime-issued evidence id is how an item is verified.
+#[test]
+fn deep_wants_the_project_test_suite_and_verifies_with_a_cited_evidence_id() {
+    let mut files = APP.to_vec();
+    files.push(("package.json", r#"{"scripts":{"test":"node check.js"}}"#));
+    let workspace = Workspace::new(&files);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Tools(vec![
+            deliverable("add", json!({"text":"add keeps adding"})),
+            edit_app(GOOD),
+            deliverable(
+                "implemented",
+                json!({"id":"d-001","evidence":"obs-00000001 wrote app.js"}),
+            ),
+        ]),
+        1 => Reply::Text("Done.".into()),
+        2 => Reply::Tools(vec![("run_terminal", json!({"command":"npm test"}))]),
+        3 => Reply::Tools(vec![verify("d-001", Some("ev-002"))]),
+        _ => Reply::Text("Verified with npm test.".into()),
+    });
+    let mut config = workspace.config(&provider.endpoint, "make add work");
+    config.reasoning_mode = "deep".into();
+    run(config);
+    let requests = provider.requests();
+    let review = last_user_text(&requests[2]);
+    assert!(review.contains("npm test"), "{review}");
+    let journal = workspace.journal();
+    assert!(completed(&journal));
+    assert_eq!(withheld_drafts(&journal), 1);
+    assert!(requests
+        .last()
+        .unwrap()
+        .to_string()
+        .contains("[verified] d-001"));
+}
+
+/// Real chat templates reject a request that ends on assistant turns. Repeating
+/// the same answer against the same failing check must neither produce one nor
+/// loop: the failure is reviewed once and the answer is then accepted.
+#[test]
+fn repeating_the_same_answer_against_one_failure_ends_and_always_ends_on_a_user_turn() {
+    let workspace = Workspace::new(APP);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Tools(vec![
+            deliverable("add", json!({"text":"add keeps adding"})),
+            edit_app(BAD),
+            deliverable(
+                "implemented",
+                json!({"id":"d-001","evidence":"wrote app.js"}),
+            ),
+        ]),
+        1 => Reply::Tools(vec![run_check()]),
+        _ => Reply::Text("The check fails and I cannot fix it here.".into()),
+    });
+    run(workspace.config(&provider.endpoint, "make add work"));
+    let journal = workspace.journal();
+    assert!(completed(&journal));
+    assert!(withheld_drafts(&journal) <= 2);
+    let requests = provider.requests();
+    assert!(requests.len() <= 6, "{} requests", requests.len());
+    for request in &requests {
+        let last = request["messages"].as_array().unwrap().last().unwrap();
+        assert_ne!(last["role"], "assistant", "{last}");
+    }
+}
+
+fn term(command: &str) -> (&'static str, Value) {
+    ("run_terminal", json!({"command": command}))
+}
+
+/// edit -> check -> verify, then `after` runs, then the model answers. Returns
+/// every request so a test can read the state the model was shown after `after`.
+fn verified_then(workspace: &Workspace, after: (&'static str, Value)) -> Vec<Value> {
+    let after = std::sync::Mutex::new(Some(after));
+    let provider = Provider::start(move |_, n| match n {
+        0 => Reply::Tools(vec![
+            deliverable("add", json!({"text":"add keeps adding"})),
+            edit_app(GOOD),
+            deliverable(
+                "implemented",
+                json!({"id":"d-001","evidence":"edited app.js"}),
+            ),
+        ]),
+        1 => Reply::Tools(vec![run_check()]),
+        2 => Reply::Tools(vec![verify("d-001", None)]),
+        3 => Reply::Tools(vec![after.lock().unwrap().take().unwrap()]),
+        _ => Reply::Text("done".into()),
+    });
+    run(workspace.config(&provider.endpoint, "make add work"));
+    provider.requests()
+}
+
+#[test]
+fn verify_then_write_file_makes_the_verification_stale() {
+    let workspace = Workspace::new(APP);
+    let requests = verified_then(&workspace, edit_app("module.exports = (a, b) => b + a;\n"));
+    assert!(requests[3].to_string().contains("[verified] d-001"));
+    let after = requests[4].to_string();
+    assert!(after.contains("[implemented] d-001"), "{after}");
+    assert!(!after.contains("[verified] d-001"), "{after}");
+    assert!(after.contains("stale"), "{after}");
+}
+
+#[test]
+fn verify_then_a_mutating_terminal_command_makes_the_verification_stale() {
+    for command in [
+        "sed -i 's/a + b/b + a/' app.js",
+        "mv app.js moved.js",
+        "rm app.js",
+        "mkdir -p out",
+    ] {
+        let workspace = Workspace::new(APP);
+        let requests = verified_then(&workspace, term(command));
+        assert!(requests[3].to_string().contains("[verified] d-001"));
+        let after = requests[4].to_string();
+        assert!(
+            after.contains("[implemented] d-001") && !after.contains("[verified] d-001"),
+            "{command}: {after}"
+        );
+        assert!(after.contains("stale"), "{command}: {after}");
+        let journal = workspace.journal();
+        assert!(completed(&journal), "{command}");
+        assert!(
+            withheld_drafts(&journal) <= 1,
+            "{command}: re-verification is one bounded review"
+        );
+    }
+}
+
+#[test]
+fn verify_then_a_read_only_terminal_command_keeps_the_verification() {
+    for command in [
+        "cat app.js",
+        "ls -la",
+        "grep -n add app.js | head -5",
+        "git status",
+    ] {
+        let workspace = Workspace::new(APP);
+        let requests = verified_then(&workspace, term(command));
+        let after = requests[4].to_string();
+        assert!(after.contains("[verified] d-001"), "{command}: {after}");
+        assert!(!after.contains("[implemented] d-001"), "{command}: {after}");
+        let journal = workspace.journal();
+        assert!(completed(&journal));
+        assert_eq!(withheld_drafts(&journal), 0, "{command}: no review needed");
+    }
+}
+
+/// A command that edits a tracked file but looks like a check cannot vouch for
+/// the code: its exit code is not recorded and earlier checks go stale.
+#[test]
+fn a_check_that_rewrites_a_tracked_file_is_not_trusted() {
+    let workspace = Workspace::new(&[
+        ("app.js", "module.exports = (a, b) => a + b;\n"),
+        (
+            "check.js",
+            "const fs = require('fs');\nfs.appendFileSync('app.js', '// touched\\n');\nconsole.log('ok');\n",
+        ),
+    ]);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Tools(vec![edit_app(GOOD), run_check()]),
+        _ => Reply::Text("done".into()),
+    });
+    run(workspace.config(&provider.endpoint, "make add work"));
+    let tail = provider.requests().last().unwrap().to_string();
+    assert!(!tail.contains("[run pass]"), "{tail}");
+}
+
+const PAGE: &[(&str, &str)] = &[
+    (
+        "index.html",
+        "<button id=\"go\">Go</button><script src=\"app.js\"></script>\n",
+    ),
+    ("app.js", "module.exports = (a, b) => a + b;\n"),
+    (
+        "dom-check.js",
+        "// stands in for the page with a fake DOM; no browser involved\nconsole.log('ok');\n",
+    ),
+];
+
+fn page_run(
+    browser: Option<bool>,
+    fake_browser: bool,
+    script: fn(usize) -> Reply,
+) -> (Vec<Value>, Vec<Value>) {
+    let workspace = Workspace::new(PAGE);
+    if fake_browser {
+        let path = workspace.root.join("chromium");
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let provider = Provider::start(move |_, n| script(n));
+    let mut config = workspace.config(&provider.endpoint, "make the button work");
+    config.browser_capability = browser;
+    run(config);
+    (workspace.journal(), provider.requests())
+}
+
+fn page_edit() -> Reply {
+    Reply::Tools(vec![
+        deliverable("add", json!({"text":"the button works when clicked"})),
+        (
+            "write_file",
+            json!({"path":"index.html","content":"<button id=\"go\">Go</button><script src=\"app.js\" defer></script>\n"}),
+        ),
+        deliverable(
+            "implemented",
+            json!({"id":"d-001","evidence":"edited index.html"}),
+        ),
+    ])
+}
+
+/// Case D: the only check the model can run is a jsdom stand-in. It exits 0 but
+/// is not a browser, so the claim stays implemented, the model is told no
+/// browser exists, and the run ends without looping.
+#[test]
+fn a_page_claim_is_never_verified_by_a_stand_in_and_ends_honestly_without_a_browser() {
+    let (journal, requests) = page_run(Some(false), false, |n| match n {
+        0 => page_edit(),
+        1 => Reply::Tools(vec![term("node dom-check.js")]),
+        2 => Reply::Tools(vec![verify("d-001", None)]),
+        _ => Reply::Text("Implemented; not checked in a browser.".into()),
+    });
+    assert!(completed(&journal));
+    assert_eq!(
+        withheld_drafts(&journal),
+        0,
+        "no loop for an unreachable check"
+    );
+    let refusal = last_tool_result(&requests[3]);
+    assert!(refusal.contains("real browser"), "{refusal}");
+    assert!(refusal.contains("implemented"), "{refusal}");
+    let tail = requests.last().unwrap().to_string();
+    assert!(tail.contains("[implemented] d-001"), "{tail}");
+    assert!(!tail.contains("[verified] d-001"), "{tail}");
+    assert!(tail.contains("Cannot be verified here"), "{tail}");
+    assert!(requests.len() <= 4, "{} requests", requests.len());
+}
+
+/// With a browser available the same stand-in is refused and the gate asks for
+/// a browser run instead.
+#[test]
+fn with_a_browser_available_a_stand_in_is_refused_and_the_gate_asks_for_a_browser_run() {
+    let (journal, requests) = page_run(Some(true), false, |n| match n {
+        0 => page_edit(),
+        1 => Reply::Tools(vec![term("node dom-check.js")]),
+        2 => Reply::Tools(vec![verify("d-001", None)]),
+        3 => Reply::Text("It works.".into()),
+        _ => Reply::Text("Implemented, not checked in a browser.".into()),
+    });
+    assert!(completed(&journal));
+    let refusal = last_tool_result(&requests[3]);
+    assert!(refusal.contains("not a browser"), "{refusal}");
+    assert_eq!(withheld_drafts(&journal), 1);
+    let reminder = last_user_text(requests.last().unwrap());
+    assert!(reminder.contains("real browser"), "{reminder}");
+    assert!(reminder.contains("d-001"), "{reminder}");
+}
+
+#[test]
+fn a_real_headless_browser_run_verifies_a_page_claim() {
+    let (journal, requests) = page_run(Some(true), true, |n| match n {
+        0 => page_edit(),
+        1 => Reply::Tools(vec![term("./chromium --headless --dump-dom index.html")]),
+        2 => Reply::Tools(vec![verify("d-001", None)]),
+        _ => Reply::Text("Verified in a headless browser.".into()),
+    });
+    assert!(completed(&journal));
+    assert_eq!(withheld_drafts(&journal), 0);
+    let tail = requests.last().unwrap().to_string();
+    assert!(tail.contains("[verified] d-001"), "{tail}");
+    assert!(tail.contains("[browser pass]"), "{tail}");
+}
+
+/// A deliverable can name what it needs; a passing test run does not satisfy a
+/// build requirement, and "file was created" needs only a read-back.
+#[test]
+fn a_deliverable_can_require_a_specific_capability() {
+    let workspace = Workspace::new(APP);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Tools(vec![
+            deliverable("add", json!({"text":"it builds","check":"build"})),
+            edit_app(GOOD),
+            deliverable("implemented", json!({"id":"d-001","evidence":"edited"})),
+        ]),
+        1 => Reply::Tools(vec![run_check()]),
+        2 => Reply::Tools(vec![verify("d-001", None)]),
+        _ => Reply::Text("done".into()),
+    });
+    run(workspace.config(&provider.endpoint, "make it build"));
+    let refusal = last_tool_result(&provider.requests()[3]);
+    assert!(refusal.contains("build"), "{refusal}");
+
+    let workspace = Workspace::new(&[("notes.md", "old")]);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Tools(vec![
+            deliverable("add", json!({"text":"file created","check":"readback"})),
+            ("write_file", json!({"path":"notes.md","content":"new"})),
+            deliverable("implemented", json!({"id":"d-001","evidence":"wrote"})),
+            verify("d-001", None),
+        ]),
+        _ => Reply::Text("done".into()),
+    });
+    run(workspace.config(&provider.endpoint, "write notes"));
+    assert!(provider
+        .requests()
+        .last()
+        .unwrap()
+        .to_string()
+        .contains("[verified] d-001"));
 }

@@ -144,6 +144,16 @@ fn is_knowledge_cache(root: &Path, target: &Path) -> bool {
         .and_then(|relative| relative.components().next())
         .is_some_and(|component| component.as_os_str() == ".ai-framework")
 }
+/// SHA-256 of a file's current bytes, with its resolved path, or `None` when it
+/// is not a readable file inside the scope. Used to notice that a file changed
+/// between a read and a later write.
+pub fn file_revision(scope: &Scope, path: &str) -> Option<(PathBuf, String)> {
+    use sha2::{Digest, Sha256};
+    let target = scoped(scope, path).ok()?;
+    let bytes = fs::read(&target).ok()?;
+    Some((target, format!("{:x}", Sha256::digest(bytes))))
+}
+
 pub fn execute(root: &Path, name: &str, args: &Value) -> Result<(Value, Option<String>), String> {
     execute_in(&Scope { root, grants: &[] }, name, args)
 }
@@ -289,12 +299,177 @@ pub fn execute_in(
     }
 }
 
-/// Apply a `*** Begin Patch` style patch (Add/Update/Delete sections). The
-/// body of an Update section is either a classic unified diff (context `/ -/ +`
-/// lines) or a literal old/new block when context is absent; both forms
-/// round-trip against the same file content. A section failure leaves the file
-/// untouched because the rewrite happens in memory until the last byte is
-/// validated.
+const PATCH_FORMAT: &str = "Format: *** Begin Patch, then per file `*** Update File: path` (hunks of ` context`, `-old`, `+new` lines, hunks separated by `@@`), `*** Add File: path` (every line prefixed `+`) or `*** Delete File: path`, then *** End Patch.";
+
+/// One file change inside a patch, computed fully in memory before anything
+/// is written.
+enum PatchOp {
+    Add {
+        rel: String,
+        lines: Vec<String>,
+    },
+    Delete {
+        rel: String,
+    },
+    Update {
+        rel: String,
+        hunks: Vec<Vec<String>>,
+    },
+}
+
+/// Parse a patch tolerantly: surrounding blank lines and a markdown fence are
+/// ignored, CRLF is normalized, and a missing `*** End Patch` is accepted.
+fn parse_patch(patch: &str) -> Result<Vec<PatchOp>, String> {
+    let normalized = patch.replace("\r\n", "\n");
+    let mut lines = normalized.split('\n').collect::<Vec<_>>();
+    while lines.first().is_some_and(|line| line.trim().is_empty()) {
+        lines.remove(0);
+    }
+    if lines
+        .first()
+        .is_some_and(|line| line.trim().starts_with("```"))
+    {
+        lines.remove(0);
+    }
+    while lines.last().is_some_and(|line| {
+        let line = line.trim();
+        line.is_empty() || line.starts_with("```")
+    }) {
+        lines.pop();
+    }
+    let lines = lines.into_iter().map(str::to_owned).collect::<Vec<_>>();
+    if lines.first().map(|line| line.trim()) != Some("*** Begin Patch") {
+        return Err(format!(
+            "patch must start with *** Begin Patch. {PATCH_FORMAT}"
+        ));
+    }
+    let mut cursor = 1;
+    let mut operations = Vec::new();
+    while cursor < lines.len() {
+        let header = lines[cursor].trim().to_owned();
+        cursor += 1;
+        if header == "*** End Patch" {
+            break;
+        }
+        if header.is_empty() {
+            continue;
+        }
+        if let Some(rel) = header.strip_prefix("*** Add File:") {
+            let body = collect_body(&lines, &mut cursor);
+            let mut content = body
+                .iter()
+                .map(|line| line.strip_prefix('+').unwrap_or(line).to_owned())
+                .collect::<Vec<_>>();
+            while content.last().is_some_and(String::is_empty) {
+                content.pop();
+            }
+            operations.push(PatchOp::Add {
+                rel: rel.trim().to_owned(),
+                lines: content,
+            });
+        } else if let Some(rel) = header.strip_prefix("*** Delete File:") {
+            operations.push(PatchOp::Delete {
+                rel: rel.trim().to_owned(),
+            });
+        } else if let Some(rel) = header.strip_prefix("*** Update File:") {
+            let body = collect_body(&lines, &mut cursor);
+            operations.push(PatchOp::Update {
+                rel: rel.trim().to_owned(),
+                hunks: hunk_blocks(&body),
+            });
+        } else {
+            return Err(format!("unknown patch section: {header}. {PATCH_FORMAT}"));
+        }
+    }
+    if operations.is_empty() {
+        return Err(format!("patch contains no file sections. {PATCH_FORMAT}"));
+    }
+    Ok(operations)
+}
+
+fn find_block(
+    haystack: &[String],
+    needle: &[&str],
+    same: impl Fn(&str, &str) -> bool,
+) -> Vec<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return Vec::new();
+    }
+    (0..=haystack.len() - needle.len())
+        .filter(|start| {
+            needle
+                .iter()
+                .enumerate()
+                .all(|(offset, line)| same(&haystack[start + offset], line))
+        })
+        .collect()
+}
+
+/// Apply the hunks of one Update section to `content`. Matching is by whole
+/// lines: exact first, then ignoring trailing whitespace. A hunk that matches
+/// several places is refused rather than applied to an arbitrary one.
+fn apply_hunks(rel: &str, content: &str, hunks: &[Vec<String>]) -> Result<String, String> {
+    let crlf = content.contains("\r\n");
+    let mut lines = content
+        .replace("\r\n", "\n")
+        .split('\n')
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    for (index, hunk) in hunks.iter().enumerate() {
+        let (old, new) = interpret_hunk(hunk);
+        if old.iter().all(|line| line.trim().is_empty()) {
+            return Err(format!(
+                "hunk {} for {rel} has no existing line to anchor on: include at least one unchanged ` context` line or a `-` line from the file",
+                index + 1
+            ));
+        }
+        let old_refs = old.iter().map(String::as_str).collect::<Vec<_>>();
+        let mut matches = find_block(&lines, &old_refs, |left, right| left == right);
+        if matches.is_empty() {
+            matches = find_block(&lines, &old_refs, |left, right| {
+                left.trim_end() == right.trim_end()
+            });
+        }
+        match matches.as_slice() {
+            [] => {
+                let first = old
+                    .iter()
+                    .find(|line| !line.trim().is_empty())
+                    .map_or("", String::as_str);
+                let hint = if lines.iter().any(|line| line.trim() == first.trim()) {
+                    "its first line exists, but the surrounding lines differ"
+                } else {
+                    "its first line is not in the file"
+                };
+                return Err(format!(
+                    "patch does not match current content: {rel} (hunk {}: {hint}). Read the file again and copy the lines exactly.",
+                    index + 1
+                ));
+            }
+            [position] => {
+                lines.splice(*position..*position + old.len(), new);
+            }
+            several => {
+                return Err(format!(
+                    "hunk {} for {rel} matches {} places: add unchanged ` context` lines around it so it matches exactly one",
+                    index + 1,
+                    several.len()
+                ));
+            }
+        }
+    }
+    let joined = lines.join("\n");
+    Ok(if crlf {
+        joined.replace('\n', "\r\n")
+    } else {
+        joined
+    })
+}
+
+/// Apply a `*** Begin Patch` style patch (Add/Update/Delete sections). Every
+/// section is computed in memory first, so a failure anywhere leaves the
+/// project untouched; the files are written only once the whole patch is
+/// known to apply, and restored if a write itself fails.
 fn apply_patch(
     scope: &Scope,
     object: &serde_json::Map<String, Value>,
@@ -303,93 +478,94 @@ fn apply_patch(
         .get("patch")
         .and_then(Value::as_str)
         .ok_or_else(|| "patch is required".to_owned())?;
-    let lines: Vec<String> = patch
-        .replace("\r\n", "\n")
-        .split('\n')
-        .map(str::to_owned)
-        .collect();
-    if lines
-        .first()
-        .map(|l| l.trim())
-        .is_some_and(|h| h != "*** Begin Patch")
-    {
-        return Err("patch must start with *** Begin Patch".to_owned());
-    }
-    let mut cursor = 1;
+    let operations = parse_patch(patch)?;
+    // Latest in-memory state per path: Some(content) or None when deleted.
+    let mut staged: Vec<(String, PathBuf, Option<String>)> = Vec::new();
+    let mut original: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::new();
     let mut changed: Vec<String> = Vec::new();
-    while cursor < lines.len() {
-        let header = lines[cursor].trim();
-        cursor += 1;
-        if header == "*** End Patch" {
-            break;
-        }
-        if let Some(rel) = header.strip_prefix("*** Add File: ") {
-            let rel = rel.trim();
-            let target = scoped(scope, rel)?;
-            if target.exists() {
-                return Err(format!("file already exists: {rel}"));
+    for operation in operations {
+        let rel = match &operation {
+            PatchOp::Add { rel, .. } | PatchOp::Delete { rel } | PatchOp::Update { rel, .. } => {
+                rel.clone()
             }
-            let body = collect_body(&lines, &mut cursor);
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-            }
-            let mut content = body
-                .iter()
-                .filter(|line| line.starts_with('+'))
-                .map(|line| line[1..].to_owned())
-                .collect::<Vec<_>>()
-                .join("\n");
-            if !content.is_empty() && !content.ends_with('\n') {
-                content.push('\n');
-            }
-            fs::write(&target, &content).map_err(|e| e.to_string())?;
-            changed.push(rel.to_owned());
-            continue;
-        }
-        if let Some(rel) = header.strip_prefix("*** Delete File: ") {
-            let rel = rel.trim();
-            let target = scoped(scope, rel)?;
-            if !target.is_file() {
-                return Err(format!("only regular files can be deleted: {rel}"));
-            }
-            fs::remove_file(&target).map_err(|e| e.to_string())?;
-            changed.push(rel.to_owned());
-            continue;
-        }
-        if let Some(rel) = header.strip_prefix("*** Update File: ") {
-            let rel = rel.trim();
-            let target = scoped(scope, rel)?;
-            let before =
-                fs::read_to_string(&target).map_err(|e| format!("cannot read {rel}: {e}"))?;
-            let body = collect_body(&lines, &mut cursor);
-            let mut content = before.clone();
-            for hunk in hunk_blocks(&body) {
-                let (old, new) = interpret_hunk(&hunk);
-                if old.trim().is_empty() {
+        };
+        let target = scoped(scope, &rel)?;
+        let position = staged.iter().position(|(_, known, _)| *known == target);
+        let current = match position {
+            Some(index) => staged[index].2.clone(),
+            None => target
+                .is_file()
+                .then(|| fs::read_to_string(&target))
+                .transpose()
+                .map_err(|e| format!("cannot read {rel}: {e}"))?,
+        };
+        let next = match operation {
+            PatchOp::Add { lines, .. } => {
+                if current.is_some() || target.exists() && position.is_none() {
                     return Err(format!(
-                        "patch for {rel} must remove or replace existing content"
+                        "file already exists: {rel}. Use *** Update File to change it."
                     ));
                 }
-                // Apply each hunk against the latest in-memory content so a
-                // multi-hunk section edits the same file consistently.
-                let position = content
-                    .find(&old)
-                    .ok_or_else(|| format!("patch does not match current content: {rel}"))?;
-                content = format!(
-                    "{}{}{}",
-                    &content[..position],
-                    new,
-                    &content[position + old.len()..]
-                );
+                let mut content = lines.join("\n");
+                if !content.is_empty() {
+                    content.push('\n');
+                }
+                Some(content)
             }
-            fs::write(&target, &content).map_err(|e| e.to_string())?;
-            changed.push(rel.to_owned());
-            continue;
+            PatchOp::Delete { .. } => {
+                if current.is_none() {
+                    return Err(format!("only regular files can be deleted: {rel}"));
+                }
+                None
+            }
+            PatchOp::Update { hunks, .. } => {
+                let before = current.ok_or_else(|| {
+                    format!("cannot update {rel}: the file does not exist (use *** Add File)")
+                })?;
+                if hunks.is_empty() {
+                    return Err(format!("patch for {rel} has no changes. {PATCH_FORMAT}"));
+                }
+                Some(apply_hunks(&rel, &before, &hunks)?)
+            }
+        };
+        if position.is_none() {
+            original.push((
+                target.clone(),
+                target
+                    .is_file()
+                    .then(|| fs::read(&target).unwrap_or_default()),
+            ));
         }
-        return Err(format!("unknown patch section: {header}"));
+        match position {
+            Some(index) => staged[index].2 = next,
+            None => staged.push((rel.clone(), target, next)),
+        }
+        if !changed.contains(&rel) {
+            changed.push(rel);
+        }
     }
-    if changed.is_empty() {
-        return Err("patch contains no file sections".to_owned());
+    let mut failure = None;
+    for (_, target, content) in &staged {
+        let outcome = match content {
+            Some(content) => target
+                .parent()
+                .map_or(Ok(()), fs::create_dir_all)
+                .and_then(|()| fs::write(target, content)),
+            None => fs::remove_file(target),
+        };
+        if let Err(error) = outcome {
+            failure = Some(format!("cannot write {}: {error}", target.display()));
+            break;
+        }
+    }
+    if let Some(message) = failure {
+        for (target, bytes) in original {
+            let _ = match bytes {
+                Some(bytes) => fs::write(&target, bytes),
+                None => fs::remove_file(&target).or(Ok(())),
+            };
+        }
+        return Err(format!("{message}; no file was changed"));
     }
     Ok((
         json!({"applied":true,"files":changed}),
@@ -412,44 +588,56 @@ fn collect_body(lines: &[String], cursor: &mut usize) -> Vec<String> {
     body
 }
 
+/// Hunks are separated by `@@` lines; a header such as `@@ fn main() @@` or
+/// `@@ -1,3 +1,3 @@` is accepted and ignored. Blank lines at the edges of a
+/// hunk are formatting, not content.
 fn hunk_blocks(body: &[String]) -> Vec<Vec<String>> {
     let mut blocks: Vec<Vec<String>> = Vec::new();
     let mut current: Vec<String> = Vec::new();
     for line in body {
-        if line.trim() == "@@" {
-            if !current.is_empty() {
-                blocks.push(std::mem::take(&mut current));
-            }
+        if line.trim_start().starts_with("@@") {
+            blocks.push(std::mem::take(&mut current));
         } else {
             current.push(line.to_owned());
         }
     }
-    if !current.is_empty() {
-        blocks.push(current);
-    }
+    blocks.push(current);
     blocks
+        .into_iter()
+        .map(|mut block| {
+            while block.last().is_some_and(String::is_empty) {
+                block.pop();
+            }
+            while block.first().is_some_and(String::is_empty) {
+                block.remove(0);
+            }
+            block
+        })
+        .filter(|block| !block.is_empty())
+        .collect()
 }
 
-/// Interpret one hunk body. Classic unified form keeps ` ` context lines and
-/// uses `-`/`+` for the old/new halves; a compact literal form pairs trailing
-/// `-` lines with trailing `+` lines and has no context. Both must produce a
-/// non-empty old half; the outer caller rejects otherwise.
-fn interpret_hunk(hunk: &[String]) -> (String, String) {
-    let mut old: Vec<&str> = Vec::new();
-    let mut new: Vec<&str> = Vec::new();
+/// Interpret one hunk body. `-` and `+` lines form the old and new halves; a
+/// ` ` line (or a bare empty line, or any other unprefixed line) is context in
+/// both halves, so the anchor matches a wider window than the changed lines
+/// alone. Context is verified against the file like everything else.
+fn interpret_hunk(hunk: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut old = Vec::new();
+    let mut new = Vec::new();
     for line in hunk {
-        if line.starts_with("-") {
-            old.push(&line[1..]);
-        } else if line.starts_with("+") {
-            new.push(&line[1..]);
-        } else if let Some(rest) = line.strip_prefix(' ') {
-            // Context lines belong to both halves and let the anchor match a
-            // wider window than a bare old-content search.
-            old.push(rest);
-            new.push(rest);
+        if let Some(rest) = line.strip_prefix('-') {
+            old.push(rest.to_owned());
+        } else if let Some(rest) = line.strip_prefix('+') {
+            new.push(rest.to_owned());
+        } else if line.starts_with('\\') {
+            continue;
+        } else {
+            let rest = line.strip_prefix(' ').unwrap_or(line);
+            old.push(rest.to_owned());
+            new.push(rest.to_owned());
         }
     }
-    (old.join("\n"), new.join("\n"))
+    (old, new)
 }
 
 #[cfg(test)]
@@ -666,6 +854,138 @@ mod tests {
         );
 
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    fn patch_fixture(files: &[(&str, &str)]) -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "fs-patch-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        for (name, content) in files {
+            fs::write(root.join(name), content).unwrap();
+        }
+        root
+    }
+
+    fn patch(root: &Path, text: &str) -> Result<(Value, Option<String>), String> {
+        apply_patch(
+            &Scope { root, grants: &[] },
+            json!({ "patch": text }).as_object().unwrap(),
+        )
+    }
+
+    #[test]
+    fn patch_tolerates_fences_blank_edges_hunk_headers_and_blank_context() {
+        let root = patch_fixture(&[("a.js", "one\ntwo\n\nthree\nfour\nfive\n")]);
+        let text = "\n```diff\n*** Begin Patch\n*** Update File: a.js\n@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n\n three\n@@ function four() @@\n-four\n+FOUR\n*** End Patch\n```\n";
+        patch(&root, text).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("a.js")).unwrap(),
+            "one\nTWO\n\nthree\nFOUR\nfive\n"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn patch_preserves_crlf_files_and_accepts_a_missing_end_marker() {
+        let root = patch_fixture(&[("a.txt", "alpha\r\nbeta\r\ngamma\r\n")]);
+        patch(
+            &root,
+            "*** Begin Patch\n*** Update File: a.txt\n-beta\n+BETA",
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("a.txt")).unwrap(),
+            "alpha\r\nBETA\r\ngamma\r\n"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_ambiguous_hunk_is_refused_and_context_disambiguates_it() {
+        let root = patch_fixture(&[("a.txt", "x\nsame\ny\nsame\nz\n")]);
+        let error = patch(
+            &root,
+            "*** Begin Patch\n*** Update File: a.txt\n-same\n+SAME\n*** End Patch",
+        )
+        .unwrap_err();
+        assert!(error.contains("matches 2 places"), "{error}");
+        assert_eq!(
+            fs::read_to_string(root.join("a.txt")).unwrap(),
+            "x\nsame\ny\nsame\nz\n"
+        );
+        patch(
+            &root,
+            "*** Begin Patch\n*** Update File: a.txt\n y\n-same\n+SAME\n*** End Patch",
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("a.txt")).unwrap(),
+            "x\nsame\ny\nSAME\nz\n"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_multi_file_patch_is_all_or_nothing() {
+        let root = patch_fixture(&[("a.txt", "a\n"), ("b.txt", "b\n")]);
+        let error = patch(
+            &root,
+            "*** Begin Patch\n*** Update File: a.txt\n-a\n+A\n*** Add File: c.txt\n+c\n*** Update File: b.txt\n-missing\n+B\n*** End Patch",
+        )
+        .unwrap_err();
+        assert!(error.contains("does not match"), "{error}");
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "a\n");
+        assert!(
+            !root.join("c.txt").exists(),
+            "an earlier Add must not survive a later failure"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn later_sections_see_earlier_sections_of_the_same_patch() {
+        let root = patch_fixture(&[("a.txt", "a\nb\n")]);
+        patch(
+            &root,
+            "*** Begin Patch\n*** Update File: a.txt\n-a\n+A\n*** Update File: a.txt\n-b\n+B\n*** End Patch",
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "A\nB\n");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn patch_errors_say_how_to_fix_the_call() {
+        let root = patch_fixture(&[("a.txt", "a\n")]);
+        let error = patch(&root, "diff --git a/a.txt b/a.txt").unwrap_err();
+        assert!(
+            error.contains("*** Begin Patch") && error.contains("Format:"),
+            "{error}"
+        );
+        let error = patch(
+            &root,
+            "*** Begin Patch\n*** Add File: a.txt\n+x\n*** End Patch",
+        )
+        .unwrap_err();
+        assert!(error.contains("Update File"), "{error}");
+        let error = patch(
+            &root,
+            "*** Begin Patch\n*** Update File: a.txt\n+only added\n*** End Patch",
+        )
+        .unwrap_err();
+        assert!(error.contains("context"), "{error}");
+        let error = patch(
+            &root,
+            "*** Begin Patch\n*** Update File: a.txt\n-nope\n+x\n*** End Patch",
+        )
+        .unwrap_err();
+        assert!(error.contains("not in the file"), "{error}");
+        fs::remove_dir_all(root).unwrap();
     }
 
     use std::time::{SystemTime, UNIX_EPOCH};

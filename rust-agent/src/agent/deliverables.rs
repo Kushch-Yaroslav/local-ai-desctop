@@ -12,6 +12,13 @@
 //! The runtime never invents entries and never decides what the user wanted.
 //! It only keeps the list the model recorded, shows all of it on every turn,
 //! and refuses to let an unfinished list pass silently.
+//!
+//! "Implemented" and "verified" are different states. The model reaches
+//! implemented by saying so. It reaches verified only through runtime-recorded
+//! evidence (see `verification`), and any later change to the project drops it
+//! back to implemented.
+
+use super::verification::Need;
 
 use serde::{Deserialize, Serialize};
 
@@ -25,7 +32,12 @@ const VISIBLE_DONE: usize = 6;
 #[serde(rename_all = "lowercase")]
 pub enum DeliverableStatus {
     Pending,
-    Done,
+    /// Built, and the model says so. Nothing has shown it works. Saved memory
+    /// from before verification existed calls this "done".
+    #[serde(alias = "done")]
+    Implemented,
+    /// Fresh, passing, runtime-recorded evidence of sufficient strength.
+    Verified,
     /// Cannot be completed; `reason` says why.
     Blocked,
     /// Not (or no longer) required; `reason` says why.
@@ -36,7 +48,8 @@ impl DeliverableStatus {
     fn label(self) -> &'static str {
         match self {
             DeliverableStatus::Pending => "pending",
-            DeliverableStatus::Done => "done",
+            DeliverableStatus::Implemented => "implemented",
+            DeliverableStatus::Verified => "verified",
             DeliverableStatus::Blocked => "blocked",
             DeliverableStatus::Dropped => "dropped",
         }
@@ -55,6 +68,16 @@ pub struct Deliverable {
     pub evidence: String,
     #[serde(default)]
     pub reason: String,
+    /// What must be shown for it to count as verified; the run's changes decide
+    /// when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<Need>,
+    /// Runtime evidence ids that verified it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proof: Vec<String>,
+    /// A check that failed after the last change, while this is unverified.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub failing: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,6 +145,16 @@ impl Deliverables {
     /// Records one requested deliverable. Re-adding the same wording returns
     /// the existing entry instead of duplicating it.
     pub fn add(&mut self, id: Option<&str>, task: &str, text: &str) -> Result<String, String> {
+        self.add_checked(id, task, text, None)
+    }
+
+    pub fn add_checked(
+        &mut self,
+        id: Option<&str>,
+        task: &str,
+        text: &str,
+        check: Option<Need>,
+    ) -> Result<String, String> {
         let text = clean(text, MAX_TEXT_CHARS, "text")?;
         if text.is_empty() {
             return Err("text is required: one short line saying what must exist or work".into());
@@ -137,7 +170,10 @@ impl Deliverables {
         }
         if let Some(id) = id.map(str::trim).filter(|id| !id.is_empty()) {
             if let Some(item) = self.items.iter_mut().find(|item| item.id == id) {
-                if item.status == DeliverableStatus::Done {
+                if matches!(
+                    item.status,
+                    DeliverableStatus::Implemented | DeliverableStatus::Verified
+                ) {
                     return Err(format!(
                         "deliverable '{id}' is already done; add a new one instead of rewording it"
                     ));
@@ -146,6 +182,8 @@ impl Deliverables {
                 item.task = task;
                 item.status = DeliverableStatus::Pending;
                 item.reason.clear();
+                // A named requirement is never weakened by rewording the item.
+                item.check = item.check.or(check);
                 self.revision = self.revision.saturating_add(1);
                 return Ok(id.to_owned());
             }
@@ -171,19 +209,109 @@ impl Deliverables {
             status: DeliverableStatus::Pending,
             evidence: String::new(),
             reason: String::new(),
+            check,
+            proof: Vec::new(),
+            failing: String::new(),
         });
         self.revision = self.revision.saturating_add(1);
         Ok(id)
     }
 
-    pub fn complete(&mut self, id: &str, evidence: &str) -> Result<(), String> {
+    /// The model says the item is built. This is a claim, not a check.
+    pub fn implement(&mut self, id: &str, evidence: &str) -> Result<(), String> {
         let evidence = clean(evidence, MAX_NOTE_CHARS, "evidence")?;
         let item = self.find_mut(id)?;
-        item.status = DeliverableStatus::Done;
+        item.status = DeliverableStatus::Implemented;
         item.evidence = evidence;
         item.reason.clear();
+        item.proof.clear();
         self.revision = self.revision.saturating_add(1);
         Ok(())
+    }
+
+    /// Records runtime-issued proof for an item that is implemented.
+    pub fn verify(&mut self, id: &str, proof: Vec<String>) -> Result<(), String> {
+        let item = self.find_mut(id)?;
+        if item.status != DeliverableStatus::Implemented {
+            return Err(format!(
+                "deliverable '{id}' is {}: only an implemented deliverable can be verified (use action implemented first)",
+                item.status.label()
+            ));
+        }
+        item.status = DeliverableStatus::Verified;
+        item.proof = proof;
+        item.failing.clear();
+        self.revision = self.revision.saturating_add(1);
+        Ok(())
+    }
+
+    /// The project changed: nothing verified before is verified now.
+    pub fn demote_verified(&mut self) -> bool {
+        let mut changed = false;
+        for item in &mut self.items {
+            if item.status == DeliverableStatus::Verified {
+                item.status = DeliverableStatus::Implemented;
+                item.proof.clear();
+                changed = true;
+            }
+            if !item.failing.is_empty() {
+                item.failing.clear();
+                changed = true;
+            }
+        }
+        if changed {
+            self.revision = self.revision.saturating_add(1);
+        }
+        changed
+    }
+
+    /// Shows a failed check on every item that is not shown to work, and takes
+    /// back a verification that a failure contradicts.
+    pub fn sync_failure(&mut self, failure: Option<&str>) -> bool {
+        let mut changed = false;
+        for item in &mut self.items {
+            match (failure, item.status) {
+                (Some(text), DeliverableStatus::Implemented | DeliverableStatus::Verified) => {
+                    if item.status == DeliverableStatus::Verified {
+                        item.status = DeliverableStatus::Implemented;
+                        item.proof.clear();
+                        changed = true;
+                    }
+                    if item.failing != text {
+                        item.failing = text.to_owned();
+                        changed = true;
+                    }
+                }
+                (None, _) if !item.failing.is_empty() => {
+                    item.failing.clear();
+                    changed = true;
+                }
+                _ => {}
+            }
+        }
+        if changed {
+            self.revision = self.revision.saturating_add(1);
+        }
+        changed
+    }
+
+    pub fn unverified(&self) -> Vec<&Deliverable> {
+        self.items
+            .iter()
+            .filter(|item| item.status == DeliverableStatus::Implemented)
+            .collect()
+    }
+
+    pub fn unverified_summary(&self) -> String {
+        Self::summarize(&self.unverified())
+    }
+
+    pub fn summarize(items: &[&Deliverable]) -> String {
+        items
+            .iter()
+            .map(|item| format!("{} {}", item.id, item.text))
+            .collect::<Vec<_>>()
+            .join("; ")
     }
 
     pub fn block(&mut self, id: &str, reason: &str) -> Result<(), String> {
@@ -226,14 +354,14 @@ impl Deliverables {
         }
         let done = live
             .iter()
-            .filter(|item| item.status == DeliverableStatus::Done)
+            .filter(|item| item.status == DeliverableStatus::Verified)
             .count();
         let hidden_done = done.saturating_sub(VISIBLE_DONE);
         let mut skipped = 0;
         let mut lines = Vec::new();
         let mut group: Option<&str> = None;
         for item in &live {
-            if item.status == DeliverableStatus::Done && skipped < hidden_done {
+            if item.status == DeliverableStatus::Verified && skipped < hidden_done {
                 skipped += 1;
                 continue;
             }
@@ -248,15 +376,22 @@ impl Deliverables {
                 DeliverableStatus::Blocked if !item.reason.is_empty() => {
                     line.push_str(&format!(" (blocked: {})", item.reason));
                 }
-                DeliverableStatus::Done if !item.evidence.is_empty() => {
-                    line.push_str(&format!(" (evidence: {})", item.evidence));
+                DeliverableStatus::Implemented => {
+                    line.push_str(" (not verified");
+                    if !item.failing.is_empty() {
+                        line.push_str(&format!("; a check failed: {}", item.failing));
+                    }
+                    line.push(')');
+                }
+                DeliverableStatus::Verified if !item.proof.is_empty() => {
+                    line.push_str(&format!(" (proof: {})", item.proof.join(", ")));
                 }
                 _ => {}
             }
             lines.push(line);
         }
         if hidden_done > 0 {
-            lines.push(format!("  (+{hidden_done} earlier deliverables done)"));
+            lines.push(format!("  (+{hidden_done} earlier deliverables verified)"));
         }
         format!("<deliverables>\n{}\n</deliverables>", lines.join("\n"))
     }
@@ -293,7 +428,7 @@ pub fn pending_review(pending: &str, created_files: &[String], deep: bool) -> St
         format!(" Files you created in this run: {listed}. Before you finish, delete the ones that existed only for diagnostics and are not part of the result (delete_file).")
     };
     let verify = if deep {
-        " When you mark an item done, cite the observation or file that shows it working."
+        " When you mark an item implemented, cite the observation or file that shows it."
     } else {
         ""
     };
@@ -329,15 +464,15 @@ mod tests {
     #[test]
     fn status_changes_are_explicit_and_blocking_needs_a_concrete_reason() {
         let mut list = two_tasks();
-        list.complete("d-001", "bot.js read in obs-00000004")
+        list.implement("d-001", "bot.js read in obs-00000004")
             .unwrap();
         assert!(list.block("d-002", "no").is_err());
         list.block("d-002", "the page cannot be opened without a browser here")
             .unwrap();
         assert!(list.drop_item("d-003", "").is_err());
-        assert!(list.complete("d-999", "").is_err());
+        assert!(list.implement("d-999", "").is_err());
         assert_eq!(list.pending().len(), 1);
-        list.complete("d-003", "").unwrap();
+        list.implement("d-003", "").unwrap();
         assert!(!list.has_pending());
     }
 
@@ -355,11 +490,11 @@ mod tests {
     #[test]
     fn a_finished_item_cannot_be_silently_reworded_back_to_pending() {
         let mut list = two_tasks();
-        list.complete("d-001", "").unwrap();
+        list.implement("d-001", "").unwrap();
         assert!(list
             .add(Some("d-001"), "bot", "something else entirely")
             .is_err());
-        assert_eq!(list.items[0].status, DeliverableStatus::Done);
+        assert_eq!(list.items[0].status, DeliverableStatus::Implemented);
     }
 
     #[test]
@@ -383,7 +518,8 @@ mod tests {
             let id = list
                 .add(None, "analysis", &format!("finished step {index}"))
                 .unwrap();
-            list.complete(&id, "").unwrap();
+            list.implement(&id, "").unwrap();
+            list.verify(&id, vec!["ev-001".into()]).unwrap();
         }
         list.add(None, "build", "the pending piece").unwrap();
         list.add(None, "build", "the blocked piece").unwrap();
@@ -393,7 +529,7 @@ mod tests {
         assert!(prompt.contains("[pending] d-011 the pending piece"));
         assert!(prompt.contains("[blocked] d-012 the blocked piece (blocked: needs a service"));
         assert!(prompt.contains("Task: build"));
-        assert!(prompt.contains("(+4 earlier deliverables done)"));
+        assert!(prompt.contains("(+4 earlier deliverables verified)"));
         assert!(!prompt.contains("finished step 0"));
         assert!(prompt.contains("finished step 9"));
     }
@@ -417,5 +553,44 @@ mod tests {
         let deep = pending_review(&list.pending_summary(), &["scratch.js".into()], true);
         assert!(deep.contains("cite the observation"));
         assert!(deep.contains("scratch.js"));
+    }
+
+    #[test]
+    fn implemented_is_a_claim_and_only_runtime_proof_makes_it_verified() {
+        let mut list = two_tasks();
+        assert!(list.verify("d-001", vec!["ev-001".into()]).is_err());
+        list.implement("d-001", "built").unwrap();
+        assert!(list
+            .prompt()
+            .contains("[implemented] d-001 bot engine exists (not verified)"));
+        list.verify("d-001", vec!["ev-002".into()]).unwrap();
+        assert!(list
+            .prompt()
+            .contains("[verified] d-001 bot engine exists (proof: ev-002)"));
+        assert!(list.unverified().is_empty());
+    }
+
+    #[test]
+    fn a_change_or_a_failed_check_takes_back_a_verification() {
+        let mut list = two_tasks();
+        list.implement("d-001", "").unwrap();
+        list.verify("d-001", vec!["ev-001".into()]).unwrap();
+        assert!(list.demote_verified());
+        assert_eq!(list.items[0].status, DeliverableStatus::Implemented);
+        list.verify("d-001", vec!["ev-002".into()]).unwrap();
+        assert!(list.sync_failure(Some("TypeError: x")));
+        assert_eq!(list.items[0].status, DeliverableStatus::Implemented);
+        assert!(list.prompt().contains("a check failed: TypeError: x"));
+        assert!(list.sync_failure(None));
+        assert!(!list.prompt().contains("a check failed"));
+    }
+
+    #[test]
+    fn memory_saved_before_verification_existed_loads_done_as_implemented() {
+        let legacy: Deliverables = serde_json::from_value(serde_json::json!({"items":[
+            {"id":"d-001","text":"x","status":"done","evidence":"saw it"}
+        ]}))
+        .unwrap();
+        assert_eq!(legacy.items[0].status, DeliverableStatus::Implemented);
     }
 }

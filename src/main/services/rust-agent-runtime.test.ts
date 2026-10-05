@@ -39,13 +39,18 @@ export function runRustAgentRuntimeRegression(): void {
   const partialTerminal = { ...knowledgeActivity, kind: 'terminal' as const, output: JSON.stringify({ command: 'rg api src | head -n 1', exit_code: 141, status: 'partial_success', stdout: 'src/App.tsx:1: api' }) };
   assert.match(displayToolResult(partialTerminal) ?? '', /частичный результат поиска/);
   const deliverables = { id: 'd', label: 'Требуемый результат', detail: 'deliverables', kind: 'planning' as const, state: 'completed' as const, output: JSON.stringify({ updated: true, deliverables: { items: [
-    { id: 'd-001', text: 'режим «с ботом» выбирается в интерфейсе', status: 'done', task: 'бот' },
+    { id: 'd-001', text: 'режим «с ботом» выбирается в интерфейсе', status: 'verified', task: 'бот', proof: ['ev-002'] },
     { id: 'd-002', text: 'переключатель темы', status: 'pending' },
     { id: 'd-003', text: 'тема из чужого проекта', status: 'blocked', reason: 'папка недоступна' },
     { id: 'd-004', text: 'снято пользователем', status: 'dropped', reason: 'пользователь отказался' },
+    { id: 'd-005', text: 'сохранение партии', status: 'implemented', failing: 'node check.js (exit 1)' },
+    { id: 'd-006', text: 'старый формат', status: 'done' },
   ] } }) };
-  assert.equal(toolResultSummary(deliverables), 'выполнено 1 из 3 · осталось 1', 'the deliverables row must summarize progress');
-  assert.equal(displayToolResult(deliverables), '✓ режим «с ботом» выбирается в интерфейсе\n○ переключатель темы\n⊘ тема из чужого проекта — не выполнено: папка недоступна', 'deliverables must render as a checklist and hide dropped items');
+  assert.equal(toolResultSummary(deliverables), 'проверено 1 из 5 · реализовано, не проверено 2 · осталось 1', 'only verified items count as checked');
+  assert.equal(displayToolResult(deliverables), '✓ режим «с ботом» выбирается в интерфейсе\n○ переключатель темы\n⊘ тема из чужого проекта — не выполнено: папка недоступна\n◐ сохранение партии — реализовано, не проверено; проверка не прошла: node check.js (exit 1)\n◐ старый формат — реализовано, не проверено', 'deliverables must render as a checklist, hide dropped items and never show implemented work as checked');
+  const planActivity = { id: 'p', label: 'План выполнения', detail: 'plan', kind: 'planning' as const, state: 'completed' as const, output: JSON.stringify({ updated: true, plan: { steps: [{ id: 's1', text: 'прочитать код', status: 'completed' }, { id: 's2', text: 'добавить бота', status: 'in_progress' }, { id: 's3', text: 'запустить проверку', status: 'blocked', note: 'нет браузера' }] } }) };
+  assert.equal(toolResultSummary(planActivity), 'шагов выполнено 1 из 3');
+  assert.equal(displayToolResult(planActivity), '✓ прочитать код\n▶ добавить бота\n⊘ запустить проверку — нет браузера');
   assert.equal(deliverablesChecklist('not json'), undefined);
   assert.equal(deliverablesChecklist(JSON.stringify({ other: 1 })), undefined);
   const legacy = taskPlan({ steps: [{ id: 'legacy-task', label: 'Old item', status: 'completed' }] });
