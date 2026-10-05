@@ -1762,3 +1762,94 @@ fn files_created_in_the_run_are_listed_and_named_in_the_review() {
         "a deleted file must leave the list"
     );
 }
+
+/// A file the model just read must be writable: the write is not a repeated read.
+#[test]
+fn write_file_after_reading_the_same_path_really_writes() {
+    let workspace = Workspace::new(&[("a.txt", "old")]);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Tools(vec![("read_file", json!({"path":"a.txt"}))]),
+        1 => Reply::Tools(vec![(
+            "write_file",
+            json!({"path":"a.txt","content":"new"}),
+        )]),
+        2 => Reply::Tools(vec![(
+            "write_file",
+            json!({"path":"a.txt","content":"newer"}),
+        )]),
+        _ => Reply::Text("done".into()),
+    });
+    run(workspace.config(&provider.endpoint, "rewrite a.txt"));
+    assert_eq!(
+        std::fs::read_to_string(workspace.root.join("a.txt")).unwrap(),
+        "newer"
+    );
+    let requests = provider.requests();
+    assert!(
+        !tool_result_text(&requests[2]).contains("already stored"),
+        "{}",
+        tool_result_text(&requests[2])
+    );
+}
+
+/// A write over a file that changed after the model's last read is refused with
+/// one concise instruction; reading again makes it writable.
+#[test]
+fn write_file_over_a_file_changed_since_the_read_is_refused_until_read_again() {
+    let workspace = Workspace::new(&[("a.txt", "old")]);
+    let file = workspace.root.join("a.txt");
+    let provider = Provider::start(move |_, n| match n {
+        0 => Reply::Tools(vec![("read_file", json!({"path":"a.txt"}))]),
+        1 => {
+            // Another process (the user, a build) edits the file between the read and the write.
+            std::fs::write(&file, "changed-elsewhere").unwrap();
+            Reply::Tools(vec![("list_directory", json!({"path":"."}))])
+        }
+        2 => Reply::Tools(vec![(
+            "write_file",
+            json!({"path":"a.txt","content":"mine"}),
+        )]),
+        3 => Reply::Tools(vec![("read_file", json!({"path":"a.txt"}))]),
+        4 => Reply::Tools(vec![(
+            "write_file",
+            json!({"path":"a.txt","content":"mine"}),
+        )]),
+        _ => Reply::Text("done".into()),
+    });
+    run(workspace.config(&provider.endpoint, "rewrite a.txt"));
+    let requests = provider.requests();
+    let refusal = tool_result_text(&requests[3]);
+    assert!(
+        refusal
+            .contains("File changed since your last read. Read the latest version before writing."),
+        "{refusal}"
+    );
+    assert!(
+        refusal.contains(
+            r#"{"error":"File changed since your last read. Read the latest version before writing."}"#
+        ),
+        "the error must be exactly the concise instruction: {refusal}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.root.join("a.txt")).unwrap(),
+        "mine"
+    );
+}
+
+/// A write to a file the model never read is not blocked just for ceremony.
+#[test]
+fn write_file_to_an_unread_file_is_allowed() {
+    let workspace = Workspace::new(&[("a.txt", "old")]);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Tools(vec![(
+            "write_file",
+            json!({"path":"a.txt","content":"new"}),
+        )]),
+        _ => Reply::Text("done".into()),
+    });
+    run(workspace.config(&provider.endpoint, "rewrite a.txt"));
+    assert_eq!(
+        std::fs::read_to_string(workspace.root.join("a.txt")).unwrap(),
+        "new"
+    );
+}

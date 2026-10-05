@@ -37,6 +37,9 @@ pub struct AgentState {
     /// Project files this run created and has not deleted since, so scratch
     /// files stay visible instead of being forgotten.
     pub created_files: Vec<String>,
+    /// Revision (content hash) of each project file as this run last read or
+    /// wrote it, so a write over a file that changed since can be refused.
+    pub file_revisions: BTreeMap<std::path::PathBuf, String>,
     /// Observability for optional `.ai-framework` virtual context access.
     pub knowledge_reads: usize,
     pub knowledge_writes: usize,
@@ -66,6 +69,17 @@ impl AgentState {
         self.mutations = self.mutations.saturating_add(1);
         self.workspace_mutated_since_validation = true;
         self.verification_nudged = false;
+    }
+
+    pub fn note_file_revision(&mut self, path: std::path::PathBuf, revision: String) {
+        self.file_revisions.insert(path, revision);
+    }
+
+    /// `true` when this run saw the file at another revision than `current`.
+    pub fn file_changed_since_seen(&self, path: &std::path::Path, current: &str) -> bool {
+        self.file_revisions
+            .get(path)
+            .is_some_and(|seen| seen != current)
     }
 
     pub fn record_created_file(&mut self, path: &str) {
@@ -139,6 +153,19 @@ mod tests {
         }
         assert_eq!(state.created_files.len(), 64);
         assert_eq!(state.created_files.last().unwrap(), "f99.js");
+    }
+
+    #[test]
+    fn a_file_is_stale_only_when_a_different_revision_was_seen() {
+        let mut state = AgentState::default();
+        let path = std::path::PathBuf::from("/p/a.txt");
+        assert!(
+            !state.file_changed_since_seen(&path, "x"),
+            "unknown is not stale"
+        );
+        state.note_file_revision(path.clone(), "x".into());
+        assert!(!state.file_changed_since_seen(&path, "x"));
+        assert!(state.file_changed_since_seen(&path, "y"));
     }
 
     #[test]

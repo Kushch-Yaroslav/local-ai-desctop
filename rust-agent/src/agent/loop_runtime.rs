@@ -731,7 +731,7 @@ fn tool_schemas(scope: ToolScope) -> Vec<Value> {
     ];
     if scope != ToolScope::None {
         tools.extend([
-            json!({"type":"function","function":{"name":"apply_patch","description":"Apply a project patch.","parameters":{"type":"object","properties":{"patch":{"type":"string"}},"required":["patch"]}}}),
+            json!({"type":"function","function":{"name":"apply_patch","description":"Edit files. Patch format: *** Begin Patch, then per file `*** Update File: path` with hunks of ` unchanged context`, `-old` and `+new` lines (separate hunks with a line `@@`; add enough context to match exactly one place), `*** Add File: path` with every line prefixed `+`, or `*** Delete File: path`, then *** End Patch. The whole patch applies or none of it does.","parameters":{"type":"object","properties":{"patch":{"type":"string"}},"required":["patch"]}}}),
             json!({"type":"function","function":{"name":"create_file","description":"Create a new project file.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}),
             json!({"type":"function","function":{"name":"delete_file","description":"Delete a project file when allowed.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}),
             json!({"type":"function","function":{"name":"list_directory","description":"List a project directory. complete=true means all directory entries are represented; false means internal runtime entries were omitted.","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}),
@@ -740,7 +740,7 @@ fn tool_schemas(scope: ToolScope) -> Vec<Value> {
             json!({"type":"function","function":{"name":"project_knowledge_read","description":"Read selected reusable project observations from .ai-framework: paths is required. Prefer relevant fresh knowledge before broad rereads; do not reread unchanged source only to reconstruct context. Read source for exact current code or a concrete unresolved/verification detail.","parameters":{"type":"object","properties":{"paths":{"type":"array","items":{"type":"string"}}},"required":["paths"]}}}),
             json!({"type":"function","function":{"name":"project_knowledge_update","description":"Optionally persist durable, reusable semantic project knowledge in .ai-framework. This is never required for normal work. Only use project/, modules/, sources/, or tasks/ markdown paths.","parameters":{"type":"object","properties":{"updates":{"type":"array","items":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["replace","merge"]}},"required":["path","content"]}},"source_paths":{"type":"array","items":{"type":"string"}}},"required":["updates"]}}}),
             json!({"type":"function","function":{"name":"run_terminal","description":"Run an existing relevant project command. After code changes, prefer a focused test, typecheck, lint, build, or check when available.","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1}},"required":["command"]}}}),
-            json!({"type":"function","function":{"name":"write_file","description":"Write a project file.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}),
+            json!({"type":"function","function":{"name":"write_file","description":"Write the full content of a project file, replacing it. To change part of a file, prefer apply_patch.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}),
         ]);
     }
     if scope == ToolScope::Workspace {
@@ -2966,14 +2966,44 @@ fn run_scoped_tool(
             let existed_before = target
                 .as_deref()
                 .is_some_and(|path| Path::new(root).join(path).exists());
-            let result = crate::tools::filesystem::execute_in(
-                &crate::tools::filesystem::Scope {
-                    root: Path::new(root),
-                    grants: &grants,
-                },
-                name,
-                &tool.arguments,
-            )?;
+            let file_scope = crate::tools::filesystem::Scope {
+                root: Path::new(root),
+                grants: &grants,
+            };
+            if name == "write_file" {
+                if let Some((file, revision)) = target
+                    .as_deref()
+                    .and_then(|path| crate::tools::filesystem::file_revision(&file_scope, path))
+                {
+                    if state.file_changed_since_seen(&file, &revision) {
+                        return Err("File changed since your last read. Read the latest version before writing.".to_owned());
+                    }
+                }
+            }
+            let result = crate::tools::filesystem::execute_in(&file_scope, name, &tool.arguments)?;
+            let touched = match name {
+                "read_file" | "write_file" | "create_file" => target.iter().cloned().collect(),
+                "apply_patch" => result
+                    .0
+                    .get("files")
+                    .and_then(Value::as_array)
+                    .map(|files| {
+                        files
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                _ => Vec::<String>::new(),
+            };
+            for path in touched {
+                if let Some((file, revision)) =
+                    crate::tools::filesystem::file_revision(&file_scope, &path)
+                {
+                    state.note_file_revision(file, revision);
+                }
+            }
             match (name, target.as_deref()) {
                 ("create_file" | "write_file", Some(path)) if !existed_before => {
                     state.record_created_file(path);
@@ -3249,6 +3279,23 @@ fn record_safe_read_effect(
             emit_knowledge_diagnostics(config, state);
         }
         "read_file" | "list_directory" => {
+            if tool.name == "read_file" {
+                if let (Some(root), Some(path)) = (
+                    config.work_root(),
+                    tool.arguments.get("path").and_then(Value::as_str),
+                ) {
+                    let grants = config.grants();
+                    let scope = crate::tools::filesystem::Scope {
+                        root: Path::new(root),
+                        grants: &grants,
+                    };
+                    if let Some((file, revision)) =
+                        crate::tools::filesystem::file_revision(&scope, path)
+                    {
+                        state.note_file_revision(file, revision);
+                    }
+                }
+            }
             if !user_requests_read_only(&config.user) && !targets_secondary_project(tool) {
                 if let Some(root) = config.root.as_deref() {
                     let _ = crate::tools::knowledge::observe_tool(
