@@ -103,6 +103,120 @@ fn confirmed_memory_rejection_is_visible_and_retry_preserves_state() {
     assert_eq!(provider.requests().len(), 7);
 }
 
+fn last_tool_result(request: &Value) -> String {
+    request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|m| m["role"] == "tool")
+        .and_then(|m| m["content"].as_str())
+        .unwrap_or("")
+        .to_owned()
+}
+
+fn memory_json(body: &str) -> Value {
+    let end = body.find("\n[observation").unwrap_or(body.len());
+    serde_json::from_str(&body[..end]).unwrap()
+}
+
+#[test]
+fn task_memory_supports_create_observe_revise_cite_revise() {
+    let fixture = Workspace::new(&[("source.txt", "observed source")]);
+    let provider = Provider::start(|_, turn| match turn {
+        // create: no id, an alias action, status still open
+        0 => Reply::Tools(vec![(
+            "task_memory",
+            json!({"action":"add","finding":"how checkout works is not known","status":"open","next":"read source.txt"}),
+        )]),
+        1 => Reply::Tools(vec![("read_file", json!({"path":"source.txt"}))]),
+        // a status-only update of an unknown id is explained, not silently created
+        2 => Reply::Tools(vec![(
+            "task_memory",
+            json!({"action":"update","id":"tm-077","status":"confirmed"}),
+        )]),
+        // revise with an unpadded reference and a compact evidence run
+        3 => Reply::Tools(vec![(
+            "task_memory",
+            json!({"action":"revise","id":"tm-001","finding":"checkout reads source.txt","status":"verified","evidence":"obs-1"}),
+        )]),
+        // revise only one field: everything else must survive
+        4 => Reply::Tools(vec![(
+            "task_memory",
+            json!({"action":"update","id":"tm-001","next":"","implication":"nothing else to read"}),
+        )]),
+        // a fabricated reference is rejected with valid ones named
+        5 => Reply::Tools(vec![(
+            "task_memory",
+            json!({"action":"record","id":"fake","finding":"made up","status":"confirmed","observations":["obs-00000099"]}),
+        )]),
+        // cite through the array form and revise the confirmed finding
+        6 => Reply::Tools(vec![(
+            "task_memory",
+            json!({"action":"update","id":"tm-001","finding":"checkout reads source.txt only","observations":["obs-00000001"]}),
+        )]),
+        _ => Reply::Text("Checkout reads source.txt.".into()),
+    });
+    run(fixture.config(&provider.endpoint, "Investigate checkout and keep notes"));
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 8);
+
+    let created = memory_json(&last_tool_result(&requests[1]));
+    assert_eq!(created["id"], "tm-001");
+    assert_eq!(created["task_memory"]["entries"][0]["status"], "unknown");
+
+    let unknown = last_tool_result(&requests[3]);
+    assert!(
+        unknown.contains("no entry 'tm-077'") || unknown.contains("There is no entry 'tm-077'"),
+        "{unknown}"
+    );
+    assert!(
+        unknown.contains("tm-001"),
+        "the error must list existing ids: {unknown}"
+    );
+
+    let cited = memory_json(&last_tool_result(&requests[4]));
+    let entry = &cited["task_memory"]["entries"][0];
+    assert_eq!(entry["status"], "confirmed");
+    assert_eq!(
+        entry["evidence"], "obs-00000001",
+        "an unpadded reference must be normalized"
+    );
+    assert_eq!(entry["next"], "read source.txt");
+
+    let partial = memory_json(&last_tool_result(&requests[5]));
+    let entry = &partial["task_memory"]["entries"][0];
+    assert_eq!(
+        entry["finding"], "checkout reads source.txt",
+        "an update without finding must keep it"
+    );
+    assert_eq!(entry["evidence"], "obs-00000001");
+    assert_eq!(entry["status"], "confirmed");
+    assert_eq!(entry["next"], "", "an empty string clears a field");
+    assert_eq!(entry["implication"], "nothing else to read");
+
+    let rejected = last_tool_result(&requests[6]);
+    assert!(
+        rejected.contains("obs-00000099") && rejected.contains("obs-00000001"),
+        "{rejected}"
+    );
+    assert!(rejected.contains("no memory was changed"));
+
+    let revised = memory_json(&last_tool_result(&requests[7]));
+    assert_eq!(
+        revised["task_memory"]["entries"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(
+        revised["task_memory"]["entries"][0]["finding"],
+        "checkout reads source.txt only"
+    );
+    assert_eq!(
+        revised["task_memory"]["entries"][0]["evidence"],
+        "obs-00000001"
+    );
+}
+
 #[test]
 fn two_project_reads_have_distinct_evidence_and_model_visible_scope() {
     let fixture = Workspace::new(&[("first-only.txt", "primary identity")]);

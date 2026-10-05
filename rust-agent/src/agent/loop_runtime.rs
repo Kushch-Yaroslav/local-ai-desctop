@@ -724,7 +724,7 @@ fn tool_schemas(scope: ToolScope) -> Vec<Value> {
     // Native tool grammars enumerate object-root properties, not union roots.
     // Action-specific requirements are enforced transactionally at dispatch.
     let mut tools = vec![
-        json!({"type":"function","function":{"name":"task_memory","description":"Durable semantic memory for the current task across compaction. Record/update meaningful findings, decisions, blockers, or unresolved questions; view reads it; invalidate needs id. Record/update requires finding and may include evidence, implication, next, id, supersedes, status. Trust precise unchanged-file memory; reread only for a concrete missing, ambiguous, changed, exact-detail, or verification need.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["record","update","invalidate","view"]},"id":{"type":"string"},"finding":{"type":"string"},"evidence":{"type":"string"},"implication":{"type":"string"},"next":{"type":"string"},"supersedes":{"type":"string"},"status":{"type":"string","enum":["confirmed","inferred","unknown","contradicted"],"description":"How well established the finding is: confirmed (observed, cited), inferred (reasoned, not observed), unknown (open; put the resolving step in next), contradicted (evidence disagrees)."}},"required":["action"]}}}),
+        json!({"type":"function","function":{"name":"task_memory","description":"Durable semantic memory for the current task across compaction. Record/update meaningful findings, decisions, blockers, or unresolved questions; view reads it; invalidate needs id. Record requires finding; update needs the id of an existing entry and changes only the fields you pass (an empty string clears one). Both may include evidence, implication, next, supersedes, status. Cite observations by exact id (obs-00000012), one per item in observations or comma-separated in evidence. Trust precise unchanged-file memory; reread only for a concrete missing, ambiguous, changed, exact-detail, or verification need.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["record","update","invalidate","view"]},"id":{"type":"string"},"finding":{"type":"string"},"evidence":{"type":"string"},"implication":{"type":"string"},"next":{"type":"string"},"supersedes":{"type":"string"},"status":{"type":"string","enum":["confirmed","inferred","unknown","contradicted"],"description":"How well established the finding is: confirmed (observed, cited), inferred (reasoned, not observed), unknown (open; put the resolving step in next), contradicted (evidence disagrees)."},"observations":{"type":"array","items":{"type":"string"},"description":"Observation IDs (obs-…) that support the finding; same as evidence, one id per item."}},"required":["action"]}}}),
         json!({"type":"function","function":{"name":"deliverables","description":"The user's requested deliverables for this task (execution contract). Use it only when the request has two or more separate things to produce or change, or one result that must work end to end. add: record each requested deliverable once (text, optional task). done: after you observed it working (id, evidence). block: it cannot be completed (id, concrete reason). drop: the user withdrew it (id, reason). view: list them. Record only what the user asked for, never your own optional ideas.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["add","done","block","drop","view"]},"id":{"type":"string"},"task":{"type":"string"},"text":{"type":"string"},"evidence":{"type":"string"},"reason":{"type":"string"}},"required":["action"]}}}),
         json!({"type":"function","function":{"name":"observation_index","description":"List historical tool observations by stable ID, with source path and outcome metadata. Use source to select the raw observation for the needed file. If more=true, continue at the returned next_offset. Observation IDs start with obs-.","parameters":{"type":"object","properties":{"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":50}}}}}),
         json!({"type":"function","function":{"name":"observation_read","description":"Recover a bounded exact slice of a stored historical tool result by observation ID. The response distinguishes historical evidence from current source and reports whether the source changed.","parameters":{"type":"object","properties":{"id":{"type":"string"},"offset_chars":{"type":"integer","minimum":0},"max_chars":{"type":"integer","minimum":1,"maximum":16000}},"required":["id"]}}}),
@@ -899,47 +899,165 @@ fn required_text(arguments: &Value, key: &str) -> Result<String, String> {
         .ok_or_else(|| format!("missing required field: {key}"))
 }
 
-fn write_task_memory(
-    memory: &mut crate::agent::task_memory::TaskMemory,
+/// Maps the action names models commonly use to the supported ones.
+fn canonical_memory_action(action: &str) -> Option<&'static str> {
+    match action.trim().to_lowercase().as_str() {
+        "record" | "add" | "create" | "new" | "write" | "save" => Some("record"),
+        "update" | "revise" | "edit" | "modify" | "amend" => Some("update"),
+        "invalidate" | "delete" | "remove" | "discard" | "retract" => Some("invalidate"),
+        "view" | "get" | "list" | "read" | "show" => Some("view"),
+        _ => None,
+    }
+}
+
+fn memory_text_field(value: &Value, key: &str) -> Result<Option<String>, String> {
+    match value.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text.clone())),
+        Some(_) => Err(format!("{key} must be a string.")),
+    }
+}
+
+/// Evidence arrives as a string, an array, or in `observations`; all are
+/// merged into one reference string.
+fn memory_evidence_field(value: &Value) -> Result<Option<String>, String> {
+    let mut parts = Vec::new();
+    let mut given = false;
+    for key in ["evidence", "observations"] {
+        match value.get(key) {
+            None | Some(Value::Null) => {}
+            Some(Value::String(text)) => {
+                given = true;
+                parts.push(text.clone());
+            }
+            Some(Value::Array(items)) => {
+                given = true;
+                for item in items {
+                    parts.push(item.as_str().map(str::to_owned).ok_or_else(|| {
+                        format!(
+                            "{key} must be a list of strings (observation ids or source paths)."
+                        )
+                    })?);
+                }
+            }
+            Some(_) => {
+                return Err(format!(
+                    "{key} must be a string or a list of strings (observation ids or source paths)."
+                ))
+            }
+        }
+    }
+    Ok(given.then(|| parts.join(", ")))
+}
+
+fn parse_task_memory_change(
     value: &Value,
-) -> Result<String, String> {
-    let finding = value
-        .get("finding")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    let evidence = value
-        .get("evidence")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    let implication = value
-        .get("implication")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    let next = value
-        .get("next")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    let status = value
-        .get("status")
-        .and_then(Value::as_str)
+    transcript: &Transcript,
+) -> Result<crate::agent::task_memory::Change, String> {
+    let status = memory_text_field(value, "status")?
         .filter(|status| !status.trim().is_empty())
-        .map(crate::agent::task_memory::Status::parse)
+        .map(|status| crate::agent::task_memory::Status::parse(&status))
         .transpose()?;
-    memory.upsert_with_status(
-        value.get("id").and_then(Value::as_str),
-        finding,
-        evidence,
-        implication,
-        next,
-        value
-            .get("supersedes")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
+    Ok(crate::agent::task_memory::Change {
+        id: memory_text_field(value, "id")?,
+        finding: memory_text_field(value, "finding")?,
+        evidence: memory_evidence_field(value)?.map(|e| normalize_evidence_refs(&e, transcript)),
+        implication: memory_text_field(value, "implication")?,
+        next: memory_text_field(value, "next")?,
+        supersedes: memory_text_field(value, "supersedes")?,
         status,
+    })
+}
+
+/// Rewrites observation references into their exact ids: unpadded ids
+/// (`obs-15`), any letter case, and compact runs such as
+/// `obs-00000015/0016` or `obs-15, 16` become one id per observation. A
+/// reference that names no real observation is left as written so that it is
+/// reported, never silently repaired.
+fn normalize_evidence_refs(evidence: &str, transcript: &Transcript) -> String {
+    let chars = evidence.chars().collect::<Vec<_>>();
+    let mut out = String::new();
+    let mut index = 0;
+    let is_prefix = |at: usize| {
+        chars.len() >= at + 4
+            && chars[at..at + 4]
+                .iter()
+                .collect::<String>()
+                .eq_ignore_ascii_case("obs-")
+            && (at == 0 || !(chars[at - 1].is_alphanumeric() || chars[at - 1] == '_'))
+    };
+    let digits_at = |at: usize| {
+        chars[at..]
+            .iter()
+            .take_while(|c| c.is_ascii_digit())
+            .count()
+    };
+    while index < chars.len() {
+        if !is_prefix(index) || digits_at(index + 4) == 0 {
+            out.push(chars[index]);
+            index += 1;
+            continue;
+        }
+        let first = digits_at(index + 4);
+        let width = first;
+        let mut numbers = vec![chars[index + 4..index + 4 + first]
+            .iter()
+            .collect::<String>()];
+        let mut end = index + 4 + first;
+        // `/0016`, `, 16` or `+0016` directly continues the run only when no new `obs-` prefix follows.
+        loop {
+            let mut at = end;
+            if at < chars.len() && matches!(chars[at], '/' | '+' | ',' | '&') {
+                at += 1;
+                while at < chars.len() && chars[at] == ' ' {
+                    at += 1;
+                }
+                let run = if at < chars.len() { digits_at(at) } else { 0 };
+                let word_boundary = at + run >= chars.len() || !chars[at + run].is_alphanumeric();
+                if run > 0 && word_boundary && !is_prefix(at) {
+                    numbers.push(chars[at..at + run].iter().collect::<String>());
+                    end = at + run;
+                    continue;
+                }
+            }
+            break;
+        }
+        let rendered = numbers
+            .iter()
+            .map(|digits| {
+                let number = digits.parse::<usize>().unwrap_or(usize::MAX);
+                let candidate = format!("obs-{number:0width$}", width = width.max(8));
+                transcript
+                    .observation(&candidate)
+                    .map_or_else(|| format!("obs-{digits}"), |o| o.id.clone())
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&rendered);
+        index = end;
+    }
+    out
+}
+
+/// A short list of real references the model can cite instead.
+fn observation_hint(transcript: &Transcript) -> String {
+    let observations = transcript.observations();
+    if observations.is_empty() {
+        return "No observations exist in this run yet: read or search something first, then cite its obs- id.".into();
+    }
+    let recent = observations
+        .iter()
+        .rev()
+        .filter(|observation| !observation.error)
+        .take(4)
+        .map(|observation| match observation.source.as_deref() {
+            Some(source) if !source.is_empty() => format!("{} ({source})", observation.id),
+            _ => observation.id.clone(),
+        })
+        .collect::<Vec<_>>();
+    format!(
+        "Valid references include: {}. observation_index lists all.",
+        recent.join(", ")
     )
 }
 
@@ -952,6 +1070,14 @@ fn task_memory_conflict(
         .get("supersedes")
         .or_else(|| arguments.get("id"))
         .and_then(Value::as_str)?;
+    // Revising only status, next or implication leaves the cited evidence in place.
+    if arguments.get("supersedes").is_none()
+        && arguments.get("finding").is_none()
+        && arguments.get("evidence").is_none()
+        && arguments.get("observations").is_none()
+    {
+        return None;
+    }
     let prior = state
         .task_memory
         .entries
@@ -961,10 +1087,11 @@ fn task_memory_conflict(
         .observations()
         .iter()
         .find(|o| prior.evidence.contains(&o.id))?;
-    let new_evidence = arguments
-        .get("evidence")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let new_evidence = memory_evidence_field(arguments)
+        .ok()
+        .flatten()
+        .map(|evidence| normalize_evidence_refs(&evidence, transcript))
+        .unwrap_or_default();
     if transcript.observations().iter().any(|o| {
         new_evidence.contains(&o.id)
             || o.source
@@ -973,7 +1100,46 @@ fn task_memory_conflict(
     }) {
         return None;
     }
-    Some(format!("Potential evidence conflict: {} cites exact historical observation {}. Retrieve that observation with observation_read and cite a verified observation before replacing this finding.", prior.id, cited.id))
+    Some(format!("Potential evidence conflict: {} cites exact historical observation {}. Retrieve that observation with observation_read and cite a verified observation before replacing this finding (to retire it without a replacement, use action=invalidate). {}", prior.id, cited.id, observation_hint(transcript)))
+}
+
+/// Why this evidence does not support a confirmed claim, or `None` if it does.
+fn evidence_problem(evidence: &str, transcript: &Transcript) -> Option<String> {
+    let reference_character = |character: char| {
+        character.is_alphanumeric() || matches!(character, '-' | '_' | '.' | '/' | '\\')
+    };
+    let tokens = evidence
+        .split(|character| !reference_character(character))
+        .flat_map(|token| token.split(".."))
+        .map(|token| token.trim_matches('.'));
+    let mut found = transcript.observations().iter().any(|observation| {
+        observation.source.as_deref().is_some_and(|source| {
+            !source.is_empty()
+                && evidence.match_indices(source).any(|(start, matched)| {
+                    let end = start + matched.len();
+                    !evidence[..start]
+                        .chars()
+                        .next_back()
+                        .is_some_and(reference_character)
+                        && !evidence[end..]
+                            .chars()
+                            .next()
+                            .is_some_and(reference_character)
+                })
+        })
+    });
+    for token in tokens.filter(|token| !token.is_empty()) {
+        if token.starts_with("obs-") {
+            if transcript.observation(token).is_none() {
+                return Some(format!(
+                    "evidence cites unknown observation '{token}'. {}",
+                    observation_hint(transcript)
+                ));
+            }
+            found = true;
+        }
+    }
+    (!found).then(|| format!("evidence is empty or names no observation ID or exact source path inspected in this run. {}", observation_hint(transcript)))
 }
 
 fn validate_confirmed_memory(
@@ -984,45 +1150,11 @@ fn validate_confirmed_memory(
     if entry.status != Some(Status::Confirmed) {
         return Ok(());
     }
-    let reference_character = |character: char| {
-        character.is_alphanumeric() || matches!(character, '-' | '_' | '.' | '/' | '\\')
-    };
-    let tokens = entry
-        .evidence
-        .split(|character| !reference_character(character))
-        .flat_map(|token| token.split(".."))
-        .map(|token| token.trim_matches('.'));
-    let mut found = transcript.observations().iter().any(|observation| {
-        observation.source.as_deref().is_some_and(|source| {
-            !source.is_empty()
-                && entry
-                    .evidence
-                    .match_indices(source)
-                    .any(|(start, matched)| {
-                        let end = start + matched.len();
-                        !entry.evidence[..start]
-                            .chars()
-                            .next_back()
-                            .is_some_and(reference_character)
-                            && !entry.evidence[end..]
-                                .chars()
-                                .next()
-                                .is_some_and(reference_character)
-                    })
-        })
-    });
-    for token in tokens.filter(|token| !token.is_empty()) {
-        if token.starts_with("obs-") {
-            if transcript.observation(token).is_none() {
-                return Err(format!("Confirmed Task Memory cites unknown observation '{token}'. Use observation_index to find a valid reference and retry; no memory was changed."));
-            }
-            found = true;
-        }
+    match evidence_problem(&entry.evidence, transcript) {
+        None => Ok(()),
+        Some(problem) if problem.starts_with("evidence cites unknown") => Err(format!("Confirmed Task Memory cites unknown observation{}. Fix the reference (or use status inferred/unknown while it is unverified) and retry; no memory was changed.", &problem["evidence cites unknown observation".len()..])),
+        Some(problem) => Err(format!("Confirmed Task Memory needs support: {problem} Add it with evidence (or observations), or use status inferred/unknown while it is unverified; no memory was changed.")),
     }
-    if !found {
-        return Err("Confirmed Task Memory requires nonempty evidence referencing an observation ID or exact source path inspected in this transcript. Use observation_index and retry with evidence, or explicitly use inferred/unknown when unverified; no memory was changed.".into());
-    }
-    Ok(())
 }
 
 fn restore_task_memory(
@@ -1046,39 +1178,65 @@ fn apply_task_memory(
     arguments: &Value,
     transcript: &Transcript,
 ) -> Result<(Value, bool), String> {
-    let action = required_text(arguments, "action")?;
+    let requested = required_text(arguments, "action")?;
+    let action = canonical_memory_action(&requested).ok_or_else(|| {
+        format!(
+            "unsupported task_memory action '{requested}': use record, update, invalidate or view"
+        )
+    })?;
     if action == "view" {
         return Ok((
             json!({"task_memory": state.task_memory, "updated": false}),
             false,
         ));
     }
+    let mut notes = Vec::new();
+    let mut touched = None;
     if action == "invalidate" {
-        state
-            .task_memory
-            .invalidate(required_text(arguments, "id")?.as_str())?;
-    } else if action == "record" || action == "update" {
+        let id = arguments
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "invalidate needs the id of the entry to retire. {}",
+                    state.task_memory.ids_hint()
+                )
+            })?;
+        state.task_memory.invalidate(id)?;
+    } else {
         if state.memory_writes_this_turn >= strategy::MAX_MEMORY_WRITES_PER_TURN {
             return Err(format!("Task Memory accepts at most {} writes per turn. Merge the remaining findings into one entry (update an existing id) instead of one entry per fact.", strategy::MAX_MEMORY_WRITES_PER_TURN));
         }
+        let kind = if action == "record" {
+            crate::agent::task_memory::WriteKind::Record
+        } else {
+            crate::agent::task_memory::WriteKind::Update
+        };
+        let change = parse_task_memory_change(arguments, transcript)?;
         let mut candidate = state.task_memory.clone();
-        let id = write_task_memory(&mut candidate, arguments)?;
+        let applied = candidate.apply(kind, change)?;
         let entry = candidate
             .entries
             .iter()
-            .find(|entry| entry.id == id)
+            .find(|entry| entry.id == applied.id)
             .ok_or_else(|| "Task Memory write did not create an entry".to_owned())?;
         validate_confirmed_memory(entry, transcript)?;
         state.task_memory = candidate;
         state.memory_writes_this_turn += 1;
-    } else {
-        return Err("unsupported task_memory action".into());
+        notes = applied.notes;
+        touched = Some(applied.id);
     }
     state.calls_since_memory = 0;
-    Ok((
-        json!({"task_memory": state.task_memory, "updated": true}),
-        true,
-    ))
+    let mut result = json!({"task_memory": state.task_memory, "updated": true});
+    if let Some(id) = touched {
+        result["id"] = json!(id);
+    }
+    if !notes.is_empty() {
+        result["notes"] = json!(notes);
+    }
+    Ok((result, true))
 }
 
 /// Updates the execution contract. In Deep, completing an item needs evidence
@@ -1115,18 +1273,11 @@ fn apply_deliverables(
         }
         "done" => {
             let id = id()?;
-            let evidence = text_of("evidence");
+            let evidence = normalize_evidence_refs(&text_of("evidence"), transcript);
             if state.strategy.is_deep() {
-                let probe = crate::agent::task_memory::TaskMemoryEntry {
-                    id: id.clone(),
-                    finding: "deliverable".into(),
-                    evidence: evidence.clone(),
-                    status: Some(crate::agent::task_memory::Status::Confirmed),
-                    ..Default::default()
-                };
-                validate_confirmed_memory(&probe, transcript).map_err(|_| {
-                    "In Deep mode a deliverable is marked done only with evidence that cites an observation ID (obs-…) or the exact path of a source you inspected in this run. Check that it works, then retry with that evidence; nothing was changed.".to_owned()
-                })?;
+                if let Some(problem) = evidence_problem(&evidence, transcript) {
+                    return Err(format!("In Deep mode a deliverable is marked done only with evidence that cites an observation ID (obs-…) or the exact path of a source you inspected in this run: {problem} Check that it works, then retry with that evidence; nothing was changed."));
+                }
             }
             candidate.complete(&id, &evidence)?;
         }
@@ -4303,10 +4454,12 @@ pub fn run(config: Config) {
                     "pause_run is available only right after the user sent a new message".into(),
                 ),
                 "task_memory"
-                    if matches!(
-                        tool.arguments.get("action").and_then(Value::as_str),
-                        Some("update" | "record") | None
-                    ) =>
+                    if match tool.arguments.get("action").and_then(Value::as_str) {
+                        None => true,
+                        Some(action) => {
+                            matches!(canonical_memory_action(action), Some("update" | "record"))
+                        }
+                    } =>
                 {
                     if let Some(conflict) =
                         task_memory_conflict(&state, &transcript, &tool.arguments)
@@ -5063,6 +5216,11 @@ mod tests {
         ] {
             assert_eq!(parameters["properties"][field]["type"], "string", "{field}");
         }
+        assert_eq!(parameters["properties"]["observations"]["type"], "array");
+        assert_eq!(
+            parameters["properties"]["observations"]["items"]["type"],
+            "string"
+        );
     }
 
     #[test]
@@ -5094,7 +5252,8 @@ mod tests {
                 "implication",
                 "next",
                 "supersedes",
-                "status"
+                "status",
+                "observations"
             ]
         );
         let read = decoded["tools"]
@@ -5620,6 +5779,116 @@ mod tests {
             &Transcript::default(),
         )
         .is_err());
+    }
+
+    fn transcript_with_reads(count: usize) -> (Transcript, std::path::PathBuf) {
+        let base = std::env::temp_dir().join(format!(
+            "memory-refs-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(base.join("project")).unwrap();
+        let root = base.join("project");
+        let mut transcript =
+            Transcript::durable(&base.join("store"), "refs-test", &[], root.to_str()).unwrap();
+        transcript.push_run_user(json!({"role":"user","content":"inspect"}));
+        for n in 0..count {
+            let file = format!("f{n}.ts");
+            std::fs::write(root.join(&file), format!("export const v = {n};")).unwrap();
+            transcript.assistant_tool_turn(
+                String::new(),
+                &[ValidatedCall {
+                    id: format!("read{n}"),
+                    name: "read_file".into(),
+                    arguments: json!({"path":file}),
+                }],
+            );
+            transcript.tool_result(
+                &format!("read{n}"),
+                "read_file",
+                json!({"path":file,"content":format!("export const v = {n};")}).to_string(),
+            );
+        }
+        (transcript, base)
+    }
+
+    #[test]
+    fn evidence_references_are_normalized_but_never_invented() {
+        let (transcript, base) = transcript_with_reads(3);
+        let normalize = |text: &str| normalize_evidence_refs(text, &transcript);
+        assert_eq!(normalize("obs-00000001"), "obs-00000001");
+        assert_eq!(normalize("obs-1"), "obs-00000001");
+        assert_eq!(normalize("OBS-2"), "obs-00000002");
+        assert_eq!(normalize("obs-00000001/0002"), "obs-00000001, obs-00000002");
+        assert_eq!(
+            normalize("obs-00000001, 0003 and f0.ts"),
+            "obs-00000001, obs-00000003 and f0.ts"
+        );
+        assert_eq!(
+            normalize("obs-00000001, obs-00000002"),
+            "obs-00000001, obs-00000002"
+        );
+        assert_eq!(
+            normalize("obs-99"),
+            "obs-99",
+            "a fabricated id stays as written so it is reported"
+        );
+        assert_eq!(normalize("obs-1/99"), "obs-00000001, obs-99");
+        assert_eq!(normalize("see src/obs-notes.md"), "see src/obs-notes.md");
+        let problem = evidence_problem(&normalize("obs-99"), &transcript).unwrap();
+        assert!(
+            problem.contains("obs-99") && problem.contains("obs-00000003"),
+            "{problem}"
+        );
+        assert!(evidence_problem(&normalize("obs-1/2"), &transcript).is_none());
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn task_memory_accepts_common_action_names_and_evidence_shapes() {
+        let (transcript, base) = transcript_with_reads(2);
+        let mut state = AgentState::default();
+        apply_task_memory(
+            &mut state,
+            &json!({"action":"create","finding":"a","status":"refuted"}),
+            &transcript,
+        )
+        .unwrap();
+        assert_eq!(
+            state.task_memory.entries[0].status,
+            Some(crate::agent::task_memory::Status::Contradicted)
+        );
+        state.memory_writes_this_turn = 0;
+        apply_task_memory(
+            &mut state,
+            &json!({"action":"edit","id":"tm-001","status":"confirmed","observations":["obs-1","obs-2"]}),
+            &transcript,
+        )
+        .unwrap();
+        assert_eq!(
+            state.task_memory.entries[0].evidence,
+            "obs-00000001, obs-00000002"
+        );
+        assert_eq!(state.task_memory.entries[0].finding, "a");
+        state.memory_writes_this_turn = 0;
+        for bad in [
+            json!({"action":"update","id":"tm-001","evidence":[1]}),
+            json!({"action":"update","id":"tm-001","evidence":{"a":1}}),
+        ] {
+            assert!(apply_task_memory(&mut state, &bad, &transcript).is_err());
+        }
+        apply_task_memory(
+            &mut state,
+            &json!({"action":"delete","id":"tm-001"}),
+            &transcript,
+        )
+        .unwrap();
+        assert!(state.task_memory.entries[0].invalidated);
+        assert!(
+            canonical_memory_action("get") == Some("view")
+                && canonical_memory_action("zzz").is_none()
+        );
+        std::fs::remove_dir_all(base).ok();
     }
 
     #[test]
