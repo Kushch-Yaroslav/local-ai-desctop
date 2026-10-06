@@ -1,11 +1,12 @@
 import { activeConversationModel } from '../../shared/model-selection';
 import { localizeProjectLabel, pauseRequestText } from '../../shared/localization';
 import { useShallow } from 'zustand/react/shallow';
-import { ChevronDown, File, Folder, Paperclip, Send, Square, X } from 'lucide-react';
-import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
+import { File, Folder, Paperclip, Send, Square, X } from 'lucide-react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { useAppStore } from '../store/app-store';
 import { ContextUsage } from './ContextUsage';
-import type { AgentPlan, ModelTodoItem, ProjectReference, ProjectSuggestion } from '../../shared/types';
+import { CurrentAgentStatus } from './AgentStatusPanel';
+import type { ProjectReference, ProjectSuggestion } from '../../shared/types';
 import { removeProjectReferenceQuery } from '../../shared/project-references';
 
 const isImageFile = (file: File): boolean => file.type.startsWith('image/') || /\.(png|jpe?g|webp)$/i.test(file.name);
@@ -84,7 +85,7 @@ export function Composer() {
     resizeHandle.current = false;
     window.requestAnimationFrame(() => { if (ref.current) { manualHeight.current = ref.current.offsetHeight; ref.current.style.overflowY = 'auto'; } });
   };
-  return <div className="composer-wrap"><div className="composer" onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); addFiles([...event.dataTransfer.files]); }}>
+  return <div className="composer-wrap"><CurrentAgentStatus /><div className="composer" onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); addFiles([...event.dataTransfer.files]); }}>
     {(files.length > 0 || projectReferences.length > 0) && <div className="attachment-draft">{projectReferences.map((reference) => <ProjectReferenceChip key={reference.id} reference={reference} onRemove={() => setProjectReferences((items) => items.filter((item) => item.id !== reference.id))} />)}{files.map((file, index) => <DraftAttachment key={`${file.name}-${index}`} file={file} index={isImageFile(file) ? files.slice(0, index + 1).filter(isImageFile).length - 1 : index} onRemove={() => { setFiles((items) => items.filter((_, itemIndex) => itemIndex !== index)); setAttachmentError(null); }} />)}</div>}
     <input ref={inputRef} className="attachment-input" type="file" multiple accept=".png,.jpg,.jpeg,.webp,.txt,.md,.json,.csv,.log,.js,.ts,.jsx,.tsx,.html,.css,.yaml,.yml,.xml,.docx,.xlsx,.xls,.pdf" onChange={(event) => { addFiles([...(event.target.files ?? [])]); event.currentTarget.value = ''; }} />
     {isGenerating && chat?.mode === 'agent' && <button className="steering-button" type="button" disabled={!value.trim() || files.length > 0 || projectReferences.length > 0 || steeringSubmitting} onClick={submit} title={steeringStatus === 'applied' ? 'Предыдущее уточнение передано модели' : steeringStatus === 'accepted' ? 'Предыдущее уточнение принято; ожидает границы хода' : 'Отправить уточнение без остановки Agent'}>Уточнить</button>}
@@ -94,33 +95,6 @@ export function Composer() {
     {suggestions.length > 0 && <div className="project-reference-menu" role="listbox" aria-label="Файлы проекта">{suggestions.map((suggestion, index) => <button type="button" role="option" aria-selected={index === activeSuggestion} className={index === activeSuggestion ? 'active' : ''} key={suggestion.id} onMouseDown={(event) => { event.preventDefault(); selectSuggestion(suggestion); }} onMouseEnter={() => setActiveSuggestion(index)}>{suggestion.kind === 'folder' ? <Folder size={15} /> : <File size={15} />}<span>{suggestion.relativePath}</span><small className={`project-badge project-${suggestion.projectSlot}`}>{localizeProjectLabel(suggestion.projectLabel)}</small></button>)}</div>}
     <ContextUsage />{isGenerating ? <button className="send-button stop" onClick={() => void stop()} title="Остановить генерацию"><Square size={16} fill="currentColor" /></button> : <button className="send-button" disabled={!modelReady || Boolean(generationConversationId) || (!value.trim() && files.length === 0)} onClick={submit} title={generationConversationId ? 'Генерация выполняется в другом чате' : 'Отправить'}><Send size={18} /></button>}
   </div>{attachmentError && <p className="attachment-error" role="status">{attachmentError}</p>}<p>Enter — отправить · Shift+Enter — новая строка · вставьте или перетащите файлы</p></div>;
-}
-
-export function taskPlanningItems(plan: AgentPlan): ModelTodoItem[] {
-  const legacy = plan.steps ?? [];
-  const milestones = plan.milestones ?? (legacy.length ? [{ id: 'legacy-plan', label: 'Предыдущий план', status: legacy.some((step) => step.status === 'in_progress') ? 'in_progress' as const : 'pending' as const, workPlan: { tasks: legacy } }] : []);
-  return plan.modelTodo?.phases.flatMap((phase) => phase.items) ?? milestones.flatMap((milestone) => milestone.workPlan.tasks.map((task) => ({ id: task.id, content: task.label, status: task.status })));
-}
-
-export function TaskPlanPanel({ plan, active = false }: { plan: AgentPlan; active?: boolean }) {
-  const [collapsed, setCollapsed] = useState(false);
-  const contentId = useId();
-  const marker = (status: string) => status === 'completed' ? '✓' : status === 'abandoned' ? '–' : status === 'in_progress' ? '●' : '○';
-  const todoItems = taskPlanningItems(plan);
-  if (!todoItems.length) return null;
-  const completed = todoItems.filter((task) => task.status === 'completed' || task.status === 'abandoned').length;
-  return <section className={`task-plan-panel milestone-plan${active ? ' active' : ''}${collapsed ? ' collapsed' : ''}`} aria-label="План задач">
-    <header>
-      <button type="button" className="task-plan-toggle" aria-expanded={!collapsed} aria-controls={contentId} onClick={() => setCollapsed((value) => !value)}>
-        <strong>План задач</strong><span>{completed}/{todoItems.length}</span><ChevronDown size={15} aria-hidden="true" />
-      </button>
-    </header>
-    <div id={contentId} className="task-plan-collapse" inert={collapsed}>
-      <div className="task-plan-content">
-        <ol className="task-plan-todo">{todoItems.map((task) => <li className={task.status} key={task.id}><i>{marker(task.status)}</i><span>{task.content}{'memoryId' in task && task.memoryId ? ` → ${task.memoryId}` : ''}</span></li>)}</ol>
-      </div>
-    </div>
-  </section>;
 }
 
 function ProjectReferenceChip({ reference, onRemove }: { reference: ProjectReference; onRemove: () => void }) {

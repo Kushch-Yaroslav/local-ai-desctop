@@ -23,7 +23,7 @@ export async function runStreamingLoadRegression(): Promise<void> {
   const frames: Array<() => void> = [];
   Object.defineProperty(globalThis, 'window', { configurable: true, value: {
     requestAnimationFrame: (callback: () => void) => { frames.push(callback); return frames.length; }, cancelAnimationFrame: () => {},
-    localAi: { messages: { list: async () => [] as ChatMessage[] }, analysis: { list: async () => [] }, conversations: { create: async () => conversation, delete: async () => {} }, chat: { send: () => new Promise<void>(() => {}), stop: async () => {} } },
+    localAi: { agentPlans: { get: async () => null }, messages: { list: async () => [] as ChatMessage[] }, analysis: { list: async () => [] }, conversations: { create: async () => conversation, delete: async () => {} }, chat: { send: () => new Promise<void>(() => {}), stop: async () => {} } },
   } });
   useAppStore.setState({ conversations: [conversation], activeId: 'A', messages: [], settings: { llamaServerPath: null, modelsPath: '', llamaRuntime: { status: 'ready', modelId: 'model', contextWindow: 16_384 } } });
   void useAppStore.getState().sendMessage('long task');

@@ -703,6 +703,7 @@ export function registerIpc(): void {
         }
         if (chunk.type === 'task-memory') {
           database.saveAgentPlan(request.conversationId, { milestones: [], taskMemory: structuredClone(chunk.memory) });
+          event.sender.send('chat:stream', { ...chunk, conversationId: request.conversationId, generationId: generation.id });
           continue;
         }
         if (chunk.type === 'context-usage') {

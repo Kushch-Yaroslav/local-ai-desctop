@@ -14,7 +14,7 @@ async function run(): Promise<void> {
   const frames: Array<() => void> = [];
   Object.defineProperty(globalThis, 'window', { configurable: true, value: {
     requestAnimationFrame: (callback: () => void) => { frames.push(callback); return 1; }, cancelAnimationFrame: () => {},
-    localAi: {
+    localAi: { agentPlans: { get: async () => null },
       messages: { list: async (id: string) => persisted.get(id) ?? [], regenerate: async () => new Promise<ChatMessage[]>((resolve) => { resolveBranch = resolve; }) },
       analysis: { list: async () => [] },
       conversations: { create: async () => chat('C'), delete: async () => {} },

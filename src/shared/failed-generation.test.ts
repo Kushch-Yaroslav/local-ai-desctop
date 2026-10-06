@@ -8,7 +8,7 @@ async function run(): Promise<void> {
   const finish: Array<() => void> = [];
   Object.defineProperty(globalThis, 'window', { configurable: true, value: {
     requestAnimationFrame: () => 1, cancelAnimationFrame() {},
-    localAi: {
+    localAi: { agentPlans: { get: async () => null },
       messages: { list: async () => [] }, analysis: { list: async () => [] },
       chat: { send: async () => new Promise<void>((resolve) => finish.push(resolve)) },
     },

@@ -21,6 +21,10 @@ export const reasoningControlText = {
 } as const;
 export const chatModeLabel = { chat: 'Чат', agent: 'Агент' } as const;
 
+export const agentStatusText = { panel: 'План и результат', plan: 'План', deliverables: 'Требуемый результат', result: 'Результат' } as const;
+export const planStatusLabel = { pending: 'Предстоит', in_progress: 'Текущий шаг', completed: 'Выполнено', blocked: 'Заблокировано', abandoned: 'Исключено' } as const;
+export const deliverableStatusLabel = { pending: 'Ожидает', implemented: 'Реализовано, не проверено', done: 'Реализовано, не проверено', verified: 'Проверено', blocked: 'Заблокировано', dropped: 'Исключено' } as const;
+
 /** Why a Max Context search stopped at its boundary. */
 export const boundaryReasonLabel: Record<string, string> = {
   'model-limit': 'предел модели',
