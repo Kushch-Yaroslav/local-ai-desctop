@@ -53,17 +53,15 @@ async function run(): Promise<void> {
     runtime = { status: 'idle', modelId: null, contextWindow: null };
     assert.equal(db.getConversation(previous.id)?.contextWindow, 81_920, 'startup must retain history configuration');
     await assert.rejects(invoke('conversations:update', previous.id, { contextWindow: 32_768 }), /Выберите модель/);
-    const selected = await invoke<Conversation>('conversations:update', previous.id, { modelId: previous.modelId });
+    const selected = await invoke<Conversation>('conversations:update', previous.id, { modelId: 'qwen3.8:27b-q4_K_M' });
     assert.equal(selected.contextWindow, 32_768, 'first selection cannot replay an old Max window from another MTP configuration');
     assert.equal(selected.llamaKvCacheType, 'f16');
     assert.match(launches[0].environment, /SPECULATIVE_MODE='mtp'/);
-    assert.match(launches[0].environment, /DRAFT_MODEL='[^']*mtp-gemma-4-31B-it-Q8_0.gguf'/);
-    assert.match(launches[0].environment, /MMPROJ='[^']*gemma-4-31b-mmproj-f16.gguf'/);
+    assert.match(launches[0].environment, /DRAFT_MODEL=''/);
+    assert.match(launches[0].environment, /MMPROJ='[^']*qwen3.8-27b-mmproj.gguf'/);
     for (const [id, mode, draft] of [
       ['qwen3.8:27b-q4_K_M', 'mtp', ''],
-      ['devstral-small-2:24b-q4_k_m', 'none', ''],
       ['huihui-qwen3.8:27b-ud-dw-q4_k_m', 'mtp', ''],
-      ['gemma4:31b-it-q4_k_m', 'mtp', '/media/yaroslav/DATA/llama-models/mtp-gemma-4-31B-it-Q8_0.gguf'],
     ]) {
       const result = await invoke<Conversation>('conversations:update', previous.id, { modelId: id });
       assert.equal(result.modelId, id); assert.equal(runtime.modelId, id);
@@ -77,7 +75,7 @@ async function run(): Promise<void> {
     assert.equal((await invoke<{ llamaRuntime: LlamaRuntimeState }>('settings:get')).llamaRuntime.modelId, null);
     await invoke('conversations:list'); await invoke('messages:list', previous.id);
     assert.equal(launches.length, before, 'restart/history reads cannot restore a selection');
-    console.log('production IPC startup/explicit selection/switch/restart regressions passed (Gemma, Qwen, Devstral, Huihui)');
+    console.log('production IPC startup/explicit selection/switch/restart regressions passed (removed-model history, Qwen, Huihui)');
   } finally { globalThis.fetch = originalFetch; loader._load = originalLoad; db.close(); rmSync(root, { recursive: true, force: true }); }
 }
 void run().catch((error: unknown) => { console.error(error); process.exitCode = 1; });

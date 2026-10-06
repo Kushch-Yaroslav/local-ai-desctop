@@ -8,7 +8,7 @@ const qwen = 'qwen3.8:27b-q4_K_M';
 const huihui = 'huihui-qwen3.8:27b-ud-dw-q4_k_m';
 const devstral = 'devstral-small-2:24b-q4_k_m';
 const gemma = 'gemma4:31b-it-q4_k_m';
-const ids = [qwen, huihui, devstral, gemma];
+const ids = [qwen, huihui];
 assert.deepEqual(modelRegistry.map((profile) => profile.id), ids);
 assert.deepEqual(llamaRuntimeProfiles.map((profile) => profile.id), ids);
 assert.notEqual(llamaRuntimeProfile(qwen)?.modelPath, llamaRuntimeProfile(huihui)?.modelPath);
@@ -29,20 +29,19 @@ for (const id of [qwen, huihui]) {
   assert(reasoningPatchError({ reasoningEffort: 'high' }, capability), 'do not invent an extra level');
   assert.deepEqual(agentReasoningOptions(id, { thinking: true, effort: 'medium' })?.main, { reasoning_effort: 'medium', chat_template_kwargs: { enable_thinking: true } });
 }
-const gemmaCapability = reasoningCapability(llamaRuntimeProfile(gemma));
-assert.deepEqual(gemmaCapability, { thinkingToggle: true, efforts: [] });
-assert(reasoningPatchError({ reasoningEffort: 'medium' }, gemmaCapability));
-assert.equal(reasoningCapability(llamaRuntimeProfile(devstral)), undefined);
+// Capability shapes remain generic even after the corresponding local models are removed.
+const toggleOnly = reasoningCapability({ id: 'future-toggle-only', maxContext: 262_144, speculative: 'none', vision: false, reasoning: { thinkingKwarg: 'enable_thinking', efforts: {}, final: {} } });
+assert.deepEqual(toggleOnly, { thinkingToggle: true, efforts: [] });
+assert(reasoningPatchError({ reasoningEffort: 'medium' }, toggleOnly));
 assert(reasoningPatchError({ thinkingEnabled: true }, undefined));
 for (const mode of ['fast', 'deep'] as const) {
-  assert.deepEqual(resolveReasoningSelection(gemmaCapability, mode, { thinkingEnabled: false, reasoningEffort: 'max' }), { thinking: false, effort: null });
-  assert.deepEqual(llamaReasoningForInput(gemma, { mode, selection: { thinking: true, effort: 'max' } }), { chat_template_kwargs: { enable_thinking: true } });
-  assert.deepEqual(llamaReasoningForInput(gemma, { mode, selection: { thinking: false, effort: 'max' } }), { chat_template_kwargs: { enable_thinking: false } });
-  assert.deepEqual(llamaReasoningForInput(devstral, { mode, selection: { thinking: true, effort: 'max' } }), {});
+  assert.deepEqual(resolveReasoningSelection(toggleOnly, mode, { thinkingEnabled: false, reasoningEffort: 'max' }), { thinking: false, effort: null });
+  assert.deepEqual(llamaReasoningForInput('future-without-reasoning', { mode, selection: { thinking: true, effort: 'max' } }), {});
 }
-assert.equal(llamaRuntimeProfile(devstral)?.speculative, 'none');
-assert.equal(llamaRuntimeProfile(gemma)?.speculative, 'mtp');
-assert.equal(llamaRuntimeProfile(gemma)?.draft?.kvCache, 'shared');
+for (const removed of [devstral, gemma]) {
+  assert.equal(llamaRuntimeProfile(removed), undefined, 'removed local runtime must not retain deleted paths/capability controls');
+  assert(!modelRegistry.some((profile) => profile.id === removed));
+}
 assert.equal(llamaRuntimeProfile(huihui)?.speculative, 'mtp');
 for (const profile of llamaRuntimeProfiles) {
   assert.equal(profile.maxContext, 262_144);
@@ -50,4 +49,4 @@ for (const profile of llamaRuntimeProfiles) {
   assert(launch.includes(profile.modelPath!));
   assert(launch.includes(profile.mmprojPath!));
 }
-console.log('model capability regression passed (4 local profiles; native controls and strategy independence)');
+console.log('model capability regression passed (2 local profiles; native controls and strategy independence)');

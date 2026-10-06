@@ -67,6 +67,6 @@ async function run() {
   assert.equal(parseLlamaRuntimeState('{"status":"ready","speculativeMode":"mtp"}')?.speculativeMode, 'mtp');
   assert.equal(parseLlamaRuntimeState('{"status":"ready","speculativeMode":"pretend"}')?.speculativeMode, undefined);
   assert.equal(parseLlamaRuntimeState('{"status":"offline","speculativeMode":"none"}')?.speculativeMode, 'none');
-  console.log('generic speculative configuration regression passed (four profiles, OFF/ON, future family, verified/invalid/missing/corrupt draft, runtime state)');
+  console.log('generic speculative configuration regression passed (local profiles, OFF/ON, future family, verified/invalid/missing/corrupt draft, runtime state)');
 }
 void run().catch((error: unknown) => { console.error(error); process.exitCode = 1; });

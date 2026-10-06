@@ -6,8 +6,8 @@ import type {} from '../renderer/env';
 import { getModelProfile, modelInfo } from '../main/models/model-registry';
 
 async function run() {
-  const saved: Conversation = { id: 'saved', title: 'Saved Gemma', modelId: 'gemma4:31b-it-q4_k_m', mode: 'chat', workingDirectory: null, secondaryWorkingDirectory: null, primaryProjectId: null, secondaryProjectId: null, contextWindow: 81_920, llamaKvCacheType: 'q8_0', llamaKvOffload: true, thinkingEnabled: null, reasoningEffort: null, reasoningMode: 'fast', contextTokens: null, contextModelId: null, webMode: 'off', createdAt: '', updatedAt: '' };
-  const other = { ...saved, id: 'other', modelId: 'qwen3.8:27b-q4_K_M' };
+  const saved: Conversation = { id: 'saved', title: 'Saved Qwen', modelId: 'qwen3.8:27b-q4_K_M', mode: 'chat', workingDirectory: null, secondaryWorkingDirectory: null, primaryProjectId: null, secondaryProjectId: null, contextWindow: 81_920, llamaKvCacheType: 'q8_0', llamaKvOffload: true, thinkingEnabled: null, reasoningEffort: null, reasoningMode: 'fast', contextTokens: null, contextModelId: null, webMode: 'off', createdAt: '', updatedAt: '' };
+  const other = { ...saved, id: 'other', modelId: 'huihui-qwen3.8:27b-ud-dw-q4_k_m' };
   let mutations = 0, sends = 0, modelOnCreate: unknown = 'not-called';
   Object.defineProperty(globalThis, 'window', { configurable: true, value: { localAi: { agentPlans: { get: async () => null },
     conversations: { list: async () => [saved, other], create: async (modelId?: string) => { modelOnCreate = modelId; return { ...saved, id: 'new', modelId: null }; }, update: async () => { mutations++; throw new Error('Unexpected startup mutation'); } },

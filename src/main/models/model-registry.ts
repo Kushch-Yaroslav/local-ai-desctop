@@ -16,8 +16,6 @@ export type ModelProfile = {
 export const modelRegistry: readonly ModelProfile[] = [
   { id: 'qwen3.8:27b-q4_K_M', displayName: 'Qwen3.8-27B', shortName: 'Qwen3.8', quantization: 'Q4_K_M', maxContext: 262_144, supportsTools: true, supportsReasoning: true },
   { id: 'huihui-qwen3.8:27b-ud-dw-q4_k_m', displayName: 'Huihui Qwen3.8-27B (abliterated)', shortName: 'Huihui Qwen3.8', quantization: 'UD-DW-Q4_K_M', maxContext: 262_144, supportsTools: true, supportsReasoning: true },
-  { id: 'devstral-small-2:24b-q4_k_m', displayName: 'Devstral Small 2 24B', shortName: 'Devstral Small 2', quantization: 'Q4_K_M', maxContext: 262_144, supportsTools: true, supportsReasoning: false },
-  { id: 'gemma4:31b-it-q4_k_m', displayName: 'Gemma 4 31B IT', shortName: 'Gemma 4', quantization: 'Q4_K_M', maxContext: 262_144, supportsTools: true, supportsReasoning: true },
 ];
 
 /** Generic family support retained for externally configured runtimes; these are not local installed entries. */

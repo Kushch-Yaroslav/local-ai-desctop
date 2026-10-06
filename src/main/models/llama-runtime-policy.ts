@@ -43,12 +43,7 @@ const qwen38Reasoning: LlamaReasoningProfile = { thinkingKwarg: 'enable_thinking
 export const llamaRuntimeProfiles: readonly LlamaRuntimeProfile[] = [
   { id: 'qwen3.8:27b-q4_K_M', maxContext: 262_144, modelPath: '/media/yaroslav/DATA/llama-models/qwen3.8-27b-q4_K_M.gguf', mmprojPath: '/media/yaroslav/DATA/llama-models/qwen3.8-27b-mmproj.gguf', speculative: 'mtp', vision: true, reasoning: qwen38Reasoning },
   { id: 'huihui-qwen3.8:27b-ud-dw-q4_k_m', maxContext: 262_144, modelPath: '/media/yaroslav/DATA/llama-models/Huihui-Qwen3.8-27B-abliterated-UD-DW-Q4_K_M.gguf', mmprojPath: '/media/yaroslav/DATA/llama-models/huihui-qwen3.8-27b-mmproj-bf16.gguf', speculative: 'mtp', vision: true, reasoning: qwen38Reasoning },
-  // The author advertises 256K even though this GGUF's raw training metadata says 393216.
-  { id: 'devstral-small-2:24b-q4_k_m', maxContext: 262_144, modelPath: '/media/yaroslav/DATA/llama-models/Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf', mmprojPath: '/media/yaroslav/DATA/llama-models/devstral-small-2-24b-mmproj-f16.gguf', speculative: 'none', vision: true },
-  // Gemma's template has enable_thinking, but no native reasoning_effort levels.
-  { id: 'gemma4:31b-it-q4_k_m', maxContext: 262_144, modelPath: '/media/yaroslav/DATA/llama-models/gemma-4-31B-it-Q4_K_M.gguf', mmprojPath: '/media/yaroslav/DATA/llama-models/gemma-4-31b-mmproj-f16.gguf', speculative: 'mtp',
-    draft: { path: '/media/yaroslav/DATA/llama-models/mtp-gemma-4-31B-it-Q8_0.gguf', sizeBytes: 514_687_104, sha256: '5ae8b0117bed601e8924c6305bd5b0585de361d51f0e77091bcb4252cf1f27de', architecture: 'gemma4-assistant', targetArchitecture: 'gemma4', targetEmbeddingLength: 5376, kvCache: 'shared', maxDraftTokens: 4 },
-    vision: true, reasoning: { thinkingKwarg: 'enable_thinking', efforts: {}, final: { chat_template_kwargs: { enable_thinking: false } } } },
+
 ];
 
 /** Generic families have no pinned local files after removal. */
