@@ -51,3 +51,64 @@ CPU expert fetches and memory bandwidth remain important even with only 3B activ
 The existing 1,550 MiB absolute non-LLM cap and 384 MiB VRAM margin remain unchanged.
 Standalone tests keep context at 65,536, Q8 K/V, GPU attention/KV, and vary CPU expert placement/threads.
 The model is registered only after successful real allocation and meaningful-context generation measurements.
+
+## Measured serving configuration
+
+The installed four-shard artifact was verified before load. The selected normal configuration is
+65,536 context with Q8 K/V, GPU KV offload, flash attention, one sequence, and the embedded
+Qwen coding/tool template. On the measured RTX 3090 / Ryzen 7 5700X3D host, the balanced
+placement is 28 CPU MoE layers, eight CPU threads, batch 1,024, ubatch 128, and
+`--load-mode none`; `--fit off` keeps llama.cpp from silently changing that placement.
+The profile has no vision projector or speculative mode.
+
+At 65,536/Q8, allocation output reported approximately 19.617 GiB of GPU-resident weights,
+25.464 GiB of host-resident weights, 816 MiB (0.797 GiB) of KV, 75 MiB of recurrent state,
+and 896 MiB of GPU compute buffers. The ordinary-launch host guard checks for the 27 GiB
+resident-weight budget plus the existing 8 GiB host reserve before starting the server. The
+existing non-LLM host cap and VRAM safety margin were not changed.
+
+The verified near-64K run processed 60,071 prompt tokens and generated 256 tokens without
+truncation. Ubatch 128 measured 204.78 prompt tokens/s and 38.05 / 37.94 decode tokens/s;
+the loaded run retained about 1,183 MiB free VRAM and 28.9 GiB available host RAM. The
+ubatch-256 baseline was faster at prefill (about 309.75 tokens/s) but slower at decode
+(35.89 / 35.81 tokens/s) and left only about 665 MiB free VRAM. The valid ubatch-64
+comparison at about 16.4K tokens left about 1,167 MiB free VRAM, no more headroom than
+ubatch 128, and its first-pass prefill was about 151.7 tokens/s. Ubatch 128 is therefore
+the selected balance; the smaller first decode observed at ubatch 64 is not representative
+of a near-64K run.
+
+## Application integration
+
+Qwen3-Coder-Next is registered as text-only and tool-capable, without adding a reasoning
+control, projector, or MTP capability. A fresh application session remains idle with no
+model selected and no llama-server allocation. Explicit selection starts the verified
+65,536/Q8 profile; live process arguments and runtime state were checked against the
+configured placement. A live Agent acceptance run read the isolated project files and used
+the project terminal to report its actual working directory, confirming both tool paths
+were available under the selected workspace.
+
+The live selector was then switched Qwen3.8-27B → Coder-Next → Huihui Qwen3.8-27B. Each
+transition reached the requested model/configuration with a new server PID and the prior
+server process gone; Huihui retained its BF16 projector and draft-MTP configuration.
+The clean first-launch check also confirmed the selector placeholder, no model allocation,
+and explicit selection before load.
+
+For a matched, isolated checkout-validation coding task, both Qwen3-Coder-Next and the
+Qwen3.8-27B baseline used the project tools and completed `npm run build`. The baseline
+produced a concise implementation with an explicit `noValidate` form, accessible live
+status, and normalized email in its success message. The Coder-Next implementation built,
+but left native email validation enabled and did not expose the normalized address. This
+was confirmed in a browser: `user@` produced the baseline's inline error, while the
+Coder-Next version was blocked by native validation before its React handler could show
+the requested inline message; the baseline's success message displayed the normalized
+lowercase address. This is a single-task qualitative integration check, not a general
+model-quality benchmark.
+
+## Regression validation
+
+Passed `npm run test:model-capabilities`, `npm run test:llama-runtime`,
+`npm run test:max-context`, and `npm run test:agent-runtime`, plus
+`npm run lint`, the production build/typecheck, `cargo test --manifest-path rust-agent/Cargo.toml`,
+and `cargo fmt --manifest-path rust-agent/Cargo.toml -- --check`. The split-GGUF,
+host-memory-guard, and allocation-estimator tests passed as part of the focused regression
+run. Production builds retain the repository's existing Vite large-chunk warning.

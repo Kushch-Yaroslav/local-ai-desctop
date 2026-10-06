@@ -133,6 +133,14 @@ export async function runLlamaCppBackendRegression(): Promise<void> {
       assert.deepEqual(models.map((item) => item.id), llamaRuntimeProfiles.map((profile) => profile.id));
       assert(!models.some((item) => ['glm-4.7-flash:q4_k', 'gpt-oss:20b'].includes(item.id)), 'removed local entries must not appear');
       for (const item of models) assert.deepEqual(item.supportedContextPresets, [16384, 32768, 65536, 131072, 262144], 'active context must not truncate another model capability');
+      const coderNext = models.find((item) => item.id === 'qwen3-coder-next:80b-a3b-q4_k_m');
+      assert(coderNext?.installed);
+      assert.equal(coderNext.supportsTools, true);
+      assert.equal(coderNext.supportsReasoning, false);
+      assert.equal(coderNext.normalContext?.initialContextWindow, 65_536);
+      assert.equal(coderNext.normalContext?.kvCacheType, 'q8_0');
+      assert.equal(coderNext.speculative, undefined);
+      assert.equal(coderNext.reasoning, undefined);
     } finally { await stop(server); }
   }
   {

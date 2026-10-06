@@ -1,0 +1,17 @@
+0.00.277.375 I srv    load_model: loading model '/media/yaroslav/DATA/llama-models/Qwen3-Coder-Next-Q4_K_M/Qwen3-Coder-Next-Q4_K_M-00001-of-00004.gguf'
+0.25.001.048 I load_tensors: offloaded 49/49 layers to GPU
+0.25.001.059 I load_tensors:        CUDA0 model buffer size = 20087.69 MiB
+0.25.001.060 I load_tensors:    CUDA_Host model buffer size = 26074.92 MiB
+1.22.039.730 I llama_context: n_seq_max             = 1
+1.22.039.731 I llama_context: n_ctx_seq             = 65536
+1.22.039.738 I llama_context: n_ctx_seq (65536) < n_ctx_train (262144) -- the full capacity of the model will not be utilized
+1.22.049.325 I llama_context:  CUDA_Host  output buffer size =     0.58 MiB
+1.22.053.839 I llama_kv_cache:      CUDA0 KV buffer size =   816.00 MiB
+1.22.071.472 I llama_kv_cache: size =  816.00 MiB ( 65536 cells,  12 layers,  1/1 seqs), K (q8_0):  408.00 MiB, V (q8_0):  408.00 MiB
+1.22.071.809 I llama_memory_recurrent:      CUDA0 RS buffer size =    75.38 MiB
+1.22.071.816 I llama_memory_recurrent: size =   75.38 MiB (     1 cells,  48 layers,  1 seqs  0 rs_seq), R (f32):    3.38 MiB, S (f32):   72.00 MiB, P (f32):    0.00 MiB
+1.22.121.913 I sched_reserve:      CUDA0 compute buffer size =   896.01 MiB
+1.22.121.916 I sched_reserve:  CUDA_Host compute buffer size =    36.27 MiB
+1.23.041.792 I srv    load_model: initializing, n_slots = 1, n_ctx_slot = 65536, kv_unified = 'false'
+1.23.041.808 I spec common_specu: no implementations specified for speculative decoding
+1.23.051.574 I srv  llama_server: model loaded

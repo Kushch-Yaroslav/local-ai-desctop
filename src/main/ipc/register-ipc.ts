@@ -23,7 +23,7 @@ import { chatMessagesWithSystemPrefix, chatSystemContext } from '../services/cap
 import { ReadonlyProjectTools, type ApprovalResult } from '../tools/project-tools';
 import { AttachmentService } from '../services/attachment-service';
 import { AttachmentPipeline } from '../services/attachment-pipeline';
-import { readFile, stat } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { saveGenerationDiagnosticsBestEffort } from '../services/generation-diagnostics';
 import { projectDirectoryName } from '../../shared/project-references';
 import { executionMode } from '../../shared/generation-mode';
@@ -34,6 +34,7 @@ import { existingProjectDirectory } from '../services/project-picker';
 import { collectRuntimeContextEstimate, defaultContextDeviceReserveBytes, defaultContextHostReserveBytes, resolveContextReserve } from '../services/context-estimate';
 import { join } from 'node:path';
 import { llamaCapabilityLimit } from '../services/gguf-context';
+import { ggufArtifactFingerprint } from '../services/gguf-artifacts';
 import { discoverContextBoundary, predictContextHeadroom, type DiscoveryProbe } from '../services/context-discovery';
 
 const database = new Database();
@@ -86,8 +87,7 @@ function currentDiscoveryHeadroomFits(option: ContextDiscoveryOption, current: R
 const hostBaselineStable = (option: ContextDiscoveryOption, current: RuntimeContextEstimate) =>
   option.restored || Math.abs(current.memoryBaseline!.hostAvailableBytes - option.memoryBaseline.hostAvailableBytes) <= 2 * 1024 ** 3;
 async function modelFileIdentity(path: string): Promise<string> {
-  const file = await stat(path);
-  return `${file.dev}:${file.ino}:${file.size}:${file.mtimeMs}`;
+  return ggufArtifactFingerprint(path, true);
 }
 async function runtimeConfigurationIdentity(modelId: string): Promise<string> {
   const profile = llamaRuntimeProfile(modelId);
@@ -106,8 +106,7 @@ async function runtimeConfigurationIdentity(modelId: string): Promise<string> {
 }
 /** Size and mtime survive restarts and remounts; device/inode numbers may not. */
 async function persistentFileFingerprint(path: string): Promise<string> {
-  const file = await stat(path);
-  return `${file.size}:${file.mtimeMs}`;
+  return ggufArtifactFingerprint(path);
 }
 /** The stable configuration a saved Max Context calibration belongs to; requires the model's launcher-managed server to be running. */
 async function persistentDiscoveryIdentity(modelId: string): Promise<{ key: string; serialized: string; hardLimit: number }> {
@@ -455,8 +454,9 @@ export function registerIpc(): void {
     const requestedContext = patch.contextWindow ?? current.contextWindow;
     const modelChanged = nextModelId !== current.modelId;
     const firstSelection = patch.modelId !== undefined && !activeConversationModel(current, runtime);
-    const initial = initialModelContext(allowed);
-    const contextWindow = firstSelection && patch.contextWindow === undefined ? initial.contextWindow : modelChanged && patch.contextWindow === undefined && allowed.length ? normalContextForModel(requestedContext, allowed) : requestedContext;
+    const normalConfiguration = llamaRuntimeProfile(nextModelId ?? '')?.normalContext;
+    const initial = initialModelContext(allowed, normalConfiguration);
+    const contextWindow = (firstSelection || (modelChanged && normalConfiguration)) && patch.contextWindow === undefined ? initial.contextWindow : modelChanged && patch.contextWindow === undefined && allowed.length ? normalContextForModel(requestedContext, allowed) : requestedContext;
     if (allowed.length && !allowed.includes(contextWindow)) {
       if (contextWindow % 4_096 !== 0 || contextWindow > capability || contextWindow <= 0) {
         throw new Error(`Запрошенный контекст ${contextWindow} выходит за пределы возможностей модели и llama.cpp или не кратен допустимому шагу.`);
@@ -464,8 +464,8 @@ export function registerIpc(): void {
     }
     if (nextModelId && profile) {
       const isRuntimeRequest = patch.modelId !== undefined || patch.contextWindow !== undefined || patch.llamaKvCacheType !== undefined || patch.llamaKvOffload !== undefined;
-      const { llamaKvCacheType: kvCacheType, llamaKvOffload: kvOffload } = resolveLlamaKvSelection(current, patch, modelChanged || firstSelection);
-      const requiresDiscovery = !allowed.includes(contextWindow) || kvCacheType !== defaultLlamaKv.llamaKvCacheType || kvOffload !== defaultLlamaKv.llamaKvOffload;
+      const { llamaKvCacheType: kvCacheType, llamaKvOffload: kvOffload } = resolveLlamaKvSelection(current, patch, modelChanged || firstSelection, initial);
+      const requiresDiscovery = !allowed.includes(contextWindow) || kvCacheType !== initial.llamaKvCacheType || kvOffload !== initial.llamaKvOffload;
       if (isRuntimeRequest && requiresDiscovery) await validateDiscoveredOption(nextModelId, contextWindow, kvCacheType, kvOffload);
       patch = { ...patch, llamaKvCacheType: kvCacheType, llamaKvOffload: kvOffload };
       const runtimeDiffers = runtime.status !== 'ready' || runtime.modelId !== nextModelId || runtime.contextWindow !== contextWindow || runtime.kvCacheType !== kvCacheType || runtime.kvOffload !== kvOffload;

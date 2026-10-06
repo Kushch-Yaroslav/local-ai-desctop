@@ -107,6 +107,8 @@ export interface AgentTelemetry {
 }
 
 export interface ModelInfo {
+  /** Validated normal startup configuration, independent of measured/manual Max options. */
+  normalContext?: { initialContextWindow: number; kvCacheType: LlamaKvCacheType };
   /** A configured, supported mechanism, not a claim that an offline runtime is active. */
   speculative?: { mechanism: 'mtp' | 'eagle3'; draftSource: 'embedded' | 'external' };
   id: string;

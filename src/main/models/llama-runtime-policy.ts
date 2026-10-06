@@ -1,4 +1,6 @@
 import { existsSync } from 'node:fs';
+import { ggufArtifactPaths } from '../services/gguf-artifacts';
+import type { ModelInfo } from '../../shared/types';
 import { contextPresetsFor } from './model-registry';
 import { legacyReasoningSelection, reasoningEffortOrder, resolveReasoningSelection, type ReasoningCapability, type ReasoningEffort, type ReasoningInput, type ReasoningSelection } from '../../shared/reasoning-controls';
 
@@ -34,6 +36,18 @@ export type LlamaRuntimeProfile = {
   draft?: LlamaDraftProfile;
   vision: boolean;
   reasoning?: LlamaReasoningProfile;
+  /** Measured per-runtime placement; absent keeps the existing fully offloaded launch unchanged. */
+  placement?: {
+    cpuMoeLayers: number;
+    threads: number;
+    threadsBatch: number;
+    batchSize: number;
+    ubatchSize: number;
+    loadMode: 'auto' | 'mmap' | 'none';
+  };
+  /** Conservative host allocation envelope, excluding the existing discovery host reserve. */
+  hostResidentBudgetBytes?: number;
+  normalContext?: ModelInfo['normalContext'];
 };
 
 /** Verified in both embedded Qwen templates: the Huihui high alias adds no separate effort level. */
@@ -42,6 +56,16 @@ const qwen38Reasoning: LlamaReasoningProfile = { thinkingKwarg: 'enable_thinking
 /** Model capability is separate from the currently loaded server context. */
 export const llamaRuntimeProfiles: readonly LlamaRuntimeProfile[] = [
   { id: 'qwen3.8:27b-q4_K_M', maxContext: 262_144, modelPath: '/media/yaroslav/DATA/llama-models/qwen3.8-27b-q4_K_M.gguf', mmprojPath: '/media/yaroslav/DATA/llama-models/qwen3.8-27b-mmproj.gguf', speculative: 'mtp', vision: true, reasoning: qwen38Reasoning },
+  {
+    id: 'qwen3-coder-next:80b-a3b-q4_k_m',
+    maxContext: 262_144,
+    modelPath: '/media/yaroslav/DATA/llama-models/Qwen3-Coder-Next-Q4_K_M/Qwen3-Coder-Next-Q4_K_M-00001-of-00004.gguf',
+    speculative: 'none',
+    vision: false,
+    placement: { cpuMoeLayers: 28, threads: 8, threadsBatch: 8, batchSize: 1024, ubatchSize: 128, loadMode: 'none' },
+    hostResidentBudgetBytes: 27 * 1024 ** 3,
+    normalContext: { initialContextWindow: 65_536, kvCacheType: 'q8_0' },
+  },
   { id: 'huihui-qwen3.8:27b-ud-dw-q4_k_m', maxContext: 262_144, modelPath: '/media/yaroslav/DATA/llama-models/Huihui-Qwen3.8-27B-abliterated-UD-DW-Q4_K_M.gguf', mmprojPath: '/media/yaroslav/DATA/llama-models/huihui-qwen3.8-27b-mmproj-bf16.gguf', speculative: 'mtp', vision: true, reasoning: qwen38Reasoning },
 
 ];
@@ -54,7 +78,7 @@ const genericRuntimeProfiles: readonly LlamaRuntimeProfile[] = [
 ];
 
 export function llamaRuntimeProfile(id: string): LlamaRuntimeProfile | undefined { return [...llamaRuntimeProfiles, ...genericRuntimeProfiles].find((profile) => profile.id === id); }
-export function llamaRuntimeInstalled(profile: LlamaRuntimeProfile): boolean { return Boolean(profile.modelPath && existsSync(profile.modelPath)); }
+export function llamaRuntimeInstalled(profile: LlamaRuntimeProfile): boolean { return Boolean(profile.modelPath && ggufArtifactPaths(profile.modelPath).every((path) => existsSync(path))); }
 export function llamaContextPresets(id: string, trainedContext?: number): number[] {
   const profile = llamaRuntimeProfile(id);
   return profile ? contextPresetsFor(Math.min(profile.maxContext, trainedContext ?? profile.maxContext)) : [];

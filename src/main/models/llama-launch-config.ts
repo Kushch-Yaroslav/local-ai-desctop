@@ -3,6 +3,8 @@ import { createReadStream, statSync } from 'node:fs';
 import { getModelProfile } from './model-registry';
 import { llamaRuntimeProfile, type LlamaRuntimeProfile } from './llama-runtime-policy';
 import { readGgufSpeculativeMetadata, type GgufSpeculativeMetadata } from '../services/gguf-speculative';
+import { verifyGgufArtifacts } from '../services/gguf-artifacts';
+import { verifyHostMemory } from '../services/host-memory-guard';
 
 export function effectiveSpeculativeMode(profile: LlamaRuntimeProfile, enabled: string | undefined) {
   if (enabled !== undefined && enabled !== '0' && enabled !== '1') throw new Error('LOCAL_AI_LLAMA_SPECULATIVE должно быть 0 или 1.');
@@ -43,6 +45,15 @@ export async function verifyDraftFile(profile: LlamaRuntimeProfile): Promise<voi
 }
 
 const quote = (value: string) => `'${value.replace(/'/g, `'"'"'`)}'`;
+export function placementArguments(profile: LlamaRuntimeProfile): string[] {
+  const placement = profile.placement;
+  if (!placement) return [];
+  if (!Number.isInteger(placement.cpuMoeLayers) || placement.cpuMoeLayers < 0 || placement.cpuMoeLayers > 1_024
+    || [placement.threads, placement.threadsBatch, placement.batchSize, placement.ubatchSize].some((value) => !Number.isInteger(value) || value < 1 || value > 65_536)
+    || placement.ubatchSize > placement.batchSize || !['auto', 'mmap', 'none'].includes(placement.loadMode)) throw new Error('Некорректная конфигурация CPU/GPU placement.');
+  return ['--fit', 'off', '--n-cpu-moe', String(placement.cpuMoeLayers), '--threads', String(placement.threads), '--threads-batch', String(placement.threadsBatch),
+    '--batch-size', String(placement.batchSize), '--ubatch-size', String(placement.ubatchSize), '--load-mode', placement.loadMode];
+}
 /** One source of model paths/capabilities for Electron and the shell launcher. */
 export function launchProfileEnvironment(profile: LlamaRuntimeProfile, enabled?: string): string {
   if (!profile.modelPath) throw new Error(`Не настроен llama.cpp GGUF: ${profile.id}.`);
@@ -50,10 +61,10 @@ export function launchProfileEnvironment(profile: LlamaRuntimeProfile, enabled?:
   const draft = mode !== 'none' ? profile.draft : undefined;
   const values = {
     VARIANT: profile.id, MODEL: profile.modelPath, MMPROJ: profile.mmprojPath ?? '', RUNTIME_MODEL_ID: profile.id,
-    RUNTIME_LABEL: getModelProfile(profile.id)?.displayName ?? profile.id, DEFAULT_LLAMA_CONTEXT: '32768', MAX_LLAMA_CONTEXT: String(profile.maxContext),
+    RUNTIME_LABEL: getModelProfile(profile.id)?.displayName ?? profile.id, DEFAULT_LLAMA_CONTEXT: String(profile.normalContext?.initialContextWindow ?? 32_768), MAX_LLAMA_CONTEXT: String(profile.maxContext),
     SPECULATIVE_MODE: mode, DRAFT_MODEL: draft?.path ?? '', DRAFT_KV_SHARED: draft?.kvCache === 'shared' ? '1' : '0', DRAFT_N_MAX: draft ? String(draft.maxDraftTokens) : '',
   };
-  return Object.entries(values).map(([key, value]) => `${key}=${quote(value)}`).join('\n');
+  return [...Object.entries(values).map(([key, value]) => `${key}=${quote(value)}`), `PROFILE_SERVER_ARGS=(${placementArguments(profile).map(quote).join(' ')})`].join('\n');
 }
 
 if (require.main === module) {
@@ -61,7 +72,11 @@ if (require.main === module) {
     const profile = llamaRuntimeProfile(process.argv[2]);
     if (!profile) throw new Error(`Unknown Local AI llama.cpp model: ${process.argv[2]}`);
     const environment = launchProfileEnvironment(profile, process.env.LOCAL_AI_LLAMA_SPECULATIVE);
-    if (process.argv[3] === '--verify' && effectiveSpeculativeMode(profile, process.env.LOCAL_AI_LLAMA_SPECULATIVE) !== 'none' && profile.draft) await verifyDraftFile(profile);
+    if (process.argv[3] === '--verify') {
+      verifyGgufArtifacts(profile.modelPath!);
+      if (profile.hostResidentBudgetBytes !== undefined) verifyHostMemory(profile.hostResidentBudgetBytes);
+      if (effectiveSpeculativeMode(profile, process.env.LOCAL_AI_LLAMA_SPECULATIVE) !== 'none' && profile.draft) await verifyDraftFile(profile);
+    }
     process.stdout.write(environment + '\n');
   })().catch((error: unknown) => { process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`); process.exitCode = 1; });
 }

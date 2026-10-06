@@ -15,6 +15,7 @@ export type ModelProfile = {
 /** The only local models exposed by the desktop client. Tags are pinned to the requested precisions. */
 export const modelRegistry: readonly ModelProfile[] = [
   { id: 'qwen3.8:27b-q4_K_M', displayName: 'Qwen3.8-27B', shortName: 'Qwen3.8', quantization: 'Q4_K_M', maxContext: 262_144, supportsTools: true, supportsReasoning: true },
+  { id: 'qwen3-coder-next:80b-a3b-q4_k_m', displayName: 'Qwen3-Coder-Next 80B-A3B', shortName: 'Qwen3 Coder Next', quantization: 'Q4_K_M', maxContext: 262_144, supportsTools: true, supportsReasoning: false },
   { id: 'huihui-qwen3.8:27b-ud-dw-q4_k_m', displayName: 'Huihui Qwen3.8-27B (abliterated)', shortName: 'Huihui Qwen3.8', quantization: 'UD-DW-Q4_K_M', maxContext: 262_144, supportsTools: true, supportsReasoning: true },
 ];
 

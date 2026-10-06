@@ -83,7 +83,7 @@ export function Toolbar() {
   const contextOptions = (() => {
     const cacheType = chat.llamaKvCacheType ?? 'f16';
     const kvOffload = chat.llamaKvOffload ?? true;
-    const options = buildContextChoices(selectedModelId ?? '', selectedModel?.supportedContextPresets ?? [], selectedModel?.maxContext ?? 0, discoveryForModel?.options ?? []);
+    const options = buildContextChoices(selectedModelId ?? '', selectedModel?.supportedContextPresets ?? [], selectedModel?.maxContext ?? 0, discoveryForModel?.options ?? [], selectedModel?.normalContext?.kvCacheType);
     if (!options.some((option) => option.contextWindow === chat.contextWindow
       && option.kvCacheType === cacheType && option.kvOffload === kvOffload)) {
       options.push({ contextWindow: chat.contextWindow, kvCacheType: cacheType, kvOffload, label: `${Math.round(chat.contextWindow / 1024)}K · текущий` });
@@ -142,7 +142,7 @@ export function Toolbar() {
         {reasoningCapability && <label className="control" title={reasoningSelection.thinking === false ? reasoningControlText.effortInactive : reasoningControlText.effortHint}><span>{reasoningControlText.effort}</span>{reasoningCapability.efforts.length
           ? <select disabled={reasoningSelection.thinking === false} value={reasoningSelection.effort ?? ''} onChange={(event) => void updateConversation(chat.id, { reasoningEffort: event.target.value as ReasoningEffort }).catch(() => undefined)}>{reasoningCapability.efforts.map((effort) => <option value={effort} key={effort}>{reasoningEffortLabel[effort]}</option>)}</select>
           : <select disabled title={reasoningControlText.effortUnavailable} value="unavailable"><option value="unavailable">{reasoningControlText.unavailable}</option></select>}</label>}
-        <label className="control" title={reasoningControlText.strategyHint}><span>{reasoningControlText.strategy}</span><select value={chat.reasoningMode === 'deep' ? 'deep' : 'fast'} onChange={(event) => void updateConversation(chat.id, { reasoningMode: event.target.value as 'fast' | 'deep' }).catch(() => undefined)}><option value="fast">{reasoningModeLabel.fast}</option><option value="deep">{reasoningModeLabel.deep}</option></select></label>
+        {reasoningCapability && <label className="control" title={reasoningControlText.strategyHint}><span>{reasoningControlText.strategy}</span><select value={chat.reasoningMode === 'deep' ? 'deep' : 'fast'} onChange={(event) => void updateConversation(chat.id, { reasoningMode: event.target.value as 'fast' | 'deep' }).catch(() => undefined)}><option value="fast">{reasoningModeLabel.fast}</option><option value="deep">{reasoningModeLabel.deep}</option></select></label>}
         <label className="control"><span>Веб</span><select value={chat.webMode} onChange={(event) => void updateConversation(chat.id, { webMode: event.target.value as 'off' | 'auto' })}><option value="off">Выкл.</option><option value="auto">Авто</option></select></label>
         <label className="control"><span>Режим</span><select value={chat.mode} onChange={(event) => void updateConversation(chat.id, { mode: event.target.value as 'chat' | 'agent' })}><option value="chat">Чат</option><option value="agent">Агент</option></select></label>
         <div className="project-selectors">{projectSelector(1, chat.workingDirectory)}{projectSelector(2, chat.secondaryWorkingDirectory)}</div>
