@@ -10,8 +10,18 @@ import type { LlamaRuntimeState } from '../services/llama-runtime-controller';
 async function run(): Promise<void> {
   const root = mkdtempSync(join(tmpdir(), 'lad-failed-ipc-'));
   process.env.LOCAL_AI_RUNTIME_ROOT = root;
+  let planNext = false;
   const provider = createServer((request, response) => {
-    request.resume(); request.on('end', () => { response.writeHead(500, {'content-type':'application/json'}); response.end(JSON.stringify({error:{message:'Jinja Exception: conversation roles must alternate'}})); });
+    request.resume(); request.on('end', () => {
+      if (planNext) {
+        planNext = false;
+        const frame = (delta: unknown, finish: string | null) => `data: ${JSON.stringify({choices:[{index:0,delta,finish_reason:finish}]})}\n\n`;
+        response.writeHead(200, {'content-type':'text/event-stream'});
+        response.end(frame({tool_calls:[{index:0,id:'plan-call',type:'function',function:{name:'plan',arguments:JSON.stringify({action:'set',steps:['Inspect projects','Verify changes']})}}]},null) + frame({},'tool_calls') + 'data: [DONE]\n\n');
+        return;
+      }
+      response.writeHead(500, {'content-type':'application/json'}); response.end(JSON.stringify({error:{message:'Jinja Exception: conversation roles must alternate'}}));
+    });
   });
   await new Promise<void>((resolve) => provider.listen(0, '127.0.0.1', resolve));
   const address = provider.address(); assert(address && typeof address !== 'string');
@@ -50,6 +60,13 @@ async function run(): Promise<void> {
     await invoke('conversations:update',next.id,{modelId:model,mode:'chat',webMode:'off'});
     await invoke('chat:send',send(next.id,'recovered'));
     assert(events.some(event=>event.conversationId===next.id && event.type==='done'), 'main-process inference slot must be immediately reusable');
+    planNext = true;
+    await invoke('chat:send',send(first.id,'plan-then-failure'));
+    const update = events.find(event=>event.type==='task-memory');
+    assert(update?.type === 'task-memory', 'canonical task-memory must reach the renderer as well as persistence');
+    assert.equal(update.memory.plan?.steps.length, 2);
+    assert.equal(db.getAgentPlan(first.id)?.taskMemory?.plan?.steps.length, 2);
+    assert.equal(db.listAnalysisRuns(first.id).at(-1)?.status, 'error', 'live plan remains persisted after a later model failure');
     console.log('production IPC + real Rust HTTP500 → persisted failed run → new-chat recovery passed');
   } finally { globalThis.fetch=originalFetch; loader._load=originalLoad; db.close(); provider.close(); rmSync(root,{recursive:true,force:true}); }
 }

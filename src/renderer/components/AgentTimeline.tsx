@@ -1,6 +1,7 @@
 import { memo, useState } from 'react';
 import type { ChatMessage, DeliverableItem, PlanStepItem, TerminalExecution, ThinkingTimelineEvent, ToolActivity } from '../../shared/types';
 import { Markdown } from './Markdown';
+import { isStatusSnapshot } from '../../shared/agent-status';
 import { thinkingTimeline } from '../../shared/thinking-timeline';
 import { formatDuration, pluralRu } from '../../shared/localization';
 
@@ -131,6 +132,6 @@ export const AgentTimeline = memo(function AgentTimeline({ timeline, activities,
     }
     if (item.kind === 'steering') return <section className={`agent-timeline-steering ${item.status}`} key={item.id}><header><b>{item.status === 'applied' ? 'Уточнение передано модели' : 'Уточнение в очереди'}</b>{item.status === 'accepted' && <span> — будет передано модели на следующем шаге</span>}</header><p>{item.message.content}</p></section>;
     if (item.kind === 'paused') return <section className="agent-timeline-steering paused" key={item.id}><header><b>Работа на паузе</b></header><p>Состояние и список невыполненного сохранены. Напишите «Продолжить», чтобы возобновить работу.</p></section>;
-    return <Action key={item.id} activity={item.activity} />;
+    return isStatusSnapshot(item.activity) && item.activity.state !== 'error' ? null : <Action key={item.id} activity={item.activity} />;
   })}{error && <section className="agent-timeline-terminal error" role="status"><b>Агент остановлен из-за ошибки</b><span>{error}</span></section>}{cancelled && <section className="agent-timeline-terminal cancelled" role="status"><b>Агент остановлен</b></section>}</div>;
 });

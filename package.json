@@ -13,6 +13,7 @@
     "lint": "eslint .",
     "build:rust-agent": "cargo build --manifest-path rust-agent/Cargo.toml",
     "build": "npm run build:rust-agent && npm run typecheck && vite build && tsc -p tsconfig.electron.json",
+    "test:agent-status": "npm run build && node dist/shared/agent-status.test.js && node scripts/agent-status-renderer.test.mjs",
     "test:attachments": "npm run build && node dist/main/services/attachment-pipeline.test.js",
     "test:agent-runtime": "npm run build && node dist/main/services/rust-agent-runtime.test.js && node dist/main/services/agent-workspace.test.js && node dist/main/tools/process-group.test.js && node dist/main/ipc/failed-run.test.js && node dist/shared/failed-generation.test.js",
     "test:context-usage": "npm run build && node dist/shared/context-format.test.js && node dist/shared/localization.test.js && node dist/shared/localization-coverage.test.js",

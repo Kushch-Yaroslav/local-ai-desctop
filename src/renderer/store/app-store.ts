@@ -1,6 +1,6 @@
 import { activeConversationModel } from '../../shared/model-selection';
 import { create } from 'zustand';
-import type { ActionApproval, AgentTelemetry, AnalysisProgress, AnalysisRun, AppSettings, Attachment, AttachmentStatus, ApprovalDecision, ApprovalStatus, ChatMessage, Conversation, FinishReason, GenerationDiagnostics, HardwareStats, ModelInfo, ProjectReference, SteeringIntent, ToolActivity } from '../../shared/types';
+import type { ActionApproval, AgentPlan, AgentTelemetry, AnalysisProgress, AnalysisRun, AppSettings, Attachment, AttachmentStatus, ApprovalDecision, ApprovalStatus, ChatMessage, Conversation, FinishReason, GenerationDiagnostics, HardwareStats, ModelInfo, ProjectReference, SteeringIntent, ToolActivity } from '../../shared/types';
 import { isCurrentGenerationEvent } from '../../shared/generation-guard';
 import { pinLegacyReasoning, revertRefusedPatch, type ModeTransition } from '../../shared/conversation-settings';
 import { appendPausedMarker, appendReasoningFragments, applySteeringEvent } from '../../shared/thinking-timeline';
@@ -24,6 +24,7 @@ type State = {
   activeContextWindow: number | null;
   analysisProgress: AnalysisProgress[];
   analysisRuns: AnalysisRun[];
+  agentPlan: AgentPlan | null;
   lastFinishReason: FinishReason | null;
   performance: GenerationDiagnostics | null;
   pendingApproval: { actionId: string; approval: ActionApproval } | null;
@@ -45,7 +46,7 @@ type State = {
   editMessage: (message: ChatMessage, content: string) => Promise<boolean>;
   regenerateMessage: (message: ChatMessage) => Promise<boolean>;
   stop: () => Promise<void>;
-  handleStream: (event: { type: string; content?: string; message?: string; userMessage?: ChatMessage; details?: string; activity?: ToolActivity; run?: AnalysisRun; progress?: AnalysisProgress; requested?: number; active?: number; supported?: number; used?: number; maximum?: number; timelinePosition?: number; telemetry?: Partial<AgentTelemetry>; conversationId: string; generationId: string; modelId?: string; assistant?: ChatMessage | null; finishReason?: FinishReason; diagnostics?: Omit<GenerationDiagnostics, 'generationId' | 'conversationId' | 'createdAt'>; actionId?: string; approval?: ActionApproval; approvalId?: string; status?: Exclude<ApprovalStatus, 'pending'> | AttachmentStatus | 'accepted' | 'applied' }) => void;
+  handleStream: (event: { type: string; content?: string; message?: string; userMessage?: ChatMessage; details?: string; activity?: ToolActivity; memory?: NonNullable<AgentPlan['taskMemory']>; run?: AnalysisRun; progress?: AnalysisProgress; requested?: number; active?: number; supported?: number; used?: number; maximum?: number; timelinePosition?: number; telemetry?: Partial<AgentTelemetry>; conversationId: string; generationId: string; modelId?: string; assistant?: ChatMessage | null; finishReason?: FinishReason; diagnostics?: Omit<GenerationDiagnostics, 'generationId' | 'conversationId' | 'createdAt'>; actionId?: string; approval?: ActionApproval; approvalId?: string; status?: Exclude<ApprovalStatus, 'pending'> | AttachmentStatus | 'accepted' | 'applied' }) => void;
 };
 
 const assistantId = (generationId: string) => `stream-${generationId}`;
@@ -68,7 +69,7 @@ const mergeToolActivity = (prior: ToolActivity | undefined, next: ToolActivity):
   return { ...prior, ...next, ...(terminal ? { terminal } : {}) };
 };
 
-const viewKeys = ['messages', 'isGenerating', 'generationId', 'generationState', 'error', 'toolActivities', 'toolActivityCount', 'activeContextWindow', 'analysisProgress', 'analysisRuns', 'lastFinishReason', 'performance', 'pendingApproval', 'approvalSubmitting', 'agentTelemetry', 'steeringStatus'] as const;
+const viewKeys = ['messages', 'isGenerating', 'generationId', 'generationState', 'error', 'toolActivities', 'toolActivityCount', 'activeContextWindow', 'analysisProgress', 'analysisRuns', 'agentPlan', 'lastFinishReason', 'performance', 'pendingApproval', 'approvalSubmitting', 'agentTelemetry', 'steeringStatus'] as const;
 type ConversationView = Pick<State, typeof viewKeys[number]>;
 const viewOf = (state: State): ConversationView => Object.fromEntries(viewKeys.map((key) => [key, state[key]])) as ConversationView;
 
@@ -136,7 +137,7 @@ export const useAppStore = create<State>((rawSet, rawGet) => {
   };
   return {
   modeTransitions: {},
-  conversations: [], activeId: null, messages: [], models: [], hardware: null, settings: null, isGenerating: false, generationId: null, generationConversationId: null, generationOwnerId: null, generationState: 'idle', error: null, toolActivities: [], toolActivityCount: 0, activeContextWindow: null, analysisProgress: [], analysisRuns: [], lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false, agentTelemetry: null, steeringStatus: null,
+  conversations: [], activeId: null, messages: [], models: [], hardware: null, settings: null, isGenerating: false, generationId: null, generationConversationId: null, generationOwnerId: null, generationState: 'idle', error: null, toolActivities: [], toolActivityCount: 0, activeContextWindow: null, analysisProgress: [], analysisRuns: [], agentPlan: null, lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false, agentTelemetry: null, steeringStatus: null,
   initialize: async () => {
     const [conversations, models, settings] = await Promise.all([window.localAi.conversations.list(), window.localAi.models.list(), window.localAi.settings.get()]);
     set({ conversations, models, settings });
@@ -146,12 +147,12 @@ export const useAppStore = create<State>((rawSet, rawGet) => {
   },
   selectConversation: async (id) => {
     const request = ++selection;
-    const [messages, analysisRuns] = await Promise.all([window.localAi.messages.list(id), window.localAi.analysis.list(id)]);
+    const [messages, analysisRuns, agentPlan] = await Promise.all([window.localAi.messages.list(id), window.localAi.analysis.list(id), window.localAi.agentPlans.get(id)]);
     if (request !== selection) return;
     if (get().activeId) views.set(get().activeId!, viewOf(get()));
     const conversation = get().conversations.find((item) => item.id === id);
     const cached = views.get(id);
-    set({ activeId: id, messages, analysisRuns, isGenerating: false, generationId: null, generationState: 'idle', error: null, toolActivities: [], toolActivityCount: 0, activeContextWindow: activeConversationModel(conversation, get().settings?.llamaRuntime) ? get().settings?.llamaRuntime?.contextWindow ?? null : null, analysisProgress: [], lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false, agentTelemetry: null, steeringStatus: null, ...(cached && (cached.isGenerating || cached.generationState === 'error' || cached.generationState === 'cancelled') ? cached : {}) });
+    set({ activeId: id, messages, analysisRuns, agentPlan: agentPlan ?? [...messages].reverse().find((message) => message.taskPlan)?.taskPlan ?? null, isGenerating: false, generationId: null, generationState: 'idle', error: null, toolActivities: [], toolActivityCount: 0, activeContextWindow: activeConversationModel(conversation, get().settings?.llamaRuntime) ? get().settings?.llamaRuntime?.contextWindow ?? null : null, analysisProgress: [], lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false, agentTelemetry: null, steeringStatus: null, ...(cached && (cached.isGenerating || cached.generationState === 'error' || cached.generationState === 'cancelled') ? cached : {}) });
   },
   createConversation: async () => {
     const conversation = await window.localAi.conversations.create();
@@ -334,6 +335,13 @@ export const useAppStore = create<State>((rawSet, rawGet) => {
     });
     if (event.type === 'approval-request' && event.actionId && event.approval) set((state) => ({ generationState: 'waiting-for-approval', pendingApproval: { actionId: event.actionId!, approval: event.approval! }, approvalSubmitting: false, toolActivities: state.toolActivities.map((activity) => activity.id === event.actionId ? { ...activity, approval: event.approval } : activity) }));
     if (event.type === 'approval-resolved' && event.actionId && event.approvalId && event.status) { const approvalStatus = event.status as Exclude<ApprovalStatus, 'pending'>; set((state) => ({ generationState: state.generationState === 'waiting-for-approval' ? 'using-tool' : state.generationState, pendingApproval: state.pendingApproval?.approval.approvalId === event.approvalId ? null : state.pendingApproval, approvalSubmitting: false, toolActivities: state.toolActivities.map((activity) => activity.id === event.actionId ? { ...activity, approval: { approvalId: event.approvalId!, category: activity.approval?.category ?? 'system_command', status: approvalStatus } } : activity) })); }
+    if (event.type === 'task-memory' && event.memory) {
+      const prior = get().agentPlan?.taskMemory;
+      // Knowledge/evidence updates do not redraw an unchanged plan/results panel.
+      if (!prior || JSON.stringify(prior?.plan) !== JSON.stringify(event.memory.plan) || JSON.stringify(prior?.deliverables) !== JSON.stringify(event.memory.deliverables)) {
+        set({ agentPlan: { milestones: [], taskMemory: { entries: [], plan: event.memory.plan, deliverables: event.memory.deliverables } } });
+      }
+    }
     if (event.type === 'analysis-run' && event.run) set((state) => ({ analysisRuns: [...state.analysisRuns.filter((run) => run.id !== event.run!.id), event.run!] }));
     if (event.type === 'analysis' && event.progress) set({ analysisProgress: [event.progress] });
     if (event.type === 'context' && event.active) set({ activeContextWindow: event.active });
