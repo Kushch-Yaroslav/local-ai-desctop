@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { collectRuntimeContextEstimate, defaultContextDeviceReserveBytes, defaultContextHostReserveBytes, parseLlamaAllocationLog, resolveContextReserve } from './context-estimate';
 import type { HardwareStats } from '../../shared/types';
 import type { RuntimeContextEvidence } from '../backends/types';
@@ -66,6 +68,26 @@ export async function runContextEstimateRegression(): Promise<void> {
   assert.match(resolveContextReserve('invalid', 'DEVICE_RESERVE', defaultContextDeviceReserveBytes).error ?? '', /целым числом байт/);
   assert.match(resolveContextReserve(String(Number.MAX_SAFE_INTEGER + 1), 'DEVICE_RESERVE', defaultContextDeviceReserveBytes).error ?? '', /допустимым целым числом/);
 
+  // Actual production Devstral startup captures, including the zero-sized
+  // initial fit pass, final GPU allocation, CPU projector and warmup.
+  for (const [context, mode, bytesPerToken, computeMiB] of [[53248, 'f16', 163840, 272.01], [98304, 'q8_0', 87040, 516.09]] as const) {
+    const log = readFileSync(resolve(process.cwd(), 'test-fixtures/llama-allocation', `devstral-${context}-${mode}.txt`), 'utf8');
+    const dev = parseLlamaAllocationLog(log);
+    assert.deepEqual(dev.unknownReasons, [], 'all real Devstral allocation classes must be understood');
+    assert.equal(dev.contextTokens, context);
+    assert.equal(dev.kvTypeK, mode); assert.equal(dev.kvTypeV, mode);
+    assert.equal(dev.visionPresent, true);
+    assert.equal(dev.speculativeMode, 'none');
+    assert.equal(dev.allocations.kv.device, context * bytesPerToken, '40 layers × 8 KV heads × 128 dimensions × K/V precision');
+    assert.equal(dev.allocations.kv.host, 0);
+    assert.equal(dev.allocations.weights.device, Math.ceil(13302.36 * 1024 ** 2));
+    assert.equal(dev.allocations.weights.host, Math.ceil(360 * 1024 ** 2) + Math.ceil(837.36 * 1024 ** 2), 'projector is host allocated, not additional GPU weights');
+    assert.equal(dev.allocations.compute.device, Math.ceil(computeMiB * 1024 ** 2));
+    assert.equal(dev.allocations.ssm.device, 0);
+    assert.equal(dev.allocations.speculativeKv.device, 0);
+    const repeated = log.replace(/(I srv\s+load_model: initializing)/, `I sched_reserve: CUDA0 compute buffer size = ${computeMiB} MiB\n$1`);
+    assert.deepEqual(parseLlamaAllocationLog(repeated).allocations, dev.allocations, 'repeated reserve logging is not another allocation');
+  }
   const parsed = parseLlamaAllocationLog(allocationLog);
   assert.equal(parsed.contextTokens, 32_768);
   assert.equal(parsed.modelPath, runtime.modelPath);
