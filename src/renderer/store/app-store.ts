@@ -1,3 +1,4 @@
+import { activeConversationModel } from '../../shared/model-selection';
 import { create } from 'zustand';
 import type { ActionApproval, AgentTelemetry, AnalysisProgress, AnalysisRun, AppSettings, Attachment, AttachmentStatus, ApprovalDecision, ApprovalStatus, ChatMessage, Conversation, FinishReason, GenerationDiagnostics, HardwareStats, ModelInfo, ProjectReference, SteeringIntent, ToolActivity } from '../../shared/types';
 import { isCurrentGenerationEvent } from '../../shared/generation-guard';
@@ -14,6 +15,8 @@ type State = {
   isGenerating: boolean;
   generationId: string | null;
   generationConversationId: string | null;
+  /** Process-wide inference ownership token; per-chat view state stays separate. */
+  generationOwnerId: string | null;
   generationState: 'idle' | 'thinking' | 'using-tool' | 'running-terminal' | 'waiting-for-approval' | 'generating' | 'stopping' | 'cancelled' | 'error';
   error: string | null;
   toolActivities: ToolActivity[];
@@ -91,6 +94,9 @@ export const useAppStore = create<State>((rawSet, rawGet) => {
     routedId = id;
     try { action(); } finally { routedId = previous; }
   };
+  const releaseGeneration = (generationId: string) => {
+    if (rawGet().generationOwnerId === generationId) rawSet({ generationConversationId: null, generationOwnerId: null });
+  };
   const pendingTokens = new Map<string, string>();
   const pendingThinking = new Map<string, Array<{ content: string; timelinePosition?: number }>>();
   let animationFrame: number | null = null;
@@ -118,19 +124,19 @@ export const useAppStore = create<State>((rawSet, rawGet) => {
     ? { ...message, ...(terminal.error ? { agentError: terminal.error } : {}), ...(terminal.cancelled ? { agentCancelled: true } : {}), agentFinishedAt: now() }
     : message);
   const regenerateSavedBranch = async (saved: ChatMessage[], errorMessage: string, activeId: string): Promise<boolean> => {
-    const chat = get().conversations.find((item) => item.id === activeId); const model = chat?.modelId ?? get().models[0]?.id;
+    const chat = get().conversations.find((item) => item.id === activeId); const model = activeConversationModel(chat, get().settings?.llamaRuntime);
     if (!activeId || !chat || !model) return false;
     set((state) => ({ conversations: state.conversations.map((item) => item.id === activeId ? { ...item, contextTokens: null, contextModelId: null } : item) }));
     const generationId = crypto.randomUUID(); const streaming: ChatMessage = { id: assistantId(generationId), conversationId: activeId, role: 'assistant', content: '', createdAt: now() };
-    withView(activeId, () => set({ messages: [...saved, streaming], isGenerating: true, generationId, generationConversationId: activeId, generationState: 'thinking', error: null, toolActivities: [], toolActivityCount: 0, analysisProgress: [], lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false, steeringStatus: null, agentTelemetry: { turn: 0, inputTokens: 0, outputTokens: 0, actions: 0, startedAt: now() } }));
+    withView(activeId, () => set({ messages: [...saved, streaming], isGenerating: true, generationId, generationConversationId: activeId, generationOwnerId: generationId, generationState: 'thinking', error: null, toolActivities: [], toolActivityCount: 0, analysisProgress: [], lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false, steeringStatus: null, agentTelemetry: { turn: 0, inputTokens: 0, outputTokens: 0, actions: 0, startedAt: now() } }));
     try { await window.localAi.chat.send({ conversationId: activeId, model, mode: chat.mode, messages: saved, generationId, persistUserMessage: false }); }
     catch (error) { withView(activeId, () => set((state) => state.generationId === generationId ? { isGenerating: false, generationId: null, generationState: 'error', error: error instanceof Error ? error.message : errorMessage, messages: finishAgentStream(state.messages, generationId, { error: error instanceof Error ? error.message : errorMessage }) } : {})); }
-    finally { set({ generationConversationId: null }); }
+    finally { releaseGeneration(generationId); }
     return true;
   };
   return {
   modeTransitions: {},
-  conversations: [], activeId: null, messages: [], models: [], hardware: null, settings: null, isGenerating: false, generationId: null, generationConversationId: null, generationState: 'idle', error: null, toolActivities: [], toolActivityCount: 0, activeContextWindow: null, analysisProgress: [], analysisRuns: [], lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false, agentTelemetry: null, steeringStatus: null,
+  conversations: [], activeId: null, messages: [], models: [], hardware: null, settings: null, isGenerating: false, generationId: null, generationConversationId: null, generationOwnerId: null, generationState: 'idle', error: null, toolActivities: [], toolActivityCount: 0, activeContextWindow: null, analysisProgress: [], analysisRuns: [], lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false, agentTelemetry: null, steeringStatus: null,
   initialize: async () => {
     const [conversations, models, settings] = await Promise.all([window.localAi.conversations.list(), window.localAi.models.list(), window.localAi.settings.get()]);
     set({ conversations, models, settings });
@@ -145,11 +151,10 @@ export const useAppStore = create<State>((rawSet, rawGet) => {
     if (get().activeId) views.set(get().activeId!, viewOf(get()));
     const conversation = get().conversations.find((item) => item.id === id);
     const cached = views.get(id);
-    set({ activeId: id, messages, analysisRuns, isGenerating: false, generationId: null, generationState: 'idle', error: null, toolActivities: [], toolActivityCount: 0, activeContextWindow: conversation?.contextWindow ?? null, analysisProgress: [], lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false, agentTelemetry: null, steeringStatus: null, ...(cached && (cached.isGenerating || cached.generationState === 'error' || cached.generationState === 'cancelled') ? cached : {}) });
+    set({ activeId: id, messages, analysisRuns, isGenerating: false, generationId: null, generationState: 'idle', error: null, toolActivities: [], toolActivityCount: 0, activeContextWindow: activeConversationModel(conversation, get().settings?.llamaRuntime) ? get().settings?.llamaRuntime?.contextWindow ?? null : null, analysisProgress: [], lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false, agentTelemetry: null, steeringStatus: null, ...(cached && (cached.isGenerating || cached.generationState === 'error' || cached.generationState === 'cancelled') ? cached : {}) });
   },
   createConversation: async () => {
-    const activeChat = get().conversations.find((chat) => chat.id === get().activeId);
-    const conversation = await window.localAi.conversations.create(activeChat?.modelId ?? get().models[0]?.id);
+    const conversation = await window.localAi.conversations.create();
     set((state) => ({ conversations: [conversation, ...state.conversations] })); await get().selectConversation(conversation.id);
   },
   updateConversation: async (id, requestedPatch) => {
@@ -176,7 +181,7 @@ export const useAppStore = create<State>((rawSet, rawGet) => {
       const updated = await window.localAi.conversations.update(id, patch);
       set((state) => ({ conversations: state.conversations.map((chat) => chat.id === id ? updated : chat), activeContextWindow: state.activeId === id ? updated.contextWindow : state.activeContextWindow, performance: state.activeId === id && patch.modelId !== undefined ? null : state.performance }));
       settle();
-      if (patch.modelId !== undefined || patch.contextWindow !== undefined) void get().refreshRuntime();
+      if (patch.modelId !== undefined || patch.contextWindow !== undefined) await get().refreshRuntime();
     } catch (error) {
       if (before) set((state) => ({ conversations: state.conversations.map((chat) => chat.id === id ? revertRefusedPatch(chat, before, patch) : chat), activeContextWindow: state.activeId === id && patch.contextWindow !== undefined ? before.contextWindow : state.activeContextWindow }));
       settle();
@@ -204,16 +209,16 @@ export const useAppStore = create<State>((rawSet, rawGet) => {
   refreshHardware: async () => set({ hardware: await window.localAi.hardware.get() }),
   sendMessage: async (content, files = [], projectReferences = []) => {
     if (get().generationConversationId || branchRegenerationPending) { set({ error: 'Уже выполняется генерация или подготовка повтора. Дождитесь завершения или остановите её в активном чате.' }); return; }
-    const { activeId, conversations, messages, models } = get();
+    const { activeId, conversations, messages, settings } = get();
     if (!activeId || (!content.trim() && files.length === 0)) return;
-    const chat = conversations.find((item) => item.id === activeId); const model = chat?.modelId ?? models[0]?.id;
-    if (!model) { set({ error: 'Нет доступных моделей. Установите GGUF и запустите llama.cpp runtime.' }); return; }
+    const chat = conversations.find((item) => item.id === activeId); const model = activeConversationModel(chat, settings?.llamaRuntime);
+    if (!model) { set({ error: 'Выберите модель перед отправкой сообщения.' }); return; }
     const userId = crypto.randomUUID();
     let imageIndex = 0;
     const attached: Attachment[] = files.map((file, index) => { const isImage = isImageFile(file); return { id: crypto.randomUUID(), messageId: userId, index, kind: isImage ? 'image' : file.name.endsWith('.pdf') ? 'pdf' : /\.(xlsx|xls)$/i.test(file.name) ? 'spreadsheet' : file.name.endsWith('.docx') ? 'document' : 'text', mimeType: file.type || 'application/octet-stream', filename: file.name, size: file.size, storageRef: '', status: 'pending', metadata: isImage ? { imageNumber: ++imageIndex } : undefined, createdAt: now(), updatedAt: now() }; });
     const user: ChatMessage = { id: userId, conversationId: activeId, role: 'user', content: content.trim() || 'Вложения', createdAt: now(), attachments: attached, projectReferences };
     const generationId = crypto.randomUUID(); const streaming: ChatMessage = { id: assistantId(generationId), conversationId: activeId, role: 'assistant', content: '', createdAt: now() };
-    set({ messages: [...messages, user, streaming], isGenerating: true, generationId, generationConversationId: activeId, generationState: 'thinking', error: null, toolActivities: [], toolActivityCount: 0, analysisProgress: [], lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false, agentTelemetry: chat?.mode === 'agent' ? { turn: 0, inputTokens: 0, outputTokens: 0, actions: 0, startedAt: now() } : null });
+    set({ messages: [...messages, user, streaming], isGenerating: true, generationId, generationConversationId: activeId, generationOwnerId: generationId, generationState: 'thinking', error: null, toolActivities: [], toolActivityCount: 0, analysisProgress: [], lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false, agentTelemetry: chat?.mode === 'agent' ? { turn: 0, inputTokens: 0, outputTokens: 0, actions: 0, startedAt: now() } : null });
     try {
       set({ steeringStatus: null });
       if (!chat?.modelId) await get().updateConversation(activeId, { modelId: model });
@@ -222,9 +227,10 @@ export const useAppStore = create<State>((rawSet, rawGet) => {
       await window.localAi.chat.send({ conversationId: activeId, model, mode: chat?.mode, messages: [...messages, user], generationId, persistUserMessage: true, attachments: attachmentInputs });
     }
     catch (error) { withView(activeId, () => set((state) => state.generationId === generationId ? { isGenerating: false, generationId: null, generationState: 'error', error: error instanceof Error ? error.message : 'Не удалось отправить сообщение', messages: state.messages.filter((message) => message.id !== assistantId(generationId)) } : {})); }
-    finally { set({ generationConversationId: null }); }
+    finally { releaseGeneration(generationId); }
   },
   editMessage: async (message, content) => {
+    if (!activeConversationModel(get().conversations.find((chat) => chat.id === message.conversationId), get().settings?.llamaRuntime)) { set({ error: 'Выберите модель перед перегенерацией.' }); return false; }
     if (get().generationConversationId || branchRegenerationPending) { set({ error: 'Дождитесь завершения генерации перед редактированием.' }); return false; }
     branchRegenerationPending = true;
     try {
@@ -241,6 +247,7 @@ export const useAppStore = create<State>((rawSet, rawGet) => {
     catch (error) { withView(activeId, () => set({ error: error instanceof Error ? error.message : String(error) })); return false; }
   },
   regenerateMessage: async (message) => {
+    if (!activeConversationModel(get().conversations.find((chat) => chat.id === message.conversationId), get().settings?.llamaRuntime)) { set({ error: 'Выберите модель перед перегенерацией.' }); return false; }
     if (branchRegenerationPending || get().generationConversationId || get().activeId !== message.conversationId) return false;
     branchRegenerationPending = true;
     try {
@@ -332,9 +339,9 @@ export const useAppStore = create<State>((rawSet, rawGet) => {
     if (event.type === 'context' && event.active) set({ activeContextWindow: event.active });
     if (event.type === 'diagnostics' && event.diagnostics) set({ performance: { ...event.diagnostics, generationId: event.generationId, conversationId: event.conversationId, createdAt: now() } });
     if (event.type === 'token' && get().generationState !== 'generating') set({ generationState: 'generating' });
-    if (event.type === 'error') { drainStream(true); pendingTokens.delete(event.generationId); pendingThinking.delete(event.generationId); const message = event.details ? `${event.message}: ${event.details}` : event.message ?? 'Ошибка генерации'; set((state) => ({ isGenerating: false, generationId: null, generationState: 'error', error: message, messages: finishAgentStream(state.messages, event.generationId, { error: message }), lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false, agentTelemetry: state.agentTelemetry ? { ...state.agentTelemetry, finishedAt: now() } : null })); }
-    if (event.type === 'cancelled') { drainStream(true); pendingTokens.delete(event.generationId); pendingThinking.delete(event.generationId); set((state) => ({ isGenerating: false, generationId: null, generationState: 'cancelled', messages: finishAgentStream(state.messages, event.generationId, { cancelled: true }), lastFinishReason: 'cancelled', performance: null, pendingApproval: null, approvalSubmitting: false, agentTelemetry: state.agentTelemetry ? { ...state.agentTelemetry, finishedAt: now() } : null })); }
-    if (event.type === 'done') { drainStream(true); set((state) => ({ isGenerating: false, generationId: null, generationState: 'idle', messages: state.messages.flatMap((message) => message.id === assistantId(event.generationId) ? (event.assistant ? [event.assistant] : []) : [message]), lastFinishReason: event.finishReason ?? 'stop', agentTelemetry: state.agentTelemetry ? { ...state.agentTelemetry, finishedAt: now() } : null })); }
+    if (event.type === 'error') { releaseGeneration(event.generationId); drainStream(true); pendingTokens.delete(event.generationId); pendingThinking.delete(event.generationId); const message = event.details ? `${event.message}: ${event.details}` : event.message ?? 'Ошибка генерации'; set((state) => ({ isGenerating: false, generationId: null, generationState: 'error', error: message, messages: finishAgentStream(state.messages, event.generationId, { error: message }), lastFinishReason: null, performance: null, pendingApproval: null, approvalSubmitting: false, agentTelemetry: state.agentTelemetry ? { ...state.agentTelemetry, finishedAt: now() } : null })); }
+    if (event.type === 'cancelled') { releaseGeneration(event.generationId); drainStream(true); pendingTokens.delete(event.generationId); pendingThinking.delete(event.generationId); set((state) => ({ isGenerating: false, generationId: null, generationState: 'cancelled', messages: finishAgentStream(state.messages, event.generationId, { cancelled: true }), lastFinishReason: 'cancelled', performance: null, pendingApproval: null, approvalSubmitting: false, agentTelemetry: state.agentTelemetry ? { ...state.agentTelemetry, finishedAt: now() } : null })); }
+    if (event.type === 'done') { releaseGeneration(event.generationId); drainStream(true); set((state) => ({ isGenerating: false, generationId: null, generationState: 'idle', messages: state.messages.flatMap((message) => message.id === assistantId(event.generationId) ? (event.assistant ? [event.assistant] : []) : [message]), lastFinishReason: event.finishReason ?? 'stop', agentTelemetry: state.agentTelemetry ? { ...state.agentTelemetry, finishedAt: now() } : null })); }
     });
   },
 };

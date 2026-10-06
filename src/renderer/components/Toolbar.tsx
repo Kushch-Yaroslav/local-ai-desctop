@@ -1,3 +1,4 @@
+import { activeConversationModel } from '../../shared/model-selection';
 import { useEffect, useState } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 import { FolderOpen, X } from 'lucide-react';
@@ -22,10 +23,10 @@ export function Toolbar() {
     return () => window.clearInterval(timer);
   }, [refreshRuntime]);
   const chat = conversations.find((item) => item.id === activeId);
-  const selectedModel = models.find((model) => model.id === chat?.modelId) ?? models[0];
+  const selectedModelId = activeConversationModel(chat, settings?.llamaRuntime);
+  const selectedModel = models.find((model) => model.id === selectedModelId);
   const reasoningCapability = selectedModel?.reasoning;
   const reasoningSelection = resolveReasoningSelection(reasoningCapability, chat?.reasoningMode ?? 'fast', chat ?? {});
-  const selectedModelId = chat ? chat.modelId ?? selectedModel?.id ?? null : null;
   useEffect(() => {
     if (!selectedModelId) { setEstimateResponse(null); return undefined; }
     let current = true;
@@ -41,6 +42,7 @@ export function Toolbar() {
     setCurrentVramBudget(undefined);
   }, [selectedModelId]);
   useEffect(() => {
+    if (!selectedModelId) { setDiscoveryLoading(false); setDiscoveryStage(''); return undefined; }
     let current = true;
     const poll = async () => {
       try {
@@ -63,11 +65,11 @@ export function Toolbar() {
   }, [selectedModelId]);
   if (!chat) return null;
   const chooseDirectory = async (slot: 1 | 2, currentDirectory: string | null) => { const directory = await window.localAi.dialog.chooseDirectory(currentDirectory); if (directory) await updateConversation(chat.id, slot === 1 ? { workingDirectory: directory } : { secondaryWorkingDirectory: directory }); };
-  const contextLabel = `${Math.round((activeContextWindow ?? chat.contextWindow) / 1024)}K`;
+  const contextLabel = selectedModelId ? `${Math.round((activeContextWindow ?? chat.contextWindow) / 1024)}K` : '—';
   const contextEstimate = estimateResponse?.modelId === selectedModelId ? estimateResponse.value : undefined;
   const projectSelector = (slot: 1 | 2, directory: string | null) => <div className={`directory project-selector project-${slot}`}><FolderOpen size={16} /><button title={directory ?? undefined} onClick={() => void chooseDirectory(slot, directory)}>{directory ? projectDirectoryName(directory) : `Проект ${slot}: не выбран`}</button>{directory && <button className="icon-button" aria-label={`Убрать проект ${slot}`} onClick={() => void updateConversation(chat.id, slot === 1 ? { workingDirectory: null } : { secondaryWorkingDirectory: null })}><X size={14} /></button>}</div>;
   const llama = settings?.llamaRuntime;
-  const runtimeLabel = !llama || llama.status === 'ready' ? 'llama.cpp'
+  const runtimeLabel = !llama || llama.status === 'ready' ? `llama.cpp${llama?.speculativeMode === 'mtp' ? ' · MTP' : llama?.speculativeMode === 'eagle3' ? ' · EAGLE3' : ''}`
       : llama.status === 'switching' || llama.status === 'starting' ? 'llama.cpp · запуск модели…'
         : 'llama.cpp · не запущен';
   const missingEstimate = contextEstimate?.unknownReasons.join(', ') ?? '';
@@ -132,8 +134,8 @@ export function Toolbar() {
         </details>
       </div>
       <div className="toolbar-controls">
-        <label className="control"><span>Модель</span><select disabled={discoveryLoading} value={chat.modelId ?? ''} onChange={(event) => void updateConversation(chat.id, { modelId: event.target.value || null }).catch(() => undefined)}><option value="">Выберите модель</option>{models.map((model) => <option value={model.id} key={model.id} disabled={!model.installed}>{model.name}{model.installed ? '' : ' · не установлена'}</option>)}</select></label>
-        <label className="control"><span>Контекст · {contextLabel}</span><select disabled={discoveryLoading} value={selectedContextOption ? contextChoiceId(selectedContextOption) : ''} onChange={(event) => { const option = contextOptions.find((candidate) => contextChoiceId(candidate) === event.target.value); if (option) void updateConversation(chat.id, { contextWindow: option.contextWindow, llamaKvCacheType: option.kvCacheType, llamaKvOffload: option.kvOffload }).catch(() => undefined); }}>{contextOptions.map((option) => <option value={contextChoiceId(option)} key={contextChoiceId(option)}>{option.label}</option>)}</select></label>
+        <label className="control"><span>Модель</span><select disabled={discoveryLoading} value={selectedModelId ?? ''} onChange={(event) => void updateConversation(chat.id, { modelId: event.target.value || null }).catch(() => undefined)}><option value="" disabled>Выберите модель</option>{models.map((model) => <option value={model.id} key={model.id} disabled={!model.installed}>{model.name}{model.installed ? '' : ' · не установлена'}</option>)}</select></label>
+        <label className="control"><span>Контекст · {contextLabel}</span><select disabled={discoveryLoading || !selectedModelId} value={selectedContextOption ? contextChoiceId(selectedContextOption) : ''} onChange={(event) => { const option = contextOptions.find((candidate) => contextChoiceId(candidate) === event.target.value); if (option) void updateConversation(chat.id, { contextWindow: option.contextWindow, llamaKvCacheType: option.kvCacheType, llamaKvOffload: option.kvOffload }).catch(() => undefined); }}>{contextOptions.map((option) => <option value={contextChoiceId(option)} key={contextChoiceId(option)}>{option.label}</option>)}</select></label>
         {reasoningCapability && <label className="control" title={reasoningControlText.thinkingHint}><span>{reasoningControlText.thinking}</span>{reasoningCapability.thinkingToggle
           ? <select value={reasoningSelection.thinking === false ? 'off' : 'on'} onChange={(event) => void updateConversation(chat.id, { thinkingEnabled: event.target.value === 'on' }).catch(() => undefined)}><option value="on">{thinkingLabel.on}</option><option value="off">{thinkingLabel.off}</option></select>
           : <select disabled title={reasoningControlText.thinkingUnavailable} value="unavailable"><option value="unavailable">{reasoningControlText.unavailable}</option></select>}</label>}

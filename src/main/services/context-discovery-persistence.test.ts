@@ -31,6 +31,12 @@ export async function runContextDiscoveryPersistenceRegression() {
   const file = join(directory, 'app.db');
   try {
     const kA = contextDiscoveryKey(identity());
+    const draftArguments = [...baseArguments, '--spec-type', 'draft-mtp', '--model-draft', '/models/assistant.gguf', '--spec-draft-n-max', '4'];
+    const draftKey = key({ arguments: draftArguments, draftFingerprint: '514687104:1700000000002' });
+    assert.notEqual(draftKey, key({ arguments: [...baseArguments, '--spec-type', 'none'], speculative: 'none' }), 'OFF/ON must not share discovery');
+    assert.notEqual(draftKey, key({ arguments: draftArguments, draftFingerprint: '514687104:1700000000003' }), 'replacement at the same draft path invalidates discovery');
+    assert.equal(draftKey, key({ arguments: [...draftArguments, '--cache-type-k-draft', 'q8_0', '--cache-type-v-draft', 'q8_0'], draftFingerprint: '514687104:1700000000002' }), 'KV precision remains a per-option identity');
+    assert.notEqual(draftKey, key({ arguments: draftArguments.slice(0, -1).concat('8'), draftFingerprint: '514687104:1700000000002' }), 'draft scheduling changes are configuration changes');
     const model = 'qwen3.8:27b-q4_K_M';
 
     // Replacing the baseline symlinks with the same standalone files must not

@@ -92,8 +92,12 @@ function setTier(allocation: Partial<Record<AllocationLocation, number>>, locati
 /** Parses final non-dry-run allocation evidence; repeat reserve summaries are maxima, not additive allocations. */
 export function parseLlamaAllocationLog(text: string, runtimeArguments?: readonly string[]): LlamaAllocationLog {
   const lines = text.split(/\r?\n/);
-  const offloadIndex = lastMatchingIndex(lines, /load_tensors:.*offloaded\s+\d+\/\d+\s+layers/i);
-  const nonZeroWeightsIndex = lastMatchingIndex(lines, /model buffer size\s*=\s*(?!0+(?:\.0+)?\s*(?:MiB|GiB|MB|GB))/i);
+  // A separate drafter has its own final offload/weight lines. Select the final
+  // target load before draft initialization, not the last model in the log.
+  const draftStart = lastMatchingIndex(lines, /common_speculative_init_result: (?:creating (?:MTP|EAGLE|draft)\b|loading draft model\b)/i);
+  const targetLines = draftStart >= 0 ? lines.slice(0, draftStart) : lines;
+  const offloadIndex = lastMatchingIndex(targetLines, /load_tensors:.*offloaded\s+\d+\/\d+\s+layers/i);
+  const nonZeroWeightsIndex = lastMatchingIndex(targetLines, /model buffer size\s*=\s*(?!0+(?:\.0+)?\s*(?:MiB|GiB|MB|GB))/i);
   const start = offloadIndex >= 0 ? offloadIndex : Math.max(0, nonZeroWeightsIndex);
   const runtimeInitIndex = lines.findIndex((line, index) => index >= start && /srv.*load_model: initializing,/i.test(line));
   const end = runtimeInitIndex >= start ? runtimeInitIndex + 1 : lines.length;
@@ -132,19 +136,21 @@ export function parseLlamaAllocationLog(text: string, runtimeArguments?: readonl
   let kvPartition = 'default';
   const kvPartitions: Record<AllocationPhase, Map<string, Partial<Record<AllocationLocation, number>>>> = { target: new Map(), speculative: new Map() };
   const kvSummaries: Record<AllocationPhase, Map<string, number>> = { target: new Map(), speculative: new Map() };
+  const sharedDraftLayers = new Map<string, Set<number>>();
+  const draftLayerCounts = new Map<string, number>();
   let latestContextFromServer: number | null = null;
   for (let index = 0; index < start; index += 1) {
     const line = lines[index];
     const loadedPath = line.match(/srv\s+load_model: loading model ['"](.+?)['"]/i)?.[1]
       ?? line.match(/llama_model_loader: loaded meta data .* from (.+?) \(version GGUF/i)?.[1];
-    if (loadedPath) modelPath = loadedPath;
+    if (loadedPath && currentPhase === 'target') modelPath = loadedPath;
   }
 
   for (let index = start; index < end; index += 1) {
     const line = lines[index];
     const loadedPath = line.match(/srv\s+load_model: loading model ['"](.+?)['"]/i)?.[1]
       ?? line.match(/llama_model_loader: loaded meta data .* from (.+?) \(version GGUF/i)?.[1];
-    if (loadedPath) modelPath = loadedPath;
+    if (loadedPath && currentPhase === 'target') modelPath = loadedPath;
     if (/clip_model_loader: has vision encoder/i.test(line)) { visionPresent = true; inVisionSection = true; }
     if (/srv.*load_model: initializing,/i.test(line)) {
       const context = line.match(/\bn_ctx_slot\s*=\s*(\d+)\b/i)?.[1];
@@ -152,10 +158,10 @@ export function parseLlamaAllocationLog(text: string, runtimeArguments?: readonl
       const slots = line.match(/\bn_slots\s*=\s*(\d+)\b/i)?.[1];
       if (slots) sequenceSlots = Number(slots);
     }
-    if (/common_speculative_init_result: creating (MTP|EAGLE|draft)\b/i.test(line)) {
+    if (/common_speculative_init_result: (?:creating (?:MTP|EAGLE|draft)\b|loading draft model\b)/i.test(line)) {
       currentPhase = 'speculative';
       kvPartition = 'default';
-      speculativeMode = /EAGLE/i.test(line) ? 'eagle3' : /MTP/i.test(line) ? 'mtp' : 'draft';
+      speculativeMode = /loading draft model/i.test(line) ? 'unknown' : /EAGLE/i.test(line) ? 'eagle3' : /MTP/i.test(line) ? 'mtp' : 'draft';
       if (/against the target model/i.test(line)) speculativeUsesTargetModel = true;
     }
     if (/speculative.*(?:disabled|none)|draft.*(?:disabled|none)/i.test(line)) speculativeMode = 'none';
@@ -171,6 +177,13 @@ export function parseLlamaAllocationLog(text: string, runtimeArguments?: readonl
 
     const partition = line.match(/llama_kv_cache_iswa:\s*creating\s+(.+?)\s+KV cache/i)?.[1];
     if (partition) kvPartition = partition.trim();
+    if (currentPhase === 'speculative') {
+      const shared = line.match(/llama_kv_cache:\s*layer\s+(\d+): sharing with layer\s+\d+/i)?.[1];
+      if (shared) {
+        const layers = sharedDraftLayers.get(kvPartition) ?? new Set<number>();
+        layers.add(Number(shared)); sharedDraftLayers.set(kvPartition, layers);
+      }
+    }
     const types = kvTypesFromLine(line);
     if (types) {
       if (/llama_kv_cache/i.test(line)) {
@@ -182,7 +195,11 @@ export function parseLlamaAllocationLog(text: string, runtimeArguments?: readonl
     const totalSize = sizeFromLine(line);
     if (/llama_kv_cache: size\s*=/i.test(line) && totalSize !== null) {
       kvSummaries[currentPhase].set(kvPartition, Math.max(kvSummaries[currentPhase].get(kvPartition) ?? 0, totalSize));
-      if (currentPhase === 'speculative') { speculativeKvSummaryBytes = totalSize; sawSpeculativeKvSummary = true; }
+      if (currentPhase === 'speculative') {
+        speculativeKvSummaryBytes = totalSize; sawSpeculativeKvSummary = true;
+        const count = line.match(/\b(\d+)\s+layers?\b/i)?.[1];
+        if (count) draftLayerCounts.set(kvPartition, Number(count));
+      }
       else { targetKvSummaryBytes = totalSize; sawTargetKvSummary = true; }
     }
     if (/llama_memory_recurrent: size\s*=/i.test(line) && totalSize !== null && currentPhase === 'target') {
@@ -212,8 +229,22 @@ export function parseLlamaAllocationLog(text: string, runtimeArguments?: readonl
   const loadedIndex = lines.findIndex((line, index) => index >= start && /\bsrv\s+llama_server: model loaded/.test(line));
   const fullyLoaded = loadedIndex >= start;
   const startupText = lines.slice(start, fullyLoaded ? loadedIndex + 1 : end).join('\n');
+  const implementation = startupText.match(/adding speculative implementation '(draft-mtp|draft-eagle3|draft)'/i)?.[1];
+  if (implementation) speculativeMode = implementation === 'draft-mtp' ? 'mtp' : implementation === 'draft-eagle3' ? 'eagle3' : 'draft';
   if (/\bspec\s+common_specu:\s+no implementations specified for speculative decoding/.test(startupText)) speculativeMode = 'none';
   if (visionPresent === null && fullyLoaded && runtimeArguments && !runtimeArguments.some((arg) => arg === '--mmproj' || arg === '-mm' || arg === '--mmproj-url' || arg.startsWith('--mmproj=') || arg.startsWith('--mmproj-url='))) visionPresent = false;
+
+  // Shared-cache summaries describe views of target tensors, not additional
+  // memory. Only a completed startup with evidence for every layer establishes
+  // zero owned bytes; missing/partial sharing logs must remain unknown.
+  if (fullyLoaded && sawTargetKvSummary) {
+    for (const [partition, count] of draftLayerCounts) {
+      if (count > 0 && sharedDraftLayers.get(partition)?.size === count && !kvPartitions.speculative.has(partition)) {
+        kvPartitions.speculative.set(partition, { host: 0, device: 0 });
+        kvSummaries.speculative.set(partition, 0);
+      }
+    }
+  }
 
   for (const measurement of measurements) {
     const target = phaseTotals[measurement.phase][measurement.kind];

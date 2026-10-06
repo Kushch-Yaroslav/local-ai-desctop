@@ -62,6 +62,25 @@ const toolSchema = [{ type: 'function', function: { name: 'read_file', descripti
 const call = (backend: LlamaCppBackend, messages: ToolMessage[], tools: unknown[] | undefined = toolSchema) => backend.chatWithTools(model, messages, tools, new AbortController().signal, 65_536, 'deep');
 
 export async function runLlamaCppBackendRegression(): Promise<void> {
+  {
+    const originalFetch = globalThis.fetch;
+    let requests = 0;
+    globalThis.fetch = async () => { requests++; throw new Error('idle backend must not contact a runtime'); };
+    try {
+      const backend = new LlamaCppBackend('http://127.0.0.1:8081', 32_768, false, null);
+      const models = await backend.getModels();
+      assert.equal(models.length, llamaRuntimeProfiles.length, 'idle selection must retain the whole model catalog');
+      assert.equal(requests, 0, 'listing installed models must not query a previously selected server');
+      assert.equal(await backend.supportsVision(model), false);
+      assert.equal(await backend.getRuntimeContextEvidence(), null);
+      await assert.rejects(backend.ensureModelAvailable(model));
+      assert.equal(requests, 0, 'generation cannot implicitly select a model');
+      backend.updateRuntimeSelection(model, 32_768);
+      assert.equal(await backend.supportsVision(model), true);
+      backend.clearRuntimeSelection();
+      assert.equal(await backend.supportsVision(model), false);
+    } finally { globalThis.fetch = originalFetch; }
+  }
   // A bare strategy keeps its historical meaning (thinking on; Fast = lowest effort, Deep = highest the model supports);
   // only the final tool-free turn may turn thinking off.
   for (const profile of llamaRuntimeProfiles) {
@@ -107,6 +126,9 @@ export async function runLlamaCppBackendRegression(): Promise<void> {
       }, 'live llama-server n_ctx was not exposed as runtime evidence');
       assert.equal(await backend.getRuntimeContextEvidence('other-model'), null, 'llama.cpp reported evidence for a model that is not loaded');
       const models = await backend.getModels();
+      assert.deepEqual(models.find((entry) => entry.id === 'gemma4:31b-it-q4_k_m')?.speculative, { mechanism: 'mtp', draftSource: 'external' });
+      assert.deepEqual(models.find((entry) => entry.id === model)?.speculative, { mechanism: 'mtp', draftSource: 'embedded' });
+      assert.equal(models.find((entry) => entry.id === 'devstral-small-2:24b-q4_k_m')?.speculative, undefined, 'no unsupported control for Devstral');
       assert.deepEqual(models.find((item) => item.id === model)?.supportedContextPresets, [16384, 32768, 65536, 131072, 262144], 'loaded 16K must not redefine model capability');
       assert.deepEqual(models.map((item) => item.id), llamaRuntimeProfiles.map((profile) => profile.id));
       assert(!models.some((item) => ['glm-4.7-flash:q4_k', 'gpt-oss:20b'].includes(item.id)), 'removed local entries must not appear');

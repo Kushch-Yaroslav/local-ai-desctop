@@ -458,7 +458,7 @@ fn the_pause_tool_is_offered_only_after_steering_and_a_clarification_does_not_pa
         }
         1 => {
             assert!(tool_names(request).contains(&"pause_run".to_owned()));
-            assert!(last_user_text(request).contains("pause_run"));
+            assert!(user_turn_context(request).contains("pause_run"));
             Reply::Tools(vec![("read_file", json!({"path":"a.txt"}))])
         }
         2 => {
@@ -591,6 +591,7 @@ impl Provider {
                 }
                 let request: Value =
                     serde_json::from_slice(&raw[body_start..body_start + length]).unwrap();
+                assert_template_turns(&request);
                 let reply = script(&request, served);
                 log.lock().unwrap().push(request);
                 served += 1;
@@ -751,14 +752,87 @@ fn completed(journal: &[Value]) -> bool {
     journal.iter().any(|entry| entry == &json!("RunComplete"))
 }
 
-fn last_user_text(request: &Value) -> String {
+// Enforce the embedded Devstral template's ordinary-turn parity for every
+// production loop fixture, including all existing Stage A/verification tests.
+// Tool calls/results continue the assistant turn and do not advance parity.
+fn assert_template_turns(request: &Value) {
+    let messages = request["messages"].as_array().unwrap();
+    assert_eq!(messages[0]["role"], "system");
+    let mut expects_user = true;
+    for message in messages.iter().skip(1) {
+        let calls = message
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .is_some_and(|calls| !calls.is_empty());
+        assert_ne!(message["role"], "system", "only one initial system turn");
+        if message["role"] == "user" || (message["role"] == "assistant" && !calls) {
+            assert_eq!(
+                message["role"] == "user",
+                expects_user,
+                "invalid template sequence: {messages:?}"
+            );
+            expects_user = !expects_user;
+        }
+    }
+}
+
+#[test]
+fn registered_and_future_families_share_valid_initial_and_multiple_tool_turns() {
+    for model in [
+        "qwen3.8:27b-q4_K_M",
+        "huihui-qwen3.8:27b-ud-dw-q4_k_m",
+        "devstral-small-2:24b-q4_k_m",
+        "gemma4:31b-it-q4_k_m",
+        "future-registered-model",
+    ] {
+        let fixture = Workspace::new(&[("a.txt", "a"), ("b.txt", "b")]);
+        let provider = Provider::start(|request, n| {
+            assert_template_turns(request);
+            match n {
+                0 => Reply::Tools(vec![("read_file", json!({"path":"a.txt"}))]),
+                1 => Reply::Tools(vec![("read_file", json!({"path":"b.txt"}))]),
+                2 => Reply::Tools(vec![("list_directory", json!({"path":"."}))]),
+                _ => Reply::Text("Both files inspected.".into()),
+            }
+        });
+        let mut config = fixture.config(&provider.endpoint, READ_ONLY);
+        config.model = model.to_owned();
+        config.supports_reasoning = !model.starts_with("devstral");
+        run(config);
+        assert!(completed(&fixture.journal()), "{model}");
+        assert_eq!(provider.requests().len(), 4, "{model}");
+        let requests = provider.requests();
+        assert_eq!(requests[0]["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            requests[3]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|message| message["role"] == "tool")
+                .count(),
+            3
+        );
+    }
+}
+
+fn user_turn_context(request: &Value) -> String {
     request["messages"]
         .as_array()
         .unwrap()
         .iter()
         .rev()
-        .filter(|m| m["role"] == "user")
-        .map(|m| m["content"].as_str().unwrap_or("").to_owned())
+        // Runtime guidance remains user-originated, but after a native tool call
+        // it is attached to the result boundary rather than opening a new turn.
+        .filter(|m| m["role"] == "user" || m["role"] == "tool")
+        .filter_map(|m| {
+            let text = m["content"].as_str().unwrap_or("");
+            if m["role"] == "user" {
+                Some(text.to_owned())
+            } else {
+                text.split_once("[CONTINUED USER TURN — NOT TOOL OUTPUT]\n")
+                    .map(|(_, tail)| tail.to_owned())
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n---\n")
 }
@@ -849,17 +923,16 @@ fn unopened_requested_files_get_exactly_one_reminder_and_never_block_the_answer(
     );
     let requests = provider.requests();
     assert_eq!(requests.len(), 3);
-    let reminded = last_user_text(&requests[2]);
+    let reminded = user_turn_context(&requests[2]);
     assert!(reminded.contains("Before finishing"), "{reminded}");
     assert!(reminded.contains("public/api.php"), "{reminded}");
     assert!(
-        !last_user_text(&requests[1]).contains("Before finishing"),
+        !user_turn_context(&requests[1]).contains("Before finishing"),
         "no reminder before a draft exists"
     );
     // the state the model sees names the unopened target on every turn
-    assert!(
-        last_user_text(&requests[1]).contains("public/api.php <- request/submit target 'api.php'")
-    );
+    assert!(user_turn_context(&requests[1])
+        .contains("public/api.php <- request/submit target 'api.php'"));
     let accepted = journal
         .iter()
         .rev()
@@ -919,7 +992,7 @@ fn exhausting_the_turn_budget_withdraws_tools_and_still_answers() {
     assert!(MAX_SYNTHESIS_TURNS >= 1);
     let last = requests.last().unwrap();
     assert!(last.get("tools").is_none() && last.get("tool_choice").is_none());
-    assert!(last_user_text(last).contains("MODE: FINALIZING"));
+    assert!(user_turn_context(last).contains("MODE: FINALIZING"));
     assert!(tool_names(&requests[MAX_INVESTIGATION_TURNS - 1]).contains(&"read_file".to_owned()));
 }
 
@@ -932,9 +1005,12 @@ fn tool_calls_during_synthesis_are_answered_with_an_instruction_to_write_the_ans
         let finalizing = request.get("tools").is_none();
         let already_told = request["messages"].as_array().unwrap().iter().any(|m| {
             m["role"] == "tool"
-                && m["content"]
-                    .as_str()
-                    .is_some_and(|c| c.contains("Write the final answer now"))
+                && m["content"].as_str().is_some_and(|c| {
+                    c.split("[CONTINUED USER TURN — NOT TOOL OUTPUT]")
+                        .next()
+                        .unwrap_or("")
+                        .contains("Write the final answer now")
+                })
         });
         if finalizing && already_told {
             Reply::Text("Final answer.".into())
@@ -964,9 +1040,12 @@ fn repeated_synthesis_misfires_still_end_in_an_answer() {
             .iter()
             .filter(|m| {
                 m["role"] == "tool"
-                    && m["content"]
-                        .as_str()
-                        .is_some_and(|c| c.contains("Write the final answer now"))
+                    && m["content"].as_str().is_some_and(|c| {
+                        c.split("[CONTINUED USER TURN — NOT TOOL OUTPUT]")
+                            .next()
+                            .unwrap_or("")
+                            .contains("Write the final answer now")
+                    })
             })
             .count();
         match misfires {
@@ -977,7 +1056,7 @@ fn repeated_synthesis_misfires_still_end_in_an_answer() {
     run(workspace.config(&provider.endpoint, READ_ONLY));
     assert!(completed(&workspace.journal()));
     assert_eq!(provider.requests().len(), MAX_INVESTIGATION_TURNS + 6);
-    let reminded = last_user_text(provider.requests().last().unwrap());
+    let reminded = user_turn_context(provider.requests().last().unwrap());
     assert!(!reminded.contains("Emit a complete structured tool call"));
 }
 
@@ -999,7 +1078,9 @@ fn an_empty_response_never_completes_the_run() {
     assert!(completed(&journal));
     let requests = provider.requests();
     assert_eq!(requests.len(), 3);
-    assert!(last_user_text(&requests[2]).contains("neither an answer nor a structured tool call"));
+    assert!(
+        user_turn_context(&requests[2]).contains("neither an answer nor a structured tool call")
+    );
     assert!(tool_names(&requests[2]).contains(&"read_file".to_owned()));
     let answers = journal
         .iter()
@@ -1025,7 +1106,7 @@ fn persistent_empty_responses_force_a_tool_free_answer_turn() {
     assert_eq!(requests.len(), 4);
     let last = requests.last().unwrap();
     assert!(last.get("tools").is_none());
-    assert!(last_user_text(last).contains("MODE: FINALIZING"));
+    assert!(user_turn_context(last).contains("MODE: FINALIZING"));
 }
 
 #[test]
@@ -1189,7 +1270,9 @@ fn a_reasoning_only_turn_is_visible_to_the_retry() {
             && m["reasoning_content"] == "DRAFT-IN-THINKING: the report is: form posts to api.php"),
         "the retry did not carry the reasoning-only turn"
     );
-    assert!(last_user_text(&requests[1]).contains("neither an answer nor a structured tool call"));
+    assert!(
+        user_turn_context(&requests[1]).contains("neither an answer nor a structured tool call")
+    );
 }
 
 #[test]
@@ -1592,7 +1675,7 @@ fn fast_sends_a_run_with_unfinished_deliverables_back_once_then_accepts() {
     );
     let requests = provider.requests();
     assert_eq!(requests.len(), 4);
-    let reminder = last_user_text(&requests[3]);
+    let reminder = user_turn_context(&requests[3]);
     assert!(reminder.contains("not all complete"), "{reminder}");
     assert!(
         reminder.contains("d-002 theme switch changes the theme (theme)"),
@@ -1667,7 +1750,7 @@ fn deep_requires_cited_evidence_for_done_and_reviews_twice() {
         "Deep reviews an unfinished list twice"
     );
     assert_eq!(requests.len(), 7);
-    assert!(last_user_text(&requests[6]).contains("cite the observation"));
+    assert!(user_turn_context(&requests[6]).contains("cite the observation"));
 }
 
 /// Trivial and analysis-only prompts must stay lean: the runtime never creates a list on its own, so nothing is reviewed.
@@ -1754,7 +1837,7 @@ fn files_created_in_the_run_are_listed_and_named_in_the_review() {
             .contains("a.txt</files_created_this_run>"),
         "an existing file is not a created file"
     );
-    let review = last_user_text(&requests[3]);
+    let review = user_turn_context(&requests[3]);
     assert!(
         review.contains("Files you created in this run: scratch-check.js"),
         "{review}"
@@ -1877,10 +1960,10 @@ fn the_plan_is_set_shown_back_and_kept_apart_from_deliverables() {
     let requests = provider.requests();
     assert!(tool_names(&requests[0]).contains(&"plan".to_owned()));
     assert!(!requests[0].to_string().contains("<plan>"));
-    let second = last_user_text(&requests[1]);
+    let second = user_turn_context(&requests[1]);
     assert!(second.contains("<plan>"), "{second}");
     assert!(second.contains("[>] s1 inspect a.txt"), "{second}");
-    let third = last_user_text(&requests[2]);
+    let third = user_turn_context(&requests[2]);
     assert!(third.contains("[x] s1 inspect a.txt"), "{third}");
     assert!(third.contains("[>] s2 change it"), "{third}");
     assert!(
@@ -1978,7 +2061,7 @@ fn an_edit_with_no_check_is_sent_back_once_and_then_accepted() {
     assert_eq!(withheld_drafts(&journal), 1);
     let requests = provider.requests();
     assert_eq!(requests.len(), 3);
-    let reminder = last_user_text(&requests[2]);
+    let reminder = user_turn_context(&requests[2]);
     assert!(
         reminder.contains("not seen your work verified"),
         "{reminder}"
@@ -2278,7 +2361,7 @@ fn regression_a_page_edited_and_only_reread_is_never_reported_as_verified() {
     let state = requests[4].to_string();
     assert!(!state.contains("[verified]"), "{state}");
     assert!(state.contains("[implemented] d-001") && state.contains("[implemented] d-002"));
-    let review = last_user_text(&requests[5]);
+    let review = user_turn_context(&requests[5]);
     assert!(
         review.contains("d-001") && review.contains("d-002"),
         "{review}"
@@ -2314,7 +2397,7 @@ fn deep_wants_the_project_test_suite_and_verifies_with_a_cited_evidence_id() {
     config.reasoning_mode = "deep".into();
     run(config);
     let requests = provider.requests();
-    let review = last_user_text(&requests[2]);
+    let review = user_turn_context(&requests[2]);
     assert!(review.contains("npm test"), "{review}");
     let journal = workspace.journal();
     assert!(completed(&journal));
@@ -2545,7 +2628,7 @@ fn with_a_browser_available_a_stand_in_is_refused_and_the_gate_asks_for_a_browse
     let refusal = last_tool_result(&requests[3]);
     assert!(refusal.contains("not a browser"), "{refusal}");
     assert_eq!(withheld_drafts(&journal), 1);
-    let reminder = last_user_text(requests.last().unwrap());
+    let reminder = user_turn_context(requests.last().unwrap());
     assert!(reminder.contains("real browser"), "{reminder}");
     assert!(reminder.contains("d-001"), "{reminder}");
 }

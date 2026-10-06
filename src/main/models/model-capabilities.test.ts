@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { launchProfileEnvironment } from './llama-launch-config';
 import { modelRegistry } from './model-registry';
 import { agentReasoningOptions, llamaReasoningForInput, llamaRuntimeProfile, llamaRuntimeProfiles, reasoningCapability } from './llama-runtime-policy';
 import { reasoningPatchError, resolveReasoningSelection } from '../../shared/reasoning-controls';
@@ -41,15 +41,13 @@ for (const mode of ['fast', 'deep'] as const) {
   assert.deepEqual(llamaReasoningForInput(devstral, { mode, selection: { thinking: true, effort: 'max' } }), {});
 }
 assert.equal(llamaRuntimeProfile(devstral)?.speculative, 'none');
-assert.equal(llamaRuntimeProfile(gemma)?.speculative, 'none');
+assert.equal(llamaRuntimeProfile(gemma)?.speculative, 'mtp');
+assert.equal(llamaRuntimeProfile(gemma)?.draft?.kvCache, 'shared');
 assert.equal(llamaRuntimeProfile(huihui)?.speculative, 'mtp');
-const launcher = readFileSync('run-local-ai-desktop-llama-cpp-mtp.sh', 'utf8');
-for (const id of ids) assert(launcher.includes(`${id})`), `launcher selection missing ${id}`);
-assert(!launcher.includes('gpt-oss-20b-MXFP4.gguf'));
-assert(!launcher.includes('GLM-4.7-Flash-Q4_K.gguf'));
 for (const profile of llamaRuntimeProfiles) {
   assert.equal(profile.maxContext, 262_144);
-  assert(launcher.includes(profile.modelPath!));
-  assert(launcher.includes(profile.mmprojPath!));
+  const launch = launchProfileEnvironment(profile);
+  assert(launch.includes(profile.modelPath!));
+  assert(launch.includes(profile.mmprojPath!));
 }
 console.log('model capability regression passed (4 local profiles; native controls and strategy independence)');

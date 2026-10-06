@@ -131,6 +131,11 @@ export class RustAgentRuntime {
   async *stream(model: string, history: ChatMessage[], projects: AgentProject[], signal: AbortSignal, contextLimit: number, reasoningMode: ReasoningMode, webMode: WebMode, runId: string, persistedTaskMemory?: AgentPlan['taskMemory'], conversationId?: string, supportsReasoning = true, reasoningOptions?: Record<string, Record<string, unknown>>, workspaceRoots: readonly string[] = []): AsyncIterable<StreamEvent> {
     if (!existsSync(this.binary)) throw new Error(`Rust Agent Runtime V2 не собран: ${this.binary}. Выполните cargo build в rust-agent.`);
     const child = spawn(this.binary, [], { stdio: 'pipe' });
+    const lines = createInterface({ input: child.stdout });
+    let processError: Error | null = null;
+    const failedProcess = (error: Error) => { processError = error; lines.close(); };
+    child.once('error', failedProcess);
+    child.stdin.on('error', failedProcess);
     const pending: Array<{ content: string; resolve: () => void; reject: (error: Error) => void }> = [];
     this.steering.set(runId, (content, intent) => {
       if (!child.stdin.writable || signal.aborted) return Promise.reject(new Error('Agent уже завершён.'));
@@ -160,11 +165,11 @@ export class RustAgentRuntime {
       provider_max_output: maxOutputTokens,
     };
     child.stdin.write(`${JSON.stringify(request)}\n`);
-    const lines = createInterface({ input: child.stdout });
     let compactions = 0;
     let statusCount = 0;
     let terminalFinal = false;
     let terminalFailure = false;
+    let terminalStopped = false;
     let terminalFinishReason: 'stop' | 'length' = 'stop';
     let stderr = '';
     child.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
@@ -221,11 +226,17 @@ export class RustAgentRuntime {
             ...(cacheWriteTokens === undefined ? {} : { cacheWriteTokens }),
           } };
         } else if (event.type === 'agent_stopped') {
-          child.stdin.end();
+          terminalStopped = true;
+          if (child.stdin.writable) child.stdin.end();
           yield { type: 'cancelled' };
+          break;
         } else if (event.type === 'agent_error') {
           terminalFailure = true;
+          // The worker has ended; its protocol supervisor still awaits stdin.
+          // End this run's stream now so IPC can release inference ownership.
+          if (child.stdin.writable) child.stdin.end();
           yield { type: 'error', message: 'Rust Agent Runtime V2 error', details: event.message };
+          break;
         }
         if (event.type === 'final') {
           // A bounded continuation cap is still a terminal user-visible result:
@@ -237,7 +248,7 @@ export class RustAgentRuntime {
         }
       }
       if (!signal.aborted && terminalFinal) yield { type: 'done', finishReason: terminalFinishReason };
-      else if (!signal.aborted && !terminalFailure) yield { type: 'error', message: 'Rust Agent Runtime V2 ended without a terminal final response', details: 'The runtime closed before emitting a final event.' };
+      else if (!signal.aborted && !terminalFailure && !terminalStopped) yield { type: 'error', message: 'Rust Agent Runtime V2 ended without a terminal final response', details: processError ? String(processError) : stderr.trim() || 'The runtime closed before emitting a final event.' };
     } finally {
       this.steering.delete(runId);
       for (const next of pending) next.reject(new Error('Agent завершён до принятия уточнения.'));
@@ -245,7 +256,6 @@ export class RustAgentRuntime {
       if (child.stdin.writable) child.stdin.end();
       if (!child.killed && child.exitCode === null) child.kill('SIGTERM');
     }
-    if (stderr.trim()) throw new Error(`Ошибка Rust Agent Runtime V2 (stderr): ${stderr.trim()}`);
   }
 }
 

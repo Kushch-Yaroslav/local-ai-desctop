@@ -1,0 +1,84 @@
+0.00.199.778 I srv    load_model: loading model '/media/yaroslav/DATA/llama-models/Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf'
+0.00.199.781 I srv    load_model: local path '/media/yaroslav/DATA/llama-models/Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf'
+0.00.211.745 I srv    load_model: [mtmd] estimated worst-case memory usage of mmproj is 901.98 MiB (took 11.95 ms)
+0.00.211.752 D srv    load_model: [mtmd] adding 901.98 MiB to fit_params_target for device CPU
+0.00.252.378 I llama_model_loader: loaded meta data with 54 key-value pairs and 363 tensors from /media/yaroslav/DATA/llama-models/Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf (version GGUF V3 (latest))
+0.00.465.514 I load_tensors: offloaded 41/41 layers to GPU
+0.00.465.518 I load_tensors:        CUDA0 model buffer size =     0.00 MiB
+0.00.465.518 I load_tensors:    CUDA_Host model buffer size =     0.00 MiB
+0.00.467.623 I llama_context: constructing llama_context
+0.00.467.628 W llama_context: setting new yarn_attn_factor = 1.0000 (mscale == 1.0, mscale_all_dim = 1.0)
+0.00.467.630 I llama_context: n_seq_max             = 1
+0.00.467.630 I llama_context: n_ctx                 = 53248
+0.00.467.631 I llama_context: n_ctx_seq             = 53248
+0.00.467.631 I llama_context: n_batch               = 2048
+0.00.467.631 I llama_context: n_ubatch              = 512
+0.00.467.631 I llama_context: causal_attn           = 1
+0.00.467.632 I llama_context: flash_attn            = enabled
+0.00.467.632 I llama_context: kv_unified            = false
+0.00.467.633 I llama_context: freq_base             = 100000000.0
+0.00.467.633 I llama_context: freq_scale            = 0.0208333
+0.00.467.634 I llama_context: n_rs_seq              = 0
+0.00.467.634 I llama_context: n_outputs_max         = 1
+0.00.467.634 I llama_context: n_outputs_max_per_seq = 1
+0.00.467.634 I llama_context: n_ctx_seq (53248) < n_ctx_train (393216) -- the full capacity of the model will not be utilized
+0.00.471.840 I llama_context:  CUDA_Host  output buffer size =     0.50 MiB
+0.00.472.085 I llama_kv_cache:      CUDA0 KV buffer size =     0.00 MiB
+0.00.472.090 I llama_kv_cache: size = 8320.00 MiB ( 53248 cells,  40 layers,  1/1 seqs), K (f16): 4160.00 MiB, V (f16): 4160.00 MiB
+0.00.472.093 D llama_context: enumerating backends
+0.00.474.517 D llama_context: backend_ptrs.size() = 2
+0.00.474.520 I sched_reserve: reserving ...
+0.00.474.523 D sched_reserve: max_nodes = 2904
+0.00.475.047 D sched_reserve: reserving full memory module
+0.00.475.067 D sched_reserve: worst-case: n_tokens = 512, n_seqs = 1, n_outputs = 1
+0.00.477.475 I sched_reserve:      CUDA0 compute buffer size =   272.01 MiB
+0.00.477.477 I sched_reserve:  CUDA_Host compute buffer size =    72.01 MiB
+0.00.477.478 I sched_reserve: graph nodes  = 1286
+0.00.477.478 I sched_reserve: graph splits = 2
+0.00.477.479 I sched_reserve: reserve took 2.96 ms, sched copies = 1
+0.00.534.002 I llama_model_loader: loaded meta data with 54 key-value pairs and 363 tensors from /media/yaroslav/DATA/llama-models/Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf (version GGUF V3 (latest))
+0.01.311.282 I load_tensors: offloaded 41/41 layers to GPU
+0.01.311.284 I load_tensors:   CPU_Mapped model buffer size =   360.00 MiB
+0.01.311.285 I load_tensors:        CUDA0 model buffer size = 13302.36 MiB
+0.02.582.694 I llama_context: constructing llama_context
+0.02.582.698 W llama_context: setting new yarn_attn_factor = 1.0000 (mscale == 1.0, mscale_all_dim = 1.0)
+0.02.582.700 I llama_context: n_seq_max             = 1
+0.02.582.700 I llama_context: n_ctx                 = 53248
+0.02.582.700 I llama_context: n_ctx_seq             = 53248
+0.02.582.700 I llama_context: n_batch               = 2048
+0.02.582.701 I llama_context: n_ubatch              = 512
+0.02.582.701 I llama_context: causal_attn           = 1
+0.02.582.701 I llama_context: flash_attn            = enabled
+0.02.582.702 I llama_context: kv_unified            = false
+0.02.582.703 I llama_context: freq_base             = 100000000.0
+0.02.582.703 I llama_context: freq_scale            = 0.0208333
+0.02.582.704 I llama_context: n_rs_seq              = 0
+0.02.582.704 I llama_context: n_outputs_max         = 1
+0.02.582.704 I llama_context: n_outputs_max_per_seq = 1
+0.02.582.704 I llama_context: n_ctx_seq (53248) < n_ctx_train (393216) -- the full capacity of the model will not be utilized
+0.02.586.391 I llama_context:  CUDA_Host  output buffer size =     0.50 MiB
+0.02.587.128 I llama_kv_cache:      CUDA0 KV buffer size =  8320.00 MiB
+0.02.600.545 I llama_kv_cache: size = 8320.00 MiB ( 53248 cells,  40 layers,  1/1 seqs), K (f16): 4160.00 MiB, V (f16): 4160.00 MiB
+0.02.600.548 D llama_context: enumerating backends
+0.02.601.758 D llama_context: backend_ptrs.size() = 2
+0.02.601.759 I sched_reserve: reserving ...
+0.02.601.760 D sched_reserve: max_nodes = 2904
+0.02.602.026 D sched_reserve: reserving full memory module
+0.02.602.028 D sched_reserve: worst-case: n_tokens = 512, n_seqs = 1, n_outputs = 1
+0.02.645.581 I sched_reserve:      CUDA0 compute buffer size =   272.01 MiB
+0.02.645.583 I sched_reserve:  CUDA_Host compute buffer size =    72.01 MiB
+0.02.645.583 I sched_reserve: graph nodes  = 1286
+0.02.645.584 I sched_reserve: graph splits = 2
+0.02.645.585 I sched_reserve: reserve took 43.83 ms, sched copies = 1
+0.02.707.225 I clip_model_loader: has vision encoder
+0.02.708.981 I load_hparams: model size:         837.36 MiB
+0.03.096.883 I reserve_compute_meta:        CPU compute buffer size =    64.62 MiB
+0.03.096.886 I reserve_compute_meta: graph splits = 1, nodes = 703
+0.03.096.905 I srv    load_model: loaded multimodal model, '/media/yaroslav/DATA/llama-models/devstral-small-2-24b-mmproj-f16.gguf'
+0.03.151.682 I srv    load_model: initializing, n_slots = 1, n_ctx_slot = 53248, kv_unified = 'false'
+0.03.151.696 I spec common_specu: no implementations specified for speculative decoding
+0.03.151.778 I srv    load_model: prompt cache is enabled, size limit: 8192 MiB
+0.03.151.779 I srv    load_model: use `--cache-ram 0` to disable the prompt cache
+0.03.151.780 I srv    load_model: for more info see https://github.com/ggml-org/llama.cpp/pull/16391
+0.03.151.780 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.03.156.340 I srv  llama_server: model loaded

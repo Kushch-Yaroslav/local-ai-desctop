@@ -107,4 +107,50 @@ rl.on('line', (line) => {
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 
-if (require.main === module) { runRustAgentRuntimeRegression(); void runSteeringBridgeRegression(); }
+export async function runFatalBridgeRegression(): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-fatal-bridge-'));
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 2000);
+  try {
+    const script = join(dir, 'fake-runtime.js');
+    writeFileSync(script, `#!/usr/bin/env node
+require('node:readline').createInterface({input:process.stdin}).on('line', () => {
+ process.stdout.write(JSON.stringify({type:'agent_error',message:'model HTTP status: HTTP/1.1 500 Internal Server Error'}) + '\\n');
+});
+`);
+    chmodSync(script, 0o755);
+    const events = [];
+    const runtime = new RustAgentRuntime('http://127.0.0.1:1', script);
+    for await (const event of runtime.stream('model', [message('user', 'task')], [], controller.signal, 4096, 'fast', 'off', 'failed-run', undefined, 'conversation')) events.push(event);
+    assert.equal(controller.signal.aborted, false, 'fatal runtime events must end the stream without waiting for supervisor EOF');
+    assert.deepEqual(events.map((event) => event.type), ['error']);
+    await assert.rejects(runtime.steer('failed-run', 'continue'), /заверш|актив/i);
+  } finally { clearTimeout(timeout); rmSync(dir, {recursive:true, force:true}); }
+}
+export async function runWorkerExitRegression(): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-worker-exit-'));
+  try {
+    for (const [name, body, executable, expected] of [
+      ['unexecutable', '', false, 'error'],
+      ['process-death', "process.stderr.write('worker died');process.exit(9)", true, 'error'],
+      ['empty-stream', 'process.exit(0)', true, 'error'],
+      ['stopped', "process.stdout.write(JSON.stringify({type:'agent_stopped'})+'\\n')", true, 'cancelled'],
+    ] as const) {
+      const script = join(dir, name + '.js');
+      writeFileSync(script, `#!/usr/bin/env node\nrequire('node:readline').createInterface({input:process.stdin}).on('line',()=>{${body}});\n`);
+      chmodSync(script, executable ? 0o755 : 0o600);
+      const controller = new AbortController(), timeout = setTimeout(() => controller.abort(), 2000);
+      try {
+        const events = [];
+        for await (const event of new RustAgentRuntime('http://127.0.0.1:1', script).stream('model', [message('user', 'task')], [], controller.signal, 4096, 'fast', 'off', name)) events.push(event);
+        assert.equal(controller.signal.aborted, false, `${name}: terminal stream did not close`);
+        assert.deepEqual(events.map(event => event.type), [expected], name);
+        if (name === 'unexecutable') assert(events.some(event => event.type === 'error' && event.details?.includes('EACCES')));
+      } finally { clearTimeout(timeout); }
+    }
+  } finally { rmSync(dir, { recursive:true, force:true }); }
+}
+if (require.main === module) {
+  runRustAgentRuntimeRegression();
+  void (async () => { await runSteeringBridgeRegression(); await runFatalBridgeRegression(); await runWorkerExitRegression(); })().catch((error: unknown) => {console.error(error); process.exitCode = 1;});
+}

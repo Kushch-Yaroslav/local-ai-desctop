@@ -23,6 +23,7 @@ assert.equal(state.status, 'offline', 'EXIT cleanup must not hide startup failur
 assert.equal(state.modelId, '');
 assert.equal(state.contextWindow, 0);
 assert.equal(state.serverPid, 0);
+assert.equal(state.speculativeMode, 'none', 'a failed startup must never claim active speculation');
 assert.match(state.error, /startup failure:.*system Chrome sandbox helper/);
 NODE
 [[ ! -e "$fixture/llama-cpp-mtp-server.pid" && ! -e "$fixture/llama-cpp-mtp-launcher.pid" ]]

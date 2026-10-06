@@ -25,7 +25,7 @@ export async function runStreamingLoadRegression(): Promise<void> {
     requestAnimationFrame: (callback: () => void) => { frames.push(callback); return frames.length; }, cancelAnimationFrame: () => {},
     localAi: { messages: { list: async () => [] as ChatMessage[] }, analysis: { list: async () => [] }, conversations: { create: async () => conversation, delete: async () => {} }, chat: { send: () => new Promise<void>(() => {}), stop: async () => {} } },
   } });
-  useAppStore.setState({ conversations: [conversation], activeId: 'A', messages: [] });
+  useAppStore.setState({ conversations: [conversation], activeId: 'A', messages: [], settings: { llamaServerPath: null, modelsPath: '', llamaRuntime: { status: 'ready', modelId: 'model', contextWindow: 16_384 } } });
   void useAppStore.getState().sendMessage('long task');
   const generationId = useAppStore.getState().generationId!;
   const emit = (event: Record<string, unknown>) => useAppStore.getState().handleStream({ conversationId: 'A', generationId, ...event } as Parameters<ReturnType<typeof useAppStore.getState>['handleStream']>[0]);

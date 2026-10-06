@@ -37,9 +37,11 @@ ACTIVE_MODEL=""
 ACTIVE_CONTEXT=""
 ACTIVE_KV_TYPE="f16"
 ACTIVE_KV_OFFLOAD="1"
+ACTIVE_SPECULATIVE_MODE="none"
 LAUNCH_ERROR=""
 REQUEST_CONTEXT_FOR_ERROR=""
 VARIANT=""; MODEL=""; MMPROJ=""; RUNTIME_MODEL_ID=""; RUNTIME_LABEL=""; DEFAULT_LLAMA_CONTEXT=""; MAX_LLAMA_CONTEXT=""
+SPECULATIVE_MODE="none"; DRAFT_MODEL=""; DRAFT_KV_SHARED="0"; DRAFT_N_MAX=""
 
 mkdir -p "$LOG_DIR"
 INITIAL_PATH="${PATH:-}"
@@ -47,34 +49,12 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 timestamp() { date --iso-8601=seconds; }
 log() { printf '%s %s\n' "$(timestamp)" "$*" >> "$LOG_FILE"; }
 
-saved_llama_selection() {
-  local database="$STATE_DIR/sqlite/local-ai-desktop.db"
-  [[ -r "$database" && -x "$ELECTRON_BIN" ]] || return 0
-  ELECTRON_RUN_AS_NODE=1 "$ELECTRON_BIN" -e "const { DatabaseSync } = require('node:sqlite'); const db = new DatabaseSync(process.argv[1], { readOnly: true }); const names = new Set(db.prepare('PRAGMA table_info(conversations)').all().map(x => x.name)); const type = names.has('llama_kv_cache_type') ? 'llama_kv_cache_type' : \"'f16'\"; const offload = names.has('llama_kv_offload') ? 'llama_kv_offload' : '1'; const row = db.prepare(\"SELECT model_id, context_window, \" + type + \" AS kv_type, \" + offload + \" AS kv_offload FROM conversations WHERE model_id IN ('qwen3.8:27b-q4_K_M', 'huihui-qwen3.8:27b-ud-dw-q4_k_m', 'devstral-small-2:24b-q4_k_m', 'gemma4:31b-it-q4_k_m') ORDER BY updated_at DESC LIMIT 1\").get(); if (row) process.stdout.write([row.model_id, row.context_window, row.kv_type, row.kv_offload].join('\\t')); db.close();" "$database" 2>/dev/null || true
-}
-
 # Sets the launch variables for a model id. Fails for a model without a runtime.
 select_variant() {
-  case "$1" in
-    qwen3.8:27b-q4_K_M)
-      VARIANT="qwen-mtp"; MODEL="/media/yaroslav/DATA/llama-models/qwen3.8-27b-q4_K_M.gguf"
-      MMPROJ="/media/yaroslav/DATA/llama-models/qwen3.8-27b-mmproj.gguf"
-      RUNTIME_MODEL_ID="qwen3.8:27b-q4_K_M"; RUNTIME_LABEL="Qwen3.8 MTP"; DEFAULT_LLAMA_CONTEXT=32768; MAX_LLAMA_CONTEXT=262144 ;;
-    huihui-qwen3.8:27b-ud-dw-q4_k_m)
-      VARIANT="qwen-mtp"; MODEL="/media/yaroslav/DATA/llama-models/Huihui-Qwen3.8-27B-abliterated-UD-DW-Q4_K_M.gguf"
-      MMPROJ="/media/yaroslav/DATA/llama-models/huihui-qwen3.8-27b-mmproj-bf16.gguf"
-      RUNTIME_MODEL_ID="$1"; RUNTIME_LABEL="Huihui Qwen3.8 MTP"; DEFAULT_LLAMA_CONTEXT=32768; MAX_LLAMA_CONTEXT=262144 ;;
-    devstral-small-2:24b-q4_k_m)
-      VARIANT="devstral-small-2"; MODEL="/media/yaroslav/DATA/llama-models/Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf"
-      MMPROJ="/media/yaroslav/DATA/llama-models/devstral-small-2-24b-mmproj-f16.gguf"
-      RUNTIME_MODEL_ID="$1"; RUNTIME_LABEL="Devstral Small 2 24B"; DEFAULT_LLAMA_CONTEXT=32768; MAX_LLAMA_CONTEXT=262144 ;;
-    gemma4:31b-it-q4_k_m)
-      VARIANT="gemma4"; MODEL="/media/yaroslav/DATA/llama-models/gemma-4-31B-it-Q4_K_M.gguf"
-      MMPROJ="/media/yaroslav/DATA/llama-models/gemma-4-31b-mmproj-f16.gguf"
-      RUNTIME_MODEL_ID="$1"; RUNTIME_LABEL="Gemma 4 31B IT"; DEFAULT_LLAMA_CONTEXT=32768; MAX_LLAMA_CONTEXT=262144 ;;
-    *)
-      LAUNCH_ERROR="Unknown Local AI llama.cpp model: $1"; return 1 ;;
-  esac
+  local config
+  config="$(ELECTRON_RUN_AS_NODE=1 "$ELECTRON_BIN" "$APP_DIR/dist/main/models/llama-launch-config.js" "$1" "${2:-}" 2>&1)" || { LAUNCH_ERROR="$config"; return 1; }
+  # The compiled profile helper emits fixed variable names and shell-quoted values.
+  eval "$config"
 }
 valid_context() { [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 >= 4096 && 10#$1 <= MAX_LLAMA_CONTEXT && 10#$1 % 4096 == 0 )); }
 
@@ -89,8 +69,8 @@ json_escape() {
 write_state() {
   local status="$1" request_id="${2:-}" error="${3:-}" rolled_back="${4:-false}"
   local tmp="$STATE_FILE.$$.tmp"
-  printf '{"status":"%s","requestId":"%s","modelId":"%s","contextWindow":%s,"kvCacheType":"%s","kvOffload":%s,"serverPid":%s,"launcherPid":%s,"error":"%s","rolledBack":%s,"updatedAt":"%s"}\n' \
-    "$status" "$(json_escape "$request_id")" "$(json_escape "$ACTIVE_MODEL")" "${ACTIVE_CONTEXT:-0}" "$ACTIVE_KV_TYPE" "$([[ "$ACTIVE_KV_OFFLOAD" == "1" ]] && echo true || echo false)" "${SERVER_PID:-0}" "$$" \
+  printf '{"status":"%s","requestId":"%s","modelId":"%s","contextWindow":%s,"kvCacheType":"%s","kvOffload":%s,"speculativeMode":"%s","serverPid":%s,"launcherPid":%s,"error":"%s","rolledBack":%s,"updatedAt":"%s"}\n' \
+    "$status" "$(json_escape "$request_id")" "$(json_escape "$ACTIVE_MODEL")" "${ACTIVE_CONTEXT:-0}" "$ACTIVE_KV_TYPE" "$([[ "$ACTIVE_KV_OFFLOAD" == "1" ]] && echo true || echo false)" "$ACTIVE_SPECULATIVE_MODE" "${SERVER_PID:-0}" "$$" \
     "$(json_escape "$error")" "$rolled_back" "$(timestamp)" > "$tmp"
   mv -f "$tmp" "$STATE_FILE"
 }
@@ -101,7 +81,7 @@ show_failure() {
   if command -v zenity >/dev/null 2>&1 && [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then zenity --error --title="Local AI Desktop — llama.cpp ${RUNTIME_LABEL:-}" --text="$message\n\nЛог: $LOG_FILE" --no-wrap >/dev/null 2>&1 &
   elif command -v notify-send >/dev/null 2>&1; then notify-send "Local AI Desktop — llama.cpp ${RUNTIME_LABEL:-}" "$message\nЛог: $LOG_FILE" || true; fi
 }
-fail() { local message="$1"; CLEANUP_REASON="startup failure: $message"; log "launcher.error=$message"; ACTIVE_MODEL=""; ACTIVE_CONTEXT=0; write_state offline "" "$message" || true; show_failure "$message"; exit 1; }
+fail() { local message="$1"; CLEANUP_REASON="startup failure: $message"; log "launcher.error=$message"; ACTIVE_MODEL=""; ACTIVE_CONTEXT=0; ACTIVE_SPECULATIVE_MODE="none"; write_state offline "" "$message" || true; show_failure "$message"; exit 1; }
 same_llama_process() { [[ -n "$1" && -r "/proc/$1/exe" && "$(readlink -f "/proc/$1/exe")" == "$LLAMA_BIN" ]]; }
 
 stop_llama_server() {
@@ -156,7 +136,13 @@ build_server_args() {
   else
     server_args+=(--no-warmup)
   fi
-  if [[ "$VARIANT" == "qwen-mtp" ]]; then server_args+=(--spec-type draft-mtp); else server_args+=(--spec-type none); fi
+  case "$SPECULATIVE_MODE" in
+    mtp) server_args+=(--spec-type draft-mtp) ;;
+    eagle3) server_args+=(--spec-type draft-eagle3) ;;
+    none) server_args+=(--spec-type none) ;;
+    *) LAUNCH_ERROR="Unsupported speculative mechanism: $SPECULATIVE_MODE"; return 1 ;;
+  esac
+  if [[ -n "$DRAFT_MODEL" ]]; then server_args+=(--model-draft "$DRAFT_MODEL" --gpu-layers-draft "$gpu_layers" --spec-draft-n-max "$DRAFT_N_MAX"); fi
 }
 
 # launch_server <model_id> <context> <kv_type> <kv_offload>
@@ -166,7 +152,7 @@ build_server_args() {
 launch_server() {
   local model_id="$1" context="$2" kv_type="${3:-f16}" kv_offload="${4:-1}"
   LAUNCH_ERROR=""; REQUEST_CONTEXT_FOR_ERROR="$context"
-  select_variant "$model_id" || return 1
+  select_variant "$model_id" --verify || return 1
   valid_context "$context" || { LAUNCH_ERROR="Неподдерживаемый размер контекста llama.cpp: $context"; return 1; }
   [[ "$kv_type" == "f16" || "$kv_type" == "q8_0" ]] || { LAUNCH_ERROR="Неподдерживаемый тип KV-cache: $kv_type"; return 1; }
   [[ "$kv_offload" == "0" || "$kv_offload" == "1" ]] || { LAUNCH_ERROR="Неподдерживаемая настройка KV offload"; return 1; }
@@ -175,7 +161,7 @@ launch_server() {
   [[ -z "$MMPROJ" || -f "$MMPROJ" ]] || { LAUNCH_ERROR="Не найден vision projector: $MMPROJ"; return 1; }
 
   local context_args=(--cache-type-k "$kv_type" --cache-type-v "$kv_type") gpu_layers=999
-  if [[ "$VARIANT" == "qwen-mtp" ]]; then context_args+=(--cache-type-k-draft "$kv_type" --cache-type-v-draft "$kv_type"); fi
+  if [[ "$SPECULATIVE_MODE" != "none" ]]; then context_args+=(--cache-type-k-draft "$kv_type" --cache-type-v-draft "$kv_type"); fi
   if [[ "$kv_offload" == "0" ]]; then context_args+=(--no-kv-offload); else context_args+=(--kv-offload); fi
   log "context.policy variant=$VARIANT ctx_size=$context kv_type=$kv_type kv_offload=$kv_offload gpu_layers=$gpu_layers"
   wait_for_gpu_release
@@ -208,17 +194,21 @@ launch_server() {
     return 1
   fi
   log "health.result=ok seconds=$waited"
-  if [[ "$VARIANT" == "qwen-mtp" ]]; then
-    if ! grep -q 'creating MTP draft context' "$SERVER_LOG"; then
-      LAUNCH_ERROR="MTP draft context не подтверждён. См. $SERVER_LOG"
+  if [[ "$SPECULATIVE_MODE" != "none" ]]; then
+    local implementation="draft-mtp"
+    [[ "$SPECULATIVE_MODE" == "eagle3" ]] && implementation="draft-eagle3"
+    if ! grep -q "adding speculative implementation '$implementation'" "$SERVER_LOG" || { [[ -n "$DRAFT_MODEL" ]] && ! grep -Fq "loading draft model '$DRAFT_MODEL'" "$SERVER_LOG"; }; then
+      LAUNCH_ERROR="Speculative decoding ($SPECULATIVE_MODE) не подтверждён. См. $SERVER_LOG"
       stop_llama_server "$SERVER_PID"; SERVER_PID=""; rm -f "$SERVER_PID_FILE"
       return 1
     fi
-    log "mtp.confirmed=true"
+    log "speculative.confirmed mode=$SPECULATIVE_MODE draft=${DRAFT_MODEL:-embedded} shared_kv=$DRAFT_KV_SHARED"
   fi
   local cache_line_count
   cache_line_count="$(grep -Ec "llama_kv_cache: size =.*K \\($kv_type\\):.*V \\($kv_type\\):" "$SERVER_LOG" || true)"
-  if [[ "$VARIANT" == "qwen-mtp" && "$cache_line_count" -lt 2 ]] || [[ "$VARIANT" != "qwen-mtp" && "$cache_line_count" -lt 1 ]]; then
+  local minimum_cache_lines=1
+  [[ "$SPECULATIVE_MODE" != "none" && "$DRAFT_KV_SHARED" != "1" ]] && minimum_cache_lines=2
+  if (( cache_line_count < minimum_cache_lines )); then
     LAUNCH_ERROR="llama-server did not confirm effective $kv_type target/draft KV cache types in its startup log"
     stop_llama_server "$SERVER_PID"; SERVER_PID=""; rm -f "$SERVER_PID_FILE"
     return 1
@@ -238,17 +228,18 @@ launch_server() {
     stop_llama_server "$SERVER_PID"; SERVER_PID=""; rm -f "$SERVER_PID_FILE"
     return 1
   fi
-  ACTIVE_MODEL="$RUNTIME_MODEL_ID"; ACTIVE_CONTEXT="$context"; ACTIVE_KV_TYPE="$kv_type"; ACTIVE_KV_OFFLOAD="$kv_offload"
+  ACTIVE_MODEL="$RUNTIME_MODEL_ID"; ACTIVE_CONTEXT="$context"; ACTIVE_KV_TYPE="$kv_type"; ACTIVE_KV_OFFLOAD="$kv_offload"; ACTIVE_SPECULATIVE_MODE="$SPECULATIVE_MODE"
   log "runtime.ready model=$ACTIVE_MODEL context=$ACTIVE_CONTEXT kv_type=$ACTIVE_KV_TYPE kv_offload=$ACTIVE_KV_OFFLOAD pid=$SERVER_PID"
   return 0
 }
 
 cleanup() {
   local status=$?
+  if [[ -n "${sleeper:-}" ]]; then kill "$sleeper" 2>/dev/null || true; wait "$sleeper" 2>/dev/null || true; fi
   log "launcher.cleanup reason=$CLEANUP_REASON status=$status launcher_pid=$$ electron_pid=${ELECTRON_PID:-none} server_pid=${SERVER_PID:-none}"
   stop_llama_server "$SERVER_PID"
   rm -f "$SERVER_PID_FILE" "$LAUNCHER_PID_FILE" "$REQUEST_FILE"
-  ACTIVE_MODEL=""; ACTIVE_CONTEXT=0; SERVER_PID=""
+  ACTIVE_MODEL=""; ACTIVE_CONTEXT=0; SERVER_PID=""; ACTIVE_SPECULATIVE_MODE="none"
   if (( status == 0 || status == 130 || status == 143 )); then
     write_state stopped "" "$CLEANUP_REASON" || true
   else
@@ -295,36 +286,18 @@ switch_runtime() {
     fi
     failure="$failure; восстановить предыдущую модель не удалось: $LAUNCH_ERROR"
   fi
-  ACTIVE_MODEL=""; ACTIVE_CONTEXT=0; SERVER_PID=""
+  ACTIVE_MODEL=""; ACTIVE_CONTEXT=0; SERVER_PID=""; ACTIVE_SPECULATIVE_MODE="none"
   write_state offline "$REQUEST_ID" "$failure"
   log "runtime.switch request=$REQUEST_ID result=offline"
   return 0
 }
 trap 'switch_runtime' USR1
 
-# ---- initial selection ----
-IFS=$'\t' read -r SELECTED_MODEL SAVED_CONTEXT SAVED_KV_TYPE SAVED_KV_OFFLOAD <<< "$(saved_llama_selection)"
-SELECTED_MODEL="${LOCAL_AI_LLAMA_MODEL_ID:-${SELECTED_MODEL:-qwen3.8:27b-q4_K_M}}"
-select_variant "$SELECTED_MODEL" || { printf '%s\n' "$LAUNCH_ERROR" >&2; exit 2; }
-SAVED_KV_TYPE="${SAVED_KV_TYPE:-f16}"
-SAVED_KV_OFFLOAD="${SAVED_KV_OFFLOAD:-1}"
-if [[ "${LOCAL_AI_LLAMA_CONTEXT_EXTERNAL:-}" == "1" && -n "${LOCAL_AI_LLAMA_CONTEXT:-}" ]]; then
-  LLAMA_CONTEXT="$LOCAL_AI_LLAMA_CONTEXT"; CONTEXT_SOURCE="external-env"
-elif [[ -n "${LOCAL_AI_LLAMA_CONTEXT:-}" && "${LOCAL_AI_LLAMA_CONTEXT_EXTERNAL:-}" != "0" ]]; then
-  LLAMA_CONTEXT="$LOCAL_AI_LLAMA_CONTEXT"; CONTEXT_SOURCE="external-env"; export LOCAL_AI_LLAMA_CONTEXT_EXTERNAL=1
-elif [[ -n "${SAVED_CONTEXT:-}" ]]; then
-  LLAMA_CONTEXT="$SAVED_CONTEXT"; CONTEXT_SOURCE="persisted"
-else
-  LLAMA_CONTEXT="$DEFAULT_LLAMA_CONTEXT"; CONTEXT_SOURCE="default"
-fi
-valid_context "$LLAMA_CONTEXT" || { printf 'LOCAL_AI_LLAMA_CONTEXT must be a 4096-token multiple from 4096 through %s; got %s\n' "$MAX_LLAMA_CONTEXT" "$LLAMA_CONTEXT" >&2; exit 2; }
-[[ "$SAVED_KV_TYPE" == "f16" || "$SAVED_KV_TYPE" == "q8_0" ]] || SAVED_KV_TYPE="f16"
-[[ "$SAVED_KV_OFFLOAD" == "0" || "$SAVED_KV_OFFLOAD" == "1" ]] || SAVED_KV_OFFLOAD="1"
-
+# Fresh processes have no active model. Conversation metadata is history,
+# not permission to allocate a runtime; only an IPC selection calls launch_server.
 log "===== launcher.started pid=$$ ====="
 log "cwd=$(pwd) project_root=$APP_DIR initial_path=$INITIAL_PATH effective_path=$PATH display=${DISPLAY:-} wayland_display=${WAYLAND_DISPLAY:-} xdg_runtime_dir=${XDG_RUNTIME_DIR:-}"
-log "context.resolve source=$CONTEXT_SOURCE value=$LLAMA_CONTEXT kv_type=$SAVED_KV_TYPE kv_offload=$SAVED_KV_OFFLOAD"
-log "electron=$ELECTRON_BIN llama_server=$LLAMA_BIN variant=$VARIANT runtime_model_id=$RUNTIME_MODEL_ID model=$MODEL mmproj=${MMPROJ:-none} port=$PORT context=$LLAMA_CONTEXT"
+log "electron=$ELECTRON_BIN llama_server=$LLAMA_BIN port=$PORT startup_selection=none"
 
 [[ -x "$ELECTRON_BIN" && -f "$APP_DIR/dist/main/index.js" && -f "$APP_DIR/dist/preload/index.js" && -f "$APP_DIR/dist/renderer/index.html" ]] || fail "Не найден production build или Electron: $ELECTRON_BIN"
 source "$APP_DIR/scripts/electron-sandbox.sh"
@@ -352,24 +325,21 @@ export LOCAL_AI_LLAMA_SERVER_LOG="$SERVER_LOG"
 unset LOCAL_AI_DEV_SERVER_URL VITE_DEV_SERVER_URL
 cd "$APP_DIR"
 printf '%s\n' "$$" > "$LAUNCHER_PID_FILE"
-write_state starting
-
-# The server owns the GPU before Electron's GPU process exists.
-launch_server "$RUNTIME_MODEL_ID" "$LLAMA_CONTEXT" "$SAVED_KV_TYPE" "$SAVED_KV_OFFLOAD" || fail "$LAUNCH_ERROR. См. $SERVER_LOG"
-write_state ready
-export LOCAL_AI_LLAMA_MODEL_ID="$ACTIVE_MODEL"
-export LOCAL_AI_LLAMA_CONTEXT="$ACTIVE_CONTEXT"
-export LOCAL_AI_LLAMA_KV_TYPE="$ACTIVE_KV_TYPE"
-export LOCAL_AI_LLAMA_KV_OFFLOAD="$ACTIVE_KV_OFFLOAD"
-export LOCAL_AI_LLAMA_CPP_VISION=$([[ -n "$MMPROJ" ]] && echo 1 || echo 0)
+write_state idle
+# Do not let inherited last-used metadata become an active backend selection.
+unset LOCAL_AI_LLAMA_MODEL_ID LOCAL_AI_LLAMA_CONTEXT LOCAL_AI_LLAMA_CONTEXT_EXTERNAL
+unset LOCAL_AI_LLAMA_KV_TYPE LOCAL_AI_LLAMA_KV_OFFLOAD LOCAL_AI_LLAMA_CPP_VISION
 
 if [[ "${LOCAL_AI_LAUNCHER_HEADLESS:-}" == "1" ]]; then
   # Test seam: supervise the server and answer runtime-switch requests without
   # opening a window. Ends on SIGTERM/SIGINT like the normal launcher.
-  log "headless=true state=ready electron=skipped"
+  log "headless=true state=idle electron=skipped"
   while true; do
     sleep 3600 &
-    wait $! || true
+    sleeper=$!
+    wait "$sleeper" || true
+    kill "$sleeper" 2>/dev/null || true
+    wait "$sleeper" 2>/dev/null || true
   done
 fi
 

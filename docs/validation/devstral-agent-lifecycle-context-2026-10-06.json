@@ -1,0 +1,1987 @@
+{
+  "date": "2026-10-06",
+  "baseline": "e54d0425fb15ddeeda669f79c90d99e03a78ad6e",
+  "branch": "fix/devstral-agent-lifecycle",
+  "mainUntouched": "44f2c6ba4dd63fb6d620a08956f013e8df5a7751",
+  "productionPath": [
+    "Electron renderer",
+    "preload IPC",
+    "registerIpc chat:send",
+    "RustAgentRuntime",
+    "Rust agent loop",
+    "unchanged llama.cpp Jinja template"
+  ],
+  "before": {
+    "error": "Rust Agent Runtime V2 error: model HTTP status: HTTP/1.1 500 Internal Server Error; server: llama.cpp access-control-allow-origin: content-type: application/json; charset=utf-8 content-length: 427 connection: close Date: Tue, 06 Oct 2026 19:03:16 GMT {\"error\":{\"code\":500,\"message\":\"\\n------------\\nWhile executing CallExpression at line 189, column 32 in source:\\n...== 0) %}↵ {{- raise_exception('After the optional system message, con...\\n ^\\nError: Jinja Exception: After the optional system message, conversation roles must alternate user and assistant roles except for tool calls and results.\",\"type\":\"server_error\"}}",
+    "badge": "● Выполняется · Devstral Small 2",
+    "roles": [
+      [
+        "system",
+        "user",
+        "user"
+      ]
+    ],
+    "status": [
+      500
+    ],
+    "newChatSendDisabled": true
+  },
+  "after": {
+    "requestCount": 19,
+    "statuses": [
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200
+    ],
+    "initialRoles": [
+      "system",
+      "user"
+    ],
+    "nextRoles": [
+      "system",
+      "user",
+      "assistant",
+      "tool"
+    ],
+    "uniqueToolCalls": [
+      "plan",
+      "list_directory",
+      "list_directory",
+      "read_file",
+      "plan",
+      "list_directory",
+      "read_file",
+      "plan",
+      "apply_patch",
+      "apply_patch",
+      "read_file",
+      "observation_read",
+      "write_file",
+      "plan",
+      "read_file",
+      "run_terminal",
+      "plan",
+      "plan"
+    ],
+    "codingTask": "128K\n256K\nСтратегия агента\nБыстрая\nГлубокая\nВеб\nВыкл.\nАвто\nРежим\nЧат\nАгент\nproject1\nproject2\nФайловые инструменты ограничены выбранным проектом и папками, которые вы назвали в сообщениях; терминал стартует в корне проекта.\n\nInspect both projects. Fix the numeric addition bug in Project 1 according to Project 2 requirements. Use a plan and Task Memory for findings, run the existing tests, and summarize the verified change.\n\n✓ План выполнения\nшагов выполнено 0 из 5\n✗ Просмотр структуры проекта\nlist_directory\npath escapes project scope\n✓ Просмотр структуры проекта\n2 элемента\n✓ Чтение\nread_file\n✓ Progress\nThe current `add` function in `calculator.js` concatenates the string representations of `a` and `b` instead of performing numeric addition. This is the bug. Le\n✓ План выполнения\nшагов выполнено 1 из 5\n✓ Просмотр структуры проекта\n1 элемент\n✓ Чтение\nread_file\n✓ Progress\nThe requirements in Project 2 specify that the calculator must add numeric values correctly, including handling negative numbers, and should have no dependencie\n✓ План выполнения\nшагов выполнено 2 из 5\n✗ Изменение проекта\napply_patch\n{\n  \"error\": \"patch does not match current content: calculator.js (hunk 1: its first line exists, but the surrounding lines differ). Read the file again and copy the lines exactly.\"\n}\n✗ Изменение проекта\napply_patch\n{\n  \"error\": \"patch does not match current content: calculator.js (hunk 1: its first line exists, but the surrounding lines differ). Read the file again and copy the lines exactly.\"\n}\n✗ Чтение\nread_file\nThis exact read is already stored as observation obs-00000004; the file contents and requested range are unchanged. No new observation was created. Use observation_read(id=\"obs-00000004\") to recover the stored result, or inspect a different file or range; do not repeat this unchanged read.\n✓ Действие агента\nobservation_read\n✓ Изменение файла\nwrite_file\n✓ Progress\nThe `add` function in `calculator.js` has been updated to perform numeric addition using `Number(a) + Number(b)` instead of string concatenation. Now I need to\n✓ План выполнения\nшагов выполнено 3 из 5\n✓ Чтение\nread_file\n✓ $ Терминал\nnode test.js\n✓ Progress\nThe tests have passed successfully. The updated `add` function now correctly performs numeric addition, as evidenced by the test output \"calculator tests passed\n✓ План выполнения\nшагов выполнено 4 из 5\n✓ План выполнения\nшагов выполнено 5 из 5\n\nTask completed.\n\n27%\n\nEnter — отправить · Shift+Enter — новая строка · вставьте или перетащите файлы"
+  },
+  "recovery": {
+    "faultInjection": "Replay captured pre-fix invalid messages to actual Devstral llama.cpp during a real Agent run; no application request normalization bypass in production code. Native server returns Jinja HTTP 500.",
+    "failure": {
+      "alert": "Rust Agent Runtime V2 error: model HTTP status: HTTP/1.1 500 Internal Server Error; server: llama.cpp access-control-allow-origin: content-type: application/json; charset=utf-8 content-length: 427 connection: close Date: Tue, 06 Oct 2026 19:27:01 GMT {\"error\":{\"code\":500,\"message\":\"\\n------------\\nWhile executing CallExpression at line 189, column 32 in source:\\n...== 0) %}↵ {{- raise_exception('After the optional system message, con...\\n ^\\nError: Jinja Exception: After the optional system message, conversation roles must alternate user and assistant roles except for tool calls and results.\",\"type\":\"server_error\"}}",
+      "badge": "Devstral Small 2",
+      "runs": [
+        {
+          "id": "752bfc0d-d45f-4e2a-bac2-c3e414699b8a",
+          "conversationId": "639deab7-fced-4ac5-92fd-9d652e805f5d",
+          "assistantMessageId": null,
+          "reasoningMode": "fast",
+          "status": "error",
+          "actionCount": 0,
+          "actions": [],
+          "createdAt": "2026-10-06T19:27:01.656Z",
+          "completedAt": "2026-10-06T19:27:01.684Z"
+        }
+      ]
+    },
+    "newChatSendEnabled": true,
+    "newChatMessages": [
+      {
+        "id": "81d41d6a-267f-4de4-b099-d67401fce673",
+        "conversationId": "33b4460a-c536-4fae-a1db-d4a17b2f340b",
+        "role": "user",
+        "content": "Reply briefly: what is 2 + 2?",
+        "createdAt": "2026-10-06T19:27:02.164Z",
+        "attachments": [],
+        "projectReferences": []
+      },
+      {
+        "id": "2d4f009b-5323-436a-af61-c174ff4b1e5e",
+        "conversationId": "33b4460a-c536-4fae-a1db-d4a17b2f340b",
+        "role": "assistant",
+        "content": "2 + 2 = 4",
+        "createdAt": "2026-10-06T19:27:04.632Z",
+        "attachments": [],
+        "projectReferences": [],
+        "generationStats": {
+          "outputTokens": 8,
+          "tokensPerSecond": 38.361629602025495,
+          "generationDurationMs": 182.474,
+          "inputTokens": 248
+        }
+      }
+    ],
+    "finalContinue": "ми, которые вы назвали в сообщениях; терминал стартует в корне проекта.\n\nReply briefly: what is 2 + 2?\n\n4\n\n4,7 ток/с · 2 токена\n\nUse read_file to inspect calculator.js in Project 1 and requirements.md in Project 2. Then run node test.js in Project 1. Do not change files. Give a short verified summary.\n\n✓ Чтение\nread_file\n✓ Чтение\nread_file\n✓ $ Терминал\nnode test.js\ncalculator.js (Project 1): exports a single add(a, b) that coerces both args with Number() and returns their sum.\nrequirements.md (Project 2): \"The primary calculator must add numeric values correctly including negatives. No dependencies.\"\nnode test.js (Project 1): ran, exit code 0, output: \"calculator tests passed\" — verified pass.\n\nNo files were changed.\n\nContinue: use project tools to read calculator.js from Project 1 and requirements.md from Project 2; run node test.js in Project 1. Do not modify files. Summarize verified result briefly.\n\n✗ Чтение\nread_file\nThis exact read is already stored as observation obs-00000001; the file contents and requested range are unchanged. No new observation was created. Use observation_read(id=\"obs-00000001\") to recover the stored result, or inspect a different file or range; do not repeat this unchanged read.\n✓ Чтение\nread_file\n✓ $ Терминал\nnode test.js\ncalculator.js (Project 1): module.exports = { add: (a,b) => Number(a) + Number(b) }; (calculator.js).\nrequirements.md (Project 2): \"The primary calculator must add numeric values correctly including negatives. No dependencies.\" (/media/yaroslav/DATA/local-ai-desktop/runtime/validation/devstral-agent/project2/requirements.md).\nnode test.js (Project 1): ran, exit code 0, output: \"calculator tests passed\" — verified pass (run_terminal result).\n18%\n\nEnter — отправить · Shift+Enter — новая строка · вставьте или перетащите файлы"
+  },
+  "devstralMetadata": {
+    "architecture": "mistral3",
+    "layers": 40,
+    "kvHeads": 8,
+    "keyDimension": 128,
+    "valueDimension": 128,
+    "nativeContext": 393216,
+    "registryCeiling": 262144,
+    "ggufPath": "/media/yaroslav/DATA/llama-models/Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf",
+    "templateSha256": "adb1c45376c8a8a1b7e0063ce87b26c8b9376fd4f0f3cb584ddbba7e66f81d2f",
+    "kvBytesPerToken": {
+      "f16": 163840,
+      "q8_0": 87040
+    }
+  },
+  "discovery": {
+    "modelId": "devstral-small-2:24b-q4_k_m",
+    "probeContextTokens": 16384,
+    "hardLimit": 262144,
+    "options": [
+      {
+        "modelId": "devstral-small-2:24b-q4_k_m",
+        "contextWindow": 53248,
+        "kvCacheType": "f16",
+        "kvOffload": true,
+        "discoveredAt": "2026-10-06T19:16:46.710Z",
+        "memoryBaseline": {
+          "hostAvailableBytes": 54649685772,
+          "deviceAvailableBytes": 23894289286
+        },
+        "measuredHeadroom": {
+          "hostBytes": 53250371584,
+          "deviceBytes": 936378368
+        },
+        "boundaryTokens": 57344,
+        "vramBudget": {
+          "totalBytes": 25769803776,
+          "nonLlmBytes": 1064304640,
+          "llmBytes": 23290970112,
+          "freeBytes": 936378368,
+          "driverReservedBytes": 478150656,
+          "backgroundBudgetBytes": 1625292800,
+          "marginBytes": 402653184,
+          "llmBudgetBytes": 23741857792,
+          "availableLlmBytes": 23741857792,
+          "backgroundOverBudget": false,
+          "loggedDeviceBytes": 22957910918,
+          "unloggedDeviceBytes": 333059194
+        },
+        "boundaryReason": "budget-guard"
+      },
+      {
+        "modelId": "devstral-small-2:24b-q4_k_m",
+        "contextWindow": 98304,
+        "kvCacheType": "q8_0",
+        "kvOffload": true,
+        "discoveredAt": "2026-10-06T19:17:17.336Z",
+        "memoryBaseline": {
+          "hostAvailableBytes": 54552923834,
+          "deviceAvailableBytes": 23974064948
+        },
+        "measuredHeadroom": {
+          "hostBytes": 53107388416,
+          "deviceBytes": 932184064
+        },
+        "boundaryTokens": 106496,
+        "vramBudget": {
+          "totalBytes": 25769803776,
+          "nonLlmBytes": 977272832,
+          "llmBytes": 23381147648,
+          "freeBytes": 932184064,
+          "driverReservedBytes": 479199232,
+          "backgroundBudgetBytes": 1625292800,
+          "marginBytes": 402653184,
+          "llmBudgetBytes": 23741857792,
+          "availableLlmBytes": 23741857792,
+          "backgroundOverBudget": false,
+          "loggedDeviceBytes": 23046075188,
+          "unloggedDeviceBytes": 335072460
+        },
+        "boundaryReason": "budget-guard"
+      }
+    ],
+    "unsupported": [],
+    "restored": true,
+    "probes": [
+      {
+        "contextWindow": 16384,
+        "kvCacheType": "f16",
+        "phase": "base",
+        "startup": true,
+        "health": true,
+        "inference": true,
+        "fits": false,
+        "headroom": {
+          "hostBytes": 53440471040,
+          "deviceBytes": 7046430720
+        },
+        "memoryBaseline": {
+          "hostAvailableBytes": 54802036492,
+          "deviceAvailableBytes": 23926795142
+        },
+        "elapsedMs": 8024,
+        "args": [
+          "/media/yaroslav/DATA/llama.cpp/build-cuda/bin/llama-server",
+          "--log-verbosity",
+          "5",
+          "-m",
+          "/media/yaroslav/DATA/llama-models/Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf",
+          "--alias",
+          "devstral-small-2:24b-q4_k_m",
+          "--host",
+          "127.0.0.1",
+          "--port",
+          "18094",
+          "--ctx-size",
+          "16384",
+          "--gpu-layers",
+          "999",
+          "--flash-attn",
+          "on",
+          "--cache-type-k",
+          "f16",
+          "--cache-type-v",
+          "f16",
+          "--kv-offload",
+          "--parallel",
+          "1",
+          "--jinja",
+          "--reasoning",
+          "on",
+          "--reasoning-format",
+          "auto",
+          "--mmproj",
+          "/media/yaroslav/DATA/llama-models/devstral-small-2-24b-mmproj-f16.gguf",
+          "--no-mmproj-offload",
+          "--spec-type",
+          "none"
+        ],
+        "vramBudget": {
+          "totalBytes": 25769803776,
+          "nonLlmBytes": 1030750208,
+          "llmBytes": 17213423616,
+          "freeBytes": 7046430720,
+          "driverReservedBytes": 479199232,
+          "backgroundBudgetBytes": 1625292800,
+          "marginBytes": 402653184,
+          "llmBudgetBytes": 23741857792,
+          "availableLlmBytes": 23741857792,
+          "backgroundOverBudget": false,
+          "loggedDeviceBytes": 16880364422,
+          "unloggedDeviceBytes": 333059194
+        },
+        "hardware": {
+          "ramUsedBytes": 13894791168,
+          "ramTotalBytes": 67321868288,
+          "vramUsedBytes": 18244173824,
+          "vramTotalBytes": 25769803776,
+          "vramAvailableBytes": 7046430720,
+          "gpuUtilization": 100,
+          "available": true
+        }
+      },
+      {
+        "contextWindow": 53248,
+        "kvCacheType": "f16",
+        "phase": "search",
+        "startup": true,
+        "health": true,
+        "inference": true,
+        "fits": true,
+        "headroom": {
+          "hostBytes": 53264781312,
+          "deviceBytes": 970981376
+        },
+        "memoryBaseline": {
+          "hostAvailableBytes": 54664095500,
+          "deviceAvailableBytes": 23928892294
+        },
+        "elapsedMs": 6518,
+        "args": [
+          "/media/yaroslav/DATA/llama.cpp/build-cuda/bin/llama-server",
+          "--log-verbosity",
+          "5",
+          "-m",
+          "/media/yaroslav/DATA/llama-models/Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf",
+          "--alias",
+          "devstral-small-2:24b-q4_k_m",
+          "--host",
+          "127.0.0.1",
+          "--port",
+          "18094",
+          "--ctx-size",
+          "53248",
+          "--gpu-layers",
+          "999",
+          "--flash-attn",
+          "on",
+          "--cache-type-k",
+          "f16",
+          "--cache-type-v",
+          "f16",
+          "--kv-offload",
+          "--parallel",
+          "1",
+          "--jinja",
+          "--reasoning",
+          "on",
+          "--reasoning-format",
+          "auto",
+          "--mmproj",
+          "/media/yaroslav/DATA/llama-models/devstral-small-2-24b-mmproj-f16.gguf",
+          "--no-mmproj-offload",
+          "--spec-type",
+          "none"
+        ],
+        "vramBudget": {
+          "totalBytes": 25769803776,
+          "nonLlmBytes": 1028653056,
+          "llmBytes": 23290970112,
+          "freeBytes": 970981376,
+          "driverReservedBytes": 479199232,
+          "backgroundBudgetBytes": 1625292800,
+          "marginBytes": 402653184,
+          "llmBudgetBytes": 23741857792,
+          "availableLlmBytes": 23741857792,
+          "backgroundOverBudget": false,
+          "loggedDeviceBytes": 22957910918,
+          "unloggedDeviceBytes": 333059194
+        },
+        "hardware": {
+          "ramUsedBytes": 14069714944,
+          "ramTotalBytes": 67321868288,
+          "vramUsedBytes": 24319623168,
+          "vramTotalBytes": 25769803776,
+          "vramAvailableBytes": 970981376,
+          "gpuUtilization": 19,
+          "available": true
+        }
+      },
+      {
+        "kvCacheType": "f16",
+        "contextWindow": 159744,
+        "phase": "search",
+        "startup": false,
+        "health": false,
+        "inference": false,
+        "fits": false,
+        "reason": "Пропущено до запуска: расчётная память выходит за общий бюджет VRAM или за защитный порог фактически свободной памяти.",
+        "headroom": {
+          "hostBytes": 53155729408,
+          "deviceBytes": -16586375168
+        },
+        "memoryBaseline": null,
+        "elapsedMs": 0
+      },
+      {
+        "kvCacheType": "f16",
+        "contextWindow": 106496,
+        "phase": "search",
+        "startup": false,
+        "health": false,
+        "inference": false,
+        "fits": false,
+        "reason": "Пропущено до запуска: расчётная память выходит за общий бюджет VRAM или за защитный порог фактически свободной памяти.",
+        "headroom": {
+          "hostBytes": 53210255360,
+          "deviceBytes": -7807696896
+        },
+        "memoryBaseline": null,
+        "elapsedMs": 0
+      },
+      {
+        "kvCacheType": "f16",
+        "contextWindow": 77824,
+        "phase": "search",
+        "startup": false,
+        "health": false,
+        "inference": false,
+        "fits": false,
+        "reason": "Пропущено до запуска: расчётная память выходит за общий бюджет VRAM или за защитный порог фактически свободной памяти.",
+        "headroom": {
+          "hostBytes": 53239615488,
+          "deviceBytes": -3080716288
+        },
+        "memoryBaseline": null,
+        "elapsedMs": 0
+      },
+      {
+        "kvCacheType": "f16",
+        "contextWindow": 65536,
+        "phase": "search",
+        "startup": false,
+        "health": false,
+        "inference": false,
+        "fits": false,
+        "reason": "Пропущено до запуска: расчётная память выходит за общий бюджет VRAM или за защитный порог фактически свободной памяти.",
+        "headroom": {
+          "hostBytes": 53252198400,
+          "deviceBytes": -1054867456
+        },
+        "memoryBaseline": null,
+        "elapsedMs": 0
+      },
+      {
+        "contextWindow": 57344,
+        "kvCacheType": "f16",
+        "phase": "search",
+        "startup": true,
+        "health": true,
+        "inference": true,
+        "fits": true,
+        "headroom": {
+          "hostBytes": 53146046464,
+          "deviceBytes": 313524224
+        },
+        "memoryBaseline": {
+          "hostAvailableBytes": 54549554956,
+          "deviceAvailableBytes": 23946718086
+        },
+        "elapsedMs": 7521,
+        "args": [
+          "/media/yaroslav/DATA/llama.cpp/build-cuda/bin/llama-server",
+          "--log-verbosity",
+          "5",
+          "-m",
+          "/media/yaroslav/DATA/llama-models/Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf",
+          "--alias",
+          "devstral-small-2:24b-q4_k_m",
+          "--host",
+          "127.0.0.1",
+          "--port",
+          "18094",
+          "--ctx-size",
+          "57344",
+          "--gpu-layers",
+          "999",
+          "--flash-attn",
+          "on",
+          "--cache-type-k",
+          "f16",
+          "--cache-type-v",
+          "f16",
+          "--kv-offload",
+          "--parallel",
+          "1",
+          "--jinja",
+          "--reasoning",
+          "on",
+          "--reasoning-format",
+          "auto",
+          "--mmproj",
+          "/media/yaroslav/DATA/llama-models/devstral-small-2-24b-mmproj-f16.gguf",
+          "--no-mmproj-offload",
+          "--spec-type",
+          "none"
+        ],
+        "vramBudget": {
+          "totalBytes": 25769803776,
+          "nonLlmBytes": 1010827264,
+          "llmBytes": 23966253056,
+          "freeBytes": 313524224,
+          "driverReservedBytes": 479199232,
+          "backgroundBudgetBytes": 1625292800,
+          "marginBytes": 402653184,
+          "llmBudgetBytes": 23741857792,
+          "availableLlmBytes": 23741857792,
+          "backgroundOverBudget": false,
+          "loggedDeviceBytes": 23633193862,
+          "unloggedDeviceBytes": 333059194
+        },
+        "hardware": {
+          "ramUsedBytes": 14170316800,
+          "ramTotalBytes": 67321868288,
+          "vramUsedBytes": 24977080320,
+          "vramTotalBytes": 25769803776,
+          "vramAvailableBytes": 313524224,
+          "gpuUtilization": 100,
+          "available": true
+        }
+      },
+      {
+        "contextWindow": 53248,
+        "kvCacheType": "f16",
+        "phase": "final",
+        "startup": true,
+        "health": true,
+        "inference": true,
+        "fits": true,
+        "headroom": {
+          "hostBytes": 53250371584,
+          "deviceBytes": 936378368
+        },
+        "memoryBaseline": {
+          "hostAvailableBytes": 54649685772,
+          "deviceAvailableBytes": 23894289286
+        },
+        "elapsedMs": 12031,
+        "args": [
+          "/media/yaroslav/DATA/llama.cpp/build-cuda/bin/llama-server",
+          "--log-verbosity",
+          "5",
+          "-m",
+          "/media/yaroslav/DATA/llama-models/Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf",
+          "--alias",
+          "devstral-small-2:24b-q4_k_m",
+          "--host",
+          "127.0.0.1",
+          "--port",
+          "18094",
+          "--ctx-size",
+          "53248",
+          "--gpu-layers",
+          "999",
+          "--flash-attn",
+          "on",
+          "--cache-type-k",
+          "f16",
+          "--cache-type-v",
+          "f16",
+          "--kv-offload",
+          "--parallel",
+          "1",
+          "--jinja",
+          "--reasoning",
+          "on",
+          "--reasoning-format",
+          "auto",
+          "--mmproj",
+          "/media/yaroslav/DATA/llama-models/devstral-small-2-24b-mmproj-f16.gguf",
+          "--no-mmproj-offload",
+          "--spec-type",
+          "none"
+        ],
+        "vramBudget": {
+          "totalBytes": 25769803776,
+          "nonLlmBytes": 1064304640,
+          "llmBytes": 23290970112,
+          "freeBytes": 936378368,
+          "driverReservedBytes": 478150656,
+          "backgroundBudgetBytes": 1625292800,
+          "marginBytes": 402653184,
+          "llmBudgetBytes": 23741857792,
+          "availableLlmBytes": 23741857792,
+          "backgroundOverBudget": false,
+          "loggedDeviceBytes": 22957910918,
+          "unloggedDeviceBytes": 333059194
+        },
+        "hardware": {
+          "ramUsedBytes": 14081052672,
+          "ramTotalBytes": 67321868288,
+          "vramUsedBytes": 24355274752,
+          "vramTotalBytes": 25769803776,
+          "vramAvailableBytes": 936378368,
+          "gpuUtilization": 81,
+          "available": true
+        }
+      },
+      {
+        "contextWindow": 16384,
+        "kvCacheType": "q8_0",
+        "phase": "base",
+        "startup": true,
+        "health": true,
+        "inference": true,
+        "fits": false,
+        "headroom": {
+          "hostBytes": 53001355264,
+          "deviceBytes": 8290041856
+        },
+        "memoryBaseline": {
+          "hostAvailableBytes": 54363004602,
+          "deviceAvailableBytes": 23912198964
+        },
+        "elapsedMs": 6529,
+        "args": [
+          "/media/yaroslav/DATA/llama.cpp/build-cuda/bin/llama-server",
+          "--log-verbosity",
+          "5",
+          "-m",
+          "/media/yaroslav/DATA/llama-models/Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf",
+          "--alias",
+          "devstral-small-2:24b-q4_k_m",
+          "--host",
+          "127.0.0.1",
+          "--port",
+          "18094",
+          "--ctx-size",
+          "16384",
+          "--gpu-layers",
+          "999",
+          "--flash-attn",
+          "on",
+          "--cache-type-k",
+          "q8_0",
+          "--cache-type-v",
+          "q8_0",
+          "--kv-offload",
+          "--parallel",
+          "1",
+          "--jinja",
+          "--reasoning",
+          "on",
+          "--reasoning-format",
+          "auto",
+          "--mmproj",
+          "/media/yaroslav/DATA/llama-models/devstral-small-2-24b-mmproj-f16.gguf",
+          "--no-mmproj-offload",
+          "--spec-type",
+          "none"
+        ],
+        "vramBudget": {
+          "totalBytes": 25769803776,
+          "nonLlmBytes": 1044381696,
+          "llmBytes": 15957229568,
+          "freeBytes": 8290041856,
+          "driverReservedBytes": 478150656,
+          "backgroundBudgetBytes": 1625292800,
+          "marginBytes": 402653184,
+          "llmBudgetBytes": 23741857792,
+          "availableLlmBytes": 23741857792,
+          "backgroundOverBudget": false,
+          "loggedDeviceBytes": 15622157108,
+          "unloggedDeviceBytes": 335072460
+        },
+        "hardware": {
+          "ramUsedBytes": 14309830656,
+          "ramTotalBytes": 67321868288,
+          "vramUsedBytes": 17000562688,
+          "vramTotalBytes": 25769803776,
+          "vramAvailableBytes": 8290041856,
+          "gpuUtilization": 17,
+          "available": true
+        }
+      },
+      {
+        "contextWindow": 94208,
+        "kvCacheType": "q8_0",
+        "phase": "search",
+        "startup": true,
+        "health": true,
+        "inference": true,
+        "fits": true,
+        "headroom": {
+          "hostBytes": 52950704128,
+          "deviceBytes": 1231028224
+        },
+        "memoryBaseline": {
+          "hostAvailableBytes": 54392045242,
+          "deviceAvailableBytes": 23899616052
+        },
+        "elapsedMs": 5523,
+        "args": [
+          "/media/yaroslav/DATA/llama.cpp/build-cuda/bin/llama-server",
+          "--log-verbosity",
+          "5",
+          "-m",
+          "/media/yaroslav/DATA/llama-models/Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf",
+          "--alias",
+          "devstral-small-2:24b-q4_k_m",
+          "--host",
+          "127.0.0.1",
+          "--port",
+          "18094",
+          "--ctx-size",
+          "94208",
+          "--gpu-layers",
+          "999",
+          "--flash-attn",
+          "on",
+          "--cache-type-k",
+          "q8_0",
+          "--cache-type-v",
+          "q8_0",
+          "--kv-offload",
+          "--parallel",
+          "1",
+          "--jinja",
+          "--reasoning",
+          "on",
+          "--reasoning-format",
+          "auto",
+          "--mmproj",
+          "/media/yaroslav/DATA/llama-models/devstral-small-2-24b-mmproj-f16.gguf",
+          "--no-mmproj-offload",
+          "--spec-type",
+          "none"
+        ],
+        "vramBudget": {
+          "totalBytes": 25769803776,
+          "nonLlmBytes": 1056964608,
+          "llmBytes": 23003660288,
+          "freeBytes": 1231028224,
+          "driverReservedBytes": 478150656,
+          "backgroundBudgetBytes": 1625292800,
+          "marginBytes": 402653184,
+          "llmBudgetBytes": 23741857792,
+          "availableLlmBytes": 23741857792,
+          "backgroundOverBudget": false,
+          "loggedDeviceBytes": 22668587828,
+          "unloggedDeviceBytes": 335072460
+        },
+        "hardware": {
+          "ramUsedBytes": 14380978176,
+          "ramTotalBytes": 67321868288,
+          "vramUsedBytes": 24060624896,
+          "vramTotalBytes": 25769803776,
+          "vramAvailableBytes": 1231028224,
+          "gpuUtilization": 41,
+          "available": true
+        }
+      },
+      {
+        "kvCacheType": "q8_0",
+        "contextWindow": 180224,
+        "phase": "search",
+        "startup": false,
+        "health": false,
+        "inference": false,
+        "fits": false,
+        "reason": "Пропущено до запуска: расчётная память выходит за общий бюджет VRAM или за защитный порог фактически свободной памяти.",
+        "headroom": {
+          "hostBytes": 52862623744,
+          "deviceBytes": -6557132045.473684
+        },
+        "memoryBaseline": null,
+        "elapsedMs": 0
+      },
+      {
+        "kvCacheType": "q8_0",
+        "contextWindow": 135168,
+        "phase": "search",
+        "startup": false,
+        "health": false,
+        "inference": false,
+        "fits": false,
+        "reason": "Пропущено до запуска: расчётная память выходит за общий бюджет VRAM или за защитный порог фактически свободной памяти.",
+        "headroom": {
+          "hostBytes": 52908761088,
+          "deviceBytes": -2477619523.368421
+        },
+        "memoryBaseline": null,
+        "elapsedMs": 0
+      },
+      {
+        "kvCacheType": "q8_0",
+        "contextWindow": 114688,
+        "phase": "search",
+        "startup": false,
+        "health": false,
+        "inference": false,
+        "fits": false,
+        "reason": "Пропущено до запуска: расчётная память выходит за общий бюджет VRAM или за защитный порог фактически свободной памяти.",
+        "headroom": {
+          "hostBytes": 52929732608,
+          "deviceBytes": -623295649.6842105
+        },
+        "memoryBaseline": null,
+        "elapsedMs": 0
+      },
+      {
+        "contextWindow": 102400,
+        "kvCacheType": "q8_0",
+        "phase": "search",
+        "startup": true,
+        "health": true,
+        "inference": true,
+        "fits": true,
+        "headroom": {
+          "hostBytes": 53030129664,
+          "deviceBytes": 533725184
+        },
+        "memoryBaseline": {
+          "hostAvailableBytes": 54479859386,
+          "deviceAvailableBytes": 23953093428
+        },
+        "elapsedMs": 7028,
+        "args": [
+          "/media/yaroslav/DATA/llama.cpp/build-cuda/bin/llama-server",
+          "--log-verbosity",
+          "5",
+          "-m",
+          "/media/yaroslav/DATA/llama-models/Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf",
+          "--alias",
+          "devstral-small-2:24b-q4_k_m",
+          "--host",
+          "127.0.0.1",
+          "--port",
+          "18094",
+          "--ctx-size",
+          "102400",
+          "--gpu-layers",
+          "999",
+          "--flash-attn",
+          "on",
+          "--cache-type-k",
+          "q8_0",
+          "--cache-type-v",
+          "q8_0",
+          "--kv-offload",
+          "--parallel",
+          "1",
+          "--jinja",
+          "--reasoning",
+          "on",
+          "--reasoning-format",
+          "auto",
+          "--mmproj",
+          "/media/yaroslav/DATA/llama-models/devstral-small-2-24b-mmproj-f16.gguf",
+          "--no-mmproj-offload",
+          "--spec-type",
+          "none"
+        ],
+        "vramBudget": {
+          "totalBytes": 25769803776,
+          "nonLlmBytes": 998244352,
+          "llmBytes": 23758635008,
+          "freeBytes": 533725184,
+          "driverReservedBytes": 479199232,
+          "backgroundBudgetBytes": 1625292800,
+          "marginBytes": 402653184,
+          "llmBudgetBytes": 23741857792,
+          "availableLlmBytes": 23741857792,
+          "backgroundOverBudget": false,
+          "loggedDeviceBytes": 23423562548,
+          "unloggedDeviceBytes": 335072460
+        },
+        "hardware": {
+          "ramUsedBytes": 14275608576,
+          "ramTotalBytes": 67321868288,
+          "vramUsedBytes": 24756879360,
+          "vramTotalBytes": 25769803776,
+          "vramAvailableBytes": 533725184,
+          "gpuUtilization": 24,
+          "available": true
+        }
+      },
+      {
+        "contextWindow": 106496,
+        "kvCacheType": "q8_0",
+        "phase": "search",
+        "startup": true,
+        "health": true,
+        "inference": true,
+        "fits": true,
+        "headroom": {
+          "hostBytes": 53151199232,
+          "deviceBytes": 171966464
+        },
+        "memoryBaseline": {
+          "hostAvailableBytes": 54605123258,
+          "deviceAvailableBytes": 23973016372
+        },
+        "elapsedMs": 6028,
+        "args": [
+          "/media/yaroslav/DATA/llama.cpp/build-cuda/bin/llama-server",
+          "--log-verbosity",
+          "5",
+          "-m",
+          "/media/yaroslav/DATA/llama-models/Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf",
+          "--alias",
+          "devstral-small-2:24b-q4_k_m",
+          "--host",
+          "127.0.0.1",
+          "--port",
+          "18094",
+          "--ctx-size",
+          "106496",
+          "--gpu-layers",
+          "999",
+          "--flash-attn",
+          "on",
+          "--cache-type-k",
+          "q8_0",
+          "--cache-type-v",
+          "q8_0",
+          "--kv-offload",
+          "--parallel",
+          "1",
+          "--jinja",
+          "--reasoning",
+          "on",
+          "--reasoning-format",
+          "auto",
+          "--mmproj",
+          "/media/yaroslav/DATA/llama-models/devstral-small-2-24b-mmproj-f16.gguf",
+          "--no-mmproj-offload",
+          "--spec-type",
+          "none"
+        ],
+        "vramBudget": {
+          "totalBytes": 25769803776,
+          "nonLlmBytes": 982515712,
+          "llmBytes": 24136122368,
+          "freeBytes": 171966464,
+          "driverReservedBytes": 479199232,
+          "backgroundBudgetBytes": 1625292800,
+          "marginBytes": 402653184,
+          "llmBudgetBytes": 23741857792,
+          "availableLlmBytes": 23741857792,
+          "backgroundOverBudget": false,
+          "loggedDeviceBytes": 23801049908,
+          "unloggedDeviceBytes": 335072460
+        },
+        "hardware": {
+          "ramUsedBytes": 14164631552,
+          "ramTotalBytes": 67321868288,
+          "vramUsedBytes": 25118638080,
+          "vramTotalBytes": 25769803776,
+          "vramAvailableBytes": 171966464,
+          "gpuUtilization": 23,
+          "available": true
+        }
+      },
+      {
+        "contextWindow": 98304,
+        "kvCacheType": "q8_0",
+        "phase": "final",
+        "startup": true,
+        "health": true,
+        "inference": true,
+        "fits": true,
+        "headroom": {
+          "hostBytes": 53107388416,
+          "deviceBytes": 932184064
+        },
+        "memoryBaseline": {
+          "hostAvailableBytes": 54552923834,
+          "deviceAvailableBytes": 23974064948
+        },
+        "elapsedMs": 5517,
+        "args": [
+          "/media/yaroslav/DATA/llama.cpp/build-cuda/bin/llama-server",
+          "--log-verbosity",
+          "5",
+          "-m",
+          "/media/yaroslav/DATA/llama-models/Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf",
+          "--alias",
+          "devstral-small-2:24b-q4_k_m",
+          "--host",
+          "127.0.0.1",
+          "--port",
+          "18094",
+          "--ctx-size",
+          "98304",
+          "--gpu-layers",
+          "999",
+          "--flash-attn",
+          "on",
+          "--cache-type-k",
+          "q8_0",
+          "--cache-type-v",
+          "q8_0",
+          "--kv-offload",
+          "--parallel",
+          "1",
+          "--jinja",
+          "--reasoning",
+          "on",
+          "--reasoning-format",
+          "auto",
+          "--mmproj",
+          "/media/yaroslav/DATA/llama-models/devstral-small-2-24b-mmproj-f16.gguf",
+          "--no-mmproj-offload",
+          "--spec-type",
+          "none"
+        ],
+        "vramBudget": {
+          "totalBytes": 25769803776,
+          "nonLlmBytes": 977272832,
+          "llmBytes": 23381147648,
+          "freeBytes": 932184064,
+          "driverReservedBytes": 479199232,
+          "backgroundBudgetBytes": 1625292800,
+          "marginBytes": 402653184,
+          "llmBudgetBytes": 23741857792,
+          "availableLlmBytes": 23741857792,
+          "backgroundOverBudget": false,
+          "loggedDeviceBytes": 23046075188,
+          "unloggedDeviceBytes": 335072460
+        },
+        "hardware": {
+          "ramUsedBytes": 14232596480,
+          "ramTotalBytes": 67321868288,
+          "vramUsedBytes": 24358420480,
+          "vramTotalBytes": 25769803776,
+          "vramAvailableBytes": 932184064,
+          "gpuUtilization": 22,
+          "available": true
+        }
+      }
+    ],
+    "configurationId": "{\"args\":[\"/media/yaroslav/DATA/llama.cpp/build-cuda/bin/llama-server\",\"--log-verbosity\",\"5\",\"-m\",\"/media/yaroslav/DATA/llama-models/Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf\",\"--alias\",\"devstral-small-2:24b-q4_k_m\",\"--host\",\"127.0.0.1\",\"--port\",\"18094\",\"--gpu-layers\",\"999\",\"--flash-attn\",\"on\",\"--kv-offload\",\"--parallel\",\"1\",\"--jinja\",\"--reasoning\",\"on\",\"--reasoning-format\",\"auto\",\"--mmproj\",\"/media/yaroslav/DATA/llama-models/devstral-small-2-24b-mmproj-f16.gguf\",\"--no-mmproj-offload\",\"--spec-type\",\"none\"],\"model\":\"66313:7208965:14334446752:1791210401286.1025\",\"projector\":\"66313:7208969:878054048:1791209917281.173\",\"binary\":\"66313:5384235:17888:1789481979685.9407\",\"hardLimit\":262144,\"speculative\":\"none\"}"
+  },
+  "restoredDiscovery": {
+    "busy": false,
+    "modelId": "devstral-small-2:24b-q4_k_m",
+    "stage": "Сохранённый результат",
+    "probeCount": 0,
+    "result": {
+      "modelId": "devstral-small-2:24b-q4_k_m",
+      "probeContextTokens": 16384,
+      "options": [
+        {
+          "modelId": "devstral-small-2:24b-q4_k_m",
+          "contextWindow": 53248,
+          "kvCacheType": "f16",
+          "kvOffload": true,
+          "discoveredAt": "2026-10-06T19:16:46.710Z",
+          "memoryBaseline": {
+            "hostAvailableBytes": 54649685772,
+            "deviceAvailableBytes": 23894289286
+          },
+          "measuredHeadroom": {
+            "hostBytes": 53250371584,
+            "deviceBytes": 936378368
+          },
+          "boundaryTokens": 57344,
+          "vramBudget": {
+            "totalBytes": 25769803776,
+            "nonLlmBytes": 1064304640,
+            "llmBytes": 23290970112,
+            "freeBytes": 936378368,
+            "driverReservedBytes": 478150656,
+            "backgroundBudgetBytes": 1625292800,
+            "marginBytes": 402653184,
+            "llmBudgetBytes": 23741857792,
+            "availableLlmBytes": 23741857792,
+            "backgroundOverBudget": false,
+            "loggedDeviceBytes": 22957910918,
+            "unloggedDeviceBytes": 333059194
+          },
+          "boundaryReason": "budget-guard",
+          "restored": true
+        },
+        {
+          "modelId": "devstral-small-2:24b-q4_k_m",
+          "contextWindow": 98304,
+          "kvCacheType": "q8_0",
+          "kvOffload": true,
+          "discoveredAt": "2026-10-06T19:17:17.336Z",
+          "memoryBaseline": {
+            "hostAvailableBytes": 54552923834,
+            "deviceAvailableBytes": 23974064948
+          },
+          "measuredHeadroom": {
+            "hostBytes": 53107388416,
+            "deviceBytes": 932184064
+          },
+          "boundaryTokens": 106496,
+          "vramBudget": {
+            "totalBytes": 25769803776,
+            "nonLlmBytes": 977272832,
+            "llmBytes": 23381147648,
+            "freeBytes": 932184064,
+            "driverReservedBytes": 479199232,
+            "backgroundBudgetBytes": 1625292800,
+            "marginBytes": 402653184,
+            "llmBudgetBytes": 23741857792,
+            "availableLlmBytes": 23741857792,
+            "backgroundOverBudget": false,
+            "loggedDeviceBytes": 23046075188,
+            "unloggedDeviceBytes": 335072460
+          },
+          "boundaryReason": "budget-guard",
+          "restored": true
+        }
+      ],
+      "unsupported": [],
+      "restored": true,
+      "hardLimit": 262144,
+      "configurationId": "{\"args\":[\"/media/yaroslav/DATA/llama.cpp/build-cuda/bin/llama-server\",\"--log-verbosity\",\"5\",\"-m\",\"/media/yaroslav/DATA/llama-models/Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf\",\"--alias\",\"devstral-small-2:24b-q4_k_m\",\"--host\",\"127.0.0.1\",\"--port\",\"18094\",\"--gpu-layers\",\"999\",\"--flash-attn\",\"on\",\"--kv-offload\",\"--parallel\",\"1\",\"--jinja\",\"--reasoning\",\"on\",\"--reasoning-format\",\"auto\",\"--mmproj\",\"/media/yaroslav/DATA/llama-models/devstral-small-2-24b-mmproj-f16.gguf\",\"--no-mmproj-offload\",\"--spec-type\",\"none\"],\"model\":\"66313:7208965:14334446752:1791210401286.1025\",\"projector\":\"66313:7208969:878054048:1791209917281.173\",\"binary\":\"66313:5384235:17888:1789481979685.9407\",\"hardLimit\":262144,\"speculative\":\"none\"}"
+    },
+    "currentVramBudget": {
+      "totalBytes": 25769803776,
+      "nonLlmBytes": 967835648,
+      "llmBytes": 19895681024,
+      "freeBytes": 4427087872,
+      "driverReservedBytes": 479199232,
+      "backgroundBudgetBytes": 1625292800,
+      "marginBytes": 402653184,
+      "llmBudgetBytes": 23741857792,
+      "availableLlmBytes": 23741857792,
+      "backgroundOverBudget": false,
+      "loggedDeviceBytes": 19581496198,
+      "unloggedDeviceBytes": 314184826
+    }
+  },
+  "boundaryProbes": [
+    {
+      "context": 53248,
+      "kv": "f16",
+      "result": {
+        "ok": true,
+        "state": {
+          "status": "ready",
+          "modelId": "devstral-small-2:24b-q4_k_m",
+          "contextWindow": 53248,
+          "kvCacheType": "f16",
+          "kvOffload": true,
+          "speculativeMode": "none",
+          "requestId": "63d1c705-550b-4ccb-8749-54ae41e45d48",
+          "launcherPid": 35456,
+          "serverPid": 35909
+        }
+      },
+      "inferenceStatus": 200,
+      "reply": "{\"choices\":[{\"finish_reason\":\"stop\",\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"OK.\"}}],\"created\":1791314345,\"model\":\"devstral-small-2:24b-q4_k_m\",\"system_fingerprint\":\"b1-d1d3c33\",\"object\":\"chat.completion\",\"usage\":{\"completion_tokens\":3,\"prompt_tokens\":559,\"total_tokens\":562,\"prompt_tokens_details\":{\"cached_tokens\":0}},\"id\":\"chatcmpl-oYZRyRfrKG0Vv1bTOwdBlMooFvD8gWcY\",\"timings\":{\"cache_n\":0,\"prompt_n\":559,\"prompt_ms\":365.453,\"prompt_per_token_ms\":0.6537620751341681,\"prompt_per_second\":1529.608458543233,\"predicted_n\":3,\"predicted_ms\":53.031,\"predicted_per_token_ms\":26.5155,\"predicted_per_second\":37.71379004733081}}",
+      "hardware": {
+        "ramUsedBytes": 14186786816,
+        "ramTotalBytes": 67321868288,
+        "vramUsedBytes": 24250417152,
+        "vramTotalBytes": 25769803776,
+        "vramAvailableBytes": 1040187392,
+        "gpuUtilization": 25,
+        "available": true
+      },
+      "budget": {
+        "totalBytes": 25769803776,
+        "nonLlmBytes": 955252736,
+        "llmBytes": 23290970112,
+        "freeBytes": 1044381696,
+        "driverReservedBytes": 479199232,
+        "backgroundBudgetBytes": 1625292800,
+        "marginBytes": 402653184,
+        "llmBudgetBytes": 23741857792,
+        "availableLlmBytes": 23741857792,
+        "backgroundOverBudget": false
+      },
+      "policyFits": true,
+      "allocations": {
+        "modelPath": "/media/yaroslav/DATA/llama-models/Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf",
+        "contextTokens": 53248,
+        "sequenceSlots": 1,
+        "speculativeSlots": 0,
+        "speculativeMode": "none",
+        "visionPresent": true,
+        "kvTypeK": "f16",
+        "kvTypeV": "f16",
+        "speculativeKvTypeK": null,
+        "speculativeKvTypeV": null,
+        "allocations": {
+          "weights": {
+            "host": 1255522960,
+            "device": 13948535440
+          },
+          "compute": {
+            "device": 285223158,
+            "host": 143266940
+          },
+          "output": {
+            "host": 524288,
+            "device": 0
+          },
+          "kv": {
+            "device": 8724152320,
+            "host": 0
+          },
+          "speculativeWeights": {
+            "host": 0,
+            "device": 0
+          },
+          "speculativeCompute": {
+            "host": 0,
+            "device": 0
+          },
+          "speculativeKv": {
+            "host": 0,
+            "device": 0
+          },
+          "ssm": {
+            "host": 0,
+            "device": 0
+          }
+        },
+        "unknownReasons": []
+      }
+    },
+    {
+      "context": 57344,
+      "kv": "f16",
+      "result": {
+        "ok": true,
+        "state": {
+          "status": "ready",
+          "modelId": "devstral-small-2:24b-q4_k_m",
+          "contextWindow": 57344,
+          "kvCacheType": "f16",
+          "kvOffload": true,
+          "speculativeMode": "none",
+          "requestId": "e92005ec-c8b9-4245-9386-80667dd2ad02",
+          "launcherPid": 35456,
+          "serverPid": 36031
+        }
+      },
+      "inferenceStatus": 200,
+      "reply": "{\"choices\":[{\"finish_reason\":\"stop\",\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"OK.\"}}],\"created\":1791314350,\"model\":\"devstral-small-2:24b-q4_k_m\",\"system_fingerprint\":\"b1-d1d3c33\",\"object\":\"chat.completion\",\"usage\":{\"completion_tokens\":3,\"prompt_tokens\":559,\"total_tokens\":562,\"prompt_tokens_details\":{\"cached_tokens\":0}},\"id\":\"chatcmpl-48SffkE815qzYGcg6DUjzxY4P59EFN9F\",\"timings\":{\"cache_n\":0,\"prompt_n\":559,\"prompt_ms\":364.095,\"prompt_per_token_ms\":0.6513327370304115,\"prompt_per_second\":1535.3135857399852,\"predicted_n\":3,\"predicted_ms\":53.212,\"predicted_per_token_ms\":26.606,\"predicted_per_second\":37.585507028489815}}",
+      "hardware": {
+        "ramUsedBytes": 14093320192,
+        "ramTotalBytes": 67321868288,
+        "vramUsedBytes": 24928845824,
+        "vramTotalBytes": 25769803776,
+        "vramAvailableBytes": 361758720,
+        "gpuUtilization": 92,
+        "available": true
+      },
+      "budget": {
+        "totalBytes": 25769803776,
+        "nonLlmBytes": 962592768,
+        "llmBytes": 23966253056,
+        "freeBytes": 361758720,
+        "driverReservedBytes": 479199232,
+        "backgroundBudgetBytes": 1625292800,
+        "marginBytes": 402653184,
+        "llmBudgetBytes": 23741857792,
+        "availableLlmBytes": 23741857792,
+        "backgroundOverBudget": false
+      },
+      "policyFits": false,
+      "allocations": {
+        "modelPath": "/media/yaroslav/DATA/llama-models/Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf",
+        "contextTokens": 57344,
+        "sequenceSlots": 1,
+        "speculativeSlots": 0,
+        "speculativeMode": "none",
+        "visionPresent": true,
+        "kvTypeK": "f16",
+        "kvTypeV": "f16",
+        "speculativeKvTypeK": null,
+        "speculativeKvTypeV": null,
+        "allocations": {
+          "weights": {
+            "host": 1255522960,
+            "device": 13948535440
+          },
+          "compute": {
+            "device": 289417462,
+            "host": 147461244
+          },
+          "output": {
+            "host": 524288,
+            "device": 0
+          },
+          "kv": {
+            "device": 9395240960,
+            "host": 0
+          },
+          "speculativeWeights": {
+            "host": 0,
+            "device": 0
+          },
+          "speculativeCompute": {
+            "host": 0,
+            "device": 0
+          },
+          "speculativeKv": {
+            "host": 0,
+            "device": 0
+          },
+          "ssm": {
+            "host": 0,
+            "device": 0
+          }
+        },
+        "unknownReasons": []
+      }
+    },
+    {
+      "context": 61440,
+      "kv": "f16",
+      "result": {
+        "ok": false,
+        "state": {
+          "status": "ready",
+          "modelId": "devstral-small-2:24b-q4_k_m",
+          "contextWindow": 57344,
+          "kvCacheType": "f16",
+          "kvOffload": true,
+          "speculativeMode": "none",
+          "error": "llama-server завершился до health check: недостаточно видеопамяти (CUDA out of memory) для Devstral Small 2 24B с контекстом 61440; закройте приложения, использующие GPU, или выберите меньший контекст",
+          "requestId": "87ec84a6-0ab9-4a78-904b-2fc84f55e52b",
+          "rolledBack": true,
+          "launcherPid": 35456,
+          "serverPid": 36249
+        },
+        "error": "llama-server завершился до health check: недостаточно видеопамяти (CUDA out of memory) для Devstral Small 2 24B с контекстом 61440; закройте приложения, использующие GPU, или выберите меньший контекст"
+      },
+      "hardware": {
+        "ramUsedBytes": 13856481280,
+        "ramTotalBytes": 67321868288,
+        "vramUsedBytes": 24906825728,
+        "vramTotalBytes": 25769803776,
+        "vramAvailableBytes": 383778816,
+        "gpuUtilization": 28,
+        "available": true
+      },
+      "failure": "CUDA out of memory"
+    },
+    {
+      "context": 98304,
+      "kv": "q8_0",
+      "result": {
+        "ok": true,
+        "state": {
+          "status": "ready",
+          "modelId": "devstral-small-2:24b-q4_k_m",
+          "contextWindow": 98304,
+          "kvCacheType": "q8_0",
+          "kvOffload": true,
+          "speculativeMode": "none",
+          "requestId": "ba9cde73-5a45-448f-bd76-13a9a1fcb030",
+          "launcherPid": 35456,
+          "serverPid": 36389
+        }
+      },
+      "inferenceStatus": 200,
+      "reply": "{\"choices\":[{\"finish_reason\":\"stop\",\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"OK.\"}}],\"created\":1791314366,\"model\":\"devstral-small-2:24b-q4_k_m\",\"system_fingerprint\":\"b1-d1d3c33\",\"object\":\"chat.completion\",\"usage\":{\"completion_tokens\":3,\"prompt_tokens\":559,\"total_tokens\":562,\"prompt_tokens_details\":{\"cached_tokens\":0}},\"id\":\"chatcmpl-6prJI0itEYMQ91HdjlJgZY3OH5eIpvpp\",\"timings\":{\"cache_n\":0,\"prompt_n\":559,\"prompt_ms\":369.372,\"prompt_per_token_ms\":0.6607728085867621,\"prompt_per_second\":1513.3794656877076,\"predicted_n\":3,\"predicted_ms\":58.542,\"predicted_per_token_ms\":29.271,\"predicted_per_second\":34.1635065423115}}",
+      "hardware": {
+        "ramUsedBytes": 14198345728,
+        "ramTotalBytes": 67321868288,
+        "vramUsedBytes": 24341643264,
+        "vramTotalBytes": 25769803776,
+        "vramAvailableBytes": 948961280,
+        "gpuUtilization": 48,
+        "available": true
+      },
+      "budget": {
+        "totalBytes": 25769803776,
+        "nonLlmBytes": 956301312,
+        "llmBytes": 23381147648,
+        "freeBytes": 953155584,
+        "driverReservedBytes": 479199232,
+        "backgroundBudgetBytes": 1625292800,
+        "marginBytes": 402653184,
+        "llmBudgetBytes": 23741857792,
+        "availableLlmBytes": 23741857792,
+        "backgroundOverBudget": false
+      },
+      "policyFits": true,
+      "allocations": {
+        "modelPath": "/media/yaroslav/DATA/llama-models/Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf",
+        "contextTokens": 98304,
+        "sequenceSlots": 1,
+        "speculativeSlots": 0,
+        "speculativeMode": "none",
+        "visionPresent": true,
+        "kvTypeK": "q8_0",
+        "kvTypeV": "q8_0",
+        "speculativeKvTypeK": null,
+        "speculativeKvTypeV": null,
+        "allocations": {
+          "weights": {
+            "host": 1255522960,
+            "device": 13948535440
+          },
+          "compute": {
+            "device": 541159588,
+            "host": 189488170
+          },
+          "output": {
+            "host": 524288,
+            "device": 0
+          },
+          "kv": {
+            "device": 8556380160,
+            "host": 0
+          },
+          "speculativeWeights": {
+            "host": 0,
+            "device": 0
+          },
+          "speculativeCompute": {
+            "host": 0,
+            "device": 0
+          },
+          "speculativeKv": {
+            "host": 0,
+            "device": 0
+          },
+          "ssm": {
+            "host": 0,
+            "device": 0
+          }
+        },
+        "unknownReasons": []
+      }
+    },
+    {
+      "context": 102400,
+      "kv": "q8_0",
+      "result": {
+        "ok": true,
+        "state": {
+          "status": "ready",
+          "modelId": "devstral-small-2:24b-q4_k_m",
+          "contextWindow": 102400,
+          "kvCacheType": "q8_0",
+          "kvOffload": true,
+          "speculativeMode": "none",
+          "requestId": "90c3a51b-ae37-420b-9be8-e7d4472236d3",
+          "launcherPid": 35456,
+          "serverPid": 36546
+        }
+      },
+      "inferenceStatus": 200,
+      "reply": "{\"choices\":[{\"finish_reason\":\"stop\",\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"OK.\"}}],\"created\":1791314372,\"model\":\"devstral-small-2:24b-q4_k_m\",\"system_fingerprint\":\"b1-d1d3c33\",\"object\":\"chat.completion\",\"usage\":{\"completion_tokens\":3,\"prompt_tokens\":559,\"total_tokens\":562,\"prompt_tokens_details\":{\"cached_tokens\":0}},\"id\":\"chatcmpl-uMvcluXoH8vQ0EaegDAdeDH6buuNEB3t\",\"timings\":{\"cache_n\":0,\"prompt_n\":559,\"prompt_ms\":369.72,\"prompt_per_token_ms\":0.6613953488372093,\"prompt_per_second\":1511.954992967651,\"predicted_n\":3,\"predicted_ms\":59.65,\"predicted_per_token_ms\":29.825,\"predicted_per_second\":33.52891869237217}}",
+      "hardware": {
+        "ramUsedBytes": 14286745600,
+        "ramTotalBytes": 67321868288,
+        "vramUsedBytes": 24720179200,
+        "vramTotalBytes": 25769803776,
+        "vramAvailableBytes": 570425344,
+        "gpuUtilization": 29,
+        "available": true
+      },
+      "budget": {
+        "totalBytes": 25769803776,
+        "nonLlmBytes": 961544192,
+        "llmBytes": 23758635008,
+        "freeBytes": 570425344,
+        "driverReservedBytes": 479199232,
+        "backgroundBudgetBytes": 1625292800,
+        "marginBytes": 402653184,
+        "llmBudgetBytes": 23741857792,
+        "availableLlmBytes": 23741857792,
+        "backgroundOverBudget": false
+      },
+      "policyFits": false,
+      "allocations": {
+        "modelPath": "/media/yaroslav/DATA/llama-models/Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf",
+        "contextTokens": 102400,
+        "sequenceSlots": 1,
+        "speculativeSlots": 0,
+        "speculativeMode": "none",
+        "visionPresent": true,
+        "kvTypeK": "q8_0",
+        "kvTypeV": "q8_0",
+        "speculativeKvTypeK": null,
+        "speculativeKvTypeV": null,
+        "allocations": {
+          "weights": {
+            "host": 1255522960,
+            "device": 13948535440
+          },
+          "compute": {
+            "device": 562131108,
+            "host": 193682474
+          },
+          "output": {
+            "host": 524288,
+            "device": 0
+          },
+          "kv": {
+            "device": 8912896000,
+            "host": 0
+          },
+          "speculativeWeights": {
+            "host": 0,
+            "device": 0
+          },
+          "speculativeCompute": {
+            "host": 0,
+            "device": 0
+          },
+          "speculativeKv": {
+            "host": 0,
+            "device": 0
+          },
+          "ssm": {
+            "host": 0,
+            "device": 0
+          }
+        },
+        "unknownReasons": []
+      }
+    },
+    {
+      "context": 106496,
+      "kv": "q8_0",
+      "result": {
+        "ok": true,
+        "state": {
+          "status": "ready",
+          "modelId": "devstral-small-2:24b-q4_k_m",
+          "contextWindow": 106496,
+          "kvCacheType": "q8_0",
+          "kvOffload": true,
+          "speculativeMode": "none",
+          "requestId": "ed12235a-8b6d-426b-9fb9-09e6c33fe5c2",
+          "launcherPid": 35456,
+          "serverPid": 36699
+        }
+      },
+      "inferenceStatus": 200,
+      "reply": "{\"choices\":[{\"finish_reason\":\"stop\",\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"OK.\"}}],\"created\":1791314378,\"model\":\"devstral-small-2:24b-q4_k_m\",\"system_fingerprint\":\"b1-d1d3c33\",\"object\":\"chat.completion\",\"usage\":{\"completion_tokens\":3,\"prompt_tokens\":559,\"total_tokens\":562,\"prompt_tokens_details\":{\"cached_tokens\":0}},\"id\":\"chatcmpl-tXxl5qWPm09pXlWokkD12UwjUWKKrvJ0\",\"timings\":{\"cache_n\":0,\"prompt_n\":559,\"prompt_ms\":369.753,\"prompt_per_token_ms\":0.6614543828264758,\"prompt_per_second\":1511.8200528460893,\"predicted_n\":3,\"predicted_ms\":57.698,\"predicted_per_token_ms\":28.849,\"predicted_per_second\":34.66324655967278}}",
+      "hardware": {
+        "ramUsedBytes": 14153416704,
+        "ramTotalBytes": 67321868288,
+        "vramUsedBytes": 25091375104,
+        "vramTotalBytes": 25769803776,
+        "vramAvailableBytes": 199229440,
+        "gpuUtilization": 30,
+        "available": true
+      },
+      "budget": {
+        "totalBytes": 25769803776,
+        "nonLlmBytes": 961544192,
+        "llmBytes": 24136122368,
+        "freeBytes": 192937984,
+        "driverReservedBytes": 479199232,
+        "backgroundBudgetBytes": 1625292800,
+        "marginBytes": 402653184,
+        "llmBudgetBytes": 23741857792,
+        "availableLlmBytes": 23741857792,
+        "backgroundOverBudget": false
+      },
+      "policyFits": false,
+      "allocations": {
+        "modelPath": "/media/yaroslav/DATA/llama-models/Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf",
+        "contextTokens": 106496,
+        "sequenceSlots": 1,
+        "speculativeSlots": 0,
+        "speculativeMode": "none",
+        "visionPresent": true,
+        "kvTypeK": "q8_0",
+        "kvTypeV": "q8_0",
+        "speculativeKvTypeK": null,
+        "speculativeKvTypeV": null,
+        "allocations": {
+          "weights": {
+            "host": 1255522960,
+            "device": 13948535440
+          },
+          "compute": {
+            "device": 583102628,
+            "host": 197876778
+          },
+          "output": {
+            "host": 524288,
+            "device": 0
+          },
+          "kv": {
+            "device": 9269411840,
+            "host": 0
+          },
+          "speculativeWeights": {
+            "host": 0,
+            "device": 0
+          },
+          "speculativeCompute": {
+            "host": 0,
+            "device": 0
+          },
+          "speculativeKv": {
+            "host": 0,
+            "device": 0
+          },
+          "ssm": {
+            "host": 0,
+            "device": 0
+          }
+        },
+        "unknownReasons": []
+      }
+    },
+    {
+      "context": 110592,
+      "kv": "q8_0",
+      "result": {
+        "ok": false,
+        "state": {
+          "status": "ready",
+          "modelId": "devstral-small-2:24b-q4_k_m",
+          "contextWindow": 106496,
+          "kvCacheType": "q8_0",
+          "kvOffload": true,
+          "speculativeMode": "none",
+          "error": "llama-server завершился до health check: недостаточно видеопамяти (CUDA out of memory) для Devstral Small 2 24B с контекстом 110592; закройте приложения, использующие GPU, или выберите меньший контекст",
+          "requestId": "85cae09e-c632-49c1-992d-5d31575f97f8",
+          "rolledBack": true,
+          "launcherPid": 35456,
+          "serverPid": 36913
+        },
+        "error": "llama-server завершился до health check: недостаточно видеопамяти (CUDA out of memory) для Devstral Small 2 24B с контекстом 110592; закройте приложения, использующие GPU, или выберите меньший контекст"
+      },
+      "hardware": {
+        "ramUsedBytes": 14142136320,
+        "ramTotalBytes": 67321868288,
+        "vramUsedBytes": 25076695040,
+        "vramTotalBytes": 25769803776,
+        "vramAvailableBytes": 213909504,
+        "gpuUtilization": 28,
+        "available": true
+      },
+      "failure": "CUDA out of memory"
+    }
+  ],
+  "oomTelemetry": {
+    "startupAfterGemma": {
+      "selector": "",
+      "runtime": {
+        "status": "idle",
+        "modelId": null,
+        "contextWindow": null,
+        "kvCacheType": "f16",
+        "kvOffload": true,
+        "speculativeMode": "none",
+        "launcherPid": 47122
+      },
+      "hardware": {
+        "ramUsedBytes": 6725246976,
+        "ramTotalBytes": 67321868288,
+        "vramUsedBytes": 1027604480,
+        "vramTotalBytes": 25769803776,
+        "vramAvailableBytes": 24263000064,
+        "gpuUtilization": 28,
+        "available": true
+      },
+      "gpuProcesses": ""
+    },
+    "probes": [
+      {
+        "context": 61440,
+        "kv": "f16",
+        "result": {
+          "ok": false,
+          "state": {
+            "status": "ready",
+            "modelId": "devstral-small-2:24b-q4_k_m",
+            "contextWindow": 16384,
+            "kvCacheType": "f16",
+            "kvOffload": true,
+            "speculativeMode": "none",
+            "error": "llama-server завершился до health check: недостаточно видеопамяти (CUDA out of memory) для Devstral Small 2 24B с контекстом 61440; закройте приложения, использующие GPU, или выберите меньший контекст",
+            "requestId": "7a7e8238-646e-4fce-b763-d3f0ef003a74",
+            "rolledBack": true,
+            "launcherPid": 47122,
+            "serverPid": 47995
+          },
+          "error": "llama-server завершился до health check: недостаточно видеопамяти (CUDA out of memory) для Devstral Small 2 24B с контекстом 61440; закройте приложения, использующие GPU, или выберите меньший контекст"
+        },
+        "failure": "CUDA out of memory",
+        "sampleCount": 59,
+        "samplesContainRollback": true,
+        "limitation": "CUDA allocation failed before a stable residency sample for the failed process. Sample peaks may describe the automatic rollback and are not presented as the failed allocation VRAM."
+      },
+      {
+        "context": 110592,
+        "kv": "q8_0",
+        "result": {
+          "ok": false,
+          "state": {
+            "status": "ready",
+            "modelId": "devstral-small-2:24b-q4_k_m",
+            "contextWindow": 16384,
+            "kvCacheType": "q8_0",
+            "kvOffload": true,
+            "speculativeMode": "none",
+            "error": "llama-server завершился до health check: недостаточно видеопамяти (CUDA out of memory) для Devstral Small 2 24B с контекстом 110592; закройте приложения, использующие GPU, или выберите меньший контекст",
+            "requestId": "71b1d0d6-4e15-47cc-811e-0c409b59587a",
+            "rolledBack": true,
+            "launcherPid": 47122,
+            "serverPid": 48674
+          },
+          "error": "llama-server завершился до health check: недостаточно видеопамяти (CUDA out of memory) для Devstral Small 2 24B с контекстом 110592; закройте приложения, использующие GPU, или выберите меньший контекст"
+        },
+        "failure": "CUDA out of memory",
+        "sampleCount": 57,
+        "samplesContainRollback": true,
+        "limitation": "CUDA allocation failed before a stable residency sample for the failed process. Sample peaks may describe the automatic rollback and are not presented as the failed allocation VRAM."
+      }
+    ]
+  },
+  "regressions": [
+    {
+      "id": "qwen3.8:27b-q4_K_M",
+      "state": {
+        "status": "ready",
+        "modelId": "qwen3.8:27b-q4_K_M",
+        "contextWindow": 32768,
+        "kvCacheType": "f16",
+        "kvOffload": true,
+        "speculativeMode": "mtp",
+        "requestId": "555d28d0-b7f6-4891-bbfb-76445e6a0142",
+        "launcherPid": 35456,
+        "serverPid": 37057
+      },
+      "chatMessages": [
+        {
+          "id": "da516d10-bb60-4743-9e78-f328133aa04e",
+          "conversationId": "b5ca9e00-9d5b-4984-8fc1-677d343d05d4",
+          "role": "user",
+          "content": "Reply briefly: what is 2 + 2?",
+          "createdAt": "2026-10-06T19:19:56.605Z",
+          "attachments": [],
+          "projectReferences": []
+        },
+        {
+          "id": "9d524b38-dcc1-434e-81e2-c84b66dfcd5a",
+          "conversationId": "b5ca9e00-9d5b-4984-8fc1-677d343d05d4",
+          "role": "assistant",
+          "content": "4",
+          "createdAt": "2026-10-06T19:19:57.268Z",
+          "attachments": [],
+          "projectReferences": [],
+          "generationStats": {
+            "outputTokens": 2,
+            "tokensPerSecond": 11.219692804811004,
+            "generationDurationMs": 89.129,
+            "inputTokens": 264
+          }
+        }
+      ],
+      "agentRequests": 3,
+      "calls": [
+        "read_file",
+        "run_terminal"
+      ],
+      "body": "Новый чат\n06.10.2026 · 5\nReply briefly: what is 2 + 2?\nQwen3.8\nReply briefly: what is 2 + 2?\nDevstral Small 2\nRead both project files using tools and summarize.\nDevstral Small 2\nInspect both projects. Fix the numeric addition bug in P\nDevstral Small 2\nInspect both projects. Fix the numeric addition bug in P\nDevstral Small 2\nLocal AI Desktop\nRAM 14.9 / 62.7 GB\nVRAM 19.2 / 24.0 GB\nGPU 99%\nllama.cpp · MTP\nНайти максимальный контекст\nМаксимальный контекст: не измерен\nМодель\nВыберите модель\nQwen3.8-27B\nHuihui Qwen3.8-27B (abliterated)\nDevstral Small 2 24B\nGemma 4 31B IT\nКонтекст · 32K\n16K\n32K\n64K\n128K\n256K\nРазмышления\nВкл.\nВыкл.\nГлубина рассуждений\nНизкая\nСредняя\nМаксимальная\nСтратегия агента\nБыстрая\nГлубокая\nВеб\nВыкл.\nАвто\nРежим\nЧат\nАгент\nproject1\nproject2\nФайловые инструменты ограничены выбранным проектом и папками, которые вы назвали в сообщениях; терминал стартует в корне проекта.\n\nReply briefly: what is 2 + 2?\n\n4\n\n11 ток/с · 2 токена\n\nUse read_file to inspect calculator.js in Project 1 and requirements.md in Project 2. Then run node test.js in Project 1. Do not change files. Give a short verified summary.\n\n✓ Чтение\nread_file\n✓ Чтение\nread_file\n✓ $ Терминал\nnode test.js\n\nVerified summary:\n\nProject 1 — calculator.js (full file, 1 line): exports { add: (a,b) => Number(a) + Number(b) } — a simple addition function that coerces arguments to numbers.\nProject 1 — node test.js: ran successfully, exit code 0, output: calculator tests passed. ✅ Verified.\nProject 2 — requirements.md (full file, 1 line): \"The primary calculator must add numeric values correctly including negatives. No dependencies.\"\n\nNo files were changed. The calculator implementation in Project 1 satisfies the requirement stated in Project 2 (adds numbers, handles negatives via Number() coercion, no dependencies), and the test run passed.\n\n14%\n\nEnter — отправить · Shift+Enter — новая строка · вставьте или перетащите файлы",
+      "speculativeActive": true,
+      "specStats": [
+        "0.16.632.748 D slot get_n_draft_: id  0 | task 45 | max possible draft: 26937",
+        "0.16.681.403 D slot   operator(): id  0 | task 45 | add accepted tokens: sampled=681, ids.size=1, n_draft=3",
+        "0.16.681.451 D slot get_n_draft_: id  0 | task 45 | max possible draft: 26936",
+        "0.16.730.169 D slot   operator(): id  0 | task 45 | add accepted tokens: sampled=1228, ids.size=3, n_draft=3",
+        "0.16.730.221 D slot get_n_draft_: id  0 | task 45 | max possible draft: 26933",
+        "0.16.781.402 D slot   operator(): id  0 | task 45 | add accepted tokens: sampled=1542, ids.size=1, n_draft=3",
+        "0.16.781.464 D slot get_n_draft_: id  0 | task 45 | max possible draft: 26932",
+        "0.16.833.748 D slot   operator(): id  0 | task 45 | add accepted tokens: sampled=5642, ids.size=1, n_draft=3",
+        "0.16.833.827 D slot get_n_draft_: id  0 | task 45 | max possible draft: 26931",
+        "0.16.886.351 D slot   operator(): id  0 | task 45 | add accepted tokens: sampled=248045, ids.size=4, n_draft=3",
+        "0.16.886.421 I slot print_timing: id  0 | task 45 | draft acceptance = 0.69811 (  111 accepted /   159 generated), mean len =  3.09",
+        "data: {\"choices\":[],\"created\":1791314408,\"id\":\"chatcmpl-nvuVlQAWY0pHqIqU3Va9FmRhaJJXeWUx\",\"model\":\"qwen3.8:27b-q4_K_M\",\"system_fingerprint\":\"b1-d1d3c33\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":163,\"prompt_tokens\":4315,\"total_tokens\":4478,\"prompt_tokens_details\":{\"cached_tokens\":3480}},\"timings\":{\"cache_n\":3480,\"prompt_n\":835,\"prompt_ms\":1029.379,\"prompt_per_token_ms\":1.232789221556886,\"prompt_per_second\":811.1686754829855,\"predicted_n\":163,\"predicted_ms\":2732.254,\"predicted_per_token_ms\":16.865765432098765,\"predicted_per_second\":59.29170567597303,\"draft_n\":159,\"draft_n_accepted\":111}}"
+      ],
+      "vision": true
+    },
+    {
+      "id": "gemma4:31b-it-q4_k_m",
+      "state": {
+        "status": "ready",
+        "modelId": "gemma4:31b-it-q4_k_m",
+        "contextWindow": 32768,
+        "kvCacheType": "f16",
+        "kvOffload": true,
+        "speculativeMode": "mtp",
+        "requestId": "f96b47ca-d769-4462-b206-737c605258ed",
+        "launcherPid": 35456,
+        "serverPid": 37728
+      },
+      "chatMessages": [
+        {
+          "id": "70112072-ca84-4a75-a61d-87cc967084ac",
+          "conversationId": "8245e064-833c-401a-8cbc-a5e293a83b4f",
+          "role": "user",
+          "content": "Reply briefly: what is 2 + 2?",
+          "createdAt": "2026-10-06T19:20:39.234Z",
+          "attachments": [],
+          "projectReferences": []
+        },
+        {
+          "id": "1e7028d2-8627-411a-9808-d0eda63de0c0",
+          "conversationId": "8245e064-833c-401a-8cbc-a5e293a83b4f",
+          "role": "assistant",
+          "content": "2 + 2 = 4",
+          "createdAt": "2026-10-06T19:20:40.472Z",
+          "attachments": [],
+          "projectReferences": [],
+          "generationStats": {
+            "outputTokens": 8,
+            "tokensPerSecond": 40.412437793711824,
+            "generationDurationMs": 173.214,
+            "inputTokens": 264
+          }
+        }
+      ],
+      "agentRequests": 2,
+      "calls": [
+        "read_file",
+        "run_terminal"
+      ],
+      "body": "Новый чат\n06.10.2026 · 6\nReply briefly: what is 2 + 2?\nGemma 4\nReply briefly: what is 2 + 2?\nQwen3.8\nReply briefly: what is 2 + 2?\nDevstral Small 2\nRead both project files using tools and summarize.\nDevstral Small 2\nInspect both projects. Fix the numeric addition bug in P\nDevstral Small 2\nInspect both projects. Fix the numeric addition bug in P\nDevstral Small 2\nLocal AI Desktop\nRAM 13.3 / 62.7 GB\nVRAM 22.7 / 24.0 GB\nGPU 99%\nllama.cpp · MTP\nНайти максимальный контекст\nМаксимальный контекст: не измерен\nМодель\nВыберите модель\nQwen3.8-27B\nHuihui Qwen3.8-27B (abliterated)\nDevstral Small 2 24B\nGemma 4 31B IT\nКонтекст · 32K\n16K\n32K\n64K\n128K\n256K\nРазмышления\nВкл.\nВыкл.\nГлубина рассуждений\nНедоступно\nСтратегия агента\nБыстрая\nГлубокая\nВеб\nВыкл.\nАвто\nРежим\nЧат\nАгент\nproject1\nproject2\nФайловые инструменты ограничены выбранным проектом и папками, которые вы назвали в сообщениях; терминал стартует в корне проекта.\n\nReply briefly: what is 2 + 2?\n\n2 + 2 = 4\n\n40 ток/с · 8 токенов\n\nUse read_file to inspect calculator.js in Project 1 and requirements.md in Project 2. Then run node test.js in Project 1. Do not change files. Give a short verified summary.\n\n✓ Чтение\nread_file\n✓ Чтение\nread_file\n✓ $ Терминал\nnode test.js\nProject 1: calculator.js implements a simple add function that casts inputs to numbers. The command node test.js exited with code 0 and output \"calculator tests passed\".\nProject 2: requirements.md specifies that the primary calculator must add numeric values correctly (including negatives) with no dependencies.\n15%\n\nEnter — отправить · Shift+Enter — новая строка · вставьте или перетащите файлы",
+      "speculativeActive": true,
+      "specStats": [
+        "0.45.924.722 D slot get_n_draft_: id  0 | task 26 | max possible draft: 26898",
+        "0.45.985.261 D slot   operator(): id  0 | task 26 | add accepted tokens: sampled=5905, ids.size=5, n_draft=4",
+        "0.45.985.299 D slot get_n_draft_: id  0 | task 26 | max possible draft: 26893",
+        "0.46.044.842 D slot   operator(): id  0 | task 26 | add accepted tokens: sampled=2979, ids.size=5, n_draft=4",
+        "0.46.044.878 D slot get_n_draft_: id  0 | task 26 | max possible draft: 26888",
+        "0.46.100.318 D slot   operator(): id  0 | task 26 | add accepted tokens: sampled=15195, ids.size=1, n_draft=4",
+        "0.46.100.351 D slot get_n_draft_: id  0 | task 26 | max possible draft: 26887",
+        "0.46.160.908 D slot   operator(): id  0 | task 26 | add accepted tokens: sampled=607, ids.size=5, n_draft=4",
+        "0.46.160.943 D slot get_n_draft_: id  0 | task 26 | max possible draft: 26882",
+        "0.46.221.270 D slot   operator(): id  0 | task 26 | add accepted tokens: sampled=107, ids.size=5, n_draft=4",
+        "0.46.221.305 I slot print_timing: id  0 | task 26 | draft acceptance = 0.64773 (   57 accepted /    88 generated), mean len =  3.59",
+        "data: {\"choices\":[],\"created\":1791314458,\"id\":\"chatcmpl-8MVi3rto8isto7CJFkXhg1nYdzRCHZbc\",\"model\":\"gemma4:31b-it-q4_k_m\",\"system_fingerprint\":\"b1-d1d3c33\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":79,\"prompt_tokens\":4001,\"total_tokens\":4080,\"prompt_tokens_details\":{\"cached_tokens\":3020}},\"timings\":{\"cache_n\":3020,\"prompt_n\":981,\"prompt_ms\":4840.519,\"prompt_per_token_ms\":4.934270132517839,\"prompt_per_second\":202.6642184443445,\"predicted_n\":79,\"predicted_ms\":1315.912,\"predicted_per_token_ms\":16.87066666666667,\"predicted_per_second\":59.27448036038884,\"draft_n\":88,\"draft_n_accepted\":57}}"
+      ],
+      "vision": true
+    },
+    {
+      "id": "huihui-qwen3.8:27b-ud-dw-q4_k_m",
+      "state": {
+        "status": "ready",
+        "modelId": "huihui-qwen3.8:27b-ud-dw-q4_k_m",
+        "contextWindow": 32768,
+        "kvCacheType": "f16",
+        "kvOffload": true,
+        "speculativeMode": "mtp",
+        "requestId": "2153513f-eac3-44f4-ade7-0230e9cb43fb",
+        "launcherPid": 35456,
+        "serverPid": 39050
+      },
+      "chatMessages": [
+        {
+          "id": "5127c53e-e0e6-4521-bc8c-16df06ad7094",
+          "conversationId": "142ba4fd-b199-48e0-a991-3596d97a267e",
+          "role": "user",
+          "content": "Reply briefly: what is 2 + 2?",
+          "createdAt": "2026-10-06T19:22:16.624Z",
+          "attachments": [],
+          "projectReferences": []
+        },
+        {
+          "id": "6faea22e-1787-4e14-8efd-6ae2be0c437d",
+          "conversationId": "142ba4fd-b199-48e0-a991-3596d97a267e",
+          "role": "assistant",
+          "content": "4",
+          "createdAt": "2026-10-06T19:22:43.082Z",
+          "attachments": [],
+          "projectReferences": [],
+          "generationStats": {
+            "outputTokens": 2,
+            "tokensPerSecond": 4.7150017209756285,
+            "generationDurationMs": 212.089,
+            "inputTokens": 264
+          }
+        }
+      ],
+      "agentRequests": 2,
+      "calls": [
+        "read_file",
+        "run_terminal"
+      ],
+      "body": "Новый чат\n06.10.2026 · 7\nReply briefly: what is 2 + 2?\nHuihui Qwen3.8\nReply briefly: what is 2 + 2?\nGemma 4\nReply briefly: what is 2 + 2?\nQwen3.8\nReply briefly: what is 2 + 2?\nDevstral Small 2\nRead both project files using tools and summarize.\nDevstral Small 2\nInspect both projects. Fix the numeric addition bug in P\nDevstral Small 2\nInspect both projects. Fix the numeric addition bug in P\nDevstral Small 2\nLocal AI Desktop\nRAM 8.9 / 62.7 GB\nVRAM 18.9 / 24.0 GB\nGPU 96%\nllama.cpp · MTP\nНайти максимальный контекст\nМаксимальный контекст: не измерен\nМодель\nВыберите модель\nQwen3.8-27B\nHuihui Qwen3.8-27B (abliterated)\nDevstral Small 2 24B\nGemma 4 31B IT\nКонтекст · 32K\n16K\n32K\n64K\n128K\n256K\nРазмышления\nВкл.\nВыкл.\nГлубина рассуждений\nНизкая\nСредняя\nМаксимальная\nСтратегия агента\nБыстрая\nГлубокая\nВеб\nВыкл.\nАвто\nРежим\nЧат\nАгент\nproject1\nproject2\nФайловые инструменты ограничены выбранным проектом и папками, которые вы назвали в сообщениях; терминал стартует в корне проекта.\n\nReply briefly: what is 2 + 2?\n\n4\n\n4,7 ток/с · 2 токена\n\nUse read_file to inspect calculator.js in Project 1 and requirements.md in Project 2. Then run node test.js in Project 1. Do not change files. Give a short verified summary.\n\n✓ Чтение\nread_file\n✓ Чтение\nread_file\n✓ $ Терминал\nnode test.js\ncalculator.js (Project 1): exports a single add(a, b) that coerces both args with Number() and returns their sum.\nrequirements.md (Project 2): \"The primary calculator must add numeric values correctly including negatives. No dependencies.\"\nnode test.js (Project 1): ran, exit code 0, output: \"calculator tests passed\" — verified pass.\n\nNo files were changed.\n\n15%\n\nEnter — отправить · Shift+Enter — новая строка · вставьте или перетащите файлы",
+      "speculativeActive": true,
+      "specStats": [
+        "2.23.684.677 D slot get_n_draft_: id  0 | task 36 | max possible draft: 26678",
+        "2.23.747.865 D slot   operator(): id  0 | task 36 | add accepted tokens: sampled=328, ids.size=1, n_draft=3",
+        "2.23.747.923 D slot get_n_draft_: id  0 | task 36 | max possible draft: 26677",
+        "2.23.803.292 D slot   operator(): id  0 | task 36 | add accepted tokens: sampled=1, ids.size=4, n_draft=3",
+        "2.23.803.350 D slot get_n_draft_: id  0 | task 36 | max possible draft: 26673",
+        "2.23.849.792 D slot   operator(): id  0 | task 36 | add accepted tokens: sampled=1440, ids.size=3, n_draft=3",
+        "2.23.849.843 D slot get_n_draft_: id  0 | task 36 | max possible draft: 26670",
+        "2.23.897.629 D slot   operator(): id  0 | task 36 | add accepted tokens: sampled=3425, ids.size=4, n_draft=3",
+        "2.23.897.682 D slot get_n_draft_: id  0 | task 36 | max possible draft: 26666",
+        "2.23.953.918 D slot   operator(): id  0 | task 36 | add accepted tokens: sampled=248046, ids.size=4, n_draft=3",
+        "2.23.953.973 I slot print_timing: id  0 | task 36 | draft acceptance = 0.78161 (   68 accepted /    87 generated), mean len =  3.34",
+        "data: {\"choices\":[],\"created\":1791314606,\"id\":\"chatcmpl-osxX4w0wjdTXmIiID0inHMwrHRBmggal\",\"model\":\"huihui-qwen3.8:27b-ud-dw-q4_k_m\",\"system_fingerprint\":\"b1-d1d3c33\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":98,\"prompt_tokens\":4279,\"total_tokens\":4377,\"prompt_tokens_details\":{\"cached_tokens\":3307}},\"timings\":{\"cache_n\":3307,\"prompt_n\":972,\"prompt_ms\":1285.95,\"prompt_per_token_ms\":1.322993827160494,\"prompt_per_second\":755.8614254053424,\"predicted_n\":98,\"predicted_ms\":1539.432,\"predicted_per_token_ms\":15.870432989690721,\"predicted_per_second\":63.01025313232413,\"draft_n\":87,\"draft_n_accepted\":68}}"
+      ],
+      "vision": true
+    }
+  ],
+  "gemmaVision": {
+    "messages": [
+      {
+        "id": "fbe12f14-908b-4bb8-8adc-3edc0dcc0e09",
+        "conversationId": "93a67bb4-dc68-4b68-a67d-8bad533bccc3",
+        "role": "user",
+        "content": "Describe the colors on the left and right halves of this image, briefly.",
+        "createdAt": "2026-10-06T19:28:49.751Z",
+        "attachments": [
+          {
+            "id": "6c65f507-35d3-4081-9129-c38e7c8c58cc",
+            "messageId": "fbe12f14-908b-4bb8-8adc-3edc0dcc0e09",
+            "index": 0,
+            "kind": "image",
+            "mimeType": "image/png",
+            "filename": "vision-test.png",
+            "size": 691,
+            "storageRef": "/media/yaroslav/DATA/local-ai-desktop/runtime/validation/devstral-agent/attachments/fbe12f14-908b-4bb8-8adc-3edc0dcc0e09/6c65f507-35d3-4081-9129-c38e7c8c58cc-vision-test.png",
+            "status": "ready",
+            "metadata": {
+              "originalSize": 691,
+              "imageNumber": 1,
+              "nativeVision": true
+            },
+            "createdAt": "2026-10-06T19:28:49.810Z",
+            "updatedAt": "2026-10-06T19:28:49.840Z"
+          }
+        ],
+        "projectReferences": []
+      },
+      {
+        "id": "c742fb25-032d-4a37-9773-85029a315a13",
+        "conversationId": "93a67bb4-dc68-4b68-a67d-8bad533bccc3",
+        "role": "assistant",
+        "content": "The left half is red and the right half is blue.",
+        "createdAt": "2026-10-06T19:28:51.966Z",
+        "attachments": [],
+        "projectReferences": [],
+        "generationStats": {
+          "outputTokens": 13,
+          "tokensPerSecond": 62.7011662416921,
+          "generationDurationMs": 191.384,
+          "inputTokens": 342
+        }
+      }
+    ],
+    "runtime": {
+      "status": "ready",
+      "requestId": "1b63d26c-e0c3-4d4e-bb38-d25ff0e550d1",
+      "modelId": "gemma4:31b-it-q4_k_m",
+      "contextWindow": 16384,
+      "kvCacheType": "f16",
+      "kvOffload": true,
+      "speculativeMode": "mtp",
+      "serverPid": 46295,
+      "launcherPid": 42767,
+      "error": "",
+      "rolledBack": false,
+      "updatedAt": "2026-10-06T22:28:41+03:00"
+    },
+    "logProof": [
+      "0.05.256.183 I spec common_specu: adding speculative implementation 'draft-mtp'",
+      "0.15.570.142 I slot print_timing: id  0 | task 0 | draft acceptance = 0.91667 (   11 accepted /    12 generated), mean len =  4.67",
+      "0.15.570.156 I spec common_specu: statistics        draft-mtp: #calls(b,g,a) =    1      3      3, #gen drafts =      3, #acc drafts =     3, #gen tokens =     12, #acc tokens =    11, #mean acc len = 4.67, #acc rate/pos = (1.000, 1.000, 1.000, 0.667), dur(b,g,a) = 0.002, 19.036, 0.004 ms"
+    ]
+  },
+  "tests": {
+    "rustUnitPassed": 205,
+    "rustIntegrationPassed": 66,
+    "rustFailed": 0,
+    "currentTypeScriptSuitesPassed": 35,
+    "typeScriptFailed": 0,
+    "shellSuitesPassed": 4,
+    "shellFailed": 0,
+    "typecheck": "passed",
+    "electronTypecheck": "passed",
+    "eslint": "passed",
+    "cargoFmt": "passed",
+    "gitDiffCheck": "passed",
+    "productionBuild": "npm run build; passed; dist/main, dist/preload, dist/renderer",
+    "inventoryNote": "An initial dist-only scan included five stale compiled tests removed from current source; four passed and agent-context-manager failed with missing removed project-chat. Final inventory derives all 35 current tests from src; all passed."
+  },
+  "runtimeArtifacts": "runtime/validation/devstral-agent",
+  "limitations": [
+    "Boundary telemetry varies with desktop VRAM and is an observed safe bucket, not a promise for all future background loads.",
+    "Exploratory search fits is distinct from final policy validation; only final options satisfy L <= availableLlmBudget.",
+    "context.discovery.probe diagnostic logs are emitted before discovery mutates fits; use returned result.probes/options for the final decision.",
+    "OOM launches lack a completed residency snapshot; exact failed CUDA allocations and rollback were captured.",
+    "These are functional smoke tests, not coding-quality or speed benchmarks."
+  ],
+  "implementationCommits": [
+    "7b58741 fix(agent): normalize native conversation turns for strict chat templates",
+    "7a2f698 fix(runtime): settle failed Agent runs and release generation ownership"
+  ]
+}

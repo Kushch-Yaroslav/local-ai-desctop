@@ -21,7 +21,7 @@ async function run(): Promise<void> {
       chat: { stop: async () => { stopped++; }, send: async () => { sends++; await new Promise<void>((resolve) => { finish = resolve; }); } },
     },
   } });
-  useAppStore.setState({ conversations: [chat('A'), chat('B'), chat('D')], activeId: 'A', messages: [] });
+  useAppStore.setState({ conversations: [chat('A'), chat('B'), chat('D')], activeId: 'A', messages: [], settings: { llamaServerPath: null, modelsPath: '', llamaRuntime: { status: 'ready', modelId: 'model', contextWindow: 16_384 } } });
   const running = useAppStore.getState().sendMessage('inspect');
   const generationId = useAppStore.getState().generationId!;
   await useAppStore.getState().deleteConversation('D');

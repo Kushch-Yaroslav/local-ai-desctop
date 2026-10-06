@@ -285,7 +285,7 @@ fn request_payload_for_phase(
         stripped = without_replayed_reasoning(messages);
         stripped.as_slice()
     };
-    let wire_messages = wire_messages(messages);
+    let wire_messages = crate::context::message_sequence::normalize(&wire_messages(messages));
     let mut payload = json!({
         "model": config.model,
         "messages": wire_messages,
@@ -4205,8 +4205,10 @@ pub fn run(config: Config) {
                     .collect(),
                 current_user_index: payload_messages.iter().rposition(|message| {
                     message.get("role").and_then(Value::as_str) == Some("user")
-                        && message.get("content").and_then(Value::as_str)
-                            == Some(config.user.as_str())
+                        && message
+                            .get("content")
+                            .and_then(Value::as_str)
+                            .is_some_and(|content| content.contains(config.user.as_str()))
                 }),
                 system_first: payload_messages
                     .first()
