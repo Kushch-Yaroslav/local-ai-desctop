@@ -62,6 +62,25 @@ const toolSchema = [{ type: 'function', function: { name: 'read_file', descripti
 const call = (backend: LlamaCppBackend, messages: ToolMessage[], tools: unknown[] | undefined = toolSchema) => backend.chatWithTools(model, messages, tools, new AbortController().signal, 65_536, 'deep');
 
 export async function runLlamaCppBackendRegression(): Promise<void> {
+  {
+    const originalFetch = globalThis.fetch;
+    let requests = 0;
+    globalThis.fetch = async () => { requests++; throw new Error('idle backend must not contact a runtime'); };
+    try {
+      const backend = new LlamaCppBackend('http://127.0.0.1:8081', 32_768, false, null);
+      const models = await backend.getModels();
+      assert.equal(models.length, llamaRuntimeProfiles.length, 'idle selection must retain the whole model catalog');
+      assert.equal(requests, 0, 'listing installed models must not query a previously selected server');
+      assert.equal(await backend.supportsVision(model), false);
+      assert.equal(await backend.getRuntimeContextEvidence(), null);
+      await assert.rejects(backend.ensureModelAvailable(model));
+      assert.equal(requests, 0, 'generation cannot implicitly select a model');
+      backend.updateRuntimeSelection(model, 32_768);
+      assert.equal(await backend.supportsVision(model), true);
+      backend.clearRuntimeSelection();
+      assert.equal(await backend.supportsVision(model), false);
+    } finally { globalThis.fetch = originalFetch; }
+  }
   // A bare strategy keeps its historical meaning (thinking on; Fast = lowest effort, Deep = highest the model supports);
   // only the final tool-free turn may turn thinking off.
   for (const profile of llamaRuntimeProfiles) {

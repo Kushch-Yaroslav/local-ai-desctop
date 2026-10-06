@@ -10,7 +10,7 @@ import { llamaCapabilityLimit } from './gguf-context';
  * server that answers on the port right now, never a requested value.
  */
 export type LlamaRuntimeState = {
-  status: 'starting' | 'ready' | 'switching' | 'offline' | 'stopped';
+  status: 'idle' | 'starting' | 'ready' | 'switching' | 'offline' | 'stopped';
   modelId: string | null;
   contextWindow: number | null;
   kvCacheType?: LlamaKvCacheType;
@@ -51,7 +51,7 @@ const defaultDeps: Deps = {
   capabilityLimit: llamaCapabilityLimit,
 };
 
-/** Error text of a state with no live launcher; callers fall back to the startup environment. */
+/** Error text of a state with no live launcher; never implies an active model. */
 export const LAUNCHER_ABSENT = 'Launcher llama.cpp не запущен';
 
 /** Parses the launcher's state document defensively: it is another process's output. */
@@ -59,7 +59,7 @@ export function parseLlamaRuntimeState(raw: string): LlamaRuntimeState | null {
   try {
     const value = JSON.parse(raw) as Record<string, unknown>;
     const status = value.status;
-    if (status !== 'starting' && status !== 'ready' && status !== 'switching' && status !== 'offline' && status !== 'stopped') return null;
+    if (status !== 'idle' && status !== 'starting' && status !== 'ready' && status !== 'switching' && status !== 'offline' && status !== 'stopped') return null;
     const modelId = typeof value.modelId === 'string' && value.modelId ? value.modelId : null;
     const contextWindow = typeof value.contextWindow === 'number' && value.contextWindow > 0 ? value.contextWindow : null;
     return {

@@ -49,12 +49,6 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 timestamp() { date --iso-8601=seconds; }
 log() { printf '%s %s\n' "$(timestamp)" "$*" >> "$LOG_FILE"; }
 
-saved_llama_selection() {
-  local database="$STATE_DIR/sqlite/local-ai-desktop.db"
-  [[ -r "$database" && -x "$ELECTRON_BIN" ]] || return 0
-  ELECTRON_RUN_AS_NODE=1 "$ELECTRON_BIN" -e "const { DatabaseSync } = require('node:sqlite'); const ids = require(process.argv[2] + '/dist/main/models/llama-runtime-policy').llamaRuntimeProfiles.filter(x => x.modelPath).map(x => x.id); const db = new DatabaseSync(process.argv[1], { readOnly: true }); const names = new Set(db.prepare('PRAGMA table_info(conversations)').all().map(x => x.name)); const type = names.has('llama_kv_cache_type') ? 'llama_kv_cache_type' : \"'f16'\"; const offload = names.has('llama_kv_offload') ? 'llama_kv_offload' : '1'; const row = db.prepare(\"SELECT model_id, context_window, \" + type + \" AS kv_type, \" + offload + \" AS kv_offload FROM conversations WHERE model_id IN (\" + ids.map(() => '?').join(',') + \") ORDER BY updated_at DESC LIMIT 1\").get(...ids); if (row) process.stdout.write([row.model_id, row.context_window, row.kv_type, row.kv_offload].join('\\t')); db.close();" "$database" "$APP_DIR" 2>/dev/null || true
-}
-
 # Sets the launch variables for a model id. Fails for a model without a runtime.
 select_variant() {
   local config
@@ -241,6 +235,7 @@ launch_server() {
 
 cleanup() {
   local status=$?
+  if [[ -n "${sleeper:-}" ]]; then kill "$sleeper" 2>/dev/null || true; wait "$sleeper" 2>/dev/null || true; fi
   log "launcher.cleanup reason=$CLEANUP_REASON status=$status launcher_pid=$$ electron_pid=${ELECTRON_PID:-none} server_pid=${SERVER_PID:-none}"
   stop_llama_server "$SERVER_PID"
   rm -f "$SERVER_PID_FILE" "$LAUNCHER_PID_FILE" "$REQUEST_FILE"
@@ -298,29 +293,11 @@ switch_runtime() {
 }
 trap 'switch_runtime' USR1
 
-# ---- initial selection ----
-IFS=$'\t' read -r SELECTED_MODEL SAVED_CONTEXT SAVED_KV_TYPE SAVED_KV_OFFLOAD <<< "$(saved_llama_selection)"
-SELECTED_MODEL="${LOCAL_AI_LLAMA_MODEL_ID:-${SELECTED_MODEL:-qwen3.8:27b-q4_K_M}}"
-select_variant "$SELECTED_MODEL" || fail "$LAUNCH_ERROR"
-SAVED_KV_TYPE="${SAVED_KV_TYPE:-f16}"
-SAVED_KV_OFFLOAD="${SAVED_KV_OFFLOAD:-1}"
-if [[ "${LOCAL_AI_LLAMA_CONTEXT_EXTERNAL:-}" == "1" && -n "${LOCAL_AI_LLAMA_CONTEXT:-}" ]]; then
-  LLAMA_CONTEXT="$LOCAL_AI_LLAMA_CONTEXT"; CONTEXT_SOURCE="external-env"
-elif [[ -n "${LOCAL_AI_LLAMA_CONTEXT:-}" && "${LOCAL_AI_LLAMA_CONTEXT_EXTERNAL:-}" != "0" ]]; then
-  LLAMA_CONTEXT="$LOCAL_AI_LLAMA_CONTEXT"; CONTEXT_SOURCE="external-env"; export LOCAL_AI_LLAMA_CONTEXT_EXTERNAL=1
-elif [[ -n "${SAVED_CONTEXT:-}" ]]; then
-  LLAMA_CONTEXT="$SAVED_CONTEXT"; CONTEXT_SOURCE="persisted"
-else
-  LLAMA_CONTEXT="$DEFAULT_LLAMA_CONTEXT"; CONTEXT_SOURCE="default"
-fi
-valid_context "$LLAMA_CONTEXT" || { printf 'LOCAL_AI_LLAMA_CONTEXT must be a 4096-token multiple from 4096 through %s; got %s\n' "$MAX_LLAMA_CONTEXT" "$LLAMA_CONTEXT" >&2; exit 2; }
-[[ "$SAVED_KV_TYPE" == "f16" || "$SAVED_KV_TYPE" == "q8_0" ]] || SAVED_KV_TYPE="f16"
-[[ "$SAVED_KV_OFFLOAD" == "0" || "$SAVED_KV_OFFLOAD" == "1" ]] || SAVED_KV_OFFLOAD="1"
-
+# Fresh processes have no active model. Conversation metadata is history,
+# not permission to allocate a runtime; only an IPC selection calls launch_server.
 log "===== launcher.started pid=$$ ====="
 log "cwd=$(pwd) project_root=$APP_DIR initial_path=$INITIAL_PATH effective_path=$PATH display=${DISPLAY:-} wayland_display=${WAYLAND_DISPLAY:-} xdg_runtime_dir=${XDG_RUNTIME_DIR:-}"
-log "context.resolve source=$CONTEXT_SOURCE value=$LLAMA_CONTEXT kv_type=$SAVED_KV_TYPE kv_offload=$SAVED_KV_OFFLOAD"
-log "electron=$ELECTRON_BIN llama_server=$LLAMA_BIN variant=$VARIANT runtime_model_id=$RUNTIME_MODEL_ID model=$MODEL mmproj=${MMPROJ:-none} port=$PORT context=$LLAMA_CONTEXT"
+log "electron=$ELECTRON_BIN llama_server=$LLAMA_BIN port=$PORT startup_selection=none"
 
 [[ -x "$ELECTRON_BIN" && -f "$APP_DIR/dist/main/index.js" && -f "$APP_DIR/dist/preload/index.js" && -f "$APP_DIR/dist/renderer/index.html" ]] || fail "Не найден production build или Electron: $ELECTRON_BIN"
 source "$APP_DIR/scripts/electron-sandbox.sh"
@@ -348,24 +325,21 @@ export LOCAL_AI_LLAMA_SERVER_LOG="$SERVER_LOG"
 unset LOCAL_AI_DEV_SERVER_URL VITE_DEV_SERVER_URL
 cd "$APP_DIR"
 printf '%s\n' "$$" > "$LAUNCHER_PID_FILE"
-write_state starting
-
-# The server owns the GPU before Electron's GPU process exists.
-launch_server "$RUNTIME_MODEL_ID" "$LLAMA_CONTEXT" "$SAVED_KV_TYPE" "$SAVED_KV_OFFLOAD" || fail "$LAUNCH_ERROR. См. $SERVER_LOG"
-write_state ready
-export LOCAL_AI_LLAMA_MODEL_ID="$ACTIVE_MODEL"
-export LOCAL_AI_LLAMA_CONTEXT="$ACTIVE_CONTEXT"
-export LOCAL_AI_LLAMA_KV_TYPE="$ACTIVE_KV_TYPE"
-export LOCAL_AI_LLAMA_KV_OFFLOAD="$ACTIVE_KV_OFFLOAD"
-export LOCAL_AI_LLAMA_CPP_VISION=$([[ -n "$MMPROJ" ]] && echo 1 || echo 0)
+write_state idle
+# Do not let inherited last-used metadata become an active backend selection.
+unset LOCAL_AI_LLAMA_MODEL_ID LOCAL_AI_LLAMA_CONTEXT LOCAL_AI_LLAMA_CONTEXT_EXTERNAL
+unset LOCAL_AI_LLAMA_KV_TYPE LOCAL_AI_LLAMA_KV_OFFLOAD LOCAL_AI_LLAMA_CPP_VISION
 
 if [[ "${LOCAL_AI_LAUNCHER_HEADLESS:-}" == "1" ]]; then
   # Test seam: supervise the server and answer runtime-switch requests without
   # opening a window. Ends on SIGTERM/SIGINT like the normal launcher.
-  log "headless=true state=ready electron=skipped"
+  log "headless=true state=idle electron=skipped"
   while true; do
     sleep 3600 &
-    wait $! || true
+    sleeper=$!
+    wait "$sleeper" || true
+    kill "$sleeper" 2>/dev/null || true
+    wait "$sleeper" 2>/dev/null || true
   done
 fi
 

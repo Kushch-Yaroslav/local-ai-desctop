@@ -2,13 +2,14 @@ import { BrowserWindow, dialog, ipcMain } from 'electron';
 import { randomUUID } from 'node:crypto';
 import type { AnalysisRun, ApprovalDecision, ApprovalStatus, ChatRequest, Conversation, ProjectReference, ProjectSuggestion, RiskCategory, SteeringIntent, ThinkingTimelineEvent } from '../../shared/types';
 import { findFreshContextDiscoveryOption, type ContextDiscoveryOption, type ContextDiscoveryResult, type ContextDiscoveryProgress, type RuntimeContextEstimate } from '../../shared/context-estimator';
+import { activeConversationModel, initialModelContext } from '../../shared/model-selection';
 import { defaultLlamaKv, normalContextForModel, resolveLlamaKvSelection } from '../../shared/context-options';
 import { Database } from '../services/database';
 import { getGpuIdentity, getHardwareStats, getOwnedServerVramBudget } from '../services/hardware';
 import { buildContextDiscoveryIdentity, contextDiscoveryKey, mergeSavedDiscoveryOptions } from '../services/context-discovery-persistence';
 import { vramBudgetStillFits, vramProbeGuardBytes } from '../../shared/vram-budget';
 import { LlamaCppBackend } from '../backends/llama-cpp-backend';
-import { LAUNCHER_ABSENT, LlamaRuntimeController, type LlamaRuntimeState } from '../services/llama-runtime-controller';
+import { LlamaRuntimeController, type LlamaRuntimeState } from '../services/llama-runtime-controller';
 import { RustAgentRuntime, taskPlan, type AgentProject } from '../services/rust-agent-runtime';
 import { paths } from '../services/paths';
 import { discardAgentEvidence } from '../services/agent-evidence';
@@ -36,16 +37,13 @@ import { llamaCapabilityLimit } from '../services/gguf-context';
 import { discoverContextBoundary, predictContextHeadroom, type DiscoveryProbe } from '../services/context-discovery';
 
 const database = new Database();
-const llamaRuntimeModelId = process.env.LOCAL_AI_LLAMA_MODEL_ID ?? 'qwen3.8:27b-q4_K_M';
-const defaultLlamaContext = 32_768;
-const maximumLlamaContext = llamaRuntimeProfile(llamaRuntimeModelId)?.maxContext ?? defaultLlamaContext;
-const configuredLlamaContext = Number(process.env.LOCAL_AI_LLAMA_CONTEXT ?? defaultLlamaContext);
-const llamaContextLimit = Number.isSafeInteger(configuredLlamaContext) && configuredLlamaContext >= 4_096 && configuredLlamaContext <= maximumLlamaContext && configuredLlamaContext % 4_096 === 0 ? configuredLlamaContext : defaultLlamaContext;
-const initialLlamaKvType = process.env.LOCAL_AI_LLAMA_KV_TYPE === 'q8_0' ? 'q8_0' : 'f16';
-const initialLlamaKvOffload = process.env.LOCAL_AI_LLAMA_KV_OFFLOAD !== '0';
+const initialLlamaKvType = defaultLlamaKv.llamaKvCacheType;
+const initialLlamaKvOffload = defaultLlamaKv.llamaKvOffload;
 const llamaCppUrl = process.env.LOCAL_AI_LLAMA_CPP_URL ?? 'http://127.0.0.1:8081';
-const llamaCpp = new LlamaCppBackend(llamaCppUrl, llamaContextLimit, process.env.LOCAL_AI_LLAMA_CPP_VISION === '1', llamaRuntimeModelId);
+const llamaCpp = new LlamaCppBackend(llamaCppUrl, 32_768, false, null);
 const backend = llamaCpp;
+// A live/stale launcher document is not an explicit selection in this Electron process.
+let modelSelectedThisProcess = false;
 const web = new WebBrowserService();
 const rustAgent = new RustAgentRuntime(process.env.LOCAL_AI_AGENT_ENDPOINT ?? `${llamaCppUrl.replace(/\/$/, '')}/v1/chat/completions`);
 const webChat = new WebChatService(backend, web);
@@ -151,10 +149,10 @@ async function adoptSavedDiscovery(modelId: string, error?: string): Promise<voi
     result: { modelId, probeContextTokens: Math.min(16_384, saved.hardLimit), options: saved.options, unsupported: [], restored: true, hardLimit: saved.hardLimit, configurationId } };
   log('context.discovery.saved.restored', { modelId, options: saved.options.map((option) => ({ contextWindow: option.contextWindow, kvCacheType: option.kvCacheType, kvOffload: option.kvOffload })) });
 }
-/** The launcher's state file is the authority. A manually managed server has no launcher, so the startup environment stands in. */
+/** Only the live launcher's state can attest to an explicitly selected runtime. */
 async function currentLlamaRuntime(): Promise<LlamaRuntimeState> {
   const state = await llamaRuntime.state();
-  if (state.status === 'offline' && state.error === LAUNCHER_ABSENT) return { status: 'ready', modelId: llamaRuntimeModelId, contextWindow: llamaContextLimit, kvCacheType: initialLlamaKvType, kvOffload: initialLlamaKvOffload };
+  if (!modelSelectedThisProcess && state.status === 'ready') return { status: 'idle', modelId: null, contextWindow: null };
   if (state.status === 'ready') {
     // The state file records the last transition; a server that died since then must not be reported as running.
     const health = await llamaCpp.getStatus();
@@ -166,7 +164,7 @@ async function syncLlamaBackend(): Promise<LlamaRuntimeState> {
   const state = await currentLlamaRuntime();
   if (state.status === 'ready' && state.modelId && state.contextWindow) {
     try { llamaCpp.updateRuntimeSelection(state.modelId, state.contextWindow, state.kvCacheType ?? initialLlamaKvType, state.kvOffload ?? initialLlamaKvOffload); } catch { /* an unsupported combination is reported by the launcher state itself */ }
-  }
+  } else { llamaCpp.clearRuntimeSelection(); }
   return state;
 }
 async function estimateModelContext(modelId: string): Promise<RuntimeContextEstimate> {
@@ -181,7 +179,7 @@ async function estimateModelContext(modelId: string): Promise<RuntimeContextEsti
   if (configuredMaxTokens) {
     if (llamaProfile) {
       const current = await llamaRuntime.state();
-      if (current.status === 'ready' && current.launcherPid !== undefined && current.modelId === modelId && current.kvCacheType && current.kvOffload !== undefined) {
+      if (modelSelectedThisProcess && current.status === 'ready' && current.launcherPid !== undefined && current.modelId === modelId && current.kvCacheType && current.kvOffload !== undefined) {
         await syncLlamaBackend();
         runtime = await llamaCpp.getRuntimeContextEvidence(modelId);
         if (current.serverPid) {
@@ -349,6 +347,7 @@ async function validateDiscoveredOption(modelId: string, contextWindow: number, 
   }
 }
 async function discoveryStatus(_event?: unknown, requestedModelId?: string): Promise<ContextDiscoveryProgress> {
+  if (!modelSelectedThisProcess) return { busy: false, modelId: null, stage: '', probeCount: 0 };
   if (contextDiscoveryBusy || runtimeSelectionBusy || activeGenerations.size) return contextDiscoveryProgress;
   if (typeof requestedModelId === 'string' && requestedModelId && savedDiscoveryAttempted !== requestedModelId && !contextDiscoveryProgress.error) {
     if (contextDiscoveryProgress.modelId !== requestedModelId) contextDiscoveryProgress = { busy: false, modelId: requestedModelId, stage: '', probeCount: 0 };
@@ -422,8 +421,8 @@ export function registerIpc(): void {
   if (interruptedRuns) log('generation.interrupted-recovered', { runs: interruptedRuns });
   ipcMain.handle('conversations:list', () => database.listConversations());
   ipcMain.handle('conversations:create', async (_event, requestedModelId?: string) => {
-    const modelId = requestedModelId ?? (await currentLlamaRuntime()).modelId ?? llamaRuntimeModelId;
-    if (!getModelProfile(modelId)) throw new Error('Выбранная модель отсутствует в реестре приложения');
+    const modelId = requestedModelId ?? (await currentLlamaRuntime()).modelId ?? null;
+    if (modelId && !getModelProfile(modelId)) throw new Error('Выбранная модель отсутствует в реестре приложения');
     return database.createConversation(modelId);
   });
   ipcMain.handle('conversations:update', async (_event, id: string, patch: Partial<Pick<Conversation, 'title' | 'modelId' | 'mode' | 'workingDirectory' | 'secondaryWorkingDirectory' | 'contextWindow' | 'llamaKvCacheType' | 'llamaKvOffload' | 'reasoningMode' | 'thinkingEnabled' | 'reasoningEffort' | 'webMode'>>) => {
@@ -446,6 +445,8 @@ export function registerIpc(): void {
     if (activeGenerations.size && Object.keys(patch).some((key) => key !== 'title')) throw new Error('Дождитесь завершения активной генерации перед изменением настроек.');
     const current = database.getConversation(id);
     if (!current) throw new Error('Чат не найден');
+    const runtime = await syncLlamaBackend();
+    if (!patch.modelId && !activeConversationModel(current, runtime)) throw new Error('Выберите модель перед изменением настроек runtime.');
     const nextModelId = patch.modelId ?? current.modelId;
     const profile = nextModelId ? getModelProfile(nextModelId) : undefined;
     if (nextModelId && !profile) throw new Error('Выбранная модель отсутствует в реестре приложения');
@@ -453,7 +454,9 @@ export function registerIpc(): void {
     const allowed = profile ? llamaContextPresets(nextModelId ?? '', capability) : [];
     const requestedContext = patch.contextWindow ?? current.contextWindow;
     const modelChanged = nextModelId !== current.modelId;
-    const contextWindow = modelChanged && patch.contextWindow === undefined && allowed.length ? normalContextForModel(requestedContext, allowed) : requestedContext;
+    const firstSelection = patch.modelId !== undefined && !activeConversationModel(current, runtime);
+    const initial = initialModelContext(allowed);
+    const contextWindow = firstSelection && patch.contextWindow === undefined ? initial.contextWindow : modelChanged && patch.contextWindow === undefined && allowed.length ? normalContextForModel(requestedContext, allowed) : requestedContext;
     if (allowed.length && !allowed.includes(contextWindow)) {
       if (contextWindow % 4_096 !== 0 || contextWindow > capability || contextWindow <= 0) {
         throw new Error(`Запрошенный контекст ${contextWindow} выходит за пределы возможностей модели и llama.cpp или не кратен допустимому шагу.`);
@@ -461,24 +464,24 @@ export function registerIpc(): void {
     }
     if (nextModelId && profile) {
       const isRuntimeRequest = patch.modelId !== undefined || patch.contextWindow !== undefined || patch.llamaKvCacheType !== undefined || patch.llamaKvOffload !== undefined;
-      const { llamaKvCacheType: kvCacheType, llamaKvOffload: kvOffload } = resolveLlamaKvSelection(current, patch, modelChanged);
+      const { llamaKvCacheType: kvCacheType, llamaKvOffload: kvOffload } = resolveLlamaKvSelection(current, patch, modelChanged || firstSelection);
       const requiresDiscovery = !allowed.includes(contextWindow) || kvCacheType !== defaultLlamaKv.llamaKvCacheType || kvOffload !== defaultLlamaKv.llamaKvOffload;
       if (isRuntimeRequest && requiresDiscovery) await validateDiscoveredOption(nextModelId, contextWindow, kvCacheType, kvOffload);
       patch = { ...patch, llamaKvCacheType: kvCacheType, llamaKvOffload: kvOffload };
-      const runtime = await syncLlamaBackend();
       const runtimeDiffers = runtime.status !== 'ready' || runtime.modelId !== nextModelId || runtime.contextWindow !== contextWindow || runtime.kvCacheType !== kvCacheType || runtime.kvOffload !== kvOffload;
       // Re-selecting the stored model is a retry when the server is not running it.
       if (runtimeDiffers && (patch.modelId !== undefined || patch.contextWindow !== undefined || patch.llamaKvCacheType !== undefined || patch.llamaKvOffload !== undefined)) {
         if (activeGenerations.size > 0) throw new Error('Нельзя переключать llama.cpp во время генерации: остановите её или дождитесь завершения.');
         log('llama.runtime.switch.requested', { conversationId: id, from: runtime, to: { modelId: nextModelId, contextWindow, kvCacheType, kvOffload } });
         const result = await llamaRuntime.switchTo(nextModelId, contextWindow, kvCacheType, kvOffload);
+        if (result.ok) modelSelectedThisProcess = true;
         await syncLlamaBackend();
         log('llama.runtime.switch.finished', { conversationId: id, ok: result.ok, state: result.state, error: result.ok ? undefined : result.error });
         // Nothing is persisted for a failed switch: the stored conversation must keep
         // naming the model that is really running (or none, when the server is down).
         if (!result.ok) throw new Error(`Не удалось переключить llama.cpp на ${profile.displayName} (${Math.round(contextWindow / 1024)}K, ${kvCacheType}, KV ${kvOffload ? 'GPU' : 'RAM'}): ${result.error}${result.state.rolledBack ? ` Продолжает работать ${result.state.modelId}.` : result.state.status === 'offline' ? ' llama.cpp сейчас не запущен.' : ''}`);
       }
-      if (modelChanged) {
+      if (modelChanged || firstSelection) {
         discoveredContextOptions.clear();
         savedDiscoveryAttempted = null;
         contextDiscoveryProgress = { busy: false, modelId: nextModelId, stage: '', probeCount: 0 };
@@ -538,7 +541,7 @@ export function registerIpc(): void {
   });
   ipcMain.handle('analysis:list', (_event, conversationId: string) => database.listAnalysisRuns(conversationId));
   ipcMain.handle('models:list', async () => {
-    try { return await backend.getModels(); }
+    try { await syncLlamaBackend(); return await backend.getModels(); }
     catch (error) { log('backend.models.failed', { backend: 'llama-cpp', message: error instanceof Error ? error.message : String(error) }); return []; }
   });
   ipcMain.handle('settings:get', async () => {
@@ -552,6 +555,7 @@ export function registerIpc(): void {
   });
   ipcMain.handle('context:discover', async (_event, modelId: string): Promise<ContextDiscoveryResult> => {
     if (typeof modelId !== 'string' || !modelId) throw new Error('Не указана модель для discovery контекста');
+    if (!modelSelectedThisProcess) throw new Error('Выберите модель перед поиском максимального контекста.');
     return discoverModelContexts(modelId);
   });
   ipcMain.handle('context:discovery-status', discoveryStatus);
@@ -604,6 +608,8 @@ export function registerIpc(): void {
     if (request.persistUserMessage && (!user || user.role !== 'user')) throw new Error('Неверное сообщение');
     const conversation = database.getConversation(request.conversationId);
     if (!conversation) throw new Error('Чат не найден');
+    const runtime = await syncLlamaBackend();
+    if (activeConversationModel(conversation, runtime) !== request.model) throw new Error('Выберите модель перед отправкой сообщения.');
     const mode = executionMode(conversation.mode, request.mode);
     generation.mode = mode;
     if (conversation.modelId && conversation.modelId !== request.model) throw new Error('Выбранная модель была изменена. Повторите отправку сообщения.');

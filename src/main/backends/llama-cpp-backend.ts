@@ -98,12 +98,12 @@ export class LlamaCppBackend implements LlmBackend, ToolCallingBackend {
   private lastActualPromptTokens: number | undefined;
   private contextLimit: number;
   private visionEnabled: boolean;
-  private runtimeModelId: string;
+  private runtimeModelId: string | null;
   private kvCacheType: LlamaKvCacheType = 'f16';
   private kvOffload = true;
   /** Avoid a second input_tokens request after context management just counted it. */
   private readonly preparedInputTokens = new WeakMap<object, { tools: unknown[] | undefined; reasoningMode: ReasoningInput; tokens: number }>();
-  constructor(private readonly baseUrl = 'http://127.0.0.1:8081', contextLimit = 32_768, visionEnabled = true, runtimeModelId = qwenModel) {
+  constructor(private readonly baseUrl = 'http://127.0.0.1:8081', contextLimit = 32_768, visionEnabled = true, runtimeModelId: string | null = qwenModel) {
     this.contextLimit = contextLimit;
     this.visionEnabled = visionEnabled;
     this.runtimeModelId = runtimeModelId;
@@ -121,15 +121,19 @@ export class LlamaCppBackend implements LlmBackend, ToolCallingBackend {
     this.visionEnabled = runtime.vision;
   }
 
+  clearRuntimeSelection(): void { this.runtimeModelId = null; this.visionEnabled = false; }
+
   async getModels(): Promise<ModelInfo[]> {
     // An unreachable server must still list the installable runtimes: choosing
     // one is how the user restarts llama.cpp after a failed switch.
     let data: ModelsResponse = {};
     try {
-      const response = await fetch(this.url('/v1/models'));
-      if (response.ok) data = await response.json() as ModelsResponse;
+      if (this.runtimeModelId) {
+        const response = await fetch(this.url('/v1/models'));
+        if (response.ok) data = await response.json() as ModelsResponse;
+      }
     } catch { /* offline: only file availability is known */ }
-    if (!getModelProfile(this.runtimeModelId)) throw new Error(`llama.cpp запущен с неизвестной моделью: ${this.runtimeModelId}`);
+    if (this.runtimeModelId && !getModelProfile(this.runtimeModelId)) throw new Error(`llama.cpp запущен с неизвестной моделью: ${this.runtimeModelId}`);
     const result: ModelInfo[] = [];
     for (const runtime of llamaRuntimeProfiles) {
       const profile = getModelProfile(runtime.id);
@@ -155,7 +159,7 @@ export class LlamaCppBackend implements LlmBackend, ToolCallingBackend {
   }
   /** Reports the loaded server context, not a memory-safe prediction. */
   async getRuntimeContextEvidence(modelId = this.runtimeModelId, signal?: AbortSignal): Promise<RuntimeContextEvidence | null> {
-    if (modelId !== this.runtimeModelId) return null;
+    if (!modelId || modelId !== this.runtimeModelId) return null;
     const response = await fetch(this.url('/v1/models'), { signal });
     if (!response.ok) throw new Error(`llama.cpp вернул HTTP ${response.status} при чтении загруженной модели`);
     const data = await response.json() as ModelsResponse;
