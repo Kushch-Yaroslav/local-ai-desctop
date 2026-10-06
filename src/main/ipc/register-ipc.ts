@@ -640,7 +640,7 @@ export function registerIpc(): void {
     if (!current()) return;
     await backend.ensureModelAvailable(request.model);
     if (!current()) return;
-    let output = ''; let thinking = ''; let messageDiagnostics: import('../../shared/types').GenerationDiagnostics | undefined; let completed = false; let failed = false; let finishReason: 'stop' | 'length' = 'stop';
+    let output = ''; let thinking = ''; let messageDiagnostics: import('../../shared/types').GenerationDiagnostics | undefined; let completed = false; let failed = false; let cancelled = false; let finishReason: 'stop' | 'length' = 'stop';
     const { thinkingTimeline, activityTimelinePositions } = generation;
     const agentProjects: AgentProject[] = mode === 'agent' ? [...selectedProjects] : [];
     const agentRoot = agentProjects[0]?.root ?? null;
@@ -720,6 +720,7 @@ export function registerIpc(): void {
         }
         if (chunk.type === 'done') { completed = true; finishReason = chunk.finishReason === 'length' ? 'length' : 'stop'; continue; }
         if (chunk.type === 'error') failed = true;
+        if (chunk.type === 'cancelled') cancelled = true;
         if (run && chunk.type === 'tool') {
           if (generation.lastTimelineKind === 'reasoning') { const prior = thinkingTimeline.at(-1); if (prior?.kind === 'reasoning') prior.completedAt = new Date().toISOString(); }
           const existingPosition = activityTimelinePositions.get(chunk.activity.id);
@@ -738,6 +739,8 @@ export function registerIpc(): void {
         } else event.sender.send('chat:stream', { ...chunk, conversationId: request.conversationId, generationId: generation.id });
       }
       if (!current()) { if (run) database.finishAnalysisRun(run.id, 'cancelled', null); return; }
+      if (cancelled) { if (run) event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run: database.finishAnalysisRun(run.id, 'cancelled', null) }); return; }
+      if (!completed && !failed) { failed = true; event.sender.send('chat:stream', { type: 'error', conversationId: request.conversationId, generationId: generation.id, message: 'Генерация завершилась без итогового результата.' }); }
       if (failed || !completed) { if (run) event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run: database.finishAnalysisRun(run.id, 'error', null) }); return; }
       if (generation.lastTimelineKind === 'reasoning') { const prior = thinkingTimeline.at(-1); if (prior?.kind === 'reasoning') prior.completedAt = new Date().toISOString(); }
       const inputTokens = messageDiagnostics?.promptEvalCount ?? messageDiagnostics?.inputTokens;
