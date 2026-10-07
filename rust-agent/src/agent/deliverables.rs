@@ -18,7 +18,7 @@
 //! evidence (see `verification`), and any later change to the project drops it
 //! back to implemented.
 
-use super::verification::Need;
+use super::verification::{Need, Verification};
 
 use serde::{Deserialize, Serialize};
 
@@ -78,6 +78,18 @@ pub struct Deliverable {
     /// A check that failed after the last change, while this is unverified.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub failing: String,
+    /// Legacy saves default to project-wide checking. New behaviour claims
+    /// require evidence associated with this item; full-test claims stay broad.
+    #[serde(default)]
+    pub verification_scope: VerificationScope,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VerificationScope {
+    #[default]
+    Project,
+    Acceptance,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -212,6 +224,11 @@ impl Deliverables {
             check,
             proof: Vec::new(),
             failing: String::new(),
+            verification_scope: if check == Some(Need::Test) {
+                VerificationScope::Project
+            } else {
+                VerificationScope::Acceptance
+            },
         });
         self.revision = self.revision.saturating_add(1);
         Ok(id)
@@ -265,12 +282,15 @@ impl Deliverables {
         changed
     }
 
-    /// Shows a failed check on every item that is not shown to work, and takes
-    /// back a verification that a failure contradicts.
-    pub fn sync_failure(&mut self, failure: Option<&str>) -> bool {
+    /// Only a failure relevant to an item's durable verification contract can
+    /// contradict it. Project warnings remain in the evidence ledger.
+    pub fn sync_failures(&mut self, ledger: &Verification) -> bool {
         let mut changed = false;
         for item in &mut self.items {
-            match (failure, item.status) {
+            let failure = ledger
+                .failure_for(item)
+                .map(|record| format!("{} ({})", record.subject, record.detail));
+            match (failure.as_deref(), item.status) {
                 (Some(text), DeliverableStatus::Implemented | DeliverableStatus::Verified) => {
                     if item.status == DeliverableStatus::Verified {
                         item.status = DeliverableStatus::Implemented;
@@ -578,10 +598,28 @@ mod tests {
         assert!(list.demote_verified());
         assert_eq!(list.items[0].status, DeliverableStatus::Implemented);
         list.verify("d-001", vec!["ev-002".into()]).unwrap();
-        assert!(list.sync_failure(Some("TypeError: x")));
+        let mut ledger = Verification::default();
+        ledger.bind("node check.js", &["d-001".into()]).unwrap();
+        ledger.record(
+            super::super::verification::Kind::Run,
+            "node check.js",
+            false,
+            "TypeError: x",
+            1,
+        );
+        assert!(list.sync_failures(&ledger));
         assert_eq!(list.items[0].status, DeliverableStatus::Implemented);
-        assert!(list.prompt().contains("a check failed: TypeError: x"));
-        assert!(list.sync_failure(None));
+        assert!(list
+            .prompt()
+            .contains("a check failed: node check.js (TypeError: x)"));
+        ledger.record(
+            super::super::verification::Kind::Run,
+            "node check.js",
+            true,
+            "exit 0",
+            2,
+        );
+        assert!(list.sync_failures(&ledger));
         assert!(!list.prompt().contains("a check failed"));
     }
 

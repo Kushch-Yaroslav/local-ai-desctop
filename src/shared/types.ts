@@ -107,6 +107,8 @@ export interface AgentTelemetry {
 }
 
 export interface ModelInfo {
+  /** Validated normal startup configuration, independent of measured/manual Max options. */
+  normalContext?: { initialContextWindow: number; kvCacheType: LlamaKvCacheType };
   /** A configured, supported mechanism, not a claim that an offline runtime is active. */
   speculative?: { mechanism: 'mtp' | 'eagle3'; draftSource: 'embedded' | 'external' };
   id: string;
@@ -291,9 +293,9 @@ export interface ModelTodoPhase { name: string; items: ModelTodoItem[]; }
 export interface ModelTodo { phases: ModelTodoPhase[]; revision?: number; }
 /** `done` is the legacy spelling of `implemented`; only `verified` means a runtime-recorded check passed. */
 export type DeliverableStatus = 'pending' | 'implemented' | 'verified' | 'done' | 'blocked' | 'dropped';
-export interface DeliverableItem { id: string; text: string; status: DeliverableStatus; task?: string; evidence?: string; reason?: string; check?: 'readback' | 'static' | 'build' | 'test' | 'runtime' | 'browser'; proof?: string[]; failing?: string; }
+export interface DeliverableItem { id: string; text: string; status: DeliverableStatus; task?: string; evidence?: string; reason?: string; check?: 'readback' | 'static' | 'build' | 'test' | 'runtime' | 'browser'; proof?: string[]; failing?: string; verification_scope?: 'project' | 'acceptance'; }
 export interface PlanStepItem { id: string; text: string; status: 'pending' | 'in_progress' | 'completed' | 'blocked'; note?: string; }
-export interface VerificationRecord { id: string; kind: string; class: 'readback' | 'static' | 'functional'; subject: string; pass: boolean; epoch: number; turn: number; detail?: string; }
+export interface VerificationRecord { id: string; kind: string; class: 'readback' | 'static' | 'functional'; subject: string; pass: boolean; epoch: number; turn: number; detail?: string; check_key?: string; deliverable_ids?: string[]; baseline?: boolean; outcome_hash?: string; baseline_failure?: string; }
 export interface TaskMemoryEntry { id: string; finding: string; evidence?: string; implication?: string; next?: string; todoId?: string | null; invalidated?: boolean; }
 /** Persistent agent planning state: stable milestones plus only the active
  * milestone's adaptive Work Plan in the primary UI. */
@@ -302,7 +304,7 @@ export interface AgentPlan {
   activeMilestoneId?: string | null;
   revision?: number;
   modelTodo?: ModelTodo;
-  taskMemory?: { entries: TaskMemoryEntry[]; revision?: number; deliverables?: { items: DeliverableItem[]; revision?: number }; plan?: { steps: PlanStepItem[]; revision?: number }; verification?: { epoch?: number; records: VerificationRecord[]; changed?: Record<string, number>; code_changed?: boolean } };
+  taskMemory?: { entries: TaskMemoryEntry[]; revision?: number; deliverables?: { items: DeliverableItem[]; revision?: number }; plan?: { steps: PlanStepItem[]; revision?: number }; verification?: { epoch?: number; records: VerificationRecord[]; changed?: Record<string, number>; code_changed?: boolean; bindings?: Record<string, string[]> } };
   /** Legacy persisted snapshots are normalized at the Electron boundary. */
   steps?: AgentPlanStep[];
 }
@@ -317,6 +319,14 @@ export interface AnalysisRun {
   actions: ToolActivity[];
   createdAt: string;
   completedAt: string | null;
+  /** Durable timeline checkpoint (reasoning blocks, steering, pauses, activity
+   * positions). Saved at stable event boundaries so a Stop, failure or restart
+   * reconstructs the same history the live view showed. */
+  timeline?: ThinkingTimelineEvent[];
+  /** Visible output received before a run ended without a final answer. */
+  partialOutput?: string;
+  /** Failure text for a run that ended in `error`. */
+  error?: string;
 }
 
 export interface AnalysisProgress {

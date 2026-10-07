@@ -8,13 +8,17 @@ context_args=(--cache-type-k f16 --cache-type-v f16 --kv-offload)
 PORT=8083
 APP_DIR="$root"
 ELECTRON_BIN="$(command -v node)"
-for id in qwen3.8:27b-q4_K_M huihui-qwen3.8:27b-ud-dw-q4_k_m devstral-small-2:24b-q4_k_m gemma4:31b-it-q4_k_m; do
+for id in qwen3.8:27b-q4_K_M qwen3-coder-next:80b-a3b-q4_k_m huihui-qwen3.8:27b-ud-dw-q4_k_m; do
   select_variant "$id"
   server_args=()
   build_server_args 32768 999
   args=" ${server_args[*]} "
   [[ "$args" == *" --alias $id "* && "$args" == *" --ctx-size 32768 "* ]]
-  [[ "$args" == *" --mmproj $MMPROJ "* && "$args" != *" --no-warmup "* ]]
+  if [[ -n "$MMPROJ" ]]; then
+    [[ "$args" == *" --mmproj $MMPROJ "* && "$args" != *" --no-warmup "* ]]
+  else
+    [[ "$args" == *" --no-warmup "* && "$args" != *" --mmproj "* ]]
+  fi
   if [[ "$SPECULATIVE_MODE" == mtp ]]; then
     [[ "$args" == *" --spec-type draft-mtp "* ]]
   else
@@ -22,11 +26,13 @@ for id in qwen3.8:27b-q4_K_M huihui-qwen3.8:27b-ud-dw-q4_k_m devstral-small-2:24
   fi
   echo "PASS launcher/projector evidence: $id"
 done
-select_variant gemma4:31b-it-q4_k_m
+# Generic external assistant launch remains covered without pinning a removed local model.
+VARIANT=future-family; MODEL=/models/future.gguf; MMPROJ=/models/projector.gguf; RUNTIME_MODEL_ID=future
+SPECULATIVE_MODE=mtp; DRAFT_MODEL=/models/compatible-assistant.gguf; DRAFT_KV_SHARED=1; DRAFT_N_MAX=4
 build_server_args 32768 999
 [[ " ${server_args[*]} " == *" --model-draft $DRAFT_MODEL "* && " ${server_args[*]} " == *" --spec-draft-n-max 4 "* ]]
 [[ "$DRAFT_KV_SHARED" == 1 ]]
-LOCAL_AI_LLAMA_SPECULATIVE=0 select_variant gemma4:31b-it-q4_k_m
+SPECULATIVE_MODE=none; DRAFT_MODEL=""; DRAFT_KV_SHARED=0; DRAFT_N_MAX=""
 build_server_args 32768 999
 [[ " ${server_args[*]} " == *" --spec-type none "* && " ${server_args[*]} " != *" --model-draft "* ]]
 echo 'PASS external shared-KV draft and MTP OFF'
@@ -42,3 +48,17 @@ build_server_args 16384 999
 [[ " ${server_args[*]} " == *" --no-warmup "* ]]
 [[ " ${server_args[*]} " != *" --mmproj "* ]]
 echo 'PASS future runtime and text-only launch configuration'
+PROFILE_SERVER_ARGS=(--fit off --n-cpu-moe 28 --threads 8 --load-mode none)
+build_server_args 65536 999
+[[ " ${server_args[*]} " == *" --ctx-size 65536 "* && " ${server_args[*]} " == *" --n-cpu-moe 28 "* ]]
+[[ " ${server_args[*]} " == *" --load-mode none "* && " ${server_args[*]} " == *" --fit off "* ]]
+context_args=(--cache-type-k q8_0 --cache-type-v q8_0 --kv-offload)
+select_variant qwen3-coder-next:80b-a3b-q4_k_m
+build_server_args 65536 999
+[[ " ${server_args[*]} " == *" --ubatch-size 128 "* && " ${server_args[*]} " == *" --batch-size 1024 "* ]]
+[[ " ${server_args[*]} " == *" --cache-type-k q8_0 "* && " ${server_args[*]} " == *" --cache-type-v q8_0 "* ]]
+[[ " ${server_args[*]} " == *" --spec-type none "* && " ${server_args[*]} " == *" --no-warmup "* ]]
+select_variant qwen3.8:27b-q4_K_M
+build_server_args 32768 999
+[[ " ${server_args[*]} " != *" --n-cpu-moe "* && " ${server_args[*]} " == *" --spec-type draft-mtp "* ]]
+echo 'PASS generic CPU expert placement and unchanged Qwen switching'

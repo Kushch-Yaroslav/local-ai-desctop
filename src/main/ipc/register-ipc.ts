@@ -23,7 +23,7 @@ import { chatMessagesWithSystemPrefix, chatSystemContext } from '../services/cap
 import { ReadonlyProjectTools, type ApprovalResult } from '../tools/project-tools';
 import { AttachmentService } from '../services/attachment-service';
 import { AttachmentPipeline } from '../services/attachment-pipeline';
-import { readFile, stat } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { saveGenerationDiagnosticsBestEffort } from '../services/generation-diagnostics';
 import { projectDirectoryName } from '../../shared/project-references';
 import { executionMode } from '../../shared/generation-mode';
@@ -34,6 +34,7 @@ import { existingProjectDirectory } from '../services/project-picker';
 import { collectRuntimeContextEstimate, defaultContextDeviceReserveBytes, defaultContextHostReserveBytes, resolveContextReserve } from '../services/context-estimate';
 import { join } from 'node:path';
 import { llamaCapabilityLimit } from '../services/gguf-context';
+import { ggufArtifactFingerprint } from '../services/gguf-artifacts';
 import { discoverContextBoundary, predictContextHeadroom, type DiscoveryProbe } from '../services/context-discovery';
 
 const database = new Database();
@@ -86,8 +87,7 @@ function currentDiscoveryHeadroomFits(option: ContextDiscoveryOption, current: R
 const hostBaselineStable = (option: ContextDiscoveryOption, current: RuntimeContextEstimate) =>
   option.restored || Math.abs(current.memoryBaseline!.hostAvailableBytes - option.memoryBaseline.hostAvailableBytes) <= 2 * 1024 ** 3;
 async function modelFileIdentity(path: string): Promise<string> {
-  const file = await stat(path);
-  return `${file.dev}:${file.ino}:${file.size}:${file.mtimeMs}`;
+  return ggufArtifactFingerprint(path, true);
 }
 async function runtimeConfigurationIdentity(modelId: string): Promise<string> {
   const profile = llamaRuntimeProfile(modelId);
@@ -106,8 +106,7 @@ async function runtimeConfigurationIdentity(modelId: string): Promise<string> {
 }
 /** Size and mtime survive restarts and remounts; device/inode numbers may not. */
 async function persistentFileFingerprint(path: string): Promise<string> {
-  const file = await stat(path);
-  return `${file.size}:${file.mtimeMs}`;
+  return ggufArtifactFingerprint(path);
 }
 /** The stable configuration a saved Max Context calibration belongs to; requires the model's launcher-managed server to be running. */
 async function persistentDiscoveryIdentity(modelId: string): Promise<{ key: string; serialized: string; hardLimit: number }> {
@@ -455,8 +454,9 @@ export function registerIpc(): void {
     const requestedContext = patch.contextWindow ?? current.contextWindow;
     const modelChanged = nextModelId !== current.modelId;
     const firstSelection = patch.modelId !== undefined && !activeConversationModel(current, runtime);
-    const initial = initialModelContext(allowed);
-    const contextWindow = firstSelection && patch.contextWindow === undefined ? initial.contextWindow : modelChanged && patch.contextWindow === undefined && allowed.length ? normalContextForModel(requestedContext, allowed) : requestedContext;
+    const normalConfiguration = llamaRuntimeProfile(nextModelId ?? '')?.normalContext;
+    const initial = initialModelContext(allowed, normalConfiguration);
+    const contextWindow = (firstSelection || (modelChanged && normalConfiguration)) && patch.contextWindow === undefined ? initial.contextWindow : modelChanged && patch.contextWindow === undefined && allowed.length ? normalContextForModel(requestedContext, allowed) : requestedContext;
     if (allowed.length && !allowed.includes(contextWindow)) {
       if (contextWindow % 4_096 !== 0 || contextWindow > capability || contextWindow <= 0) {
         throw new Error(`Запрошенный контекст ${contextWindow} выходит за пределы возможностей модели и llama.cpp или не кратен допустимому шагу.`);
@@ -464,8 +464,8 @@ export function registerIpc(): void {
     }
     if (nextModelId && profile) {
       const isRuntimeRequest = patch.modelId !== undefined || patch.contextWindow !== undefined || patch.llamaKvCacheType !== undefined || patch.llamaKvOffload !== undefined;
-      const { llamaKvCacheType: kvCacheType, llamaKvOffload: kvOffload } = resolveLlamaKvSelection(current, patch, modelChanged || firstSelection);
-      const requiresDiscovery = !allowed.includes(contextWindow) || kvCacheType !== defaultLlamaKv.llamaKvCacheType || kvOffload !== defaultLlamaKv.llamaKvOffload;
+      const { llamaKvCacheType: kvCacheType, llamaKvOffload: kvOffload } = resolveLlamaKvSelection(current, patch, modelChanged || firstSelection, initial);
+      const requiresDiscovery = !allowed.includes(contextWindow) || kvCacheType !== initial.llamaKvCacheType || kvOffload !== initial.llamaKvOffload;
       if (isRuntimeRequest && requiresDiscovery) await validateDiscoveredOption(nextModelId, contextWindow, kvCacheType, kvOffload);
       patch = { ...patch, llamaKvCacheType: kvCacheType, llamaKvOffload: kvOffload };
       const runtimeDiffers = runtime.status !== 'ready' || runtime.modelId !== nextModelId || runtime.contextWindow !== contextWindow || runtime.kvCacheType !== kvCacheType || runtime.kvOffload !== kvOffload;
@@ -603,6 +603,20 @@ export function registerIpc(): void {
     activeGenerations.set(request.conversationId, generation);
     const current = () => activeGenerations.get(request.conversationId) === generation && !abort.signal.aborted;
     let run: AnalysisRun | null = null;
+    let output = ''; let thinking = ''; let messageDiagnostics: import('../../shared/types').GenerationDiagnostics | undefined; let completed = false; let failed = false; let cancelled = false; let finishReason: 'stop' | 'length' = 'stop';
+    const { thinkingTimeline, activityTimelinePositions } = generation;
+    let failure: string | undefined;
+    // The timeline is checkpointed at stable boundaries (steering, pause, tool
+    // start/finish), never per token, so a Stop, failure or crash keeps every
+    // event the live view already committed.
+    const checkpoint = () => { if (run) database.saveAnalysisRunTimeline(run.id, thinkingTimeline); };
+    const closeReasoning = () => { if (generation.lastTimelineKind === 'reasoning') { const prior = thinkingTimeline.at(-1); if (prior?.kind === 'reasoning' && !prior.completedAt) prior.completedAt = new Date().toISOString(); } };
+    const finishRun = (status: AnalysisRun['status'], assistantMessageId: string | null = null) => {
+      if (!run) return null;
+      closeReasoning();
+      return database.finishAnalysisRun(run.id, status, assistantMessageId, { timeline: thinkingTimeline, ...(status === 'completed' ? {} : { partialOutput: output, ...(failure ? { error: failure } : {}) }) });
+    };
+    const sendRun = (finished: AnalysisRun | null) => { if (finished) event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run: finished }); };
     try {
     const user = request.persistUserMessage ? request.messages.at(-1) : null;
     if (request.persistUserMessage && (!user || user.role !== 'user')) throw new Error('Неверное сообщение');
@@ -640,8 +654,6 @@ export function registerIpc(): void {
     if (!current()) return;
     await backend.ensureModelAvailable(request.model);
     if (!current()) return;
-    let output = ''; let thinking = ''; let messageDiagnostics: import('../../shared/types').GenerationDiagnostics | undefined; let completed = false; let failed = false; let cancelled = false; let finishReason: 'stop' | 'length' = 'stop';
-    const { thinkingTimeline, activityTimelinePositions } = generation;
     const agentProjects: AgentProject[] = mode === 'agent' ? [...selectedProjects] : [];
     const agentRoot = agentProjects[0]?.root ?? null;
     // Directories the user named in their own messages extend the file/terminal scope; without a project they are the scope.
@@ -675,20 +687,22 @@ export function registerIpc(): void {
           const followup = generation.followups?.find((entry) => !entry.applied && entry.message.content === content);
           if (followup) {
             followup.applied = true;
-            if (generation.lastTimelineKind === 'reasoning') { const prior = thinkingTimeline.at(-1); if (prior?.kind === 'reasoning') prior.completedAt = new Date().toISOString(); }
+            closeReasoning();
             const timelinePosition = ++generation.timelinePosition;
             thinkingTimeline.push({ id: `steering-${followup.message.id}`, kind: 'steering', messageId: followup.message.id, position: timelinePosition, status: 'applied' });
             generation.lastTimelineKind = 'steering';
+            checkpoint();
             event.sender.send('chat:stream', { ...chunk, userMessage: followup.message, timelinePosition, conversationId: request.conversationId, generationId: generation.id });
             log('generation.steering.applied', { conversationId: request.conversationId, generationId: generation.id, messageId: followup.message.id, timelinePosition });
           }
           continue;
         }
         if (chunk.type === 'paused') {
-          if (generation.lastTimelineKind === 'reasoning') { const prior = thinkingTimeline.at(-1); if (prior?.kind === 'reasoning') prior.completedAt = new Date().toISOString(); }
+          closeReasoning();
           const timelinePosition = ++generation.timelinePosition;
           thinkingTimeline.push({ id: `paused-${timelinePosition}`, kind: 'paused', position: timelinePosition });
           generation.lastTimelineKind = 'paused';
+          checkpoint();
           event.sender.send('chat:stream', { type: 'paused', timelinePosition, conversationId: request.conversationId, generationId: generation.id });
           continue;
         }
@@ -720,16 +734,19 @@ export function registerIpc(): void {
           continue;
         }
         if (chunk.type === 'done') { completed = true; finishReason = chunk.finishReason === 'length' ? 'length' : 'stop'; continue; }
-        if (chunk.type === 'error') failed = true;
-        if (chunk.type === 'cancelled') cancelled = true;
+        // Terminal events are delivered only after the run's history is final,
+        // so the renderer always reconciles against the persisted state.
+        if (chunk.type === 'error') { failed = true; failure ??= chunk.details ? `${chunk.message}: ${chunk.details}` : chunk.message; continue; }
+        if (chunk.type === 'cancelled') { cancelled = true; continue; }
         if (run && chunk.type === 'tool') {
-          if (generation.lastTimelineKind === 'reasoning') { const prior = thinkingTimeline.at(-1); if (prior?.kind === 'reasoning') prior.completedAt = new Date().toISOString(); }
+          closeReasoning();
           const existingPosition = activityTimelinePositions.get(chunk.activity.id);
           const position = existingPosition ?? ++generation.timelinePosition;
           if (existingPosition === undefined) { activityTimelinePositions.set(chunk.activity.id, position); thinkingTimeline.push({ id: randomUUID(), kind: 'activity', activityId: chunk.activity.id, position }); }
           generation.lastTimelineKind = 'activity';
           const activity = { ...chunk.activity, timelinePosition: position };
           const updated = database.addAnalysisAction(run.id, activity);
+          if (existingPosition === undefined || activity.state !== 'running') checkpoint();
           const visibleActivity = { ...activity };
           delete visibleActivity.rawOutput;
           event.sender.send('chat:stream', { ...chunk, activity: visibleActivity, runId: run.id, conversationId: request.conversationId, generationId: generation.id });
@@ -739,11 +756,16 @@ export function registerIpc(): void {
           if (existingPosition === undefined || activity.state !== 'running') event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run: updated });
         } else event.sender.send('chat:stream', { ...chunk, conversationId: request.conversationId, generationId: generation.id });
       }
-      if (!current()) { if (run) database.finishAnalysisRun(run.id, 'cancelled', null); return; }
-      if (cancelled) { if (run) event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run: database.finishAnalysisRun(run.id, 'cancelled', null) }); return; }
-      if (!completed && !failed) { failed = true; event.sender.send('chat:stream', { type: 'error', conversationId: request.conversationId, generationId: generation.id, message: 'Генерация завершилась без итогового результата.' }); }
-      if (failed || !completed) { if (run) event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run: database.finishAnalysisRun(run.id, 'error', null) }); return; }
-      if (generation.lastTimelineKind === 'reasoning') { const prior = thinkingTimeline.at(-1); if (prior?.kind === 'reasoning') prior.completedAt = new Date().toISOString(); }
+      // Stop: the run is finalized before `chat:stop` resolves; `finally` reports the cancellation.
+      if (!current()) { sendRun(finishRun('cancelled')); return; }
+      if (cancelled) { sendRun(finishRun('cancelled')); event.sender.send('chat:stream', { type: 'cancelled', conversationId: request.conversationId, generationId: generation.id }); return; }
+      if (failed || !completed) {
+        failure ??= 'Генерация завершилась без итогового результата.';
+        sendRun(finishRun('error'));
+        event.sender.send('chat:stream', { type: 'error', conversationId: request.conversationId, generationId: generation.id, message: failure });
+        return;
+      }
+      closeReasoning();
       const inputTokens = messageDiagnostics?.promptEvalCount ?? messageDiagnostics?.inputTokens;
       const generationStats = messageDiagnostics?.evalCount === undefined ? undefined : {
         outputTokens: messageDiagnostics.evalCount,
@@ -753,11 +775,15 @@ export function registerIpc(): void {
         ...(inputTokens !== undefined ? { inputTokens } : {}),
       };
       const assistant = output ? database.addMessage(request.conversationId, 'assistant', output, undefined, [], { ...(thinking.trim() ? { thinking } : {}), ...(thinkingTimeline.length ? { thinkingTimeline } : {}), ...(generationStats ? { generationStats } : {}) }) : null;
-      if (run) event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run: database.finishAnalysisRun(run.id, 'completed', assistant?.id ?? null) });
+      sendRun(finishRun('completed', assistant?.id ?? null));
       event.sender.send('chat:stream', { type: 'done', conversationId: request.conversationId, generationId: generation.id, assistant, finishReason });
     } catch (error) {
       log('generation.failed', { generationId: generation.id, conversationId: request.conversationId, model: request.model, message: error instanceof Error ? error.message : String(error) });
-      if (run) { const finished = database.finishAnalysisRun(run.id, abort.signal.aborted ? 'cancelled' : 'error', null); if (current()) event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run: finished }); }
+      if (run) {
+        failure ??= `Не удалось выполнить запрос: ${error instanceof Error ? error.message : String(error)}`;
+        const finished = finishRun(abort.signal.aborted ? 'cancelled' : 'error');
+        if (activeGenerations.get(request.conversationId) === generation) sendRun(finished);
+      }
       if (current()) event.sender.send('chat:stream', { type: 'error', conversationId: request.conversationId, generationId: generation.id, message: 'Не удалось выполнить запрос', details: error instanceof Error ? error.message : String(error) });
     } finally {
       if (activeGenerations.get(request.conversationId) === generation) {

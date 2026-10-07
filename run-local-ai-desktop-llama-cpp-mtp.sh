@@ -42,6 +42,7 @@ LAUNCH_ERROR=""
 REQUEST_CONTEXT_FOR_ERROR=""
 VARIANT=""; MODEL=""; MMPROJ=""; RUNTIME_MODEL_ID=""; RUNTIME_LABEL=""; DEFAULT_LLAMA_CONTEXT=""; MAX_LLAMA_CONTEXT=""
 SPECULATIVE_MODE="none"; DRAFT_MODEL=""; DRAFT_KV_SHARED="0"; DRAFT_N_MAX=""
+PROFILE_SERVER_ARGS=()
 
 mkdir -p "$LOG_DIR"
 INITIAL_PATH="${PATH:-}"
@@ -129,6 +130,7 @@ server_failure_reason() {
 build_server_args() {
   local context="$1" gpu_layers="$2"
   server_args=(--log-verbosity 5 -m "$MODEL" --alias "$RUNTIME_MODEL_ID" --host 127.0.0.1 --port "$PORT" --ctx-size "$context" --gpu-layers "$gpu_layers" --flash-attn on "${context_args[@]}" --parallel 1 --jinja --reasoning on --reasoning-format auto)
+  server_args+=("${PROFILE_SERVER_ARGS[@]}")
   # A projector must reserve its compute buffers at startup: Max Context
   # requires measured vision allocations before it can safely probe candidates.
   if [[ -n "$MMPROJ" ]]; then

@@ -46,7 +46,7 @@ async function run(): Promise<void> {
   const invoke = async <T>(channel:string, ...args:unknown[]) => await handlers.get(channel)!({sender:{send:(_channel:string,event:StreamEvent & {conversationId:string})=>events.push(event)}},...args) as T;
   try {
     const {registerIpc} = await import('./register-ipc'); registerIpc();
-    const model = 'devstral-small-2:24b-q4_k_m';
+    const model = 'qwen3.8:27b-q4_K_M';
     const first = await invoke<Conversation>('conversations:create');
     mkdirSync(join(root,'project1')); mkdirSync(join(root,'project2'));
     await invoke('conversations:update',first.id,{modelId:model,mode:'agent',webMode:'off',workingDirectory:join(root,'project1'),secondaryWorkingDirectory:join(root,'project2')});

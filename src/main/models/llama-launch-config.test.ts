@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { effectiveSpeculativeMode, launchProfileEnvironment, validateDraftMetadata, verifyDraftFile } from './llama-launch-config';
+import { effectiveSpeculativeMode, launchProfileEnvironment, placementArguments, validateDraftMetadata, verifyDraftFile } from './llama-launch-config';
 import { llamaRuntimeProfiles, type LlamaRuntimeProfile } from './llama-runtime-policy';
 import { readGgufSpeculativeMetadata } from '../services/gguf-speculative';
 import { parseLlamaRuntimeState } from '../services/llama-runtime-controller';
@@ -32,6 +32,13 @@ async function run() {
   }
   const plain: LlamaRuntimeProfile = { id: 'future-without-reasoning', maxContext: 32_768, modelPath: "/models/a'b.gguf", speculative: 'none', vision: false };
   assert.equal(effectiveSpeculativeMode(plain, '1'), 'none');
+  assert.deepEqual(placementArguments(plain), [], 'existing runtimes retain their original placement');
+  const placed: LlamaRuntimeProfile = { ...plain, placement: { cpuMoeLayers: 28, threads: 8, threadsBatch: 8, batchSize: 1024, ubatchSize: 256, loadMode: 'none' } };
+  assert.deepEqual(placementArguments(placed), ['--fit', 'off', '--n-cpu-moe', '28', '--threads', '8', '--threads-batch', '8', '--batch-size', '1024', '--ubatch-size', '256', '--load-mode', 'none']);
+  assert(launchProfileEnvironment(placed).includes("PROFILE_SERVER_ARGS=('--fit' 'off' '--n-cpu-moe' '28'"));
+  assert(launchProfileEnvironment(plain).includes('PROFILE_SERVER_ARGS=()'), 'switching away clears previous placement');
+  assert.throws(() => placementArguments({ ...placed, placement: { ...placed.placement!, cpuMoeLayers: -1 } }), /placement/);
+  assert.throws(() => placementArguments({ ...placed, placement: { ...placed.placement!, ubatchSize: 2048 } }), /placement/);
   assert(launchProfileEnvironment(plain).includes("a'\"'\"'b.gguf"), 'profile values must be shell escaped');
   assert.throws(() => effectiveSpeculativeMode(plain, 'yes'), /0 или 1/);
   assert.throws(() => effectiveSpeculativeMode({ ...plain, speculative: 'eagle3' }, '1'), /EAGLE/);
@@ -67,6 +74,6 @@ async function run() {
   assert.equal(parseLlamaRuntimeState('{"status":"ready","speculativeMode":"mtp"}')?.speculativeMode, 'mtp');
   assert.equal(parseLlamaRuntimeState('{"status":"ready","speculativeMode":"pretend"}')?.speculativeMode, undefined);
   assert.equal(parseLlamaRuntimeState('{"status":"offline","speculativeMode":"none"}')?.speculativeMode, 'none');
-  console.log('generic speculative configuration regression passed (four profiles, OFF/ON, future family, verified/invalid/missing/corrupt draft, runtime state)');
+  console.log('generic speculative configuration regression passed (local profiles, OFF/ON, future family, verified/invalid/missing/corrupt draft, runtime state)');
 }
 void run().catch((error: unknown) => { console.error(error); process.exitCode = 1; });

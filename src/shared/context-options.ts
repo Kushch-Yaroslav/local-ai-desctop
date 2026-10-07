@@ -21,10 +21,11 @@ export function buildContextChoices(
   normalPresets: readonly number[],
   hardLimit: number,
   discovered: readonly ContextDiscoveryOption[],
+  normalCacheType: LlamaKvCacheType = 'f16',
 ): ContextChoice[] {
   const options: ContextChoice[] = [...new Set(normalPresets)]
     .filter((contextWindow) => contextWindow > 0 && contextWindow <= hardLimit)
-    .map((contextWindow) => ({ contextWindow, kvCacheType: 'f16', kvOffload: true, label: `${contextWindow / 1024}K` }));
+    .map((contextWindow) => ({ contextWindow, kvCacheType: normalCacheType, kvOffload: true, label: `${contextWindow / 1024}K${normalCacheType === 'q8_0' ? ' (Q8)' : ''}` }));
   for (const candidate of discovered) {
     if (candidate.modelId !== modelId || candidate.contextWindow > hardLimit) continue;
     const existing = options.find((option) => contextChoiceId(option) === contextChoiceId(candidate));
@@ -48,10 +49,11 @@ export function resolveLlamaKvSelection(
   current: { llamaKvCacheType?: LlamaKvCacheType; llamaKvOffload?: boolean },
   patch: { contextWindow?: number; llamaKvCacheType?: LlamaKvCacheType; llamaKvOffload?: boolean },
   modelChanged: boolean,
+  normalKv: { llamaKvCacheType: LlamaKvCacheType; llamaKvOffload: boolean } = defaultLlamaKv,
 ) {
   const normalRequest = patch.contextWindow !== undefined && patch.llamaKvCacheType === undefined && patch.llamaKvOffload === undefined;
   return {
-    llamaKvCacheType: patch.llamaKvCacheType ?? (modelChanged || normalRequest ? defaultLlamaKv.llamaKvCacheType : current.llamaKvCacheType ?? defaultLlamaKv.llamaKvCacheType),
-    llamaKvOffload: patch.llamaKvOffload ?? (modelChanged || normalRequest ? defaultLlamaKv.llamaKvOffload : current.llamaKvOffload ?? defaultLlamaKv.llamaKvOffload),
+    llamaKvCacheType: patch.llamaKvCacheType ?? (modelChanged || normalRequest ? normalKv.llamaKvCacheType : current.llamaKvCacheType ?? normalKv.llamaKvCacheType),
+    llamaKvOffload: patch.llamaKvOffload ?? (modelChanged || normalRequest ? normalKv.llamaKvOffload : current.llamaKvOffload ?? normalKv.llamaKvOffload),
   };
 }

@@ -30,7 +30,7 @@ list pass silently. The runtime never invents entries and never decides what the
 `rust-agent/src/agent/deliverables.rs`:
 
 - Item: `id`, optional `task` (the user's task it belongs to), `text`, `status` (`pending | implemented | verified | blocked | dropped`; the legacy `done` is read as `implemented`),
-  `evidence`, `reason`. At most 24 items, one short line each; re-adding the same wording returns the existing item.
+  `evidence`, `reason`, runtime-owned `verification_scope` (new acceptance items are scoped; full-test and legacy items remain project-wide). At most 24 items, one short line each; re-adding the same wording returns the existing item.
 - Tool actions: `add` (optional `check`: readback | static | build | test | runtime | browser; `functional` is an old alias of `runtime`), `implemented` (the work was written; `done` is accepted as an alias), `verify` (only with fresh runtime-recorded evidence, see [planning and verification](agent-planning-verification.md)), `block` (concrete reason required), `drop` (the user
   withdrew it; reason required), `view`. The schema is flat, in declaration order, like the other tools.
 - Stored inside the Task Memory JSON, so it is persisted with it (`agent_plans`), restored on Continue after an
@@ -76,7 +76,7 @@ the prompt.
 ## What the user sees
 
 The `deliverables` calls appear in the timeline as "Требуемый результат", with a one-line progress summary
-(`проверено 1 из 3 · реализовано, не проверено 1 · осталось 1`) and, when expanded, the checklist (`✓ verified`, `◐ implemented, not verified`, `○ pending`, `⊘ blocked — reason`). Only `verified` ever shows as checked.
+(`проверено 1 из 3 · реализовано, не проверено 1 · осталось 1`) and, when expanded, the checklist (`✓ verified`, `◐ implemented, not verified`, `○ pending`, `⊘ blocked — reason`). Only `verified` ever shows as checked. The compact composer panel shows passing proof separately from project warnings, including identical observed baseline failures; unselected warnings do not demote a scoped verified item. See [evidence scoping](agent-planning-verification.md#scoped-acceptance-evidence).
 
 ## Not done on purpose
 

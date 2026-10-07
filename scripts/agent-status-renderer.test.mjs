@@ -60,6 +60,15 @@ try {
   await panel.waitFor(); assert.equal(await panel.count(), 1);
   assert(await panel.locator('.implemented').innerText().then((text) => text.includes('Реализовано, не проверено')));
   assert(await panel.locator('.verified').innerText().then((text) => text.includes('Проверено')));
+  memory.deliverables.items[0].proof = ['ev-runtime'];
+  memory.verification = { epoch: 2, records: [
+    { id: 'ev-runtime', kind: 'browser', class: 'functional', subject: 'browser runtime', pass: true, epoch: 2, turn: 1, deliverable_ids: ['build'] },
+    { id: 'ev-warning', kind: 'test', class: 'functional', subject: 'project suite', pass: false, epoch: 2, turn: 2, baseline_failure: 'ev-baseline', detail: 'independent assertion' },
+  ] };
+  await page.evaluate((memory) => window.statusFixture.update(memory), memory);
+  await panel.getByText('browser runtime — Пройдена').waitFor();
+  assert(await panel.innerText().then((text) => text.includes('Предупреждения проекта') && text.includes('Сбой наблюдался до изменений') && text.includes('independent assertion')));
+  assert(await panel.locator('.verified').innerText().then((text) => text.includes('Проверено')), 'project warning must not replace the verified acceptance status');
   const position = await page.evaluate(() => ({ panel: document.querySelector('.agent-status-panel').getBoundingClientRect().bottom, composer: document.querySelector('.composer').getBoundingClientRect().top }));
   assert(position.composer - position.panel >= 0 && position.composer - position.panel <= 12, 'panel must sit immediately above the composer');
   await panel.locator('button').click(); assert.equal(await panel.locator('button').getAttribute('aria-expanded'), 'false');
@@ -103,7 +112,7 @@ try {
   // Final screenshot of the populated projection.
   await send('Inspect UI'); await page.evaluate((memory) => window.statusFixture.update(memory), memory); await panel.waitFor();
   if (process.env.LOCAL_AI_UI_SCREENSHOT) { await mkdir(resolve(process.env.LOCAL_AI_UI_SCREENSHOT, '..'), { recursive: true }); await page.screenshot({ path: process.env.LOCAL_AI_UI_SCREENSHOT }); }
-  console.log('Production renderer: live plan/deliverables, collapse/expand, snapshot suppression, chronological reasoning/tools, follow-scroll, chat switching, Continue, completion/failure, localization passed');
+  console.log('Production renderer: scoped passing proof and baseline warnings, live plan/deliverables, collapse/expand, snapshot suppression, chronological reasoning/tools, follow-scroll, chat switching, Continue, completion/failure, localization passed');
 } finally {
   if (browser) await browser.close(); await new Promise((done) => server.close(done));
 }

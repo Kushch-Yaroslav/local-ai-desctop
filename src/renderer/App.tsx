@@ -10,6 +10,7 @@ import { AgentTimeline } from './components/AgentTimeline';
 import { Markdown } from './components/Markdown';
 import { useAppStore } from './store/app-store';
 import { steeringMessageIds } from '../shared/thinking-timeline';
+import { runForMessage, runTurnId, withRunHistory } from '../shared/run-history';
 import type { Attachment, GenerationStats, ProjectReference } from '../shared/types';
 
 function GenerationIndicator({ state }: { state: string }) {
@@ -93,18 +94,19 @@ export function App() {
   }, [messages, isGenerating, toolActivities]);
   useEffect(() => () => { if (scrollFrame.current !== null) window.cancelAnimationFrame(scrollFrame.current); }, []);
   const updateFollowState = () => { const element = conversationRef.current; if (element) followStream.current = element.scrollHeight - element.scrollTop - element.clientHeight < 96; };
-  const embeddedSteeringIds = steeringMessageIds(messages);
+  const rendered = withRunHistory(messages, analysisRuns);
+  const embeddedSteeringIds = steeringMessageIds(rendered);
   return <div className="app-shell"><Sidebar /><main className="main"><Toolbar /><section ref={conversationRef} onScroll={updateFollowState} className="conversation">
     {error && <p className="attachment-error" role="alert">{error}</p>}
     {generationConversationId && generationConversationId !== activeId && <p role="status">Генерация продолжается в другом чате. Откройте отмеченный чат, чтобы увидеть ход работы или остановить её.</p>}
     {active?.mode === 'agent' && <div className="agent-notice"><Bot size={17} /> {active.workingDirectory ? 'Файловые инструменты ограничены выбранным проектом и папками, которые вы назвали в сообщениях; терминал стартует в корне проекта.' : 'Проект не выбран: файловые инструменты и терминал доступны только для папок, абсолютный путь к которым вы укажете в сообщении (терминал стартует в последней названной). Без пути — только рассуждение и планирование.'}</div>}
     {messages.length === 0 && <div className="welcome"><Bot size={34} /><h1>Чем могу помочь?</h1><p>Выберите одну из локальных моделей и начните разговор.</p></div>}
-    {messages.map((message) => {
+    {rendered.map((message) => {
       if (message.role === 'user' && embeddedSteeringIds.has(message.id)) return null;
-      const run = analysisRuns.find((candidate) => candidate.assistantMessageId === message.id);
+      const run = runForMessage(analysisRuns, message.id);
       const activities = message.id.startsWith('stream-') && isGenerating ? toolActivities : run?.actions ?? [];
-      const isAgentTurn = active?.mode === 'agent' && message.role === 'assistant';
-      const body = editingId === message.id ? <MessageEditor text={editingText} onChange={setEditingText} onSave={() => { void (async () => { if (await editMessage(message, editingText)) setEditingId(null); })(); }} onCancel={() => setEditingId(null)} /> : <>{message.projectReferences?.length ? <MessageProjectReferences references={message.projectReferences} /> : null}{message.attachments?.length ? <MessageAttachments attachments={message.attachments} /> : null}{isAgentTurn ? <AgentTimeline timeline={message.thinkingTimeline} activities={activities} messages={messages} reasoning={message.thinking} now={agentClock} streaming={message.id.startsWith('stream-') && isGenerating} error={message.agentError} cancelled={message.agentCancelled} /> : null}{message.content ? <Markdown streaming={message.id.startsWith('stream-') && isGenerating}>{message.content}</Markdown> : message.role === 'assistant' && isGenerating && !message.thinking && !isAgentTurn ? <GenerationIndicator state={generationState} /> : null}{message.role === 'assistant' && message.generationStats ? <GenerationStatsView stats={message.generationStats} /> : null}</>;
+      const isAgentTurn = message.role === 'assistant' && (active?.mode === 'agent' || message.id === (run && runTurnId(run.id)));
+      const body = editingId === message.id ? <MessageEditor text={editingText} onChange={setEditingText} onSave={() => { void (async () => { if (await editMessage(message, editingText)) setEditingId(null); })(); }} onCancel={() => setEditingId(null)} /> : <>{message.projectReferences?.length ? <MessageProjectReferences references={message.projectReferences} /> : null}{message.attachments?.length ? <MessageAttachments attachments={message.attachments} /> : null}{isAgentTurn ? <AgentTimeline timeline={message.thinkingTimeline} activities={activities} messages={rendered} reasoning={message.thinking} now={agentClock} streaming={message.id.startsWith('stream-') && isGenerating} error={message.agentError} cancelled={message.agentCancelled} /> : null}{message.content ? <Markdown streaming={message.id.startsWith('stream-') && isGenerating}>{message.content}</Markdown> : message.role === 'assistant' && isGenerating && !message.thinking && !isAgentTurn ? <GenerationIndicator state={generationState} /> : null}{message.role === 'assistant' && message.generationStats ? <GenerationStatsView stats={message.generationStats} /> : null}</>;
       const editing = editingId === message.id;
       return <article className={`message ${message.role} ${editing ? 'is-editing' : ''} ${message.id.startsWith('stream-') && isGenerating ? 'is-generating' : ''}`} key={message.id}>{message.role === 'user' ? <div className="user-message-stack"><div className="message-content">{body}</div>{!editing && <UserMessageActions content={message.content} onEdit={() => { if (!generationConversationId) { setEditingId(message.id); setEditingText(message.content); } }} onRegenerate={() => { void regenerateMessage(message); }} regenerateDisabled={!activeConversationModel(active, settings?.llamaRuntime) || Boolean(generationConversationId)} />}</div> : <div className="message-content">{body}</div>}</article>;
     })}
