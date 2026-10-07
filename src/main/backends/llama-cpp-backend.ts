@@ -110,7 +110,7 @@ export class LlamaCppBackend implements LlmBackend, ToolCallingBackend {
   }
   private url(path: string): string { return `${this.baseUrl.replace(/\/$/, '')}${path}`; }
   supportsReasoning(model: string): boolean { return getModelProfile(model)?.supportsReasoning === true; }
-  updateRuntimeSelection(model: string, contextLimit: number, kvCacheType: LlamaKvCacheType = 'f16', kvOffload = true): void {
+  updateRuntimeSelection(model: string, contextLimit: number, kvCacheType: LlamaKvCacheType = 'f16', kvOffload = true, visionEnabled?: boolean): void {
     const runtime = llamaRuntimeProfile(model);
     if (!runtime || !Number.isSafeInteger(contextLimit) || contextLimit < 4_096 || contextLimit > runtime.maxContext || contextLimit % 4_096 !== 0) throw new Error('Выбранная конфигурация llama.cpp не поддерживается');
     if (kvCacheType !== 'f16' && kvCacheType !== 'q8_0') throw new Error('Выбранный тип KV-кэша llama.cpp не поддерживается');
@@ -118,7 +118,7 @@ export class LlamaCppBackend implements LlmBackend, ToolCallingBackend {
     this.contextLimit = contextLimit;
     this.kvCacheType = kvCacheType;
     this.kvOffload = kvOffload;
-    this.visionEnabled = runtime.vision;
+    this.visionEnabled = visionEnabled ?? (runtime.vision && (runtime.speculative !== 'mtp' || runtime.visionWithMtp !== false));
   }
 
   clearRuntimeSelection(): void { this.runtimeModelId = null; this.visionEnabled = false; }

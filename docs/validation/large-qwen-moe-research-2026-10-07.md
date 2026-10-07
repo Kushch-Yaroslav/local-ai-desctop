@@ -1,5 +1,9 @@
 # Large Qwen MoE selection — 7 October 2026
 
+> **Superseded:** The 80B Qwen3-Coder-Next selection below was retired before release.
+> The installed replacement, Qwen3.6-35B-A3B, and its measured runtime profile are documented in
+> [the Qwen3.6 validation report](qwen3.6-35b-a3b-2026-10-07.md). This file remains as historical research only.
+
 Selection was made before downloading the chosen weights and before registering a new local model.
 Hardware: RTX 3090 24 GiB, 64 GB RAM (62.7 GiB usable), Ryzen 7 5700X3D.
 The requirement is usable 65,536-token context with Q8 KV and adequate resources for ordinary desktop use.

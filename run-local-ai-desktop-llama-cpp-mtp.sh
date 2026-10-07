@@ -144,7 +144,8 @@ build_server_args() {
     none) server_args+=(--spec-type none) ;;
     *) LAUNCH_ERROR="Unsupported speculative mechanism: $SPECULATIVE_MODE"; return 1 ;;
   esac
-  if [[ -n "$DRAFT_MODEL" ]]; then server_args+=(--model-draft "$DRAFT_MODEL" --gpu-layers-draft "$gpu_layers" --spec-draft-n-max "$DRAFT_N_MAX"); fi
+  if [[ -n "$DRAFT_MODEL" ]]; then server_args+=(--model-draft "$DRAFT_MODEL" --gpu-layers-draft "$gpu_layers"); fi
+  if [[ -n "$DRAFT_N_MAX" ]]; then server_args+=(--spec-draft-n-max "$DRAFT_N_MAX"); fi
 }
 
 # launch_server <model_id> <context> <kv_type> <kv_offload>

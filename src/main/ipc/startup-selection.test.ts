@@ -65,14 +65,15 @@ async function run(): Promise<void> {
       assert.match(launches.at(-1)!.environment, new RegExp(`SPECULATIVE_MODE='${mode}'`));
       assert(launches.at(-1)!.environment.includes(`DRAFT_MODEL='${draft}'`));
     }
-    const coder = await invoke<Conversation>('conversations:update', previous.id, { modelId: 'qwen3-coder-next:80b-a3b-q4_k_m' });
-    assert.equal(coder.modelId, 'qwen3-coder-next:80b-a3b-q4_k_m');
-    assert.equal(coder.contextWindow, 65_536);
-    assert.equal(coder.llamaKvCacheType, 'q8_0');
+    const qwen36 = await invoke<Conversation>('conversations:update', previous.id, { modelId: 'qwen3.6:35b-a3b-ud-q4_k_m' });
+    assert.equal(qwen36.modelId, 'qwen3.6:35b-a3b-ud-q4_k_m');
+    assert.equal(qwen36.contextWindow, 65_536);
+    assert.equal(qwen36.llamaKvCacheType, 'q8_0');
     assert.equal(runtime.contextWindow, 65_536);
     assert.equal(runtime.kvCacheType, 'q8_0');
-    assert.match(launches.at(-1)!.environment, /SPECULATIVE_MODE='none'/);
-    assert.match(launches.at(-1)!.environment, /PROFILE_SERVER_ARGS=.*--n-cpu-moe.*28.*--ubatch-size.*128.*--load-mode.*none/);
+    assert.match(launches.at(-1)!.environment, /SPECULATIVE_MODE='mtp'/);
+    assert.match(launches.at(-1)!.environment, /DRAFT_N_MAX='2'/);
+    assert.match(launches.at(-1)!.environment, /PROFILE_SERVER_ARGS=.*--n-cpu-moe.*4.*--ubatch-size.*128.*--load-mode.*none/);
     assert.match(launches.at(-1)!.environment, /DRAFT_MODEL=''/);
     assert.match(launches.at(-1)!.environment, /MMPROJ=''/);
     const huihui = await invoke<Conversation>('conversations:update', previous.id, { modelId: 'huihui-qwen3.8:27b-ud-dw-q4_k_m' });
@@ -81,6 +82,11 @@ async function run(): Promise<void> {
     assert.equal(huihui.llamaKvCacheType, 'f16');
     assert.match(launches.at(-1)!.environment, /SPECULATIVE_MODE='mtp'/);
     assert.match(launches.at(-1)!.environment, /PROFILE_SERVER_ARGS=\(\)/, 'switching away clears model-specific placement');
+    const qwen36Again = await invoke<Conversation>('conversations:update', previous.id, { modelId: 'qwen3.6:35b-a3b-ud-q4_k_m' });
+    assert.equal(qwen36Again.modelId, 'qwen3.6:35b-a3b-ud-q4_k_m');
+    assert.equal(qwen36Again.contextWindow, 65_536);
+    assert.equal(qwen36Again.llamaKvCacheType, 'q8_0');
+    assert.match(launches.at(-1)!.environment, /SPECULATIVE_MODE='mtp'/);
     const before = launches.length;
     await invoke('conversations:update', previous.id, { title: 'Retained history' });
     assert.equal(launches.length, before, 'unrelated settings must not restart the model');
@@ -88,7 +94,7 @@ async function run(): Promise<void> {
     assert.equal((await invoke<{ llamaRuntime: LlamaRuntimeState }>('settings:get')).llamaRuntime.modelId, null);
     await invoke('conversations:list'); await invoke('messages:list', previous.id);
     assert.equal(launches.length, before, 'restart/history reads cannot restore a selection');
-    console.log('production IPC startup/explicit selection/switch/restart regressions passed (removed-model history, Qwen, Coder Next, Huihui)');
+    console.log('production IPC startup/explicit selection/switch/restart regressions passed (removed-model history, Qwen3.8, Qwen3.6, Huihui)');
   } finally { globalThis.fetch = originalFetch; loader._load = originalLoad; db.close(); rmSync(root, { recursive: true, force: true }); }
 }
 void run().catch((error: unknown) => { console.error(error); process.exitCode = 1; });

@@ -68,21 +68,27 @@ export async function runContextEstimateRegression(): Promise<void> {
   assert.match(resolveContextReserve('invalid', 'DEVICE_RESERVE', defaultContextDeviceReserveBytes).error ?? '', /целым числом байт/);
   assert.match(resolveContextReserve(String(Number.MAX_SAFE_INTEGER + 1), 'DEVICE_RESERVE', defaultContextDeviceReserveBytes).error ?? '', /допустимым целым числом/);
 
-  // Actual hybrid MoE capture: CPU-offloaded weights are allocated without mmap,
-  // so MemAvailable already includes host residency; do not subtract it twice.
-  const moeLog = readFileSync(resolve(process.cwd(), 'test-fixtures/llama-allocation/qwen3-coder-next-65536-q8_0.txt'), 'utf8');
-  const moe = parseLlamaAllocationLog(moeLog, ['llama-server', '--n-cpu-moe', '28', '--load-mode', 'none']);
+  // Actual Qwen3.6 hybrid-MoE MTP capture: CPU-offloaded weights are allocated
+  // without mmap, so MemAvailable already includes host residency.
+  const moeLog = readFileSync(resolve(process.cwd(), 'test-fixtures/llama-allocation/qwen3.6-65536-q8_0-mtp.txt'), 'utf8');
+  const moe = parseLlamaAllocationLog(moeLog, ['llama-server', '--n-cpu-moe', '4', '--load-mode', 'none']);
   assert.deepEqual(moe.unknownReasons, []);
   assert.equal(moe.contextTokens, 65_536);
-  assert.equal(moe.allocations.kv.device, 65_536 * 13_056, '12 attention layers × 2 heads × 256 dimensions × K/V × Q8 block size');
-  assert.equal(moe.allocations.weights.host, Math.ceil(26_074.92 * 1024 ** 2));
-  assert.equal(moe.allocations.weights.device, Math.ceil(20_087.69 * 1024 ** 2));
-  assert.equal(moe.allocations.ssm.device, Math.ceil(75.38 * 1024 ** 2));
-  assert.equal(moe.speculativeMode, 'none'); assert.equal(moe.visionPresent, false);
-  const moeRequest = { backend: 'llama-cpp' as const, modelId: 'future-cpu-moe', configuredMaxTokens: 262_144, contextPresets: [16_384, 32_768, 65_536],
+  assert.equal(moe.allocations.kv.device, 65_536 * 10 * 4 * 128 * 2 * 34 / 32, '10 attention layers × 4 KV heads × 128 dimensions × K/V × Q8 block size');
+  assert.equal(moe.allocations.weights.host, Math.ceil(2_371.31 * 1024 ** 2));
+  assert.equal(moe.allocations.weights.device, Math.ceil(19_231.70 * 1024 ** 2));
+  assert.equal(moe.allocations.compute.device, 210 * 1024 ** 2);
+  assert.equal(moe.allocations.compute.host, Math.ceil(18.27 * 1024 ** 2));
+  assert.equal(moe.allocations.ssm.device, Math.ceil(188.44 * 1024 ** 2));
+  assert.equal(moe.allocations.speculativeKv.device, 68 * 1024 ** 2);
+  assert.equal(moe.allocations.speculativeCompute.device, Math.ceil(156.27 * 1024 ** 2));
+  assert.equal(moe.allocations.speculativeCompute.host, Math.ceil(18.27 * 1024 ** 2));
+  assert.equal(moe.allocations.output.host, 2 * Math.ceil(0.95 * 1024 ** 2));
+  assert.equal(moe.speculativeMode, 'mtp'); assert.equal(moe.visionPresent, false);
+  const moeRequest = { backend: 'llama-cpp' as const, modelId: 'qwen3.6:35b-a3b-ud-q4_k_m', configuredMaxTokens: 262_144, contextPresets: [16_384, 32_768, 65_536],
     hardware: { ...hardware, ramTotalBytes: 64 * 1024 ** 3, ramUsedBytes: 35 * 1024 ** 3 },
-    runtime: { ...runtime, modelId: 'future-cpu-moe', modelPath: moe.modelPath!, activeContextTokens: 65_536, kvCacheType: 'q8_0' as const },
-    runtimeArguments: ['llama-server', '--load-mode', 'none'], hostReserveBytes: defaultContextHostReserveBytes, deviceReserveBytes: defaultContextDeviceReserveBytes };
+    runtime: { ...runtime, modelId: 'qwen3.6:35b-a3b-ud-q4_k_m', modelPath: moe.modelPath!, activeContextTokens: 65_536, kvCacheType: 'q8_0' as const },
+    runtimeArguments: ['llama-server', '--n-cpu-moe', '4', '--load-mode', 'none'], hostReserveBytes: defaultContextHostReserveBytes, deviceReserveBytes: defaultContextDeviceReserveBytes };
   const moeEstimate = await collectRuntimeContextEstimate(moeRequest, async () => ({ text: moeLog }));
   assert.equal(moeEstimate.status, 'estimated');
   assert.equal(moeEstimate.memoryHeadroom?.hostBytes, 29 * 1024 ** 3, 'allocated CPU weights are already reflected in live available RAM');

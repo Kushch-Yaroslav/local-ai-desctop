@@ -33,6 +33,10 @@ export type LlamaRuntimeProfile = {
   modelPath?: string;
   mmprojPath?: string;
   speculative: LlamaSpeculativeMode;
+  /** Maximum tokens proposed per step by an embedded MTP head. */
+  speculativeDraftTokens?: number;
+  /** Whether this runtime can load its vision projector while MTP is active. */
+  visionWithMtp?: boolean;
   draft?: LlamaDraftProfile;
   vision: boolean;
   reasoning?: LlamaReasoningProfile;
@@ -55,18 +59,22 @@ const qwen38Reasoning: LlamaReasoningProfile = { thinkingKwarg: 'enable_thinking
 
 /** Model capability is separate from the currently loaded server context. */
 export const llamaRuntimeProfiles: readonly LlamaRuntimeProfile[] = [
-  { id: 'qwen3.8:27b-q4_K_M', maxContext: 262_144, modelPath: '/media/yaroslav/DATA/llama-models/qwen3.8-27b-q4_K_M.gguf', mmprojPath: '/media/yaroslav/DATA/llama-models/qwen3.8-27b-mmproj.gguf', speculative: 'mtp', vision: true, reasoning: qwen38Reasoning },
+  { id: 'qwen3.8:27b-q4_K_M', maxContext: 262_144, modelPath: '/media/yaroslav/DATA/llama-models/qwen3.8-27b-q4_K_M.gguf', mmprojPath: '/media/yaroslav/DATA/llama-models/qwen3.8-27b-mmproj.gguf', speculative: 'mtp', vision: true, visionWithMtp: true, reasoning: qwen38Reasoning },
   {
-    id: 'qwen3-coder-next:80b-a3b-q4_k_m',
+    id: 'qwen3.6:35b-a3b-ud-q4_k_m',
     maxContext: 262_144,
-    modelPath: '/media/yaroslav/DATA/llama-models/Qwen3-Coder-Next-Q4_K_M/Qwen3-Coder-Next-Q4_K_M-00001-of-00004.gguf',
-    speculative: 'none',
-    vision: false,
-    placement: { cpuMoeLayers: 28, threads: 8, threadsBatch: 8, batchSize: 1024, ubatchSize: 128, loadMode: 'none' },
-    hostResidentBudgetBytes: 27 * 1024 ** 3,
+    modelPath: '/media/yaroslav/DATA/llama-models/Qwen3.6-35B-A3B-Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf',
+    mmprojPath: '/media/yaroslav/DATA/llama-models/Qwen3.6-35B-A3B-Q4_K_M/mmproj-BF16.gguf',
+    speculative: 'mtp',
+    speculativeDraftTokens: 2,
+    vision: true,
+    visionWithMtp: false,
+    reasoning: { thinkingKwarg: 'enable_thinking', efforts: {}, final: { chat_template_kwargs: { enable_thinking: false } } },
+    placement: { cpuMoeLayers: 4, threads: 8, threadsBatch: 8, batchSize: 1024, ubatchSize: 128, loadMode: 'none' },
+    hostResidentBudgetBytes: 8 * 1024 ** 3,
     normalContext: { initialContextWindow: 65_536, kvCacheType: 'q8_0' },
   },
-  { id: 'huihui-qwen3.8:27b-ud-dw-q4_k_m', maxContext: 262_144, modelPath: '/media/yaroslav/DATA/llama-models/Huihui-Qwen3.8-27B-abliterated-UD-DW-Q4_K_M.gguf', mmprojPath: '/media/yaroslav/DATA/llama-models/huihui-qwen3.8-27b-mmproj-bf16.gguf', speculative: 'mtp', vision: true, reasoning: qwen38Reasoning },
+  { id: 'huihui-qwen3.8:27b-ud-dw-q4_k_m', maxContext: 262_144, modelPath: '/media/yaroslav/DATA/llama-models/Huihui-Qwen3.8-27B-abliterated-UD-DW-Q4_K_M.gguf', mmprojPath: '/media/yaroslav/DATA/llama-models/huihui-qwen3.8-27b-mmproj-bf16.gguf', speculative: 'mtp', vision: true, visionWithMtp: true, reasoning: qwen38Reasoning },
 
 ];
 

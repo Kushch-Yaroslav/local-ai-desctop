@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { effectiveSpeculativeMode, launchProfileEnvironment, placementArguments, validateDraftMetadata, verifyDraftFile } from './llama-launch-config';
+import { effectiveSpeculativeMode, launchProfileEnvironment, placementArguments, validateDraftMetadata, verifyDraftFile, verifyEmbeddedMtp } from './llama-launch-config';
 import { llamaRuntimeProfiles, type LlamaRuntimeProfile } from './llama-runtime-policy';
 import { readGgufSpeculativeMetadata } from '../services/gguf-speculative';
 import { parseLlamaRuntimeState } from '../services/llama-runtime-controller';
@@ -70,6 +70,10 @@ async function run() {
     assert.throws(() => readGgufSpeculativeMetadata(path), /GGUF/);
     await writeFile(path, contents.subarray(0, contents.length - 1));
     assert.throws(() => readGgufSpeculativeMetadata(path), /обрезан/);
+    await writeFile(main, fixture('future-main', true));
+    verifyEmbeddedMtp({ ...profile, draft: undefined });
+    await writeFile(main, fixture('future-main', false));
+    assert.throws(() => verifyEmbeddedMtp({ ...profile, draft: undefined }), /встроенные MTP/);
   } finally { await rm(directory, { recursive: true, force: true }); }
   assert.equal(parseLlamaRuntimeState('{"status":"ready","speculativeMode":"mtp"}')?.speculativeMode, 'mtp');
   assert.equal(parseLlamaRuntimeState('{"status":"ready","speculativeMode":"pretend"}')?.speculativeMode, undefined);
