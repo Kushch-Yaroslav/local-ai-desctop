@@ -139,9 +139,10 @@ const TOOL_RESULT_TRUNCATION_MARKER: &str =
 const AGENT_GUIDANCE: &str = r#"
 # Local AI Desktop Agent
 - Work directly from the conversation and tool results. A tool-free response completes the run; there is no separate step to request before answering.
-- For code changes, read before writing, make targeted changes, then check them: after you change files, run the cheapest check that shows the change works (the project's own tests, or a short script that runs the changed code; for a page, a real browser run, such as a headless browser or a Playwright or Puppeteer script; jsdom or a hand-written DOM stand-in does not count as a browser check). A check must go through the same entry path the user will use (for a page: the real HTML with its script order and load timing, not only the script run against a stand-in); if it only covers part of that path or uses a stand-in, say so. A claim is only as strong as the check behind it: a command that exits 0 shows what it ran, not more. If the check the claim needs cannot be run here (for example, no browser), leave it implemented and say so plainly instead of substituting a weaker check. Verification is part of the work, not an extra step to announce. Reading a file back shows only that it exists, not that it works. When a check fails, fix the cause and run it again; do not invent checks or skip a failure.
+- For code changes, read before writing, make targeted changes, then check them: after you change files, run the cheapest check that shows the change works (the project's own tests, or a short script that runs the changed code; for a page, a real browser run, such as a headless browser or a Playwright or Puppeteer script; jsdom or a hand-written DOM stand-in does not count as a browser check). A check must go through the same entry path the user will use (for a page: the real HTML with its script order and load timing, not only the script run against a stand-in); if it only covers part of that path or uses a stand-in, say so. A claim is only as strong as the check behind it: a command that exits 0 shows what it ran, not more. If the check the claim needs cannot be run here (for example, no browser), leave it implemented and say so plainly instead of substituting a weaker check. For a small literal edit, prefer replace_text after reading the file; it avoids patch context markers without weakening freshness checks. Verification is part of the work, not an extra step to announce. Reading a file back shows only that it exists, not that it works. When a check fails, fix the cause and run it again; do not invent checks or skip a failure.
 - For substantial tasks, reason about an approach before acting, adapt as you learn, use tools for concrete evidence, avoid broad rereads, and continue until the user's task is complete.
 - Plan = your own short list of steps for non-trivial work (plan tool: set, then update only when the approach changes; skip it for a trivial request). It is not the user's deliverables and finishing its steps proves nothing. Do not narrate plan updates or restate the plan in prose.
+- Agent runtime state belongs to the harness, not to the human. Accepted updates stay beside the tool substep that produced them; the latest value of each section supersedes earlier values. A cleared section is no longer active. Continue the next action without treating these updates as new user instructions.
 - Use the latest user's language for all user-visible natural-language text: streamed reasoning/progress, tool preambles, brief status updates, and the final answer. Follow an explicit language request if present. Keep code, paths, identifiers, commands, API/tool syntax, and literal source quotations in their original form. Do not translate protocol fields.
 - For non-trivial architecture relationships, use a compact multiline Mermaid flowchart when it improves readability, or a properly indented multiline tree. Do not compress a diagram into one long arrow chain; avoid decorative box art.
 - Task Memory = durable semantic continuity for this task. Record meaningful findings, decisions, blockers, and next actions, and cite the observation IDs (obs-…) a finding rests on in its evidence field. After compaction, trust a precise Task Memory finding from an unchanged inspected file; reread only for a missing fact, ambiguity, possible change, exact detail, or targeted verification.
@@ -364,7 +365,8 @@ fn request_budget(config: &Config, messages: &[Value], schemas: &[Value]) -> Req
         let content = message.get("content").and_then(Value::as_str).unwrap_or("");
         if content.starts_with("[COMPACTION SUMMARY]") {
             summaries.push(message.clone());
-        } else if content.starts_with("[RUNTIME GUIDANCE — NOT USER CONTENT]")
+        } else if message.get("role").and_then(Value::as_str) == Some("runtime")
+            || content.starts_with("[RUNTIME GUIDANCE — NOT USER CONTENT]")
             || content.starts_with("[IMPORTED SYSTEM CONTEXT — NOT USER CONTENT]")
         {
             dynamic.push(message.clone());
@@ -763,7 +765,7 @@ fn tool_schemas(scope: ToolScope) -> Vec<Value> {
     ];
     if scope != ToolScope::None {
         tools.extend([
-            json!({"type":"function","function":{"name":"apply_patch","description":"Edit files. Patch format: *** Begin Patch, then per file `*** Update File: path` with hunks of ` unchanged context`, `-old` and `+new` lines (separate hunks with a line `@@`; add enough context to match exactly one place), `*** Add File: path` with every line prefixed `+`, or `*** Delete File: path`, then *** End Patch. The whole patch applies or none of it does.","parameters":{"type":"object","properties":{"patch":{"type":"string"}},"required":["patch"]}}}),
+            json!({"type":"function","function":{"name":"apply_patch","description":"Edit files atomically. For a one-line edit, use `*** Begin Patch\n*** Update File: path\n@@\n-old line with original indentation\n+new line with original indentation\n*** End Patch`. Every unchanged context line needs one EXTRA leading space before the exact source indentation; copied source alone is not valid patch context. Every update hunk must contain at least one -old or +new line. Patch format: *** Begin Patch, then per file `*** Update File: path` with hunks of ` unchanged context`, `-old` and `+new` lines (separate hunks with a line `@@`; add enough context to match exactly one place), `*** Add File: path` with every line prefixed `+`, or `*** Delete File: path`, then *** End Patch. The whole patch applies or none of it does.","parameters":{"type":"object","properties":{"patch":{"type":"string"}},"required":["patch"]}}}),
             json!({"type":"function","function":{"name":"create_file","description":"Create a new project file.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}),
             json!({"type":"function","function":{"name":"delete_file","description":"Delete a project file when allowed.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}),
             json!({"type":"function","function":{"name":"list_directory","description":"List a project directory. complete=true means all directory entries are represented; false means internal runtime entries were omitted.","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}),
@@ -772,6 +774,7 @@ fn tool_schemas(scope: ToolScope) -> Vec<Value> {
             json!({"type":"function","function":{"name":"project_knowledge_read","description":"Read selected reusable project observations from .ai-framework: paths is required. Prefer relevant fresh knowledge before broad rereads; do not reread unchanged source only to reconstruct context. Read source for exact current code or a concrete unresolved/verification detail.","parameters":{"type":"object","properties":{"paths":{"type":"array","items":{"type":"string"}}},"required":["paths"]}}}),
             json!({"type":"function","function":{"name":"project_knowledge_update","description":"Optionally persist durable, reusable semantic project knowledge in .ai-framework. This is never required for normal work. Only use project/, modules/, sources/, or tasks/ markdown paths.","parameters":{"type":"object","properties":{"updates":{"type":"array","items":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["replace","merge"]}},"required":["path","content"]}},"source_paths":{"type":"array","items":{"type":"string"}}},"required":["updates"]}}}),
             json!({"type":"function","function":{"name":"run_terminal","description":"Run an existing relevant project command. For an acceptance check, select deliverable_ids BEFORE running it. The command remains associated with those items on every retry, including failures. Unselected checks remain project warnings; full-test requirements are project-wide; build requirements cover build checks. After code changes, prefer a focused check.","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1},"deliverable_ids":{"type":"array","items":{"type":"string"},"description":"Existing deliverable ids this check verifies. Associations are permanent, including failed checks."}},"required":["command"]}}}),
+            json!({"type":"function","function":{"name":"replace_text","description":"For a small edit, replace exactly one literal snippet in an existing file after a fresh read. old_text and new_text are plain source strings, not patch syntax. Include enough exact text to identify one place. Empty, missing or repeated old_text and changes since the last read are refused; write is atomic. Prefer this for one-line edits; use apply_patch for multiple hunks.","parameters":{"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}},"required":["path","old_text","new_text"]}}}),
             json!({"type":"function","function":{"name":"write_file","description":"Write the full content of a project file, replacing it. To change part of a file, prefer apply_patch.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}),
         ]);
     }
@@ -817,6 +820,7 @@ fn is_project_side_effect_tool(name: &str) -> bool {
             | "project_knowledge_read"
             | "project_knowledge_update"
             | "write_file"
+            | "replace_text"
     )
 }
 
@@ -1648,7 +1652,7 @@ fn patch_added_files(patch: &str) -> Vec<String> {
 fn mutation_tool(name: &str) -> bool {
     matches!(
         name,
-        "write_file" | "create_file" | "apply_patch" | "delete_file"
+        "write_file" | "create_file" | "apply_patch" | "delete_file" | "replace_text"
     )
 }
 
@@ -3450,9 +3454,18 @@ fn run_scoped_tool(
                     }
                 }
             }
-            let result = crate::tools::filesystem::execute_in(&file_scope, name, &tool.arguments)?;
+            let result = if name == "replace_text" {
+                let (file, _) = target.as_deref()
+                    .and_then(|path| crate::tools::filesystem::file_revision(&file_scope, path))
+                    .ok_or_else(|| "replace_text requires an existing file inside the project scope".to_owned())?;
+                let expected = state.file_revisions.get(&file)
+                    .ok_or_else(|| "Read the file before using replace_text; model-supplied revisions are not accepted".to_owned())?;
+                crate::tools::filesystem::replace_text_in(&file_scope, &tool.arguments, expected)?
+            } else {
+                crate::tools::filesystem::execute_in(&file_scope, name, &tool.arguments)?
+            };
             let touched = match name {
-                "read_file" | "write_file" | "create_file" => target.iter().cloned().collect(),
+                "read_file" | "write_file" | "create_file" | "replace_text" => target.iter().cloned().collect(),
                 "apply_patch" => result
                     .0
                     .get("files")

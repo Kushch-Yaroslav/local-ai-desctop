@@ -635,7 +635,7 @@ impl Ledger {
                         }
                     }
                 }
-                "write_file" | "create_file" | "delete_file" | "apply_patch" => {
+                "write_file" | "create_file" | "delete_file" | "apply_patch" | "replace_text" => {
                     // Files the run itself wrote are not unexplored code.
                     let mut written = Vec::new();
                     if let Some(path) = arguments.get("path").and_then(Value::as_str) {

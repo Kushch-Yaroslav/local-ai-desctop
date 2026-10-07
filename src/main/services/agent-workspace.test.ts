@@ -8,7 +8,7 @@ import { enabledAgentTools, explicitWorkspaceRoots, extractAbsolutePaths, isGran
 
 export async function runAgentWorkspaceRegression(): Promise<void> {
   // Tool exposure by mode and scope. Chat never gets Agent capabilities; Agent gets execution tools only with a scope.
-  const execution = ['apply_patch', 'create_file', 'delete_file', 'list_directory', 'read_file', 'run_terminal', 'write_file'];
+  const execution = ['apply_patch', 'create_file', 'delete_file', 'list_directory', 'read_file', 'replace_text', 'run_terminal', 'write_file'];
   const knowledge = ['project_knowledge_index', 'project_knowledge_read', 'project_knowledge_update'];
   const always = ['observation_index', 'observation_read', 'task_memory'];
   for (const scope of [{ hasProject: false, workspaceRootCount: 0 }, { hasProject: false, workspaceRootCount: 2 }, { hasProject: true, workspaceRootCount: 0 }]) {

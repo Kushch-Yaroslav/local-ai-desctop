@@ -51,6 +51,8 @@ impl Strategy {
 const FAST_GUIDANCE: &str = r#"
 # Investigation strategy: Fast
 - Aim for the smallest set of observations that supports a correct, honest answer. Orient once, pick the few sources most likely to decide each question, and read those.
+- For implementation: understand, make the targeted edit, verify the acceptance criterion, then continue. Runtime state is your working state, not a new human request; continue from it without re-orienting or restating the plan.
+- Give a brief visible progress update for a meaningful milestone, finding or blocker. Do not repeat the same intended action before successive tools. A tool call may have an empty prose preamble; useful progress does not require a separate turn.
 - Request independent reads/listings together in one turn instead of one per turn.
 - Do not widen the search to be thorough. Follow a reference only if your answer would be materially wrong or empty without it; otherwise say it was not inspected.
 - Stop investigating as soon as the questions are answerable from what you hold, then answer. Prefer a precise, compact answer over an exhaustive one.
