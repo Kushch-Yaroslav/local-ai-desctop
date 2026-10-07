@@ -462,22 +462,21 @@ impl Transcript {
         .join("\n\n")
     }
 
-    /// Only the latest accepted dynamic tail is current. Older snapshots stay
-    /// canonical but do not accumulate as stale user-shaped prompt messages.
+    /// Tool substeps do not invalidate accepted state. Compaction/finalization
+    /// boundaries do: the first request after them needs a fresh full snapshot.
     pub fn has_active_prompt_tail(&self, content: &str) -> bool {
         let boundary = self
             .compaction_boundary()
             .unwrap_or(0)
-            .max(self.finalization_index().unwrap_or(0));
+            .max(self.finalization_index().unwrap_or(0))
+            .max(self.entries.iter().rposition(|entry| matches!(entry, Entry::RunUser(_))).unwrap_or(0));
         self.entries
             .iter()
             .skip(boundary)
             .rev()
             .find_map(|entry| match entry {
                 Entry::PromptTail(existing) => Some(existing == content),
-                // A message after the tail means the request would end on it;
-                // the tail must be sent again or the request ends on assistant turns.
-                Entry::Message(_) => Some(false),
+                // Assistant/tool substeps do not change accepted runtime state.
                 _ => None,
             })
             .unwrap_or(false)
@@ -525,15 +524,9 @@ impl Transcript {
     /// covered raw history again.
     fn conversation(&self) -> (Vec<Value>, Vec<usize>) {
         let boundary = self.compaction_boundary().unwrap_or(0);
-        let active_tail = self
-            .entries
-            .iter()
-            .enumerate()
-            .skip(boundary.max(self.finalization_index().unwrap_or(0)))
-            .rfind(|(_, entry)| matches!(entry, Entry::PromptTail(_)))
-            .map(|(index, _)| index);
         let mut messages = Vec::new();
         let mut sources = Vec::new();
+        let mut previous_state: Option<&str> = None;
         if let Some((summary, _)) = self.latest_summary() {
             messages.push(
                 json!({"role":"assistant", "content":format!("[earlier summary]\n{summary}")}),
@@ -549,6 +542,7 @@ impl Transcript {
                     sources.push(index);
                 }
                 Entry::RunUser(message) => {
+                    previous_state = None;
                     messages.push(message.clone());
                     sources.push(index);
                 }
@@ -558,9 +552,12 @@ impl Transcript {
                     );
                     sources.push(index);
                 }
-                Entry::PromptTail(content) if active_tail == Some(index) => {
-                    messages.push(prompt_tail_message(content));
-                    sources.push(index);
+                Entry::PromptTail(content) if index >= self.finalization_index().unwrap_or(0) => {
+                    if let Some(message) = crate::context::runtime_state::message(previous_state, content) {
+                        messages.push(message);
+                        sources.push(index);
+                    }
+                    previous_state = Some(content);
                 }
                 Entry::Compaction { .. }
                 | Entry::Reminder(_)
@@ -644,7 +641,8 @@ pub fn preferred_visible_language(user: &str) -> String {
 }
 
 pub fn prompt_tail_message(content: &str) -> Value {
-    json!({"role":"user", "content":format!("[RUNTIME GUIDANCE — NOT USER CONTENT]\n{content}")})
+    crate::context::runtime_state::message(None, content)
+        .unwrap_or_else(|| json!({"role":"runtime", "content":""}))
 }
 
 fn attach_reasoning(message: &mut Value, reasoning: String) {
@@ -944,6 +942,36 @@ mod tests {
         std::fs::remove_dir_all(base).unwrap();
     }
 
+    #[test]
+    fn accepted_state_deltas_resume_identically_and_compaction_refreshes_full_state() {
+        let base = std::env::temp_dir().join(format!(
+            "state-restart-{}-{:?}", std::process::id(), std::thread::current().id()
+        ));
+        let mut transcript = Transcript::durable(&base, "first", &[], None).unwrap();
+        transcript.push_run_user(json!({"role":"user","content":"implement"}));
+        let old = "<plan>\ns1 active\n</plan>\n<deliverables>\nd1 pending\n</deliverables>";
+        let current = old.replace("s1 active", "s1 done");
+        transcript.record_prompt_tail(old);
+        transcript.assistant_message("working".into());
+        transcript.record_prompt_tail(&current);
+        let before = crate::context::projection::project(&transcript, "stable", "");
+        drop(transcript);
+        let mut resumed = Transcript::durable(&base, "second", &[], None).unwrap();
+        assert_eq!(crate::context::projection::project(&resumed, "stable", ""), before);
+        assert!(resumed.has_active_prompt_tail(&current));
+        let count = resumed.entries().len();
+        resumed.record_prompt_tail(&current);
+        assert_eq!(resumed.entries().len(), count);
+        resumed.compact("implementation checkpoint".into(), count);
+        assert!(!resumed.has_active_prompt_tail(&current));
+        let refreshed = crate::context::projection::project(&resumed, "stable", &current);
+        let state = refreshed.last().unwrap()["content"].as_str().unwrap();
+        assert!(state.contains("s1 done") && state.contains("d1 pending"));
+        assert!(state.contains("Current runtime state"));
+        drop(resumed);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
     /// Journals written while the runtime graded claims and gated finalization
     /// must keep loading: an unparseable line would otherwise be treated as a
     /// torn tail and the rest of the run truncated from disk.
@@ -1078,15 +1106,15 @@ mod tests {
     }
 
     #[test]
-    fn an_identical_tail_is_sent_again_once_an_assistant_turn_follows_it() {
+    fn an_identical_tail_does_not_repeat_after_an_assistant_substep() {
         let mut t = Transcript::default();
         t.push_run_user(json!({"role":"user","content":"task"}));
         t.record_prompt_tail("same tail");
         assert!(t.has_active_prompt_tail("same tail"));
         t.assistant_withheld_draft("draft".into(), "unverified changes");
         assert!(
-            !t.has_active_prompt_tail("same tail"),
-            "the request would end on the assistant draft"
+            t.has_active_prompt_tail("same tail"),
+            "an assistant substep does not change runtime-owned state"
         );
     }
 

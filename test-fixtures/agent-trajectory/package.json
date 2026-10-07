@@ -1,0 +1,5 @@
+{
+  "name": "agent-trajectory-fixture",
+  "private": true,
+  "scripts": { "test": "node test.cjs" }
+}

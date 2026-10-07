@@ -41,7 +41,25 @@ pub fn normalize(messages: &[Value]) -> Vec<Value> {
     let mut last_turn = "";
     let mut last_user = None;
     for message in messages {
-        if role(message) == "user" && last_turn == "user" {
+        if role(message) == "runtime" {
+            // State belongs to this assistant/tool substep, not to a new
+            // human turn. Initial state shares the original request envelope.
+            // A runtime review after a completed draft needs a continuation
+            // envelope for strict alternating templates; its origin stays
+            // explicit and it is never persisted as a human message.
+            if let Some(target) = normalized.last_mut().filter(|m| {
+                role(m) == "tool" || role(m) == "user"
+            }) {
+                append_content(target, message);
+            } else {
+                let mut continuation = message.clone();
+                continuation["role"] = json!("user");
+                continuation["metadata"] = json!({"runtime":true});
+                normalized.push(continuation);
+                last_turn = "user";
+                last_user = Some(normalized.len() - 1);
+            }
+        } else if role(message) == "user" && last_turn == "user" {
             let index = if normalized
                 .last()
                 .is_some_and(|m| role(m) == "tool" || role(m) == "user")

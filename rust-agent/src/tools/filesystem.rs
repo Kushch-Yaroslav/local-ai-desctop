@@ -154,6 +154,60 @@ pub fn file_revision(scope: &Scope, path: &str) -> Option<(PathBuf, String)> {
     Some((target, format!("{:x}", Sha256::digest(bytes))))
 }
 
+/// A literal, single-occurrence edit. The expected revision comes from runtime
+/// read tracking, never from model arguments. Staging and rename preserve the
+/// original on every validation/write failure and preserve its permissions.
+pub fn replace_text_in(
+    scope: &Scope,
+    args: &Value,
+    expected_revision: &str,
+) -> Result<(Value, Option<String>), String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let text = |key: &str| args.get(key).and_then(Value::as_str)
+        .ok_or_else(|| format!("{key} must be a string"));
+    let path = text("path")?;
+    let old = text("old_text")?;
+    let new = text("new_text")?;
+    if old.is_empty() || old == new {
+        return Err("old_text must be nonempty and new_text must differ".into());
+    }
+    let target = scoped(scope, path)?;
+    let original = fs::read(&target).map_err(|error| error.to_string())?;
+    if format!("{:x}", Sha256::digest(&original)) != expected_revision {
+        return Err("File changed since your last read. Read the latest version before replacing text.".into());
+    }
+    let content = std::str::from_utf8(&original).map_err(|error| error.to_string())?;
+    let start = content.find(old).ok_or_else(|| "old_text does not exactly match current content; no file was written".to_owned())?;
+    let next_character = start + old.chars().next().expect("nonempty").len_utf8();
+    if content[next_character..].contains(old) {
+        return Err("old_text matches more than one place; include a larger exact snippet; no file was written".into());
+    }
+    let updated = format!("{}{}{}", &content[..start], new, &content[start + old.len()..]);
+    let permissions = fs::metadata(&target).map_err(|error| error.to_string())?.permissions();
+    let temporary = target.parent().ok_or("file has no parent")?.join(format!(
+        ".local-ai-replace-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut staged = fs::OpenOptions::new().write(true).create_new(true)
+        .open(&temporary).map_err(|error| error.to_string())?;
+    let result = (|| {
+        staged.set_permissions(permissions).map_err(|error| error.to_string())?;
+        staged.write_all(updated.as_bytes()).map_err(|error| error.to_string())?;
+        staged.sync_all().map_err(|error| error.to_string())?;
+        drop(staged);
+        if scoped(scope, path)? != target || fs::read(&target).map_err(|error| error.to_string())? != original {
+            return Err("File changed while staging the edit; no file was written. Read the latest version.".into());
+        }
+        fs::rename(&temporary, &target).map_err(|error| error.to_string())
+    })();
+    let _ = fs::remove_file(&temporary);
+    result?;
+    Ok((json!({"path":path,"bytes":updated.len(),"replacements":1}),
+        Some(format!("--- {path}\n+++ {path}\n-{old}\n+{new}"))))
+}
+
 pub fn execute(root: &Path, name: &str, args: &Value) -> Result<(Value, Option<String>), String> {
     execute_in(&Scope { root, grants: &[] }, name, args)
 }
@@ -416,6 +470,12 @@ fn apply_hunks(rel: &str, content: &str, hunks: &[Vec<String>]) -> Result<String
         .map(str::to_owned)
         .collect::<Vec<_>>();
     for (index, hunk) in hunks.iter().enumerate() {
+        if !hunk.iter().any(|line| line.starts_with('+') || line.starts_with('-')) {
+            return Err(format!(
+                "hunk {} for {rel} contains no change lines. Prefix the removed line with `-` and its replacement with `+`; prefix each unchanged context line with one EXTRA space before its original indentation. Context-only hunks cannot edit a file.",
+                index + 1
+            ));
+        }
         let (old, new) = interpret_hunk(hunk);
         if old.iter().all(|line| line.trim().is_empty()) {
             return Err(format!(
@@ -441,8 +501,22 @@ fn apply_hunks(rel: &str, content: &str, hunks: &[Vec<String>]) -> Result<String
                 } else {
                     "its first line is not in the file"
                 };
+                let candidate = lines.iter().position(|line| line.trim() == first.trim());
+                let detail = candidate.and_then(|start| {
+                    let anchor_offset = old.iter().position(|line| !line.trim().is_empty())?;
+                    let start = start.checked_sub(anchor_offset)?;
+                    old.iter().enumerate().find_map(|(offset, expected)| {
+                        let actual = lines.get(start + offset)?;
+                        (actual.trim_end() != expected.trim_end()).then(|| format!(
+                            " First mismatch at file line {}: expected {:?}, current {:?}.",
+                            start + offset + 1,
+                            expected.chars().take(160).collect::<String>(),
+                            actual.chars().take(160).collect::<String>()
+                        ))
+                    })
+                }).unwrap_or_default();
                 return Err(format!(
-                    "patch does not match current content: {rel} (hunk {}: {hint}). Read the file again and copy the lines exactly.",
+                    "patch does not match current content: {rel} (hunk {}: {hint}).{detail} Context lines need one EXTRA leading space as the patch marker, followed by the exact original indentation. Prefer a small `-old` / `+new` replacement for a one-line edit. If the source actually changed, read the latest range; no file was written.",
                     index + 1
                 ));
             }
@@ -876,6 +950,61 @@ mod tests {
             &Scope { root, grants: &[] },
             json!({ "patch": text }).as_object().unwrap(),
         )
+    }
+
+    #[test]
+    fn incident_context_marker_error_reports_indentation_without_fuzzy_editing() {
+        let root = patch_fixture(&[("a.js", "    function count() {\n      return 1;\n    }\n")]);
+        let error = patch(&root, "*** Begin Patch\n*** Update File: a.js\n@@\n    function count() {\n      return 1;\n    }\n+    const added = true;\n*** End Patch").unwrap_err();
+        assert!(error.contains("hunk 1"), "{error}");
+        assert!(error.contains("file line 1"), "{error}");
+        assert!(error.contains("expected \"   function"), "{error}");
+        assert!(error.contains("current \"    function"), "{error}");
+        assert!(error.contains("EXTRA leading space"), "{error}");
+        assert_eq!(fs::read_to_string(root.join("a.js")).unwrap(), "    function count() {\n      return 1;\n    }\n");
+        patch(&root, "*** Begin Patch\n*** Update File: a.js\n@@\n     function count() {\n-      return 1;\n+      return 2;\n     }\n*** End Patch").unwrap();
+        let stale = patch(&root, "*** Begin Patch\n*** Update File: a.js\n@@\n-      return 1;\n+      return 3;\n*** End Patch").unwrap_err();
+        assert!(stale.contains("does not match"));
+        assert!(fs::read_to_string(root.join("a.js")).unwrap().contains("return 2"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn context_only_hunks_are_rejected_before_matching_or_writing() {
+        let root = patch_fixture(&[("a.js", "    old();\n")]);
+        let error = patch(&root, "*** Begin Patch\n*** Update File: a.js\n@@\n     old();\n*** End Patch").unwrap_err();
+        assert!(error.contains("contains no change lines"), "{error}");
+        assert!(error.contains("replacement with `+`"), "{error}");
+        assert_eq!(fs::read_to_string(root.join("a.js")).unwrap(), "    old();\n");
+        assert!(patch(&root, "not a patch").is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn literal_replacement_is_unique_fresh_atomic_and_preserves_line_endings() {
+        let root = patch_fixture(&[("a.txt", "alpha\r\nbeta\r\n"), ("overlap.txt", "aaa")]);
+        let scope = Scope { root: &root, grants: &[] };
+        let (_, revision) = file_revision(&scope, "a.txt").unwrap();
+        let result = replace_text_in(&scope, &json!({"path":"a.txt","old_text":"beta","new_text":"BETA"}), &revision).unwrap();
+        assert_eq!(result.0["replacements"], 1);
+        assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"alpha\r\nBETA\r\n");
+        let stale = replace_text_in(&scope, &json!({"path":"a.txt","old_text":"BETA","new_text":"new"}), &revision).unwrap_err();
+        assert!(stale.contains("changed since your last read"));
+        let (_, current) = file_revision(&scope, "a.txt").unwrap();
+        for args in [
+            json!({"path":"a.txt","old_text":"","new_text":"new"}),
+            json!({"path":"a.txt","old_text":"BETA","new_text":"BETA"}),
+            json!({"path":"a.txt","old_text":"missing","new_text":"new"}),
+            json!({"path":"../escape.txt","old_text":"x","new_text":"y"}),
+        ] {
+            assert!(replace_text_in(&scope, &args, &current).is_err());
+        }
+        let (_, overlap) = file_revision(&scope, "overlap.txt").unwrap();
+        assert!(replace_text_in(&scope, &json!({"path":"overlap.txt","old_text":"aa","new_text":"b"}), &overlap).unwrap_err().contains("more than one place"));
+        assert_eq!(fs::read_to_string(root.join("overlap.txt")).unwrap(), "aaa");
+        assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"alpha\r\nBETA\r\n");
+        assert!(!fs::read_dir(&root).unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().starts_with(".local-ai-replace")));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

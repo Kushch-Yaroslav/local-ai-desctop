@@ -72,7 +72,7 @@ export async function explicitWorkspaceRoots(userTexts: readonly string[], home:
   return roots;
 }
 
-const executionTools = ['apply_patch', 'create_file', 'delete_file', 'list_directory', 'read_file', 'run_terminal', 'write_file'];
+const executionTools = ['apply_patch', 'create_file', 'delete_file', 'list_directory', 'read_file', 'replace_text', 'run_terminal', 'write_file'];
 const knowledgeTools = ['project_knowledge_index', 'project_knowledge_read', 'project_knowledge_update'];
 const alwaysAvailableAgentTools = ['observation_index', 'observation_read', 'task_memory'];
 

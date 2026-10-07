@@ -536,6 +536,7 @@ enum Reply {
     /// Only reasoning, no content and no structured call.
     Reasoning(String),
     Tools(Vec<(&'static str, Value)>),
+    ProgressTools(String, Vec<(&'static str, Value)>),
     /// Reasoning streamed first, then structured calls.
     ReasonedTools(String, Vec<(&'static str, Value)>),
     /// Reasoning streamed first, then visible content.
@@ -624,6 +625,13 @@ impl Provider {
                             .map(|(index, (name, arguments))| json!({"index":index,"id":format!("call_{served}_{index}"),"type":"function","function":{"name":name,"arguments":arguments.to_string()}}))
                             .collect::<Vec<_>>();
                         out.push_str(&frame(json!({"tool_calls": calls}), None));
+                        out.push_str(&frame(json!({}), Some("tool_calls")));
+                    }
+                    Reply::ProgressTools(text, calls) => {
+                        out.push_str(&frame(json!({"content": text}), None));
+                        let calls = calls.into_iter().enumerate()
+                            .map(|(index, (name, arguments))| json!({"index":index,"id":format!("call_{served}_{index}"),"type":"function","function":{"name":name,"arguments":arguments.to_string()}})).collect::<Vec<_>>();
+                        out.push_str(&frame(json!({"tool_calls":calls}), None));
                         out.push_str(&frame(json!({}), Some("tool_calls")));
                     }
                     Reply::Tools(calls) => {
@@ -815,21 +823,38 @@ fn registered_and_future_families_share_valid_initial_and_multiple_tool_turns() 
     }
 }
 
+fn latest_runtime_section(request: &Value, tag: &str) -> String {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let cleared = format!("Runtime section cleared: {tag}.");
+    for message in request["messages"].as_array().unwrap().iter().rev() {
+        let text = message["content"].as_str().unwrap_or("");
+        if text.contains(&cleared) { return String::new(); }
+        if let Some(start) = text.rfind(&open) {
+            if let Some(end) = text[start..].find(&close) {
+                return text[start..start + end + close.len()].to_owned();
+            }
+        }
+    }
+    String::new()
+}
+
 fn user_turn_context(request: &Value) -> String {
     request["messages"]
         .as_array()
         .unwrap()
         .iter()
         .rev()
-        // Runtime guidance remains user-originated, but after a native tool call
-        // it is attached to the result boundary rather than opening a new turn.
+        // Runtime-owned state is attached to tool boundaries; actual steering
+        // retains its explicit continued-user attribution.
         .filter(|m| m["role"] == "user" || m["role"] == "tool")
         .filter_map(|m| {
             let text = m["content"].as_str().unwrap_or("");
             if m["role"] == "user" {
                 Some(text.to_owned())
             } else {
-                text.split_once("[CONTINUED USER TURN — NOT TOOL OUTPUT]\n")
+                text.split_once("[AGENT RUNTIME STATE — NOT A USER MESSAGE]\n")
+                    .or_else(|| text.split_once("[CONTINUED USER TURN — NOT TOOL OUTPUT]\n"))
                     .map(|(_, tail)| tail.to_owned())
             }
         })
@@ -1009,6 +1034,9 @@ fn tool_calls_during_synthesis_are_answered_with_an_instruction_to_write_the_ans
                     c.split("[CONTINUED USER TURN — NOT TOOL OUTPUT]")
                         .next()
                         .unwrap_or("")
+                        .split("[AGENT RUNTIME STATE — NOT A USER MESSAGE]")
+                        .next()
+                        .unwrap_or("")
                         .contains("Write the final answer now")
                 })
         });
@@ -1042,6 +1070,9 @@ fn repeated_synthesis_misfires_still_end_in_an_answer() {
                 m["role"] == "tool"
                     && m["content"].as_str().is_some_and(|c| {
                         c.split("[CONTINUED USER TURN — NOT TOOL OUTPUT]")
+                            .next()
+                            .unwrap_or("")
+                            .split("[AGENT RUNTIME STATE — NOT A USER MESSAGE]")
                             .next()
                             .unwrap_or("")
                             .contains("Write the final answer now")
@@ -1310,6 +1341,7 @@ const EXECUTION_TOOLS: &[&str] = &[
     "delete_file",
     "list_directory",
     "read_file",
+    "replace_text",
     "run_terminal",
     "write_file",
 ];
@@ -1843,7 +1875,7 @@ fn files_created_in_the_run_are_listed_and_named_in_the_review() {
         "{review}"
     );
     assert!(
-        !requests[4].to_string().contains("<files_created_this_run>"),
+        latest_runtime_section(&requests[4], "files_created_this_run").is_empty(),
         "a deleted file must leave the list"
     );
 }
@@ -1941,6 +1973,114 @@ fn write_file_to_an_unread_file_is_allowed() {
 
 fn plan(arguments: Value) -> (&'static str, Value) {
     ("plan", arguments)
+}
+
+#[test]
+fn fresh_small_patch_succeeds_and_stale_or_malformed_patch_does_not_write() {
+    let workspace = Workspace::new(&[("a.txt", "    value = 1;\n")]);
+    let file = workspace.root.join("a.txt");
+    let external = file.clone();
+    let provider = Provider::start(move |request, n| match n {
+        0 => Reply::Tools(vec![("read_file", json!({"path":"a.txt"}))]),
+        1 => {
+            assert!(last_tool_result(request).contains("value = 1"));
+            Reply::Tools(vec![("apply_patch", json!({"patch":"*** Begin Patch\n*** Update File: a.txt\n@@\n-    value = 1;\n+    value = 2;\n*** End Patch"}))])
+        }
+        2 => {
+            assert_eq!(std::fs::read_to_string(&external).unwrap(), "    value = 2;\n");
+            std::fs::write(&external, "    value = 3;\n").unwrap();
+            Reply::Tools(vec![("apply_patch", json!({"patch":"*** Begin Patch\n*** Update File: a.txt\n@@\n-    value = 2;\n+    value = 4;\n*** End Patch"}))])
+        }
+        3 => {
+            assert!(last_tool_result(request).contains("does not match current content"));
+            assert!(last_tool_result(request).contains("hunk 1"));
+            Reply::Tools(vec![("apply_patch", json!({"patch":"not a patch"}))])
+        }
+        _ => {
+            assert!(last_tool_result(request).contains("must start with *** Begin Patch"));
+            Reply::Text("Applied the fresh edit; later conflicting edits were refused.".into())
+        }
+    });
+    run(workspace.config(&provider.endpoint, "edit this text file"));
+    assert_eq!(std::fs::read_to_string(file).unwrap(), "    value = 3;\n");
+    assert_eq!(provider.requests().len(), 5);
+    assert!(completed(&workspace.journal()));
+}
+
+#[test]
+fn literal_replacement_requires_runtime_read_revision_and_demotes_verification() {
+    let workspace = Workspace::new(APP);
+    let file = workspace.root.join("app.js");
+    std::fs::write(&file, BAD).unwrap();
+    let external = file.clone();
+    let provider = Provider::start(move |request, n| match n {
+        0 => Reply::Tools(vec![
+            deliverable("add", json!({"text":"add returns the correct result"})),
+            ("replace_text", json!({"path":"app.js","old_text":"a - b","new_text":"a + b","_expected_revision":"forged"})),
+        ]),
+        1 => {
+            assert!(last_tool_result(request).contains("Read the file before"));
+            Reply::Tools(vec![("read_file", json!({"path":"app.js"}))])
+        }
+        2 => Reply::Tools(vec![
+            ("replace_text", json!({"path":"app.js","old_text":"a - b","new_text":"a + b"})),
+            deliverable("implemented", json!({"id":"d-001","evidence":"edited app.js"})),
+        ]),
+        3 => {
+            assert!(std::fs::read_to_string(&external).unwrap().contains("a + b"));
+            Reply::Tools(vec![run_check()])
+        }
+        4 => Reply::Tools(vec![verify("d-001", None)]),
+        5 => {
+            assert!(latest_runtime_section(request, "deliverables").contains("[verified] d-001"));
+            Reply::Tools(vec![("replace_text", json!({"path":"app.js","old_text":"a + b","new_text":"b + a"}))])
+        }
+        6 => {
+            assert!(!latest_runtime_section(request, "deliverables").contains("[verified] d-001"));
+            assert!(latest_runtime_section(request, "verification_state").contains("stale"));
+            std::fs::write(&external, "module.exports = (a, b) => a * b;\n").unwrap();
+            Reply::Tools(vec![("replace_text", json!({"path":"app.js","old_text":"a * b","new_text":"a + b","_expected_revision":"forged"}))])
+        }
+        _ => {
+            assert!(last_tool_result(request).contains("changed since your last read"));
+            Reply::Text("Implemented, not verified after the later changes.".into())
+        }
+    });
+    run(workspace.config(&provider.endpoint, "fix the addition function"));
+    assert_eq!(std::fs::read_to_string(file).unwrap(), "module.exports = (a, b) => a * b;\n");
+    assert!(completed(&workspace.journal()));
+}
+
+#[test]
+fn runtime_plan_updates_and_visible_progress_do_not_create_human_turns_or_extra_requests() {
+    let workspace = Workspace::new(&[("a.txt", "a"), ("b.txt", "b")]);
+    let provider = Provider::start(|request, n| {
+        let messages = request["messages"].as_array().unwrap();
+        assert_eq!(messages.iter().filter(|m| m["role"] == "user").count(), 1);
+        assert!(!request.to_string().contains("CONTINUED USER TURN"));
+        match n {
+            0 => Reply::ProgressTools("Inspecting the sources.".into(), vec![plan(
+                json!({"action":"set","steps":["inspect","report"]}),
+            )]),
+            1 => Reply::Tools(vec![("read_file", json!({"path":"a.txt"}))]),
+            2 => Reply::Tools(vec![plan(json!({"action":"update","id":"s1","status":"completed"}))]),
+            3 => Reply::Tools(vec![("read_file", json!({"path":"b.txt"}))]),
+            _ => Reply::Text("Both sources inspected.".into()),
+        }
+    });
+    run(workspace.config(&provider.endpoint, "inspect these two files"));
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 5, "progress is part of a tool response, not a new generation");
+    for pair in requests.windows(2) {
+        let old = pair[0]["messages"].as_array().unwrap();
+        let new = pair[1]["messages"].as_array().unwrap();
+        assert_eq!(&new[..old.len()], old.as_slice(), "accepted prompt prefix must be immutable");
+    }
+    assert!(requests[1]["messages"].as_array().unwrap().iter().any(|m| {
+        m["role"] == "assistant" && m["content"] == "Inspecting the sources."
+    }));
+    assert!(completed(&workspace.journal()));
+    assert_eq!(workspace.journal().iter().filter(|e| e.get("RunUser").is_some()).count(), 1);
 }
 
 /// The plan is its own state: it is shown back every turn, never mistaken for the deliverables, and its result is compact.
@@ -2401,7 +2541,7 @@ fn a_later_edit_demotes_a_verified_deliverable() {
     run(workspace.config(&provider.endpoint, "make add work"));
     let requests = provider.requests();
     assert!(requests[3].to_string().contains("[verified] d-001"));
-    let after_edit = requests[4].to_string();
+    let after_edit = latest_runtime_section(&requests[4], "deliverables");
     assert!(after_edit.contains("[implemented] d-001"), "{after_edit}");
     assert!(!after_edit.contains("[verified] d-001"), "{after_edit}");
 }
@@ -2685,7 +2825,7 @@ fn verify_then_write_file_makes_the_verification_stale() {
     let workspace = Workspace::new(APP);
     let requests = verified_then(&workspace, edit_app("module.exports = (a, b) => b + a;\n"));
     assert!(requests[3].to_string().contains("[verified] d-001"));
-    let after = requests[4].to_string();
+    let after = format!("{}\n{}", latest_runtime_section(&requests[4], "deliverables"), latest_runtime_section(&requests[4], "verification_state"));
     assert!(after.contains("[implemented] d-001"), "{after}");
     assert!(!after.contains("[verified] d-001"), "{after}");
     assert!(after.contains("stale"), "{after}");
@@ -2702,7 +2842,7 @@ fn verify_then_a_mutating_terminal_command_makes_the_verification_stale() {
         let workspace = Workspace::new(APP);
         let requests = verified_then(&workspace, term(command));
         assert!(requests[3].to_string().contains("[verified] d-001"));
-        let after = requests[4].to_string();
+        let after = format!("{}\n{}", latest_runtime_section(&requests[4], "deliverables"), latest_runtime_section(&requests[4], "verification_state"));
         assert!(
             after.contains("[implemented] d-001") && !after.contains("[verified] d-001"),
             "{command}: {after}"
@@ -2727,7 +2867,7 @@ fn verify_then_a_read_only_terminal_command_keeps_the_verification() {
     ] {
         let workspace = Workspace::new(APP);
         let requests = verified_then(&workspace, term(command));
-        let after = requests[4].to_string();
+        let after = format!("{}\n{}", latest_runtime_section(&requests[4], "deliverables"), latest_runtime_section(&requests[4], "verification_state"));
         assert!(after.contains("[verified] d-001"), "{command}: {after}");
         assert!(!after.contains("[implemented] d-001"), "{command}: {after}");
         let journal = workspace.journal();
