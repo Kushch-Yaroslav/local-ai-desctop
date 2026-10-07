@@ -33,6 +33,15 @@ export function validateDraftMetadata(profile: LlamaRuntimeProfile, target: Gguf
   if (expected.kvCache === 'shared' && !(Number(draft.values[`${arch}.attention.shared_kv_layers`]) > 0)) throw new Error('Draft GGUF не подтверждает разделяемый KV-cache.');
 }
 
+export function verifyEmbeddedMtp(profile: LlamaRuntimeProfile): void {
+  if (!profile.modelPath) throw new Error('Не настроена GGUF встроенной MTP-модели.');
+  const metadata = readGgufSpeculativeMetadata(profile.modelPath);
+  const architecture = metadata.values['general.architecture'];
+  if (typeof architecture !== 'string' || !(Number(metadata.values[`${architecture}.nextn_predict_layers`]) > 0)) {
+    throw new Error(`GGUF не подтверждает встроенные MTP-слои: ${profile.modelPath}.`);
+  }
+}
+
 export async function verifyDraftFile(profile: LlamaRuntimeProfile): Promise<void> {
   const draft = profile.draft;
   if (!draft || !profile.modelPath) throw new Error('Не настроены основная модель и draft.');
@@ -59,10 +68,13 @@ export function launchProfileEnvironment(profile: LlamaRuntimeProfile, enabled?:
   if (!profile.modelPath) throw new Error(`Не настроен llama.cpp GGUF: ${profile.id}.`);
   const mode = effectiveSpeculativeMode(profile, enabled);
   const draft = mode !== 'none' ? profile.draft : undefined;
+  const mmproj = profile.mmprojPath && (mode !== 'mtp' || profile.visionWithMtp !== false) ? profile.mmprojPath : '';
+  if (profile.speculativeDraftTokens !== undefined && (!Number.isInteger(profile.speculativeDraftTokens) || profile.speculativeDraftTokens < 1)) throw new Error('Некорректное число токенов embedded MTP.');
   const values = {
-    VARIANT: profile.id, MODEL: profile.modelPath, MMPROJ: profile.mmprojPath ?? '', RUNTIME_MODEL_ID: profile.id,
+    VARIANT: profile.id, MODEL: profile.modelPath, MMPROJ: mmproj, RUNTIME_MODEL_ID: profile.id,
     RUNTIME_LABEL: getModelProfile(profile.id)?.displayName ?? profile.id, DEFAULT_LLAMA_CONTEXT: String(profile.normalContext?.initialContextWindow ?? 32_768), MAX_LLAMA_CONTEXT: String(profile.maxContext),
-    SPECULATIVE_MODE: mode, DRAFT_MODEL: draft?.path ?? '', DRAFT_KV_SHARED: draft?.kvCache === 'shared' ? '1' : '0', DRAFT_N_MAX: draft ? String(draft.maxDraftTokens) : '',
+    SPECULATIVE_MODE: mode, DRAFT_MODEL: draft?.path ?? '', DRAFT_KV_SHARED: draft?.kvCache === 'shared' ? '1' : '0',
+    DRAFT_N_MAX: draft ? String(draft.maxDraftTokens) : mode === 'mtp' && profile.speculativeDraftTokens ? String(profile.speculativeDraftTokens) : '',
   };
   return [...Object.entries(values).map(([key, value]) => `${key}=${quote(value)}`), `PROFILE_SERVER_ARGS=(${placementArguments(profile).map(quote).join(' ')})`].join('\n');
 }
@@ -75,7 +87,9 @@ if (require.main === module) {
     if (process.argv[3] === '--verify') {
       verifyGgufArtifacts(profile.modelPath!);
       if (profile.hostResidentBudgetBytes !== undefined) verifyHostMemory(profile.hostResidentBudgetBytes);
-      if (effectiveSpeculativeMode(profile, process.env.LOCAL_AI_LLAMA_SPECULATIVE) !== 'none' && profile.draft) await verifyDraftFile(profile);
+      const mode = effectiveSpeculativeMode(profile, process.env.LOCAL_AI_LLAMA_SPECULATIVE);
+      if (mode === 'mtp' && !profile.draft) verifyEmbeddedMtp(profile);
+      if (mode !== 'none' && profile.draft) await verifyDraftFile(profile);
     }
     process.stdout.write(environment + '\n');
   })().catch((error: unknown) => { process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`); process.exitCode = 1; });

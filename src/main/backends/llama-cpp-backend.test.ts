@@ -77,6 +77,10 @@ export async function runLlamaCppBackendRegression(): Promise<void> {
       assert.equal(requests, 0, 'generation cannot implicitly select a model');
       backend.updateRuntimeSelection(model, 32_768);
       assert.equal(await backend.supportsVision(model), true);
+      backend.updateRuntimeSelection('qwen3.6:35b-a3b-ud-q4_k_m', 65_536, 'q8_0', true);
+      assert.equal(await backend.supportsVision('qwen3.6:35b-a3b-ud-q4_k_m'), false, 'MTP-active Qwen3.6 runtime does not load its unsupported projector');
+      backend.updateRuntimeSelection('qwen3.6:35b-a3b-ud-q4_k_m', 65_536, 'q8_0', true, true);
+      assert.equal(await backend.supportsVision('qwen3.6:35b-a3b-ud-q4_k_m'), true, 'MTP-off runtime may expose its verified projector');
       backend.clearRuntimeSelection();
       assert.equal(await backend.supportsVision(model), false);
     } finally { globalThis.fetch = originalFetch; }
@@ -133,14 +137,14 @@ export async function runLlamaCppBackendRegression(): Promise<void> {
       assert.deepEqual(models.map((item) => item.id), llamaRuntimeProfiles.map((profile) => profile.id));
       assert(!models.some((item) => ['glm-4.7-flash:q4_k', 'gpt-oss:20b'].includes(item.id)), 'removed local entries must not appear');
       for (const item of models) assert.deepEqual(item.supportedContextPresets, [16384, 32768, 65536, 131072, 262144], 'active context must not truncate another model capability');
-      const coderNext = models.find((item) => item.id === 'qwen3-coder-next:80b-a3b-q4_k_m');
-      assert(coderNext?.installed);
-      assert.equal(coderNext.supportsTools, true);
-      assert.equal(coderNext.supportsReasoning, false);
-      assert.equal(coderNext.normalContext?.initialContextWindow, 65_536);
-      assert.equal(coderNext.normalContext?.kvCacheType, 'q8_0');
-      assert.equal(coderNext.speculative, undefined);
-      assert.equal(coderNext.reasoning, undefined);
+      const qwen36 = models.find((item) => item.id === 'qwen3.6:35b-a3b-ud-q4_k_m');
+      assert(qwen36?.installed);
+      assert.equal(qwen36.supportsTools, true);
+      assert.equal(qwen36.supportsReasoning, true);
+      assert.equal(qwen36.normalContext?.initialContextWindow, 65_536);
+      assert.equal(qwen36.normalContext?.kvCacheType, 'q8_0');
+      assert.deepEqual(qwen36.speculative, { mechanism: 'mtp', draftSource: 'embedded' });
+      assert.deepEqual(qwen36.reasoning, { thinkingToggle: true, efforts: [] });
     } finally { await stop(server); }
   }
   {

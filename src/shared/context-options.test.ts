@@ -4,7 +4,7 @@ import type { ContextDiscoveryOption } from './context-estimator';
 import { llamaContextPresets } from '../main/models/llama-runtime-policy';
 
 const qwen = 'qwen3.8:27b-q4_K_M';
-const coderNext = 'qwen3-coder-next:80b-a3b-q4_k_m';
+const qwen36 = 'qwen3.6:35b-a3b-ud-q4_k_m';
 const glm = 'glm-4.7-flash:q4_k';
 const option = (modelId: string, contextWindow: number, kvCacheType: 'f16' | 'q8_0'): ContextDiscoveryOption => ({
   modelId, contextWindow, kvCacheType, kvOffload: true, discoveredAt: new Date().toISOString(),
@@ -13,7 +13,7 @@ const option = (modelId: string, contextWindow: number, kvCacheType: 'f16' | 'q8
 
 export function runContextOptionsRegression() {
   assert.deepEqual(llamaContextPresets(qwen), [16384, 32768, 65536, 131072, 262144]);
-  assert.deepEqual(llamaContextPresets(coderNext), [16384, 32768, 65536, 131072, 262144]);
+  assert.deepEqual(llamaContextPresets(qwen36), [16384, 32768, 65536, 131072, 262144]);
   assert.deepEqual(llamaContextPresets(glm), [16384, 32768, 65536, 131072]);
   assert.deepEqual(llamaContextPresets(qwen, 65536), [16384, 32768, 65536], 'only trained/backend capability may reduce normal presets');
   for (const model of [qwen, glm]) {
@@ -43,8 +43,8 @@ export function runContextOptionsRegression() {
   assert.equal(normalContextForModel(106496, llamaContextPresets(glm)), 65536, 'model change must replace an unverified custom context with a normal target-model preset');
   assert.equal(normalContextForModel(262144, llamaContextPresets(glm)), 131072, 'model change must respect the new model capability');
   assert.equal(normalContextForModel(16384, llamaContextPresets(qwen)), 16384);
-  const coderChoices = buildContextChoices(coderNext, llamaContextPresets(coderNext), 262144, [], 'q8_0');
-  assert(coderChoices.some((choice) => choice.contextWindow === 65536 && choice.kvCacheType === 'q8_0' && choice.label === '64K (Q8)'));
+  const qwen36Choices = buildContextChoices(qwen36, llamaContextPresets(qwen36), 262144, [], 'q8_0');
+  assert(qwen36Choices.some((choice) => choice.contextWindow === 65536 && choice.kvCacheType === 'q8_0' && choice.label === '64K (Q8)'));
 }
 
 if (require.main === module) runContextOptionsRegression();

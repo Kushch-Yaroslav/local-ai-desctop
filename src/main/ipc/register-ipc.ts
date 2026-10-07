@@ -162,7 +162,9 @@ async function currentLlamaRuntime(): Promise<LlamaRuntimeState> {
 async function syncLlamaBackend(): Promise<LlamaRuntimeState> {
   const state = await currentLlamaRuntime();
   if (state.status === 'ready' && state.modelId && state.contextWindow) {
-    try { llamaCpp.updateRuntimeSelection(state.modelId, state.contextWindow, state.kvCacheType ?? initialLlamaKvType, state.kvOffload ?? initialLlamaKvOffload); } catch { /* an unsupported combination is reported by the launcher state itself */ }
+    const profile = llamaRuntimeProfile(state.modelId);
+    const visionEnabled = profile?.vision && (state.speculativeMode !== 'mtp' || profile.visionWithMtp !== false);
+    try { llamaCpp.updateRuntimeSelection(state.modelId, state.contextWindow, state.kvCacheType ?? initialLlamaKvType, state.kvOffload ?? initialLlamaKvOffload, visionEnabled); } catch { /* an unsupported combination is reported by the launcher state itself */ }
   } else { llamaCpp.clearRuntimeSelection(); }
   return state;
 }

@@ -8,7 +8,7 @@ context_args=(--cache-type-k f16 --cache-type-v f16 --kv-offload)
 PORT=8083
 APP_DIR="$root"
 ELECTRON_BIN="$(command -v node)"
-for id in qwen3.8:27b-q4_K_M qwen3-coder-next:80b-a3b-q4_k_m huihui-qwen3.8:27b-ud-dw-q4_k_m; do
+for id in qwen3.8:27b-q4_K_M qwen3.6:35b-a3b-ud-q4_k_m huihui-qwen3.8:27b-ud-dw-q4_k_m; do
   select_variant "$id"
   server_args=()
   build_server_args 32768 999
@@ -21,6 +21,7 @@ for id in qwen3.8:27b-q4_K_M qwen3-coder-next:80b-a3b-q4_k_m huihui-qwen3.8:27b-
   fi
   if [[ "$SPECULATIVE_MODE" == mtp ]]; then
     [[ "$args" == *" --spec-type draft-mtp "* ]]
+    if [[ "$id" == qwen3.6:* ]]; then [[ "$args" == *" --spec-draft-n-max 2 "* ]]; fi
   else
     [[ "$args" == *" --spec-type none "* ]]
   fi
@@ -53,12 +54,15 @@ build_server_args 65536 999
 [[ " ${server_args[*]} " == *" --ctx-size 65536 "* && " ${server_args[*]} " == *" --n-cpu-moe 28 "* ]]
 [[ " ${server_args[*]} " == *" --load-mode none "* && " ${server_args[*]} " == *" --fit off "* ]]
 context_args=(--cache-type-k q8_0 --cache-type-v q8_0 --kv-offload)
-select_variant qwen3-coder-next:80b-a3b-q4_k_m
+select_variant qwen3.6:35b-a3b-ud-q4_k_m
 build_server_args 65536 999
 [[ " ${server_args[*]} " == *" --ubatch-size 128 "* && " ${server_args[*]} " == *" --batch-size 1024 "* ]]
 [[ " ${server_args[*]} " == *" --cache-type-k q8_0 "* && " ${server_args[*]} " == *" --cache-type-v q8_0 "* ]]
-[[ " ${server_args[*]} " == *" --spec-type none "* && " ${server_args[*]} " == *" --no-warmup "* ]]
+[[ " ${server_args[*]} " == *" --spec-type draft-mtp "* && " ${server_args[*]} " == *" --spec-draft-n-max 2 "* && " ${server_args[*]} " == *" --no-warmup "* ]]
 select_variant qwen3.8:27b-q4_K_M
 build_server_args 32768 999
 [[ " ${server_args[*]} " != *" --n-cpu-moe "* && " ${server_args[*]} " == *" --spec-type draft-mtp "* ]]
+LOCAL_AI_LLAMA_SPECULATIVE=0 select_variant qwen3.6:35b-a3b-ud-q4_k_m
+build_server_args 32768 999
+[[ "$MMPROJ" == *"mmproj-BF16.gguf" && " ${server_args[*]} " == *" --mmproj $MMPROJ "* && " ${server_args[*]} " == *" --spec-type none "* ]]
 echo 'PASS generic CPU expert placement and unchanged Qwen switching'

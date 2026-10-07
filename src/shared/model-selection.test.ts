@@ -18,5 +18,5 @@ assert.deepEqual(initialModelContext([16_384, 32_768, 65_536, 131_072]), { conte
 assert.equal(initialModelContext([4_096, 8_192]).contextWindow, 8_192, 'respect a lower model ceiling');
 assert.deepEqual(initialModelContext([16_384, 32_768, 65_536, 131_072], { initialContextWindow: 65_536, kvCacheType: 'q8_0' }), { contextWindow: 65_536, llamaKvCacheType: 'q8_0', llamaKvOffload: true }, 'explicit selection uses a profile normal configuration, never a saved Max');
 assert.equal(initialModelContext([16_384, 32_768], { initialContextWindow: 65_536, kvCacheType: 'q8_0' }).contextWindow, 32_768, 'normal configuration respects the runtime ceiling');
-assert.deepEqual(llamaRuntimeProfiles.map((profile) => effectiveSpeculativeMode(profile, undefined)), ['mtp', 'none', 'mtp']);
-console.log('model startup/history/explicit selection regressions passed (installed models, all non-ready states, restart, ceiling and MTP OFF)');
+assert.deepEqual(llamaRuntimeProfiles.map((profile) => effectiveSpeculativeMode(profile, undefined)), ['mtp', 'mtp', 'mtp']);
+console.log('model startup/history/explicit selection regressions passed (installed models, all non-ready states, restart, ceiling and default MTP)');
