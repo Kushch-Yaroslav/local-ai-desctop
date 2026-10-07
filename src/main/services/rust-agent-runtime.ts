@@ -200,8 +200,14 @@ export class RustAgentRuntime {
         } else if (event.type === 'tool_output_delta') {
           yield { type: 'tool', activity: { id: event.id ?? crypto.randomUUID(), label: activityLabel('run_terminal'), kind: 'terminal', state: 'running', terminal: event.stream === 'stderr' ? { stderr: `${event.content ?? ''}\n` } : { stdout: `${event.content ?? ''}\n` } } };
         } else if (event.type === 'tool_result' || event.type === 'tool_error') {
-          const terminal = event.name === 'run_terminal' ? terminalResult(event.content ?? event.message) : undefined;
-          yield { type: 'tool', activity: { id: event.id ?? crypto.randomUUID(), label: activityLabel(event.name), detail: terminal?.command ?? event.name, kind: activityKind(event.name), state: event.is_error || event.type === 'tool_error' ? 'error' : 'completed', output: event.content ?? event.message, rawOutput: event.content ?? event.message, ...(terminal ? { terminal } : {}), ...(event.diff ? { metadata: { diff: event.diff } } : {}) } };
+          const failed = event.is_error || event.type === 'tool_error';
+          // A result carries its call ID, so it finalizes the card the call
+          // opened. Fields it does not know must stay absent rather than
+          // undefined, or the merge would erase the started command.
+          const parsed = event.name === 'run_terminal' ? terminalResult(event.content ?? event.message) ?? (failed ? { exitCode: null } : undefined) : undefined;
+          const terminal = parsed && { ...parsed, status: parsed.status ?? (failed ? 'error' as const : 'completed' as const), finishedAt: parsed.finishedAt ?? new Date().toISOString() };
+          const detail = terminal?.command ?? (event.name === 'run_terminal' ? undefined : event.name);
+          yield { type: 'tool', activity: { id: event.id ?? crypto.randomUUID(), label: activityLabel(event.name), ...(detail ? { detail } : {}), kind: activityKind(event.name), state: failed ? 'error' : 'completed', output: event.content ?? event.message, rawOutput: event.content ?? event.message, ...(terminal ? { terminal } : {}), ...(event.diff ? { metadata: { diff: event.diff } } : {}) } };
         } else if (event.type === 'task_memory_update' && event.memory && typeof event.memory === 'object') {
           yield { type: 'task-memory', memory: event.memory as NonNullable<AgentPlan['taskMemory']> };
         } else if (event.type === 'context_optimized') {
@@ -269,8 +275,11 @@ function timestamp(value: number | undefined): string | undefined { return typeo
 function terminalResult(raw: string | undefined): TerminalExecution | undefined {
   if (!raw) return undefined;
   try {
-    const result = JSON.parse(raw) as Record<string, unknown>;
-    return { command: text(result.command), cwd: text(result.cwd), pid: number(result.pid), pgid: number(result.pgid), sessionId: number(result.session_id), startedAt: timestamp(number(result.started_at)), finishedAt: timestamp(number(result.finished_at)), exitCode: number(result.exit_code) ?? null, timedOut: bool(result.timed_out), cancelled: bool(result.cancelled), status: terminalStatus(result.status), stdout: text(result.stdout), stderr: text(result.stderr) };
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const result = parsed.execution && typeof parsed.execution === 'object' ? parsed.execution as Record<string, unknown> : parsed;
+    if (!('command' in result) && !('exit_code' in result) && !('status' in result)) return { status: 'error', exitCode: null };
+    const terminal: TerminalExecution = { command: text(result.command), cwd: text(result.cwd), pid: number(result.pid), pgid: number(result.pgid), sessionId: number(result.session_id), startedAt: timestamp(number(result.started_at)), finishedAt: timestamp(number(result.finished_at)), exitCode: number(result.exit_code) ?? null, timedOut: bool(result.timed_out), cancelled: bool(result.cancelled), status: terminalStatus(result.status), stdout: text(result.stdout), stderr: text(result.stderr) };
+    return Object.fromEntries(Object.entries(terminal).filter(([, value]) => value !== undefined)) as TerminalExecution;
   } catch { return undefined; }
 }
 const text = (value: unknown) => typeof value === 'string' ? value : undefined;

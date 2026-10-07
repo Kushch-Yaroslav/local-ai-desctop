@@ -319,6 +319,14 @@ export interface AnalysisRun {
   actions: ToolActivity[];
   createdAt: string;
   completedAt: string | null;
+  /** Durable timeline checkpoint (reasoning blocks, steering, pauses, activity
+   * positions). Saved at stable event boundaries so a Stop, failure or restart
+   * reconstructs the same history the live view showed. */
+  timeline?: ThinkingTimelineEvent[];
+  /** Visible output received before a run ended without a final answer. */
+  partialOutput?: string;
+  /** Failure text for a run that ended in `error`. */
+  error?: string;
 }
 
 export interface AnalysisProgress {

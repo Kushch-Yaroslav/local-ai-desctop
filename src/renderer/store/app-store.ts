@@ -121,6 +121,16 @@ export const useAppStore = create<State>((rawSet, rawGet) => {
     }) })));
     if (!immediate && (pendingTokens.size || pendingThinking.size)) animationFrame = window.requestAnimationFrame(() => drainStream());
   };
+  // The live stream turn is replaced by the run's persisted history once the
+  // run is final without an assistant message, so the view after Stop/failure
+  // is the same one a chat switch or restart reconstructs from the database.
+  const generationRuns = new Map<string, string>();
+  const isOrphanFinished = (run: AnalysisRun) => run.status !== 'running' && !run.assistantMessageId;
+  const adoptRuns = (generationId: string, runs: AnalysisRun[]) => (state: State): Partial<State> => {
+    const runId = generationRuns.get(generationId);
+    const finished = runs.find((run) => run.id === runId && isOrphanFinished(run));
+    return { analysisRuns: runs, ...(finished ? { messages: state.messages.filter((message) => message.id !== assistantId(generationId)) } : {}) };
+  };
   const finishAgentStream = (messages: ChatMessage[], generationId: string, terminal: { error?: string; cancelled?: boolean }) => messages.map((message) => message.id === assistantId(generationId)
     ? { ...message, ...(terminal.error ? { agentError: terminal.error } : {}), ...(terminal.cancelled ? { agentCancelled: true } : {}), agentFinishedAt: now() }
     : message);
@@ -264,7 +274,16 @@ export const useAppStore = create<State>((rawSet, rawGet) => {
     const accepted = await window.localAi.chat.approve({ conversationId: activeId, generationId, approvalId: pendingApproval.approval.approvalId, decision });
     if (!accepted) set((state) => state.generationId === generationId ? { approvalSubmitting: false } : {});
   },
-  stop: async () => { const { activeId, generationId } = get(); if (!activeId || !generationId) return; set({ generationState: 'stopping', pendingApproval: null, approvalSubmitting: false }); await window.localAi.chat.stop(activeId, generationId); pendingTokens.delete(generationId); pendingThinking.delete(generationId); if (animationFrame !== null) { window.cancelAnimationFrame(animationFrame); animationFrame = null; } set((state) => state.generationId === generationId ? { isGenerating: false, generationId: null, generationState: 'cancelled', messages: finishAgentStream(state.messages, generationId, { cancelled: true }), performance: null, pendingApproval: null, approvalSubmitting: false } : {}); },
+  stop: async () => {
+    const { activeId, generationId } = get(); if (!activeId || !generationId) return;
+    set({ generationState: 'stopping', pendingApproval: null, approvalSubmitting: false });
+    await window.localAi.chat.stop(activeId, generationId);
+    pendingTokens.delete(generationId); pendingThinking.delete(generationId); if (animationFrame !== null) { window.cancelAnimationFrame(animationFrame); animationFrame = null; }
+    withView(activeId, () => set((state) => state.generationId === generationId ? { isGenerating: false, generationId: null, generationState: 'cancelled', messages: finishAgentStream(state.messages, generationId, { cancelled: true }), performance: null, pendingApproval: null, approvalSubmitting: false } : {}));
+    // `chat:stop` resolves after the main process finalized the run, so the database is authoritative here.
+    if (!generationRuns.has(generationId)) return;
+    try { const runs = await window.localAi.analysis.list(activeId); withView(activeId, () => set(adoptRuns(generationId, runs))); } catch { /* the analysis-run event already carried the final run */ }
+  },
   handleStream: (event) => {
     if (event.conversationId !== rawGet().activeId && !views.has(event.conversationId)) return;
     withView(event.conversationId, () => {
@@ -342,7 +361,7 @@ export const useAppStore = create<State>((rawSet, rawGet) => {
         set({ agentPlan: { milestones: [], taskMemory: { entries: [], plan: event.memory.plan, deliverables: event.memory.deliverables } } });
       }
     }
-    if (event.type === 'analysis-run' && event.run) set((state) => ({ analysisRuns: [...state.analysisRuns.filter((run) => run.id !== event.run!.id), event.run!] }));
+    if (event.type === 'analysis-run' && event.run) { generationRuns.set(event.generationId, event.run.id); set((state) => adoptRuns(event.generationId, [...state.analysisRuns.filter((run) => run.id !== event.run!.id), event.run!])(state)); }
     if (event.type === 'analysis' && event.progress) set({ analysisProgress: [event.progress] });
     if (event.type === 'context' && event.active) set({ activeContextWindow: event.active });
     if (event.type === 'diagnostics' && event.diagnostics) set({ performance: { ...event.diagnostics, generationId: event.generationId, conversationId: event.conversationId, createdAt: now() } });

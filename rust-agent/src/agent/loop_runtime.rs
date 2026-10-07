@@ -1949,8 +1949,83 @@ fn suffix_prefix_length(value: &str, marker: &str) -> usize {
         .unwrap_or(0)
 }
 
+/// Prefix of the stream error raised when the model's output degenerates into
+/// verbatim repetition. Sampling can trap a local model in a paragraph loop that
+/// otherwise runs until `max_tokens` (tens of minutes on a large MoE model).
+const REPETITION_LOOP_ERROR: &str = "repetition_loop";
+const REPETITION_CHECK_STEP_CHARS: usize = 256;
+const REPETITION_WINDOW_CHARS: usize = 16_000;
+const REPETITION_MIN_PERIOD: usize = 32;
+const REPETITION_MAX_PERIOD: usize = 4_000;
+const REPETITION_MIN_RUN_CHARS: usize = 1_500;
+
+/// Detects a tail that repeats one block verbatim at least four times (the
+/// periodic run covers three further periods) over at least
+/// `REPETITION_MIN_RUN_CHARS`. The block must be textual (≥10 distinct chars), so
+/// separators or padding runs are not mistaken for a loop.
+fn degenerate_repetition(text: &str) -> Option<(usize, usize)> {
+    let tail: Vec<char> = {
+        let total = text.chars().count();
+        text.chars()
+            .skip(total.saturating_sub(REPETITION_WINDOW_CHARS))
+            .collect()
+    };
+    let n = tail.len();
+    let max_period = REPETITION_MAX_PERIOD.min(n / 4);
+    for period in REPETITION_MIN_PERIOD..=max_period {
+        let mut run = 0;
+        let mut index = n - 1;
+        while index >= period && tail[index] == tail[index - period] {
+            run += 1;
+            index -= 1;
+        }
+        if run >= (3 * period).max(REPETITION_MIN_RUN_CHARS) {
+            let distinct: std::collections::BTreeSet<char> =
+                tail[n - period..].iter().copied().collect();
+            if distinct.len() >= 10 {
+                return Some((period, run));
+            }
+        }
+    }
+    None
+}
+
+fn check_repetition(text: &str, checked: &mut usize, kind: &str) -> Result<(), String> {
+    let length = text.len();
+    if length < *checked + REPETITION_CHECK_STEP_CHARS {
+        return Ok(());
+    }
+    *checked = length;
+    match degenerate_repetition(text) {
+        Some((period, run)) => Err(format!(
+            "{REPETITION_LOOP_ERROR}: model {kind} repeated a {period}-character block verbatim over the last {run} characters"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Text returned to the model when a call needs approval it cannot get in this run.
+fn approval_refusal(tool: &ValidatedCall) -> &'static str {
+    if tool.name == "run_terminal"
+        && tool
+            .arguments
+            .get("command")
+            .and_then(Value::as_str)
+            .is_some_and(|c| c.contains("git "))
+    {
+        "approval required for shell composition. For read-only history, retry as one scoped command: git -C <selected-project> log --oneline -30. Do not treat this attempt as evidence of repository history."
+    } else if tool.name == "run_terminal" {
+        "approval required: this command uses shell composition (&&, ||, ;, redirection, substitution, a wrapper) or affects the user session, and it was not run. Run each step as its own simple command; the terminal already starts in the working directory, so cd is not needed. Do not treat this refusal as a result."
+    } else {
+        "approval required"
+    }
+}
+
 #[derive(Default)]
 struct StreamedTurn {
+    /// Byte lengths of `content`/`reasoning_raw` at the last repetition check.
+    content_repetition_checked: usize,
+    reasoning_repetition_checked: usize,
     content: String,
     /// What the UI shows: reasoning with provider tool-call markup removed.
     reasoning: String,
@@ -2391,6 +2466,11 @@ fn consume_sse(
                     json!({"chars":reasoning.chars().count()}),
                 );
                 append_reasoning(turn, run_id, reasoning, emit_visible);
+                check_repetition(
+                    &turn.reasoning_raw,
+                    &mut turn.reasoning_repetition_checked,
+                    "reasoning",
+                )?;
             }
             if let Some(content) = delta
                 .and_then(|delta| delta.get("content"))
@@ -2410,6 +2490,11 @@ fn consume_sse(
                         },
                     );
                 }
+                check_repetition(
+                    &turn.content,
+                    &mut turn.content_repetition_checked,
+                    "output",
+                )?;
             }
             if let Some(calls) = delta
                 .and_then(|delta| delta.get("tool_calls"))
@@ -4337,6 +4422,16 @@ pub fn run(config: Config) {
                     continue;
                 }
             }
+            Err(error) if error.starts_with(REPETITION_LOOP_ERROR) => {
+                emit(
+                    &config.run_id,
+                    Event::AgentError {
+                        code: REPETITION_LOOP_ERROR.into(),
+                        message: format!("Модель зациклилась и начала дословно повторять один и тот же фрагмент, поэтому генерация остановлена автоматически. Уже выполненная работа сохранена — отправьте сообщение, чтобы продолжить. ({error})"),
+                    },
+                );
+                return;
+            }
             Err(error) => {
                 emit(
                     &config.run_id,
@@ -4820,6 +4915,14 @@ pub fn run(config: Config) {
                 },
             );
             if config.cancelled.load(Ordering::Relaxed) {
+                emit(
+                    &config.run_id,
+                    Event::ToolError {
+                        id: tool.id.clone(),
+                        name: tool.name.clone(),
+                        message: "generation cancelled".into(),
+                    },
+                );
                 transcript.tool_result(
                     &tool.id,
                     &tool.name,
@@ -4915,13 +5018,18 @@ pub fn run(config: Config) {
                             .to_owned(),
                     },
                 );
-                transcript.tool_result(
-                    &tool.id,
-                    &tool.name,
-                    concise_tool_error(if tool.name == "run_terminal" && tool.arguments.get("command").and_then(Value::as_str).is_some_and(|c| c.contains("git ")) {
-                        "approval required for shell composition. For read-only history, retry as one scoped command: git -C <selected-project> log --oneline -30. Do not treat this attempt as evidence of repository history."
-                    } else if tool.name == "run_terminal" { "approval required: this command uses shell composition (&&, ||, ;, redirection, substitution, a wrapper) or affects the user session, and it was not run. Run each step as its own simple command; the terminal already starts in the working directory, so cd is not needed. Do not treat this refusal as a result." } else { "approval required" }),
+                let refusal = approval_refusal(tool);
+                // The started card must end with this call's own result: the
+                // model's retry is a new call with a new ID.
+                emit(
+                    &config.run_id,
+                    Event::ToolError {
+                        id: tool.id.clone(),
+                        name: tool.name.clone(),
+                        message: refusal.into(),
+                    },
                 );
+                transcript.tool_result(&tool.id, &tool.name, concise_tool_error(refusal));
                 continue;
             }
             emit(
@@ -5033,14 +5141,6 @@ pub fn run(config: Config) {
                     record_read_evidence(&config, &transcript, tool);
                 }
                 Err(message) => {
-                    emit(
-                        &config.run_id,
-                        Event::ToolError {
-                            id: tool.id.clone(),
-                            name: tool.name.clone(),
-                            message: concise_tool_error(&message),
-                        },
-                    );
                     let stored_error = if tool.name == "run_terminal" {
                         serde_json::from_str::<Value>(&message)
                             .map(|execution| {
@@ -5051,6 +5151,16 @@ pub fn run(config: Config) {
                     } else {
                         concise_tool_error(&message)
                     };
+                    // A failed terminal keeps its structured execution so the
+                    // result closes the same card the process started.
+                    emit(
+                        &config.run_id,
+                        Event::ToolError {
+                            id: tool.id.clone(),
+                            name: tool.name.clone(),
+                            message: stored_error.clone(),
+                        },
+                    );
                     if matches!(tool.name.as_str(), "observation_read" | "observation_index") {
                         transcript.inline_tool_result(&tool.id, &tool.name, stored_error);
                     } else {
@@ -5080,6 +5190,53 @@ fn is_context_overflow(error: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn verbatim_paragraph_loop_aborts_the_stream_but_normal_text_does_not() {
+        let block = "**Итог**: я нашёл ключевую проблему — `makeBotMove()` может вернуться без вызова `finishTurn()`.\n\nНо это не объяснит, почему бот не ходит после хода игрока.\n\n";
+        let mut turn = StreamedTurn::default();
+        let mut buffer = String::new();
+        let mut result = Ok(());
+        let mut frames = 0;
+        // Stream the loop one delta at a time, as the provider does.
+        for _ in 0..40 {
+            for piece in block.split_inclusive(' ') {
+                buffer.push_str(&format!(
+                    "data: {}\n\n",
+                    json!({"choices":[{"index":0,"delta":{"content":piece}}]})
+                ));
+                frames += 1;
+                result = consume_sse(&mut buffer, &mut turn, "test-run", false, false);
+                if result.is_err() {
+                    break;
+                }
+            }
+            if result.is_err() {
+                break;
+            }
+        }
+        let error = result.expect_err("a verbatim loop must stop the stream");
+        assert!(error.starts_with(REPETITION_LOOP_ERROR), "{error}");
+        // Detected after a handful of repetitions, not at max_tokens.
+        assert!(
+            turn.content.chars().count() < REPETITION_MIN_RUN_CHARS + 3 * block.chars().count(),
+            "{frames} {} {}",
+            turn.content.chars().count(),
+            block.chars().count()
+        );
+
+        let varied: String = (0..400)
+            .map(|n| {
+                format!(
+                    "Шаг {n}: проверяю файл module_{n}.js и фиксирую результат {}.\n",
+                    n * 7
+                )
+            })
+            .collect();
+        assert_eq!(degenerate_repetition(&varied), None);
+        assert_eq!(degenerate_repetition(&"=".repeat(8_000)), None);
+        let table: String = (0..300).map(|n| format!("| {n} | ok | — |\n")).collect();
+        assert_eq!(degenerate_repetition(&table), None);
+    }
     #[test]
     fn pause_restricts_schemas_to_the_checkpoint_and_offers_pause_run_only_after_steering() {
         let schemas = tool_schemas_for_request(ToolScope::Project, RunPolicy::Auto, "build it");

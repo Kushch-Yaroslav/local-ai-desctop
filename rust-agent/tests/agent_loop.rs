@@ -2685,3 +2685,86 @@ fn a_deliverable_can_require_a_specific_capability() {
         .to_string()
         .contains("[verified] d-001"));
 }
+
+/// Every terminal call the UI saw start is closed by a result event carrying
+/// the same call ID: a refused composition included (no process ever starts),
+/// and a failed command keeps its structured execution so the result card
+/// still names the command and process.
+#[test]
+fn every_started_tool_call_emits_its_own_result_event() {
+    let workspace = Workspace::new(&[("a.txt", "a")]);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Tools(vec![(
+            "run_terminal",
+            json!({"command":"echo a && echo b"}),
+        )]),
+        1 => Reply::Tools(vec![("run_terminal", json!({"command":"exit 3"}))]),
+        _ => Reply::Text("reported".into()),
+    });
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_local-ai-agent-runtime"))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let request = json!({
+        "type":"run","run_id":"lifecycle","endpoint":provider.endpoint,"model":"scripted",
+        "system":"system","user":"run the checks","project_root":workspace.root,
+        "context_limit":65536,"reasoning_mode":"fast","web_mode":"off","policy":"auto",
+        "evidence_dir":workspace.base.join("evidence"),
+    });
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(stdin, "{request}").unwrap();
+    let mut events = Vec::new();
+    for line in std::io::BufRead::lines(std::io::BufReader::new(child.stdout.take().unwrap())) {
+        let event: Value = serde_json::from_str(&line.unwrap()).unwrap();
+        let event = event.get("event").cloned().unwrap_or(event);
+        let kind = event["type"].as_str().unwrap_or("").to_owned();
+        events.push(event);
+        if matches!(kind.as_str(), "final" | "agent_error" | "agent_stopped") {
+            break;
+        }
+    }
+    drop(stdin);
+    let _ = child.wait();
+    let ids = |kinds: &[&str]| -> Vec<String> {
+        events
+            .iter()
+            .filter(|event| kinds.contains(&event["type"].as_str().unwrap_or("")))
+            .map(|event| event["id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let started = ids(&["tool_call_started"]);
+    assert_eq!(started.len(), 2, "{events:?}");
+    assert_eq!(
+        ids(&["tool_result", "tool_error"]),
+        started,
+        "each started call needs exactly one result with its own ID"
+    );
+    let result = |id: &str| {
+        events
+            .iter()
+            .find(|event| {
+                event["id"] == id
+                    && matches!(event["type"].as_str(), Some("tool_result" | "tool_error"))
+            })
+            .unwrap()
+            .clone()
+    };
+    assert!(result(&started[0])["message"]
+        .as_str()
+        .unwrap()
+        .contains("approval required"));
+    let failed = result(&started[1]);
+    let payload: Value = serde_json::from_str(
+        failed["message"]
+            .as_str()
+            .or(failed["content"].as_str())
+            .unwrap(),
+    )
+    .unwrap();
+    let execution = payload.get("execution").unwrap_or(&payload);
+    assert_eq!(execution["command"], "exit 3", "{payload}");
+    assert_eq!(execution["exit_code"], 3, "{payload}");
+    assert!(execution["pid"].is_u64(), "{payload}");
+}

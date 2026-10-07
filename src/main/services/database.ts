@@ -21,7 +21,7 @@ type ConversationRow = {
 type MessageRow = { id: string; conversation_id: string; role: ChatMessage['role']; content: string; thinking: string | null; thinking_timeline: string | null; task_plan: string | null; generation_stats: string | null; created_at: string };
 type ProjectReferenceRow = { id: string; message_id: string; position: number; project_id: string; project_slot: 1 | 2; project_path: string; project_label: string; relative_path: string; kind: ProjectReferenceKind };
 type AttachmentRow = { id: string; message_id: string; position: number; kind: AttachmentKind; mime_type: string; filename: string; size: number; storage_ref: string; status: AttachmentStatus; extracted_text: string | null; structured_data: string | null; vision_analysis: string | null; error: string | null; metadata: string | null; created_at: string; updated_at: string };
-type AnalysisRunRow = { id: string; conversation_id: string; assistant_message_id: string | null; reasoning_mode: ReasoningMode; status: AnalysisRun['status']; action_count: number; created_at: string; completed_at: string | null };
+type AnalysisRunRow = { id: string; conversation_id: string; assistant_message_id: string | null; reasoning_mode: ReasoningMode; status: AnalysisRun['status']; action_count: number; created_at: string; completed_at: string | null; timeline?: string | null; partial_output?: string | null; error?: string | null };
 type AnalysisActionRow = { id: string; run_id: string; label: string; detail: string | null; data: string | null; position: number };
 type AgentPlanRow = { plan: string };
 
@@ -53,14 +53,18 @@ function parseGenerationStats(value: string | null): GenerationStats | undefined
     };
   } catch { return undefined; }
 }
+/** Old or damaged timeline metadata remains optional; malformed entries are dropped. */
+const parseTimeline = (value: string | null | undefined): ThinkingTimelineEvent[] | undefined => {
+  try {
+    const parsed = value ? JSON.parse(value) as unknown : undefined;
+    if (!Array.isArray(parsed)) return undefined;
+    return parsed.filter((item): item is ThinkingTimelineEvent => Boolean(item) && typeof item === 'object' && typeof item.id === 'string' && typeof item.position === 'number' && ((item.kind === 'reasoning' && typeof item.content === 'string' && (item.startedAt === undefined || typeof item.startedAt === 'string') && (item.completedAt === undefined || typeof item.completedAt === 'string')) || (item.kind === 'activity' && typeof item.activityId === 'string') || (item.kind === 'steering' && typeof item.messageId === 'string' && (item.status === 'accepted' || item.status === 'applied')) || item.kind === 'paused'));
+  } catch { return undefined; }
+};
 const mapMessage = (row: MessageRow, attachments?: Attachment[], projectReferences?: ProjectReference[]): ChatMessage => {
   const generationStats = parseGenerationStats(row.generation_stats);
-  let thinkingTimeline: ThinkingTimelineEvent[] | undefined;
   let taskPlan: import('../../shared/types').AgentPlan | undefined;
-  try {
-    const parsed = row.thinking_timeline ? JSON.parse(row.thinking_timeline) as unknown : undefined;
-    if (Array.isArray(parsed)) thinkingTimeline = parsed.filter((item): item is ThinkingTimelineEvent => Boolean(item) && typeof item === 'object' && typeof item.id === 'string' && typeof item.position === 'number' && ((item.kind === 'reasoning' && typeof item.content === 'string' && (item.startedAt === undefined || typeof item.startedAt === 'string') && (item.completedAt === undefined || typeof item.completedAt === 'string')) || (item.kind === 'activity' && typeof item.activityId === 'string') || (item.kind === 'steering' && typeof item.messageId === 'string' && (item.status === 'accepted' || item.status === 'applied'))));
-  } catch { /* Old or damaged timeline metadata remains optional. */ }
+  const thinkingTimeline = parseTimeline(row.thinking_timeline);
   try {
     const parsed = row.task_plan ? JSON.parse(row.task_plan) as unknown : undefined;
     if (parsed && typeof parsed === 'object' && (Array.isArray((parsed as { milestones?: unknown }).milestones) || Array.isArray((parsed as { steps?: unknown }).steps))) {
@@ -85,8 +89,14 @@ const mapRun = (row: AnalysisRunRow, actions: AnalysisActionRow[]): AnalysisRun 
   // `analysis_actions.id` is a storage primary key. New rows scope that key by
   // run, while persisted activity data retains the stable per-run ID used by
   // timelines, approval events and the renderer.
-  return { ...visible, id: typeof stored.id === 'string' ? stored.id : action.id, label: action.label, detail: action.detail ?? undefined };
-}), createdAt: row.created_at, completedAt: row.completed_at });
+  // Runs finalized before running actions were closed on Stop/failure must not show live work forever.
+  const stale = visible.state === 'running' && row.status !== 'running' && row.status !== 'completed';
+  return { ...visible, ...(stale ? { state: 'error' as const, ...(visible.terminal && !visible.terminal.finishedAt ? { terminal: { ...visible.terminal, status: row.status === 'error' ? 'error' as const : 'cancelled' as const } } : {}) } : {}), id: typeof stored.id === 'string' ? stored.id : action.id, label: action.label, detail: action.detail ?? undefined };
+}), createdAt: row.created_at, completedAt: row.completed_at, ...runHistory(row) });
+const runHistory = (row: AnalysisRunRow): Pick<AnalysisRun, 'timeline' | 'partialOutput' | 'error'> => {
+  const timeline = parseTimeline(row.timeline);
+  return { ...(timeline?.length ? { timeline } : {}), ...(row.partial_output ? { partialOutput: row.partial_output } : {}), ...(row.error ? { error: row.error } : {}) };
+};
 
 export class Database {
   private readonly db: DatabaseSync;
@@ -167,6 +177,9 @@ export class Database {
     try { this.db.exec('ALTER TABLE generation_diagnostics ADD COLUMN time_to_first_token_ms REAL'); } catch { /* Existing databases already have this column. */ }
     try { this.db.exec('ALTER TABLE analysis_actions ADD COLUMN data TEXT'); } catch { /* Existing databases already have this column. */ }
     this.migrateAnalysisRuns();
+    try { this.db.exec('ALTER TABLE analysis_runs ADD COLUMN timeline TEXT'); } catch { /* Existing databases already have this column. */ }
+    try { this.db.exec('ALTER TABLE analysis_runs ADD COLUMN partial_output TEXT'); } catch { /* Existing databases already have this column. */ }
+    try { this.db.exec('ALTER TABLE analysis_runs ADD COLUMN error TEXT'); } catch { /* Existing databases already have this column. */ }
     try { this.db.exec('ALTER TABLE generation_diagnostics ADD COLUMN reasoning_mode TEXT'); } catch { /* Existing databases already have this column. */ }
     // Map values persisted by the removed four-level control once. The legacy
     // columns stay in place for old SQLite files but are never read again.
@@ -419,7 +432,7 @@ export class Database {
       }
       : undefined;
     const data = JSON.stringify({ ...prior, ...activity, ...(terminal ? { terminal } : {}), approval: undefined, attachment: undefined });
-    if (existing) this.db.prepare('UPDATE analysis_actions SET label=?, detail=?, data=? WHERE id=? AND run_id=?').run(activity.label, activity.detail ?? null, data, existing.id, runId);
+    if (existing) this.db.prepare('UPDATE analysis_actions SET label=?, detail=?, data=? WHERE id=? AND run_id=?').run(activity.label, activity.detail ?? prior.detail ?? null, data, existing.id, runId);
     else {
       this.db.prepare('INSERT INTO analysis_actions (id, run_id, label, detail, data, position) VALUES (?, ?, ?, ?, ?, ?)').run(storageId, runId, activity.label, activity.detail ?? null, data, position);
       if (activity.kind !== 'progress') this.db.prepare('UPDATE analysis_runs SET action_count=action_count+1 WHERE id=?').run(runId);
@@ -431,7 +444,10 @@ export class Database {
    * live generation can own it. Marking it keeps it distinguishable from a
    * completed or cancelled run. Its Task Memory and evidence are retained. */
   recoverInterruptedRuns(): number {
-    return Number(this.db.prepare("UPDATE analysis_runs SET status='interrupted', completed_at=? WHERE status='running'").run(new Date().toISOString()).changes);
+    const finishedAt = new Date().toISOString();
+    const runs = this.db.prepare("SELECT id FROM analysis_runs WHERE status='running'").all() as unknown as Array<{ id: string }>;
+    for (const run of runs) this.closeRunningActions(run.id, 'interrupted', finishedAt);
+    return Number(this.db.prepare("UPDATE analysis_runs SET status='interrupted', completed_at=? WHERE status='running'").run(finishedAt).changes);
   }
 
   /** The last successful Max Context result per stable configuration and KV mode. Only
@@ -462,9 +478,39 @@ export class Database {
     return rows.flatMap((row) => parseStoredDiscoveryOption(row.option, { modelId, kvCacheType: row.kv_cache_type, kvOffload: row.kv_offload === 1, hardLimit }) ?? []);
   }
 
-  finishAnalysisRun(runId: string, status: AnalysisRun['status'], assistantMessageId: string | null): AnalysisRun {
-    this.db.prepare('UPDATE analysis_runs SET status=?, assistant_message_id=?, completed_at=? WHERE id=?').run(status, assistantMessageId, new Date().toISOString(), runId);
+  /** Checkpoints the run's timeline at a stable event boundary (never per token). */
+  saveAnalysisRunTimeline(runId: string, timeline: readonly ThinkingTimelineEvent[]): void {
+    this.db.prepare("UPDATE analysis_runs SET timeline=? WHERE id=? AND status='running'").run(JSON.stringify(timeline), runId);
+  }
+
+  /** Ends a run. A run that ends without a final answer keeps its timeline,
+   * any visible partial output and its failure text, and actions still shown
+   * as running are closed so the reconstructed history never shows live work. */
+  finishAnalysisRun(runId: string, status: AnalysisRun['status'], assistantMessageId: string | null, history: { timeline?: readonly ThinkingTimelineEvent[]; partialOutput?: string; error?: string } = {}): AnalysisRun {
+    const finishedAt = new Date().toISOString();
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.prepare('UPDATE analysis_runs SET status=?, assistant_message_id=?, completed_at=?, timeline=COALESCE(?, timeline), partial_output=?, error=? WHERE id=?')
+        .run(status, assistantMessageId, finishedAt, history.timeline ? JSON.stringify(history.timeline) : null, history.partialOutput?.trim() ? history.partialOutput : null, history.error ?? null, runId);
+      if (status !== 'completed') this.closeRunningActions(runId, status, finishedAt);
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
     return this.getAnalysisRun(runId)!;
+  }
+
+  private closeRunningActions(runId: string, status: AnalysisRun['status'], finishedAt: string): void {
+    const rows = this.db.prepare('SELECT id, data FROM analysis_actions WHERE run_id=?').all(runId) as unknown as Array<{ id: string; data: string | null }>;
+    for (const row of rows) {
+      let data: Partial<ToolActivity>;
+      try { data = row.data ? JSON.parse(row.data) as Partial<ToolActivity> : {}; } catch { continue; }
+      if (data.state !== 'running') continue;
+      const stopped = status !== 'error';
+      const closed: Partial<ToolActivity> = { ...data, state: 'error', ...(data.terminal && !data.terminal.finishedAt ? { terminal: { ...data.terminal, finishedAt, ...(stopped ? { cancelled: true, status: 'cancelled' as const } : { status: 'error' as const }) } } : {}) };
+      this.db.prepare('UPDATE analysis_actions SET data=? WHERE id=? AND run_id=?').run(JSON.stringify(closed), row.id, runId);
+    }
   }
 
   listAnalysisRuns(conversationId: string): AnalysisRun[] { return (this.db.prepare('SELECT * FROM analysis_runs WHERE conversation_id=? ORDER BY created_at ASC').all(conversationId) as unknown as AnalysisRunRow[]).map((row) => mapRun(row, this.db.prepare('SELECT * FROM analysis_actions WHERE run_id=? ORDER BY position ASC').all(row.id) as unknown as AnalysisActionRow[])); }
