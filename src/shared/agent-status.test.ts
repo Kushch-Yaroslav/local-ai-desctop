@@ -22,6 +22,22 @@ async function run(): Promise<void> {
   assert.match(markup, /1\/3/); assert.match(markup, /1\/4/);
   for (const label of [agentStatusText.plan, agentStatusText.deliverables, deliverableStatusLabel.implemented, deliverableStatusLabel.verified, deliverableStatusLabel.blocked, deliverableStatusLabel.dropped]) assert(markup.includes(label));
   assert.equal(renderToStaticMarkup(createElement(AgentStatusPanel, { plan: null })), '');
+  const evidencePlan: AgentPlan = { taskMemory: { entries: [], deliverables: { items: [
+    { id: 'runtime', text: 'Automatic response', status: 'verified', proof: ['ev-pass'], verification_scope: 'acceptance' },
+  ] }, verification: { epoch: 2, records: [
+    { id: 'ev-pass', kind: 'browser', class: 'functional', subject: 'browser interaction', pass: true, epoch: 2, turn: 1, deliverable_ids: ['runtime'] },
+    { id: 'ev-baseline', kind: 'test', class: 'functional', subject: 'project suite', pass: false, epoch: 0, turn: 0, baseline: true },
+    { id: 'ev-warning', kind: 'test', class: 'functional', subject: 'project suite', pass: false, epoch: 2, turn: 2, baseline_failure: 'ev-baseline', detail: 'independent assertion' },
+  ] } } };
+  const evidenceMarkup = renderToStaticMarkup(createElement(AgentStatusPanel, { plan: evidencePlan }));
+  assert(evidenceMarkup.includes('browser interaction — Пройдена'));
+  assert(evidenceMarkup.includes(agentStatusText.warnings) && evidenceMarkup.includes(agentStatusText.preExisting));
+  assert(evidenceMarkup.includes('independent assertion'));
+  assert.equal(agentStatus(evidencePlan).warnings.length, 1, 'stale baseline is not an active duplicate warning');
+  evidencePlan.taskMemory!.verification!.records.push({ id: 'ev-resolved', kind: 'test', class: 'functional', subject: 'project suite', pass: true, epoch: 2, turn: 3 });
+  assert.equal(agentStatus(evidencePlan).warnings.length, 0, 'a successful retry resolves the displayed warning');
+  evidencePlan.taskMemory!.verification!.epoch = 3;
+  assert.equal(agentStatus(evidencePlan).checks.length, 0, 'old checks are stale after a mutation');
   assert.equal(agentStatus({ ...plan, modelTodo: { phases: [{ name: 'old', items: [{ id: 'legacy', content: 'old', status: 'pending' }] }] }, taskMemory: { entries: [], plan: { steps: [] } } }).steps.length, 0, 'an explicitly cleared plan must not resurrect a legacy snapshot');
   assert.equal(agentStatus({ steps: [{ id: 'old', label: 'Legacy', status: 'in_progress' }] }).steps[0]?.text, 'Legacy');
   assert(isStatusSnapshot({ id: 'p', label: 'Plan', kind: 'planning', detail: 'plan' }));
@@ -48,6 +64,9 @@ async function run(): Promise<void> {
   const currentPlan = useAppStore.getState().agentPlan;
   emit('task-memory', { memory: { ...changed, entries: [{ id: 'knowledge', finding: 'New finding' }] } });
   assert.strictEqual(useAppStore.getState().agentPlan, currentPlan, 'unrelated knowledge/evidence updates must not redraw current status');
+  changed.verification = evidencePlan.taskMemory!.verification;
+  emit('task-memory', { memory: changed });
+  assert.deepEqual(useAppStore.getState().agentPlan?.taskMemory?.verification, changed.verification, 'live evidence must reach the compact panel and persist through Continue');
   await useAppStore.getState().selectConversation('B');
   assert.equal(useAppStore.getState().agentPlan, null);
   changed.plan!.steps[2].status = 'in_progress';

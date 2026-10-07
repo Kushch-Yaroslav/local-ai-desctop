@@ -16,7 +16,7 @@ use crate::agent::{
     state::{AgentState, PauseState},
     strategy::{self, Strategy},
     transcript::{validate_calls, CompactionPlan, ToolResultPolicy, Transcript, ValidatedCall},
-    verification::{self, Class, Need},
+    verification::{self, Need},
 };
 use crate::context::evidence_projection::{
     apply_folds, attach_historical_index, fold_to_budget, folded_ids,
@@ -756,7 +756,7 @@ fn tool_schemas(scope: ToolScope) -> Vec<Value> {
     // Action-specific requirements are enforced transactionally at dispatch.
     let mut tools = vec![
         json!({"type":"function","function":{"name":"task_memory","description":"Durable semantic memory for the current task across compaction. Record/update meaningful findings, decisions, blockers, or unresolved questions; view reads it; invalidate needs id. Record requires finding; update needs the id of an existing entry and changes only the fields you pass (an empty string clears one). Both may include evidence, implication, next, supersedes, status. Cite observations by exact id (obs-00000012), one per item in observations or comma-separated in evidence. Trust precise unchanged-file memory; reread only for a concrete missing, ambiguous, changed, exact-detail, or verification need.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["record","update","invalidate","view"]},"id":{"type":"string"},"finding":{"type":"string"},"evidence":{"type":"string"},"implication":{"type":"string"},"next":{"type":"string"},"supersedes":{"type":"string"},"status":{"type":"string","enum":["confirmed","inferred","unknown","contradicted"],"description":"How well established the finding is: confirmed (observed, cited), inferred (reasoned, not observed), unknown (open; put the resolving step in next), contradicted (evidence disagrees)."},"observations":{"type":"array","items":{"type":"string"},"description":"Observation IDs (obs-…) that support the finding; same as evidence, one id per item."}},"required":["action"]}}}),
-        json!({"type":"function","function":{"name":"deliverables","description":"The user's requested deliverables for this task (execution contract). Use it only when the request has two or more separate things to produce or change, or one result that must work end to end. add: record each requested deliverable once (text, optional task, optional check: the weakest evidence that proves the claim: readback = it exists, static = lint/typecheck, build = it builds, test = the tests pass, runtime = running the code works, browser = it works in a real browser; a changed page is always held to browser). implemented: you built it (id, evidence): this is your claim and is not proof. verify: the runtime has a passing check of it (id; evidence = ev-… ids from <verification_state>; Fast may omit them): only checks the runtime saw run after your last change count, and any later change to the project takes the verification back. block: it cannot be completed (id, concrete reason). drop: the user withdrew it (id, reason). view: list them. Record only what the user asked for, never your own optional ideas.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["add","implemented","verify","block","drop","view"]},"id":{"type":"string"},"task":{"type":"string"},"text":{"type":"string"},"evidence":{"type":"string"},"reason":{"type":"string"},"check":{"type":"string","enum":["readback","static","build","test","runtime","browser"]}},"required":["action"]}}}),
+        json!({"type":"function","function":{"name":"deliverables","description":"The user's requested deliverables for this task (execution contract). Use it only when the request has two or more separate things to produce or change, or one result that must work end to end. add: record each requested deliverable once (text, optional task, optional check: the weakest evidence that proves the claim: readback = it exists, static = lint/typecheck, build = it builds, test = the tests pass, runtime = running the code works, browser = it works in a real browser; a changed page is always held to browser). implemented: you built it (id, evidence): this is your claim and is not proof. verify: select relevant run_terminal checks with deliverable_ids before executing them; the runtime has a passing check of it (id; evidence = ev-… ids from <verification_state>; Fast may omit them): only checks the runtime saw run after your last change count, and any later change to the project takes the verification back. block: it cannot be completed (id, concrete reason). drop: the user withdrew it (id, reason). view: list them. Record only what the user asked for, never your own optional ideas.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["add","implemented","verify","block","drop","view"]},"id":{"type":"string"},"task":{"type":"string"},"text":{"type":"string"},"evidence":{"type":"string"},"reason":{"type":"string"},"check":{"type":"string","enum":["readback","static","build","test","runtime","browser"]}},"required":["action"]}}}),
         json!({"type":"function","function":{"name":"plan","description":"Your own short execution plan: how you will get the work done. Optional: skip it for a trivial or single-step request. set: replace the unfinished steps with a short ordered list of one-line steps (steps); the first becomes active. update: change a step (id; status pending|in_progress|completed|blocked, optional text or note; blocked needs a note); completing the active step activates the next. add: insert a step (text, optional after). view: list. Change the plan only when your approach changes; do not narrate it or update it after every call. A plan is not proof: finishing steps does not complete the user's deliverables.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["set","update","add","view"]},"steps":{"type":"array","items":{"type":"string"}},"id":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","completed","blocked"]},"text":{"type":"string"},"note":{"type":"string"},"after":{"type":"string"}},"required":["action"]}}}),
         json!({"type":"function","function":{"name":"observation_index","description":"List historical tool observations by stable ID, with source path and outcome metadata. Use source to select the raw observation for the needed file. If more=true, continue at the returned next_offset. Observation IDs start with obs-.","parameters":{"type":"object","properties":{"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":50}}}}}),
         json!({"type":"function","function":{"name":"observation_read","description":"Recover a bounded exact slice of a stored historical tool result by observation ID. The response distinguishes historical evidence from current source and reports whether the source changed.","parameters":{"type":"object","properties":{"id":{"type":"string"},"offset_chars":{"type":"integer","minimum":0},"max_chars":{"type":"integer","minimum":1,"maximum":16000}},"required":["id"]}}}),
@@ -771,7 +771,7 @@ fn tool_schemas(scope: ToolScope) -> Vec<Value> {
             json!({"type":"function","function":{"name":"project_knowledge_index","description":"Read the small .ai-framework manifest index and source freshness map. Use it before repeating broad project orientation.","parameters":{"type":"object","properties":{}}}}),
             json!({"type":"function","function":{"name":"project_knowledge_read","description":"Read selected reusable project observations from .ai-framework: paths is required. Prefer relevant fresh knowledge before broad rereads; do not reread unchanged source only to reconstruct context. Read source for exact current code or a concrete unresolved/verification detail.","parameters":{"type":"object","properties":{"paths":{"type":"array","items":{"type":"string"}}},"required":["paths"]}}}),
             json!({"type":"function","function":{"name":"project_knowledge_update","description":"Optionally persist durable, reusable semantic project knowledge in .ai-framework. This is never required for normal work. Only use project/, modules/, sources/, or tasks/ markdown paths.","parameters":{"type":"object","properties":{"updates":{"type":"array","items":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["replace","merge"]}},"required":["path","content"]}},"source_paths":{"type":"array","items":{"type":"string"}}},"required":["updates"]}}}),
-            json!({"type":"function","function":{"name":"run_terminal","description":"Run an existing relevant project command. After code changes, prefer a focused test, typecheck, lint, build, or check when available.","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1}},"required":["command"]}}}),
+            json!({"type":"function","function":{"name":"run_terminal","description":"Run an existing relevant project command. For an acceptance check, select deliverable_ids BEFORE running it. The command remains associated with those items on every retry, including failures. Unselected checks remain project warnings; full-test requirements are project-wide; build requirements cover build checks. After code changes, prefer a focused check.","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1},"deliverable_ids":{"type":"array","items":{"type":"string"},"description":"Existing deliverable ids this check verifies. Associations are permanent, including failed checks."}},"required":["command"]}}}),
             json!({"type":"function","function":{"name":"write_file","description":"Write the full content of a project file, replacing it. To change part of a file, prefer apply_patch.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}),
         ]);
     }
@@ -1381,16 +1381,20 @@ fn apply_deliverables(
         }
         "verify" => {
             let id = id()?;
-            let declared = candidate
+            let item = candidate
                 .items
                 .iter()
                 .find(|item| item.id == id)
-                .and_then(|item| item.check);
-            let need = state.task_memory.verification.effective_need(declared);
+                .ok_or_else(|| format!("unknown deliverable '{id}'"))?;
             let cited = evidence_ids(arguments);
-            let proof = state.task_memory.verification.proof_for(
+            // Persist the relationship BEFORE judging the result. A rejected
+            // verify attempt cannot be undone by subsequently omitting its ids.
+            let attachment = state.task_memory.verification.attach(&id, &cited);
+            sync_verification_failure(state);
+            attachment?;
+            let proof = state.task_memory.verification.proof_for_item(
+                item,
                 &cited,
-                need,
                 state.strategy.is_deep(),
                 state.browser_available,
             )?;
@@ -1404,6 +1408,7 @@ fn apply_deliverables(
         ),
     }
     state.task_memory.deliverables = candidate;
+    sync_verification_failure(state);
     Ok((
         json!({"deliverables": state.task_memory.deliverables, "updated": true}),
         true,
@@ -1447,15 +1452,10 @@ fn emit_task_memory(config: &Config, state: &AgentState) {
 /// Keeps the deliverables honest about the checks the runtime saw fail. Returns
 /// whether anything changed.
 fn sync_verification_failure(state: &mut AgentState) -> bool {
-    let failure = state
-        .task_memory
-        .verification
-        .active_failure_at_least(Class::Static)
-        .map(|record| format!("{} ({})", record.subject, record.detail));
     state
         .task_memory
         .deliverables
-        .sync_failure(failure.as_deref())
+        .sync_failures(&state.task_memory.verification)
 }
 
 /// Applies what a terminal command may have done to the project, so a command
@@ -1577,10 +1577,18 @@ fn record_terminal_evidence(
         format!("exit {exit_code}: {tail}")
     };
     let turn = state.turn;
-    state
-        .task_memory
-        .verification
-        .record(kind, command, pass, &detail, turn);
+    state.task_memory.verification.record_outcome(
+        kind,
+        command,
+        pass,
+        &detail,
+        turn,
+        &json!({
+            "exit_code": exit_code, "status": completed,
+            "stdout": value.get("stdout"), "stderr": value.get("stderr")
+        })
+        .to_string(),
+    );
     if state.verification_reviews > 0 {
         state.checks_since_review += 1;
     }
@@ -3271,7 +3279,12 @@ fn run_scoped_tool(
             Ok((value, None))
         }
         "deliverables" => {
-            let (value, changed) = apply_deliverables(state, &tool.arguments, transcript)?;
+            let result = apply_deliverables(state, &tool.arguments, transcript);
+            // Failed verify citations also change the durable evidence state.
+            if result.is_err() {
+                emit_task_memory(config, state);
+            }
+            let (value, changed) = result?;
             if changed {
                 emit(
                     &config.run_id,
@@ -3320,6 +3333,38 @@ fn run_scoped_tool(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_owned();
+            let ids = match tool.arguments.get("deliverable_ids") {
+                None => Vec::new(),
+                Some(Value::Array(values)) => values
+                    .iter()
+                    .map(|value| {
+                        let id = value
+                            .as_str()
+                            .ok_or_else(|| "deliverable_ids must contain strings".to_owned())?;
+                        if !state.task_memory.deliverables.items.iter().any(|item| {
+                            item.id == id
+                                && !matches!(
+                                    item.status,
+                                    deliverables::DeliverableStatus::Dropped
+                                        | deliverables::DeliverableStatus::Blocked
+                                )
+                        }) {
+                            return Err(format!("unknown or inactive deliverable '{id}'"));
+                        }
+                        Ok(id.to_owned())
+                    })
+                    .collect::<Result<Vec<_>, String>>()?,
+                _ => {
+                    return Err(
+                        "deliverable_ids must be an array of recorded deliverable ids".into(),
+                    )
+                }
+            };
+            state.task_memory.verification.bind(&command, &ids)?;
+            if !ids.is_empty() {
+                sync_verification_failure(state);
+                emit_task_memory(config, state);
+            }
             let value = crate::tools::shell::execute(
                 &PathBuf::from(&root),
                 &tool.arguments,
@@ -3783,7 +3828,7 @@ fn verification_gap(state: &AgentState) -> Option<String> {
     }
     let ledger = &state.task_memory.verification;
     let mut lines = Vec::new();
-    if let Some(failure) = ledger.active_failure_at_least(Class::Static) {
+    if let Some(failure) = ledger.blocking_failure(&state.task_memory.deliverables) {
         lines.push(format!(
             "{} failed after your last change: {} ({})",
             failure.id, failure.subject, failure.detail
@@ -3821,6 +3866,11 @@ fn verification_gap(state: &AgentState) -> Option<String> {
         }
     }
     if state.strategy.is_deep()
+        && (deliverables.is_empty()
+            || deliverables
+                .unverified()
+                .iter()
+                .any(|item| item.check == Some(Need::Test)))
         && ledger.code_changed
         && !ledger.has_fresh_pass_of(verification::Kind::Test)
     {
@@ -3882,7 +3932,7 @@ fn review_tool_free_final(
         let failure = state
             .task_memory
             .verification
-            .active_failure_at_least(Class::Static)
+            .blocking_failure(&state.task_memory.deliverables)
             .map(|record| record.id.clone());
         // A new failing check earns one review of its own; the same failure is
         // never sent back twice, and otherwise reviews are fixed per mode.
@@ -3972,6 +4022,7 @@ pub fn run(config: Config) {
         }
     };
     state.task_memory.verification.start_run();
+    state.task_memory.deliverables.demote_verified();
     if !user_requests_read_only(&config.user) {
         if let Some(root) = config.root.as_deref() {
             let _ = crate::tools::knowledge::bootstrap(&PathBuf::from(root));
@@ -4040,6 +4091,11 @@ pub fn run(config: Config) {
             run_id: config.run_id.clone(),
         },
     );
+    // Continue's epoch/status transition must reach persistence and the panel
+    // even if the model finishes without another tool call.
+    if !state.task_memory.verification.is_empty() || !state.task_memory.deliverables.is_empty() {
+        emit_task_memory(&config, &state);
+    }
     emit_knowledge_diagnostics(&config, &state);
     for turn in 0..MAX_INVESTIGATION_TURNS + MAX_SYNTHESIS_TURNS {
         if let Some(error) = transcript.storage_error() {

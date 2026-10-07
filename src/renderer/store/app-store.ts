@@ -356,9 +356,9 @@ export const useAppStore = create<State>((rawSet, rawGet) => {
     if (event.type === 'approval-resolved' && event.actionId && event.approvalId && event.status) { const approvalStatus = event.status as Exclude<ApprovalStatus, 'pending'>; set((state) => ({ generationState: state.generationState === 'waiting-for-approval' ? 'using-tool' : state.generationState, pendingApproval: state.pendingApproval?.approval.approvalId === event.approvalId ? null : state.pendingApproval, approvalSubmitting: false, toolActivities: state.toolActivities.map((activity) => activity.id === event.actionId ? { ...activity, approval: { approvalId: event.approvalId!, category: activity.approval?.category ?? 'system_command', status: approvalStatus } } : activity) })); }
     if (event.type === 'task-memory' && event.memory) {
       const prior = get().agentPlan?.taskMemory;
-      // Knowledge/evidence updates do not redraw an unchanged plan/results panel.
-      if (!prior || JSON.stringify(prior?.plan) !== JSON.stringify(event.memory.plan) || JSON.stringify(prior?.deliverables) !== JSON.stringify(event.memory.deliverables)) {
-        set({ agentPlan: { milestones: [], taskMemory: { entries: [], plan: event.memory.plan, deliverables: event.memory.deliverables } } });
+      // Knowledge updates do not redraw unchanged plan/results/evidence.
+      if (!prior || JSON.stringify(prior?.plan) !== JSON.stringify(event.memory.plan) || JSON.stringify(prior?.deliverables) !== JSON.stringify(event.memory.deliverables) || JSON.stringify(prior?.verification) !== JSON.stringify(event.memory.verification)) {
+        set({ agentPlan: { milestones: [], taskMemory: { entries: [], plan: event.memory.plan, deliverables: event.memory.deliverables, verification: event.memory.verification } } });
       }
     }
     if (event.type === 'analysis-run' && event.run) { generationRuns.set(event.generationId, event.run.id); set((state) => adoptRuns(event.generationId, [...state.analysisRuns.filter((run) => run.id !== event.run!.id), event.run!])(state)); }

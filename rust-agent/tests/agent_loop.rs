@@ -2023,7 +2023,10 @@ fn edit_app(content: &str) -> (&'static str, Value) {
 }
 
 fn run_check() -> (&'static str, Value) {
-    ("run_terminal", json!({"command":"node check.js"}))
+    (
+        "run_terminal",
+        json!({"command":"node check.js","deliverable_ids":["d-001"]}),
+    )
 }
 
 fn verify(id: &str, proof: Option<&str>) -> (&'static str, Value) {
@@ -2100,6 +2103,215 @@ fn a_passing_check_after_the_edit_verifies_and_ends_without_a_review() {
     let last = requests[3].to_string();
     assert!(last.contains("[verified] d-001"), "{last}");
     assert!(last.contains("proof: ev-"), "{last}");
+}
+
+/// The production loop must settle the acceptance claim without fixing a
+/// separate project warning, in both strategies. The inverse remains blocked.
+#[test]
+fn scoped_runtime_acceptance_and_baseline_project_warning_in_fast_and_deep() {
+    for deep in [false, true] {
+        for passing in [false, true] {
+            let mut files = APP.to_vec();
+            files.push((
+                "suite.js",
+                "console.error('independent quality assertion'); process.exit(1);\n",
+            ));
+            files.push(("package.json", r#"{"scripts":{"test":"node suite.js"}}"#));
+            let workspace = Workspace::new(&files);
+            let provider = Provider::start(move |_, n| match n {
+                0 => Reply::Tools(vec![
+                    deliverable(
+                        "add",
+                        json!({"text":"runtime responds correctly","check":"runtime"}),
+                    ),
+                    term("npm test"),
+                ]),
+                1 => Reply::Tools(vec![
+                    edit_app(if passing { GOOD } else { BAD }),
+                    deliverable(
+                        "implemented",
+                        json!({"id":"d-001","evidence":"edited app.js"}),
+                    ),
+                ]),
+                2 => Reply::Tools(vec![run_check(), term("npm test")]),
+                3 => Reply::Tools(vec![verify(
+                    "d-001",
+                    if deep { Some("ev-003") } else { None },
+                )]),
+                _ => Reply::Text(
+                    if passing {
+                        "Runtime verified; project suite still fails as it did before the change."
+                    } else {
+                        "Implemented, not verified: the runtime assertion failed."
+                    }
+                    .into(),
+                ),
+            });
+            let mut config = workspace.config(&provider.endpoint, "fix runtime response");
+            if deep {
+                config.reasoning_mode = "deep".into();
+            }
+            run(config);
+            let requests = provider.requests();
+            let tail = requests.last().unwrap().to_string();
+            assert!(
+                tail.contains("independent quality assertion"),
+                "warning lost: {tail}"
+            );
+            assert!(
+                tail.contains("pre-existing observed failure"),
+                "baseline relation lost: {tail}"
+            );
+            assert!(tail.contains("scope: d-001"), "selection lost: {tail}");
+            assert_eq!(tail.contains("[verified] d-001"), passing, "{tail}");
+            assert!(completed(&workspace.journal()));
+            if passing {
+                assert_eq!(
+                    withheld_drafts(&workspace.journal()),
+                    0,
+                    "project warnings must not trigger scope creep"
+                );
+                assert_eq!(requests.len(), 5);
+            } else {
+                assert!(last_tool_result(&requests[4]).contains("relevant failed check"));
+                assert!(withheld_drafts(&workspace.journal()) > 0);
+            }
+        }
+    }
+}
+
+/// Optional real-browser regression of the production agent loop. Uses only
+/// isolated temporary projects, a deterministic provider and installed Chrome.
+#[test]
+#[ignore = "requires installed Chrome and the desktop project's playwright-core"]
+fn live_scoped_browser_acceptance_with_project_warning_and_inverse() {
+    let driver = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("node_modules/playwright-core");
+    assert!(driver.is_dir(), "install the desktop dependencies first");
+    let browser =
+        std::env::var("LOCAL_AI_TEST_BROWSER").unwrap_or_else(|_| "/usr/bin/google-chrome".into());
+    assert!(
+        std::path::Path::new(&browser).is_file(),
+        "Chrome is required for the live regression"
+    );
+    let browser_script = format!(
+        r#"
+const {{ chromium }} = require({driver});
+const assert = require('node:assert/strict');
+(async () => {{
+  const browser = await chromium.launch({{ executablePath: {browser}, headless: true }});
+  try {{
+    const page = await browser.newPage();
+    await page.goto('file://' + process.cwd() + '/index.html');
+    for (let turn = 1; turn <= 3; turn++) {{
+      await page.locator('#human').click();
+      await page.waitForFunction((turn) => window.responses === turn, turn, {{ timeout: 1000 }});
+      assert.equal(await page.evaluate(() => window.humans), turn);
+    }}
+    console.log('PASS: human action, automatic response, three turns continued without freeze');
+  }} finally {{ await browser.close(); }}
+}})().catch((error) => {{ console.error(error.message); process.exitCode = 1; }});
+"#,
+        driver = json!(driver.to_string_lossy()),
+        browser = json!(browser)
+    );
+    for deep in [false, true] {
+        for passing in [false, true] {
+            let workspace = Workspace::new(&[
+                (
+                    "index.html",
+                    "<button id='human'>Human action</button><script src='app.js'></script>",
+                ),
+                ("app.js", "window.humans=0; window.responses=0;"),
+                ("browser-check.cjs", &browser_script),
+                (
+                    "suite.js",
+                    "console.error('separate quality expectation failed'); process.exit(1);",
+                ),
+                ("package.json", r#"{"scripts":{"test":"node suite.js"}}"#),
+            ]);
+            let provider = Provider::start(move |_, n| {
+                match n {
+                0 => Reply::Tools(vec![deliverable("add", json!({"text":"automatic response follows the human action without freezing","check":"browser"})), term("npm test")]),
+                1 => Reply::Tools(vec![
+                    edit_app(if passing { "window.humans=0; window.responses=0; document.querySelector('#human').onclick=()=>{window.humans++; setTimeout(()=>window.responses++,10);};" } else { "window.humans=0; window.responses=0; document.querySelector('#human').onclick=()=>{window.humans++;};" }),
+                    deliverable("implemented", json!({"id":"d-001","evidence":"edited app.js"})),
+                ]),
+                2 => Reply::Tools(vec![("run_terminal", json!({"command":"node browser-check.cjs","deliverable_ids":["d-001"]})), term("npm test")]),
+                3 => Reply::Tools(vec![verify("d-001", if deep { Some("ev-003") } else { None })]),
+                _ => Reply::Text(if passing { "Browser acceptance verified; independent baseline suite failure remains visible." } else { "Implemented, not verified: automatic runtime response failed." }.into()),
+            }
+            });
+            let mut config = workspace.config(&provider.endpoint, "fix automatic runtime response");
+            config.browser_capability = Some(true);
+            if deep {
+                config.reasoning_mode = "deep".into();
+            }
+            run(config);
+            let requests = provider.requests();
+            let tail = requests.last().unwrap().to_string();
+            assert!(
+                tail.contains("separate quality expectation failed")
+                    && tail.contains("pre-existing observed failure")
+            );
+            assert_eq!(tail.contains("[verified] d-001"), passing, "{tail}");
+            assert!(
+                tail.contains(if passing {
+                    "[browser pass]"
+                } else {
+                    "[browser FAIL]"
+                }),
+                "real browser evidence was not recorded: {tail}"
+            );
+            if passing {
+                assert_eq!(withheld_drafts(&workspace.journal()), 0);
+            } else {
+                assert!(withheld_drafts(&workspace.journal()) > 0);
+            }
+            assert!(completed(&workspace.journal()));
+            println!("LIVE: mode={} runtime={} independent suite=FAIL baseline retained, verified={passing}", if deep { "deep" } else { "fast" }, if passing { "PASS" } else { "FAIL" });
+        }
+    }
+}
+
+#[test]
+fn a_failed_verification_citation_cannot_be_removed_from_the_item() {
+    let workspace = Workspace::new(APP);
+    let provider = Provider::start(|_, n| match n {
+        0 => Reply::Tools(vec![
+            deliverable("add", json!({"text":"runtime responds","check":"runtime"})),
+            edit_app(BAD),
+            deliverable(
+                "implemented",
+                json!({"id":"d-001","evidence":"edited app.js"}),
+            ),
+        ]),
+        1 => Reply::Tools(vec![term("node check.js")]),
+        2 => Reply::Tools(vec![verify("d-001", Some("ev-002"))]),
+        // An empty selection, a forged scope argument, and re-implementing
+        // the item cannot erase the failed explicit citation.
+        3 => Reply::Tools(vec![
+            (
+                "run_terminal",
+                json!({"command":"node check.js","deliverable_ids":[]}),
+            ),
+            deliverable(
+                "implemented",
+                json!({"id":"d-001","evidence":"built","verification_scope":"acceptance","ignore":["ev-002"]}),
+            ),
+            verify("d-001", None),
+        ]),
+        _ => Reply::Text("Not verified.".into()),
+    });
+    run(workspace.config(&provider.endpoint, "fix runtime"));
+    let requests = provider.requests();
+    assert!(last_tool_result(&requests[3]).contains("relevant failed check"));
+    assert!(last_tool_result(&requests[4]).contains("relevant failed check"));
+    let tail = requests.last().unwrap().to_string();
+    assert!(tail.contains("[implemented] d-001") && tail.contains("scope: d-001"));
+    assert!(!tail.contains("[verified] d-001"));
 }
 
 /// Verify is refused without evidence: the model's own claim changes nothing.
@@ -2295,8 +2507,8 @@ fn verification_state_returns_on_continue_with_old_checks_stale_and_a_fresh_run_
     run(resumed);
     let first = resumed_provider.requests()[0].to_string();
     assert!(
-        first.contains("[verified] d-001"),
-        "the recorded status returns: {first}"
+        first.contains("[implemented] d-001"),
+        "stale verification is demoted on Continue: {first}"
     );
     assert!(
         first.contains("stale"),
@@ -2381,7 +2593,10 @@ fn deep_wants_the_project_test_suite_and_verifies_with_a_cited_evidence_id() {
     let workspace = Workspace::new(&files);
     let provider = Provider::start(|_, n| match n {
         0 => Reply::Tools(vec![
-            deliverable("add", json!({"text":"add keeps adding"})),
+            deliverable(
+                "add",
+                json!({"text":"all project tests pass","check":"test"}),
+            ),
             edit_app(GOOD),
             deliverable(
                 "implemented",
@@ -2533,7 +2748,10 @@ fn a_check_that_rewrites_a_tracked_file_is_not_trusted() {
         ),
     ]);
     let provider = Provider::start(|_, n| match n {
-        0 => Reply::Tools(vec![edit_app(GOOD), run_check()]),
+        0 => Reply::Tools(vec![
+            edit_app(GOOD),
+            ("run_terminal", json!({"command":"node check.js"})),
+        ]),
         _ => Reply::Text("done".into()),
     });
     run(workspace.config(&provider.endpoint, "make add work"));
@@ -2593,7 +2811,10 @@ fn page_edit() -> Reply {
 fn a_page_claim_is_never_verified_by_a_stand_in_and_ends_honestly_without_a_browser() {
     let (journal, requests) = page_run(Some(false), false, |n| match n {
         0 => page_edit(),
-        1 => Reply::Tools(vec![term("node dom-check.js")]),
+        1 => Reply::Tools(vec![(
+            "run_terminal",
+            json!({"command":"node dom-check.js","deliverable_ids":["d-001"]}),
+        )]),
         2 => Reply::Tools(vec![verify("d-001", None)]),
         _ => Reply::Text("Implemented; not checked in a browser.".into()),
     });
@@ -2619,7 +2840,10 @@ fn a_page_claim_is_never_verified_by_a_stand_in_and_ends_honestly_without_a_brow
 fn with_a_browser_available_a_stand_in_is_refused_and_the_gate_asks_for_a_browser_run() {
     let (journal, requests) = page_run(Some(true), false, |n| match n {
         0 => page_edit(),
-        1 => Reply::Tools(vec![term("node dom-check.js")]),
+        1 => Reply::Tools(vec![(
+            "run_terminal",
+            json!({"command":"node dom-check.js","deliverable_ids":["d-001"]}),
+        )]),
         2 => Reply::Tools(vec![verify("d-001", None)]),
         3 => Reply::Text("It works.".into()),
         _ => Reply::Text("Implemented, not checked in a browser.".into()),
@@ -2637,7 +2861,10 @@ fn with_a_browser_available_a_stand_in_is_refused_and_the_gate_asks_for_a_browse
 fn a_real_headless_browser_run_verifies_a_page_claim() {
     let (journal, requests) = page_run(Some(true), true, |n| match n {
         0 => page_edit(),
-        1 => Reply::Tools(vec![term("./chromium --headless --dump-dom index.html")]),
+        1 => Reply::Tools(vec![(
+            "run_terminal",
+            json!({"command":"./chromium --headless --dump-dom index.html","deliverable_ids":["d-001"]}),
+        )]),
         2 => Reply::Tools(vec![verify("d-001", None)]),
         _ => Reply::Text("Verified in a headless browser.".into()),
     });

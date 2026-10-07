@@ -12,8 +12,9 @@
 //! The ledger decides nothing about the user's intent. It only answers whether
 //! a deliverable has fresh, passing evidence of the strength it needs.
 
-use super::deliverables::{Deliverable, Deliverables};
+use super::deliverables::{Deliverable, Deliverables, VerificationScope};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -162,6 +163,30 @@ pub struct Evidence {
     pub turn: usize,
     #[serde(default)]
     pub detail: String,
+    /// Exact identity, separate from the shortened display subject.
+    #[serde(default)]
+    pub check_key: String,
+    /// Runtime-captured associations, never a post-result exclusion flag.
+    #[serde(default)]
+    pub deliverable_ids: Vec<String>,
+    #[serde(default)]
+    pub baseline: bool,
+    #[serde(default)]
+    pub outcome_hash: String,
+    /// An identical failure observed before the lineage's first mutation.
+    /// This is provenance, not proof that the behaviour is unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_failure: Option<String>,
+}
+
+impl Evidence {
+    fn key(&self) -> &str {
+        if self.check_key.is_empty() {
+            &self.subject
+        } else {
+            &self.check_key
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,6 +212,10 @@ pub struct Verification {
     /// a change made outside the file tools is noticed by comparing.
     #[serde(default)]
     pub revisions: BTreeMap<String, String>,
+    /// Append-only command-to-deliverable relationships. Survive record
+    /// eviction, mutations and Continue; retries cannot shed a failing link.
+    #[serde(default)]
+    pub bindings: BTreeMap<String, Vec<String>>,
 }
 
 const CODE_EXTENSIONS: [&str; 30] = [
@@ -291,8 +320,37 @@ impl Verification {
         detail: &str,
         turn: usize,
     ) -> String {
+        self.record_outcome(kind, subject, pass, detail, turn, detail)
+    }
+
+    pub fn record_outcome(
+        &mut self,
+        kind: Kind,
+        subject: &str,
+        pass: bool,
+        detail: &str,
+        turn: usize,
+        outcome: &str,
+    ) -> String {
         self.next += 1;
         let id = format!("ev-{:03}", self.next);
+        let key = subject.trim();
+        let outcome_hash = format!("{:x}", Sha256::digest(outcome.as_bytes()));
+        let baseline = self.epoch == 0 && self.changed.is_empty() && !self.code_changed;
+        let baseline_failure = (!pass && !baseline)
+            .then(|| {
+                self.records
+                    .iter()
+                    .find(|record| {
+                        record.baseline
+                            && !record.pass
+                            && record.kind == kind
+                            && record.key() == key
+                            && record.outcome_hash == outcome_hash
+                    })
+                    .map(|record| record.id.clone())
+            })
+            .flatten();
         self.records.push(Evidence {
             id: id.clone(),
             kind,
@@ -302,14 +360,147 @@ impl Verification {
             epoch: self.epoch,
             turn,
             detail: shorten(detail, MAX_DETAIL_CHARS),
+            check_key: key.to_owned(),
+            deliverable_ids: self.bindings.get(key).cloned().unwrap_or_default(),
+            baseline,
+            outcome_hash,
+            baseline_failure,
         });
         while self.records.len() > MAX_RECORDS {
             let drop = (0..self.records.len())
                 .find(|&index| !self.fresh(&self.records[index]))
-                .unwrap_or(0);
+                .or_else(|| {
+                    let active = self.active_failures();
+                    (0..self.records.len()).find(|&index| {
+                        !active
+                            .iter()
+                            .any(|failure| failure.id == self.records[index].id)
+                    })
+                });
+            // Active contradictions cannot be forgotten to make room for
+            // passes. In an all-fail ledger keep them until a mutation or a
+            // successful retry; the run's existing tool budget bounds growth.
+            let Some(drop) = drop else {
+                break;
+            };
             self.records.remove(drop);
         }
         id
+    }
+
+    /// Associations can only be added. There is deliberately no remove,
+    /// replace, unrelated or ignore operation. Exact command identity avoids
+    /// collisions from truncated display subjects.
+    ///
+    /// # Errors
+    /// Rejects an empty check identity. Previously stored bindings remain.
+    pub fn bind(&mut self, subject: &str, ids: &[String]) -> Result<(), String> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let key = subject.trim();
+        if key.is_empty() {
+            return Err("a verification check must have a nonempty command/path".into());
+        }
+        let targets = self.bindings.entry(key.to_owned()).or_default();
+        for id in ids {
+            if !targets.contains(id) {
+                targets.push(id.clone());
+            }
+        }
+        // A later citation also attaches the earlier result, including a
+        // failure. Selection never erases contradictory evidence of this check.
+        for record in &mut self.records {
+            if record.key() == key {
+                record.deliverable_ids.clone_from(targets);
+            }
+        }
+        Ok(())
+    }
+
+    /// Permanently attaches every known citation, even if another ID is invalid.
+    ///
+    /// # Errors
+    /// Reports unknown IDs or invalid check identities without rolling back
+    /// valid associations. Callers must sync failure state even on error.
+    pub fn attach(&mut self, id: &str, cited: &[String]) -> Result<(), String> {
+        let mut keys = Vec::new();
+        let mut error = None;
+        for evidence_id in cited {
+            if let Some(record) = self.get(evidence_id) {
+                keys.push(record.key().to_owned());
+            } else {
+                error = Some(format!(
+                    "unknown evidence '{evidence_id}': ids are issued by the runtime"
+                ));
+            }
+        }
+        for key in keys {
+            self.bind(&key, &[id.to_owned()])?;
+        }
+        // An extra invalid ID must not roll back a valid failed selection.
+        error.map_or(Ok(()), Err)
+    }
+
+    #[must_use]
+    pub fn relevant(&self, record: &Evidence, item: &Deliverable) -> bool {
+        // Full-test requirements cannot be narrowed by selecting one pass.
+        // Legacy items retain their previous project-wide scope. A named build
+        // requirement structurally covers build checks, not unrelated tests.
+        item.verification_scope == VerificationScope::Project
+            || item.check == Some(Need::Test)
+            || item.check == Some(Need::Build) && record.kind == Kind::Build
+            || record.deliverable_ids.contains(&item.id)
+            || self.bindings.get(record.key()).is_some_and(|ids| ids.contains(&item.id))
+            || item.proof.iter().any(|id| self.get(id).is_some_and(|proof| proof.key() == record.key()))
+            // Readback remains per-file and runtime-produced; no terminal
+            // selection is necessary for a file-existence claim.
+            || self.effective_need(item.check) == Need::Readback && record.kind == Kind::Readback
+    }
+
+    #[must_use]
+    pub fn failure_for(&self, item: &Deliverable) -> Option<&Evidence> {
+        self.active_failures()
+            .into_iter()
+            .rev()
+            .find(|record| self.relevant(record, item))
+    }
+
+    #[must_use]
+    pub fn blocking_failure(&self, items: &Deliverables) -> Option<&Evidence> {
+        self.active_failures().into_iter().rev().find(|record| {
+            if items.is_empty() {
+                return record.class >= Class::Static;
+            }
+            items.items.iter().any(|item| {
+                matches!(
+                    item.status,
+                    super::deliverables::DeliverableStatus::Implemented
+                        | super::deliverables::DeliverableStatus::Verified
+                ) && self.relevant(record, item)
+            })
+        })
+    }
+
+    /// Resolves proof within the item's immutable check relationships.
+    ///
+    /// # Errors
+    /// Refuses relevant failures, unavailable capabilities, missing or stale
+    /// evidence, and insufficient proof. This never authors a passing result.
+    pub fn proof_for_item(
+        &self,
+        item: &Deliverable,
+        cited: &[String],
+        deep: bool,
+        browser_available: bool,
+    ) -> Result<Vec<String>, String> {
+        let need = self.effective_need(item.check);
+        if let Some(failure) = self.failure_for(item) {
+            return Err(format!("{} is a relevant failed check for {} ({}): {}. Run this check successfully before verifying the item.", failure.id, item.id, failure.subject, failure.detail));
+        }
+        let mut scoped = self.clone();
+        scoped.records.retain(|record| self.relevant(record, item));
+        scoped.proof_for(cited, need, deep, browser_available)
     }
 
     /// Whether the record still describes the project as it is now. Functional
@@ -319,7 +510,7 @@ impl Verification {
         if record.kind == Kind::Readback {
             return self
                 .changed
-                .get(&record.subject)
+                .get(record.key())
                 .is_none_or(|changed| *changed <= record.epoch);
         }
         record.epoch == self.epoch
@@ -342,7 +533,7 @@ impl Verification {
                     && !self.records[index + 1..].iter().any(|later| {
                         later.pass
                             && later.kind == record.kind
-                            && later.subject == record.subject
+                            && later.key() == record.key()
                             && self.fresh(later)
                     })
             })
@@ -551,6 +742,35 @@ impl Verification {
                     format!(" — {}", record.detail)
                 }
             ));
+            lines.push(format!(
+                "    scope: {}{}",
+                if record.deliverable_ids.is_empty() {
+                    "project check (not selected for an acceptance item)".to_owned()
+                } else {
+                    record.deliverable_ids.join(", ")
+                },
+                record
+                    .baseline_failure
+                    .as_ref()
+                    .map_or(String::new(), |id| format!(
+                        "; pre-existing observed failure, identical to {id}"
+                    ))
+            ));
+        }
+        // Never hide an active failure merely because five newer passes exist.
+        for failure in self.active_failures() {
+            if fresh
+                .iter()
+                .rev()
+                .take(SHOWN_RECORDS)
+                .any(|record| record.id == failure.id)
+            {
+                continue;
+            }
+            lines.push(format!(
+                "  {} [project warning FAIL] {} — {}",
+                failure.id, failure.subject, failure.detail
+            ));
         }
         if stale > 0 {
             lines.push(format!(
@@ -578,6 +798,7 @@ impl Verification {
             lines.push("The verification budget is used up: run no more checks. Report exactly what is verified and what is not.".to_owned());
         }
         lines.push("Say \"verified\" or \"works\" only for deliverables marked verified. An implemented deliverable is \"implemented, not verified\". Never write a result, count or behaviour you did not see in a check above.".to_owned());
+        lines.push("Select run_terminal deliverable_ids before running acceptance checks. Associations are permanent, including failed verification citations. Unselected project failures remain warnings and must be reported; full-test requirements and legacy items retain project-wide failure blocking, and build requirements cover build checks.".to_owned());
         format!(
             "<verification_state>\n{}\n</verification_state>",
             lines.join("\n")
@@ -1174,6 +1395,225 @@ mod tests {
         ledger.record(Kind::Run, "node check.js", true, "exit 0", 4);
         assert!(ledger.active_failures().is_empty());
         assert!(ledger.proof_for(&[], Need::Runtime, false, false).is_ok());
+    }
+
+    #[test]
+    fn acceptance_proof_is_scoped_and_project_failures_stay_visible() {
+        let mut items = Deliverables::default();
+        let id = items
+            .add_checked(
+                None,
+                "",
+                "automatic response continues",
+                Some(Need::Browser),
+            )
+            .unwrap();
+        items.implement(&id, "built").unwrap();
+        let mut ledger = Verification::default();
+        ledger.note_change(Some("app.js"));
+        ledger
+            .bind("browser interaction", std::slice::from_ref(&id))
+            .unwrap();
+        let pass = ledger.record(
+            Kind::Browser,
+            "browser interaction",
+            true,
+            "several turns continued",
+            1,
+        );
+        let failure = ledger.record(Kind::Test, "project suite", false, "strategy assertion", 2);
+        for deep in [false, true] {
+            let cited = if deep { vec![pass.clone()] } else { vec![] };
+            assert_eq!(
+                ledger
+                    .proof_for_item(&items.items[0], &cited, deep, true)
+                    .unwrap(),
+                vec![pass.clone()]
+            );
+        }
+        items.verify(&id, vec![pass.clone()]).unwrap();
+        assert!(!items.sync_failures(&ledger));
+        assert!(ledger.blocking_failure(&items).is_none());
+        assert_eq!(ledger.active_failures()[0].id, failure);
+        assert!(ledger
+            .prompt(&items, false, true)
+            .contains("strategy assertion"));
+
+        let broad = items
+            .add_checked(None, "", "all project tests pass", Some(Need::Test))
+            .unwrap();
+        items.implement(&broad, "built").unwrap();
+        assert!(ledger
+            .proof_for_item(&items.items[1], &[pass], false, true)
+            .unwrap_err()
+            .contains(&failure));
+        items.sync_failures(&ledger);
+        assert!(!items.items[1].failing.is_empty());
+        assert_eq!(
+            items.items[0].status,
+            super::super::deliverables::DeliverableStatus::Verified
+        );
+    }
+
+    #[test]
+    fn selected_failures_cannot_be_detached_by_retry_citation_or_ledger_eviction() {
+        let mut items = Deliverables::default();
+        let id = items
+            .add_checked(None, "", "runtime responds", Some(Need::Runtime))
+            .unwrap();
+        items.implement(&id, "built").unwrap();
+        let mut ledger = Verification::default();
+        ledger.note_change(Some("app.js"));
+        ledger
+            .bind("runtime check", std::slice::from_ref(&id))
+            .unwrap();
+        let failure = ledger.record(Kind::Run, "runtime check", false, "did not respond", 1);
+        ledger.bind("runtime check", &[]).unwrap();
+        ledger
+            .bind("other check", std::slice::from_ref(&id))
+            .unwrap();
+        let pass = ledger.record(Kind::Run, "other check", true, "exit 0", 2);
+        assert!(ledger
+            .proof_for_item(&items.items[0], std::slice::from_ref(&pass), false, false)
+            .unwrap_err()
+            .contains(&failure));
+        for n in 3..70 {
+            ledger.record(Kind::Test, &format!("suite-{n}"), true, "exit 0", n);
+        }
+        assert!(
+            ledger.get(&failure).is_some(),
+            "active contradictions must not be evicted by passes"
+        );
+        assert!(ledger
+            .proof_for_item(&items.items[0], &[], false, false)
+            .is_err());
+        ledger.record(Kind::Run, "runtime check", true, "exit 0", 70);
+        assert!(ledger
+            .proof_for_item(&items.items[0], &[], false, false)
+            .is_ok());
+
+        // Rejected post-result citations are also permanent selections.
+        let failed_citation =
+            ledger.record(Kind::Run, "another failure", false, "runtime failed", 71);
+        assert!(ledger
+            .attach(&id, &[failed_citation, "ev-unknown".into()])
+            .is_err());
+        assert!(ledger
+            .proof_for_item(&items.items[0], &[], false, false)
+            .is_err());
+        let mut resumed: Verification =
+            serde_json::from_value(serde_json::to_value(&ledger).unwrap()).unwrap();
+        resumed.start_run();
+        let retry = resumed.record(Kind::Run, "another failure", false, "runtime failed", 0);
+        assert!(resumed.get(&retry).unwrap().deliverable_ids.contains(&id));
+        assert!(resumed
+            .proof_for_item(&items.items[0], &[], false, false)
+            .is_err());
+    }
+
+    #[test]
+    fn exact_baseline_failure_is_provenance_and_never_an_exemption() {
+        let mut ledger = Verification::default();
+        let baseline = ledger.record(Kind::Test, "suite", false, "assertion B", 0);
+        ledger.note_change(Some("app.js"));
+        let after = ledger.record(Kind::Test, "suite", false, "assertion B", 1);
+        assert_eq!(
+            ledger.get(&after).unwrap().baseline_failure.as_deref(),
+            Some(baseline.as_str())
+        );
+        let different = ledger.record(Kind::Test, "suite", false, "assertion C", 2);
+        assert!(ledger.get(&different).unwrap().baseline_failure.is_none());
+        let mut items = Deliverables::default();
+        let id = items
+            .add_checked(None, "", "runtime works", Some(Need::Runtime))
+            .unwrap();
+        items.implement(&id, "built").unwrap();
+        ledger
+            .bind("targeted runtime", std::slice::from_ref(&id))
+            .unwrap();
+        ledger.record(Kind::Run, "targeted runtime", true, "exit 0", 3);
+        assert!(ledger
+            .proof_for_item(&items.items[0], &[], false, false)
+            .is_ok());
+        ledger.attach(&id, &[after]).unwrap();
+        assert!(ledger
+            .proof_for_item(&items.items[0], &[], false, false)
+            .is_err());
+    }
+
+    #[test]
+    fn scoped_evidence_stales_on_mutation_and_legacy_items_remain_conservative() {
+        let mut items = Deliverables::default();
+        let id = items.add(None, "", "runtime works").unwrap();
+        items.implement(&id, "built").unwrap();
+        let mut ledger = Verification::default();
+        ledger.note_change(Some("app.js"));
+        ledger.bind("runtime", &[id]).unwrap();
+        let pass = ledger.record(Kind::Run, "runtime", true, "exit 0", 1);
+        assert!(ledger
+            .proof_for_item(&items.items[0], std::slice::from_ref(&pass), true, false)
+            .is_ok());
+        ledger.note_change(Some("app.js"));
+        assert!(ledger
+            .proof_for_item(&items.items[0], &[pass], true, false)
+            .unwrap_err()
+            .contains("stale"));
+        let legacy: Deliverables = serde_json::from_value(serde_json::json!({"items":[{"id":"old","text":"runtime works","status":"implemented"}]})).unwrap();
+        ledger.record(Kind::Run, "runtime", true, "exit 0", 2);
+        ledger.record(Kind::Test, "unselected suite", false, "failed", 3);
+        assert!(ledger
+            .proof_for_item(&legacy.items[0], &[], false, false)
+            .is_err());
+        assert_eq!(
+            legacy.items[0].verification_scope,
+            VerificationScope::Project
+        );
+    }
+
+    #[test]
+    fn display_truncation_does_not_merge_different_check_bindings() {
+        let mut ledger = Verification::default();
+        let tail = "x".repeat(MAX_SUBJECT_CHARS + 20);
+        let first = format!("node first.js {tail}");
+        let second = format!("node second.js {tail}");
+        ledger.bind(&first, &["d-001".into()]).unwrap();
+        let failed = ledger.record(Kind::Run, &first, false, "failure", 1);
+        ledger.record(Kind::Run, &second, true, "exit 0", 2);
+        assert_eq!(ledger.active_failures()[0].id, failed);
+        assert!(ledger.records[1].deliverable_ids.is_empty());
+        let path = format!("{tail}/app.js");
+        let readback = ledger.record(Kind::Readback, &path, true, "on disk", 3);
+        ledger.note_change(Some(&path));
+        assert!(!ledger.fresh(ledger.get(&readback).unwrap()));
+    }
+
+    #[test]
+    fn build_requirements_cover_build_results_without_project_test_poisoning() {
+        let mut items = Deliverables::default();
+        let id = items
+            .add_checked(None, "", "project builds", Some(Need::Build))
+            .unwrap();
+        items.implement(&id, "built").unwrap();
+        let mut ledger = Verification::default();
+        ledger.note_change(Some("app.js"));
+        ledger.record(
+            Kind::Test,
+            "unselected tests",
+            false,
+            "quality assertion",
+            1,
+        );
+        let pass = ledger.record(Kind::Build, "build", true, "exit 0", 2);
+        assert_eq!(
+            ledger
+                .proof_for_item(&items.items[0], &[], false, false)
+                .unwrap(),
+            vec![pass]
+        );
+        ledger.record(Kind::Build, "build", false, "compiler failed", 3);
+        assert!(ledger
+            .proof_for_item(&items.items[0], &[], false, false)
+            .is_err());
     }
 
     #[test]

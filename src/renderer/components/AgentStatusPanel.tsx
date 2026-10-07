@@ -18,8 +18,8 @@ export function CurrentAgentStatus() {
 export const AgentStatusPanel = memo(function AgentStatusPanel({ plan }: { plan: AgentPlan | null }) {
   const [expanded, setExpanded] = useState(true);
   const contentId = useId();
-  const { steps, deliverables } = agentStatus(plan);
-  if (!steps.length && !deliverables.length) return null;
+  const { steps, deliverables, checks, warnings } = agentStatus(plan);
+  if (!steps.length && !deliverables.length && !warnings.length) return null;
   const completed = steps.filter((step) => step.status === 'completed').length;
   const verified = deliverables.filter((item) => item.status === 'verified').length;
   const total = deliverables.filter((item) => item.status !== 'dropped').length;
@@ -29,6 +29,7 @@ export const AgentStatusPanel = memo(function AgentStatusPanel({ plan }: { plan:
       {steps.length > 0 && <span><strong>{agentStatusText.plan}</strong> {completed}/{steps.length}</span>}
       {steps.length > 0 && deliverables.length > 0 && <span aria-hidden="true">·</span>}
       {deliverables.length > 0 && <span><strong>{agentStatusText.result}</strong> {verified}/{total}</span>}
+      {warnings.length > 0 && <span>{agentStatusText.warnings}: {warnings.length}</span>}
     </button>
     {expanded && <div id={contentId} className="agent-status-content">
       {steps.length > 0 && <section aria-label={agentStatusText.plan}><h3>{agentStatusText.plan}<small>{completed}/{steps.length}</small></h3>
@@ -38,9 +39,10 @@ export const AgentStatusPanel = memo(function AgentStatusPanel({ plan }: { plan:
       </section>}
       {deliverables.length > 0 && <section aria-label={agentStatusText.deliverables}><h3>{agentStatusText.deliverables}<small>{verified}/{total}</small></h3>
         <ul>{deliverables.map((item) => <li key={item.id} className={item.status}>
-          <i aria-hidden="true">{resultMarker[item.status]}</i><span>{item.text}{(item.reason || item.failing) && <small>{item.reason || item.failing}</small>}</span><small className="agent-status-label">{deliverableStatusLabel[item.status]}</small>
+          <i aria-hidden="true">{resultMarker[item.status]}</i><span>{item.text}{(item.reason || item.failing) && <small>{item.reason || item.failing}</small>}{item.status === 'verified' && checks.filter((record) => record.pass && item.proof?.includes(record.id)).map((record) => <small key={record.id}>{record.subject} — {agentStatusText.passed}</small>)}</span><small className="agent-status-label">{deliverableStatusLabel[item.status]}</small>
         </li>)}</ul>
       </section>}
+      {warnings.length > 0 && <section aria-label={agentStatusText.warnings}><h3>{agentStatusText.warnings}<small>{warnings.length}</small></h3><ul>{warnings.map((record) => <li key={record.id} className="implemented"><i aria-hidden="true">!</i><span>{record.subject}<small>{record.baseline_failure ? agentStatusText.preExisting : record.baseline ? agentStatusText.baseline : agentStatusText.failed}{record.deliverable_ids?.length ? ` · ${record.deliverable_ids.join(', ')}` : ''}{record.detail ? ` · ${record.detail}` : ''}</small></span><small className="agent-status-label">{record.id}</small></li>)}</ul></section>}
     </div>}
   </section>;
 });
