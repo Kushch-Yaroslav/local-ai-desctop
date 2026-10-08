@@ -1,5 +1,6 @@
 node_modules/
 dist/
+release/
 local-cache/
 # Local application data. These are created by Electron/SQLite/launchers and
 # are intentionally not source-controlled.
