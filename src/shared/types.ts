@@ -397,6 +397,7 @@ export interface LocalAiApi {
   };
   analysis: { list(conversationId: string): Promise<AnalysisRun[]> };
   models: { list(): Promise<ModelInfo[]> };
+  runtime: { state(): Promise<NonNullable<AppSettings['llamaRuntime']>> };
   settings: { get(): Promise<AppSettings>; save(config: RuntimeConfiguration): Promise<AppSettings>; dismissSetup(): Promise<AppSettings> };
   hardware: { get(): Promise<HardwareStats> };
   contextEstimate(modelId: string): Promise<RuntimeContextEstimate>;

@@ -7,6 +7,7 @@ import { dismissRuntimeSetup, loadRuntimeConfiguration, modelPaths, normalizeCon
 import { getModelProfile, registeredModelProfiles } from '../models/model-registry';
 import { llamaRuntimeProfilesList } from '../models/llama-runtime-policy';
 import { builtinModelCatalog } from '../models/model-catalog';
+import { readGgufSpeculativeMetadata } from './gguf-speculative';
 
 const u32 = (n: number) => { const b = Buffer.alloc(4); b.writeUInt32LE(n); return b; };
 const u64 = (n: number) => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(n)); return b; };
@@ -39,6 +40,14 @@ try {
   const weights = join(root, 'weights with spaces'); mkdirSync(weights);
   const original = join(weights, 'chosen model.gguf'), projector = join(weights, 'chosen vision.gguf');
   writeFileSync(original, gguf()); writeFileSync(projector, gguf('fixture_vision'));
+  const parsedModel = readGgufSpeculativeMetadata(original);
+  assert.strictEqual(readGgufSpeculativeMetadata(original), parsedModel,
+    'repeated readiness/runtime checks reuse parsed metadata for an unchanged GGUF');
+  writeFileSync(original, gguf('fixture_replaced'));
+  const replacedModel = readGgufSpeculativeMetadata(original);
+  assert.notStrictEqual(replacedModel, parsedModel, 'replacing a GGUF invalidates its cached metadata');
+  assert.equal(replacedModel.values['general.architecture'], 'fixture_replaced');
+  writeFileSync(original, gguf());
   const qwen36 = 'qwen3.6:35b-a3b-ud-q4_k_m';
   const legacyFile = join(root, 'data/runtime-settings.json');
   mkdirSync(join(root, 'data'), { recursive: true });

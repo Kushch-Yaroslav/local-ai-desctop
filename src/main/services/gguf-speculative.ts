@@ -1,10 +1,59 @@
-import { closeSync, fstatSync, openSync, readSync } from 'node:fs';
+import { closeSync, fstatSync, openSync, readSync, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
+import { resolve } from 'node:path';
 
 export type GgufSpeculativeMetadata = { values: Record<string, string | number | boolean>; tokenizer: Record<string, string> };
 
+const metadataCache = new Map<string, { identity: string; metadata?: GgufSpeculativeMetadata; error?: string }>();
+const metadataCacheLimit = 32;
+
+function fileIdentity(path: string): string | undefined {
+  try {
+    const file = statSync(path, { bigint: true });
+    if (!file.isFile()) return undefined;
+    return `${file.dev}:${file.ino}:${file.size}:${file.mtimeNs}:${file.ctimeNs}`;
+  } catch { return undefined; }
+}
+
+function cacheMetadata(path: string, identity: string, result: { metadata?: GgufSpeculativeMetadata; error?: string }): void {
+  const key = resolve(path);
+  metadataCache.delete(key);
+  metadataCache.set(key, { identity, ...result });
+  if (metadataCache.size > metadataCacheLimit) metadataCache.delete(metadataCache.keys().next().value!);
+}
+
 /** Bounded, buffered metadata inspection. No model tensors are interpreted or loaded for inference. */
 export function readGgufSpeculativeMetadata(path: string): GgufSpeculativeMetadata {
+  const key = resolve(path);
+  const before = fileIdentity(path);
+  const cached = metadataCache.get(key);
+  if (before && cached?.identity === before) {
+    // Reads are shared by readiness checks and launch configuration. The
+    // returned records are immutable so one caller cannot poison the cache.
+    metadataCache.delete(key);
+    metadataCache.set(key, cached);
+    if (cached.error) throw new Error(cached.error);
+    return cached.metadata!;
+  }
+  try {
+    const metadata = parseGgufSpeculativeMetadata(path);
+    const after = fileIdentity(path);
+    if (before && before === after) {
+      Object.freeze(metadata.values);
+      Object.freeze(metadata.tokenizer);
+      Object.freeze(metadata);
+      cacheMetadata(path, before, { metadata });
+    }
+    return metadata;
+  } catch (error) {
+    const after = fileIdentity(path);
+    const message = error instanceof Error ? error.message : String(error);
+    if (before && before === after) cacheMetadata(path, before, { error: message });
+    throw error;
+  }
+}
+
+function parseGgufSpeculativeMetadata(path: string): GgufSpeculativeMetadata {
   const fd = openSync(path, 'r');
   try {
     const size = fstatSync(fd).size;

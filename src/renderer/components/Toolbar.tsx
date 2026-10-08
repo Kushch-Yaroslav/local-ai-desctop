@@ -11,7 +11,7 @@ import { boundaryReasonLabel, reasoningControlText, reasoningEffortLabel, reason
 import { resolveReasoningSelection, type ReasoningEffort } from '../../shared/reasoning-controls';
 
 export function Toolbar() {
-  const { conversations, activeId, models, hardware, settings, activeContextWindow, isGenerating, updateConversation, refreshRuntime } = useAppStore(useShallow((state) => ({ conversations: state.conversations, activeId: state.activeId, models: state.models, hardware: state.hardware, settings: state.settings, activeContextWindow: state.activeContextWindow, isGenerating: state.isGenerating, updateConversation: state.updateConversation, refreshRuntime: state.refreshRuntime })));
+  const { conversations, activeId, models, hardware, settings, activeContextWindow, isGenerating, updateConversation, refreshRuntimeStatus } = useAppStore(useShallow((state) => ({ conversations: state.conversations, activeId: state.activeId, models: state.models, hardware: state.hardware, settings: state.settings, activeContextWindow: state.activeContextWindow, isGenerating: state.isGenerating, updateConversation: state.updateConversation, refreshRuntimeStatus: state.refreshRuntimeStatus })));
   const [estimateResponse, setEstimateResponse] = useState<{ modelId: string; value?: RuntimeContextEstimate; error?: string } | null>(null);
   const [discovery, setDiscovery] = useState<ContextDiscoveryResult | null>(null);
   const [discoveryLoading, setDiscoveryLoading] = useState(false);
@@ -19,9 +19,9 @@ export function Toolbar() {
   const [discoveryStage, setDiscoveryStage] = useState('');
   const [currentVramBudget, setCurrentVramBudget] = useState<import('../../shared/vram-budget').VramBudget | undefined>();
   useEffect(() => {
-    const timer = window.setInterval(() => void refreshRuntime(), 4_000);
+    const timer = window.setInterval(() => void refreshRuntimeStatus(), 4_000);
     return () => window.clearInterval(timer);
-  }, [refreshRuntime]);
+  }, [refreshRuntimeStatus]);
   const chat = conversations.find((item) => item.id === activeId);
   const selectedModelId = activeConversationModel(chat, settings?.llamaRuntime);
   const selectedModel = models.find((model) => model.id === selectedModelId);

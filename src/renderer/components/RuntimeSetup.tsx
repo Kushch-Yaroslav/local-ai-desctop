@@ -13,6 +13,7 @@ export function RuntimeSetup({ setup, onClose }: { setup: SetupState; onClose: (
   const [editingId, setEditingId] = useState<string | null>(null);
   const [message, setMessage] = useState('');
   const [saving, setSaving] = useState(false);
+  useEffect(() => { void useAppStore.getState().refreshRuntime(); }, []);
   useEffect(() => { setConfig(setup.config); }, [setup.config]);
   const selected = config.models.find((model) => model.id === editingId) ?? null;
   const updateModel = (id: string, patch: Partial<RuntimeModelConfiguration>) => setConfig((current) => ({

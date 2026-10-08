@@ -547,6 +547,9 @@ export function registerIpc(): void {
     try { await syncLlamaBackend(); return await backend.getModels(); }
     catch (error) { log('backend.models.failed', { backend: 'llama-cpp', message: error instanceof Error ? error.message : String(error) }); return []; }
   });
+  // The toolbar polls only live process health. Model paths and GGUF metadata
+  // are checked on initialization and when model settings are opened/saved.
+  ipcMain.handle('runtime:state', currentLlamaRuntime);
   const getSettings = async () => {
     const llama = await syncLlamaBackend();
     const setup = runtimeSetup();

@@ -37,6 +37,7 @@ type State = {
   createConversation: () => Promise<void>;
   updateConversation: (id: string, patch: Partial<Conversation>) => Promise<void>;
   refreshRuntime: () => Promise<void>;
+  refreshRuntimeStatus: () => Promise<void>;
   deleteConversation: (id: string) => Promise<void>;
   refreshHardware: () => Promise<void>;
   sendMessage: (content: string, files?: File[], projectReferences?: ProjectReference[]) => Promise<void>;
@@ -207,6 +208,14 @@ export const useAppStore = create<State>((rawSet, rawGet) => {
       const [settings, models] = await Promise.all([window.localAi.settings.get(), window.localAi.models.list()]);
       set({ settings, models });
     } catch { /* the next poll retries */ }
+  },
+  refreshRuntimeStatus: async () => {
+    try {
+      const llamaRuntime = await window.localAi.runtime.state();
+      const settings = get().settings;
+      if (!settings || JSON.stringify(settings.llamaRuntime) === JSON.stringify(llamaRuntime)) return;
+      set({ settings: { ...settings, llamaRuntime, llamaRuntimeModelId: llamaRuntime.modelId ?? undefined } });
+    } catch { /* the next status poll retries */ }
   },
   deleteConversation: async (id) => {
     await window.localAi.conversations.delete(id);
