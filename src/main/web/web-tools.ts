@@ -1,5 +1,6 @@
 import { access } from 'node:fs/promises';
 import { chromium, type Browser, type BrowserContext, type Page } from 'playwright-core';
+import { fetchPublicResource, publicDestination } from './public-network';
 import { log } from '../services/logger';
 import type { ProjectToolCall, ProjectToolDefinition } from '../tools/project-tools';
 
@@ -133,7 +134,7 @@ async function snapshot(page: Page): Promise<PageSnapshot> {
 export class WebBrowserSession {
   private page: Page | null = null;
   private lastSnapshot: PageSnapshot | null = null;
-  constructor(private readonly browser: Browser, private readonly context: BrowserContext, private readonly searchProvider: SearchProvider) {}
+  constructor(private readonly browser: Browser, private readonly context: BrowserContext, private readonly searchProvider: SearchProvider, private readonly abort: AbortController = new AbortController()) {}
 
   async execute(call: ProjectToolCall): Promise<string> {
     try {
@@ -150,7 +151,7 @@ export class WebBrowserSession {
     }
   }
 
-  async close(): Promise<void> { await this.context.close().catch(() => undefined); await this.browser.close().catch(() => undefined); }
+  async close(): Promise<void> { this.abort.abort(); await this.context.close().catch(() => undefined); await this.browser.close().catch(() => undefined); }
 
   private async activePage(): Promise<Page> {
     if (!this.page) this.page = await this.context.newPage();
@@ -171,6 +172,7 @@ export class WebBrowserSession {
   private async open(rawUrl: string): Promise<string> {
     const url = safeUrl(rawUrl); if (!url) return toolError('Некорректный URL');
     const preflight = policyBlock(url); if (preflight) { log('web.blocked', { timestamp: new Date().toISOString(), tool: 'web_open', url, reason: preflight }); return blocked(preflight); }
+    await publicDestination(url, undefined, this.abort.signal);
     log('web.open.started', { timestamp: new Date().toISOString(), url });
     const page = await this.activePage(); const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: pageTimeoutMs });
     if (response && !response.ok()) {
@@ -212,14 +214,24 @@ export class WebBrowserService {
 
   async openSession(): Promise<WebBrowserSession> {
     const executablePath = await chromeExecutable();
-    const browser = await chromium.launch({ executablePath, headless: true, args: ['--disable-extensions', '--disable-sync', '--no-first-run', '--no-default-browser-check'] });
+    const browser = await chromium.launch({ executablePath, headless: true, args: ['--force-webrtc-ip-handling-policy=disable_non_proxied_udp', '--disable-extensions', '--disable-sync', '--no-first-run', '--no-default-browser-check'] });
+    try {
+    const abort = new AbortController();
     const context = await browser.newContext({ acceptDownloads: false, serviceWorkers: 'block', viewport: { width: 1280, height: 900 }, userAgent: 'Local AI Desktop read-only web research' });
+    await context.addInitScript(() => { Object.defineProperty(window, 'RTCPeerConnection', { value: undefined, configurable: false }); });
     await context.route('**/*', async (route) => {
       const request = route.request(); const resource = request.resourceType();
       if (!['GET', 'HEAD'].includes(request.method()) || ['image', 'media', 'font'].includes(resource) || policyBlock(request.url())) return route.abort();
-      return route.continue();
+      try {
+        const response = await fetchPublicResource(request.url(), request.method(), request.headers(), abort.signal);
+        // Redirects are fulfilled rather than followed here. Chromium's next
+        // request is intercepted and validated independently.
+        return await route.fulfill({ status: response.status, headers: response.headers, body: response.body });
+      } catch { return route.abort('blockedbyclient'); }
     });
+    await context.routeWebSocket('**/*', (socket) => socket.close());
     log('web.session.started', { timestamp: new Date().toISOString(), engine: 'Google Chrome headless', isolated: true });
-    return new WebBrowserSession(browser, context, this.searchProvider);
+    return new WebBrowserSession(browser, context, this.searchProvider, abort);
+    } catch (error) { await browser.close().catch(() => undefined); throw error; }
   }
 }

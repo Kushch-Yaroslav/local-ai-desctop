@@ -31,7 +31,8 @@
     "test:model-capabilities": "npm run build && node dist/main/models/model-capabilities.test.js && node dist/main/models/llama-launch-config.test.js",
     "package:linux": "npm run build && cargo build --locked --release --target x86_64-unknown-linux-musl --manifest-path rust-agent/Cargo.toml && electron-builder --linux deb --x64 --publish never",
     "test:linux-setup": "npm run build && node dist/main/services/runtime-settings.test.js && node scripts/renderer-runtime-status.test.mjs && bash scripts/linux-launcher-setup.test.sh",
-    "test:linux-package": "node scripts/linux-package-smoke.mjs"
+    "test:linux-package": "node scripts/linux-package-smoke.mjs",
+    "test:vision-web-localization": "npm run build && bash scripts/vision-web-localization.test.sh"
   },
   "dependencies": {
     "@electron/remote": "^2.1.3",

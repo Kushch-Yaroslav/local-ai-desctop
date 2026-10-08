@@ -33,6 +33,16 @@ export async function runLlamaRuntimeControllerRegression(): Promise<void> {
   assert.deepEqual(parseLlamaRuntimeState(state({ modelId: qwen, contextWindow: 65_536, kvCacheType: 'f16', kvOffload: true })), { status: 'ready', modelId: qwen, contextWindow: 65_536, kvCacheType: 'f16', kvOffload: true, launcherPid: 4242, serverPid: 1 });
 
   {
+    const { files, make } = await fixture();
+    const controller = make(async request => {
+      assert.equal(request.PROJECTOR_DEVICE, 'gpu');
+      await writeFile(files.stateFile, state({ requestId: request.REQUEST_ID, modelId: qwen, contextWindow: 32768, projectorDevice: 'gpu' }));
+    });
+    const result = await controller.switchTo(qwen, 32768, 'f16', true, 'gpu');
+    assert.equal(result.ok, true);
+    assert.equal(result.state.projectorDevice, 'gpu');
+  }
+  {
     const { files, signals, make } = await fixture();
     let captured: Record<string, string> = {};
     const controller = make(async (request) => { captured = request; await writeFile(files.stateFile, state({ status: 'ready', requestId: request.REQUEST_ID, modelId: request.MODEL_ID, contextWindow: Number(request.CONTEXT), kvCacheType: request.KV_TYPE, kvOffload: request.KV_OFFLOAD === '1' })); });

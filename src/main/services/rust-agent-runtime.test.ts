@@ -1,3 +1,4 @@
+import { setLanguage } from '../../shared/locale';
 import assert from 'node:assert/strict';
 import type { ChatMessage } from '../../shared/types';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, chmodSync } from 'node:fs';
@@ -160,3 +161,74 @@ if (require.main === module) {
   runRustAgentRuntimeRegression();
   void (async () => { await runSteeringBridgeRegression(); await runFatalBridgeRegression(); await runWorkerExitRegression(); })().catch((error: unknown) => {console.error(error); process.exitCode = 1;});
 }
+
+export async function runWebImageBridgeRegression(): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-web-images-'));
+  try {
+    for (const mode of ['auto', 'off'] as const) {
+      setLanguage(mode === 'auto' ? 'en' : 'ru');
+      const script = join(dir, `${mode}.js`), received = join(dir, `${mode}.json`);
+      writeFileSync(script, `#!/usr/bin/env node
+const fs = require('node:fs'); let run;
+const out = event => process.stdout.write(JSON.stringify(event)+'\\n');
+require('node:readline').createInterface({input:process.stdin}).on('line', line => {
+ const request = JSON.parse(line);
+ if(request.type === 'run') { run = request; out({type:'host_tool_call', id:'web-1', name:'web_open', arguments:{url:'https://example.com'}}); }
+ if(request.type === 'host_tool_result') { fs.writeFileSync(${JSON.stringify(received)}, JSON.stringify({run,result:request})); out({type:'final',content:'done'}); }
+});`);
+      chmodSync(script, 0o755);
+      let opened = 0, closed = 0;
+      const web = { openSession: async () => { opened++; return { execute: async (call: { name: string; arguments: unknown }) => { assert.equal(call.name, 'web_open'); assert.deepEqual(call.arguments, { url: 'https://example.com' }); return JSON.stringify({ title: 'Example', content: 'Public page', links: [] }); }, close: async () => { closed++; } }; } };
+      const runtime = new RustAgentRuntime('http://127.0.0.1:1', script, web as unknown as import('../web/web-tools').WebBrowserService);
+      const images = ['data:image/png;base64,iVBORw==', 'data:image/jpeg;base64,/9j/', 'data:image/webp;base64,UklGRg=='];
+      const old = { ...message('user', 'old image'), images: [images[0]] };
+      const current: ChatMessage = { ...message('user', 'new image'), images, attachments: images.map((_url, index) => ({
+        id: `current-image-${index}`, messageId: 'current', index, kind: 'image', mimeType: 'image/png', filename: `${index}.png`, size: 4, storageRef: '/fixture', status: 'ready', createdAt: '', updatedAt: '',
+      })) };
+      const controller = new AbortController(), timeout = setTimeout(() => controller.abort(), 5000);
+      try { for await (const _event of runtime.stream('model', [old, message('assistant', 'prior answer'), current], [], controller.signal, 32768, 'fast', mode, `web-${mode}`, undefined, undefined, true, { main: { chat_template_kwargs: { enable_thinking: mode === 'off' } } })) { assert.notEqual(_event.type, 'error'); } }
+      finally { clearTimeout(timeout); }
+      const request = JSON.parse(readFileSync(received, 'utf8'));
+      assert.deepEqual(request.run.user_images, images); assert.deepEqual(request.run.user_image_refs, ['current-image-0', 'current-image-1', 'current-image-2']); assert.deepEqual(request.run.history[0].images, [images[0]]);
+      assert.deepEqual(request.run.reasoning_options, { main: { chat_template_kwargs: { enable_thinking: mode === 'off' } } });
+      assert.equal(request.run.supports_reasoning, true);
+      assert.equal(request.run.ui_language, mode === 'auto' ? 'en' : 'ru');
+      assert.match(request.run.system, mode === 'auto' ? /Interface language: English/ : /Язык интерфейса: русский/);
+      assert.equal(request.run.web_tools.length, mode === 'auto' ? 5 : 0);
+      assert.equal(opened, mode === 'auto' ? 1 : 0); assert.equal(closed, opened);
+      if (mode === 'auto') assert.equal(request.result.result.content, 'Public page');
+      else assert.match(request.result.result.error, /unavailable/);
+    }
+  } finally { setLanguage('ru'); rmSync(dir, { recursive: true, force: true }); }
+}
+if (require.main === module) void runWebImageBridgeRegression().catch(error => { console.error(error); process.exitCode = 1; });
+
+export async function runWebCancellationRegression() {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-web-cancel-'));
+  try {
+    const script = join(dir, 'worker.js');
+    writeFileSync(script, `#!/usr/bin/env node
+const out = event => process.stdout.write(JSON.stringify(event)+'\\n');
+require('node:readline').createInterface({input:process.stdin}).on('line', line => {
+ const request = JSON.parse(line);
+ if(request.type === 'run') out({type:'host_tool_call',id:'cancel-web',name:'web_read',arguments:{}});
+ if(request.type === 'cancel') out({type:'agent_stopped'});
+});`); chmodSync(script, 0o755);
+    const controller = new AbortController(); let closed = 0;
+    let fail: (error: Error) => void = () => {};
+    const web = { openSession: async () => ({
+      execute: async () => new Promise<string>((_resolve, reject) => { fail = reject; controller.abort(); }),
+      close: async () => { closed++; fail(new Error('Browser cancelled')); },
+    }) };
+    const runtime = new RustAgentRuntime('http://127.0.0.1:1', script, web as unknown as import('../web/web-tools').WebBrowserService);
+    const events: string[] = []; const timeout = setTimeout(() => controller.abort(), 3000);
+    try { for await (const event of runtime.stream('model', [message('user', 'task')], [], controller.signal, 32768, 'fast', 'auto', 'cancel-web')) events.push(event.type); }
+    finally { clearTimeout(timeout); }
+    assert(closed > 0, 'Stop did not close the browser session'); assert(events.includes('cancelled'));
+    const alreadyStopped = new AbortController(); alreadyStopped.abort();
+    const early = [];
+    for await (const event of new RustAgentRuntime('', '/does-not-exist').stream('model', [message('user', 'task')], [], alreadyStopped.signal, 32768, 'fast', 'auto', 'early')) early.push(event.type);
+    assert.deepEqual(early, ['cancelled']);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+if (require.main === module) void runWebCancellationRegression().catch(error => { console.error(error); process.exitCode = 1; });

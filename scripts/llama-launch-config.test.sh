@@ -76,3 +76,38 @@ LOCAL_AI_LLAMA_SPECULATIVE=0 select_variant qwen3.6:35b-a3b-ud-q4_k_m
 build_server_args 32768 999
 [[ "$MMPROJ" == *"mmproj-BF16.gguf" && " ${server_args[*]} " == *" --mmproj $MMPROJ "* && " ${server_args[*]} " == *" --spec-type none "* ]]
 echo 'PASS generic CPU expert placement and unchanged Qwen switching'
+# Projector device is independent from MTP/KV settings, with an explicit fallback.
+MMPROJ=/models/vision.gguf; PROJECTOR_DEVICE=cpu
+build_server_args 32768 999
+[[ " ${server_args[*]} " == *" --no-mmproj-offload "* ]]
+LLAMA_BIN="$fixture/mock-llama"
+cat > "$LLAMA_BIN" <<'MOCK'
+#!/bin/sh
+printf 'CUDA0: fixture GPU\n'
+MOCK
+chmod +x "$LLAMA_BIN"
+PROJECTOR_DEVICE=gpu
+build_server_args 32768 999
+[[ " ${server_args[*]} " == *" --mmproj-offload "* && " ${server_args[*]} " != *" --no-mmproj-offload "* ]]
+PROJECTOR_DEVICE=auto
+nvidia-smi() { return 0; }
+build_server_args 32768 999
+[[ " ${server_args[*]} " == *" --mmproj-offload "* ]]
+build_server_args 32768 0
+[[ " ${server_args[*]} " == *" --no-mmproj-offload "* ]]
+PROJECTOR_DEVICE=invalid
+if build_server_args 32768 999; then echo 'invalid device accepted' >&2; exit 1; fi
+PROJECTOR_DEVICE=auto
+LLAMA_BIN=/bin/false
+build_server_args 32768 999
+[[ " ${server_args[*]} " == *" --no-mmproj-offload "* ]]
+PROJECTOR_DEVICE=gpu
+if build_server_args 32768 999; then echo 'GPU-only request accepted CPU-only runtime' >&2; exit 1; fi
+[[ "$LAUNCH_ERROR" == *"GPU projector unavailable"* ]]
+unset -f nvidia-smi
+PROJECTOR_DEVICE=auto
+PROJECTOR_PREFERENCE=cpu; LOCAL_AI_MMPROJ_DEVICE=gpu
+build_server_args 32768 999
+[[ " ${server_args[*]} " == *" --no-mmproj-offload "* ]]
+unset PROJECTOR_PREFERENCE LOCAL_AI_MMPROJ_DEVICE
+echo 'PASS projector auto/GPU/CPU fallback'

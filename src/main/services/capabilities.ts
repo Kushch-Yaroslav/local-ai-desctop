@@ -1,3 +1,4 @@
+import { modelLanguageDirective } from '../../shared/model-language';
 import type { ChatMessage } from '../../shared/types';
 
 export type RuntimeCapabilities = {
@@ -17,7 +18,7 @@ export function chatCompletionGuidance(mode: 'fast' | 'deep' = 'deep'): string {
 
 /** Complete system context for ordinary Chat mode. */
 export function chatSystemContext(capabilities: RuntimeCapabilities, mode: 'fast' | 'deep' = 'deep'): string {
-  return `${chatCompletionGuidance(mode)}\n${capabilitySystemContext(capabilities)}`;
+  return `${chatCompletionGuidance(mode)}\n${capabilitySystemContext(capabilities)}\n${modelLanguageDirective()}`;
 }
 
 /**

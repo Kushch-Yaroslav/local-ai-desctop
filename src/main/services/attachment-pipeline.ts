@@ -1,6 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import type { Attachment, ChatMessage, ProjectReference, StreamEvent, ToolActivity } from '../../shared/types';
-import { AttachmentService, attachmentDisplayName } from './attachment-service';
+import { AttachmentService, attachmentDisplayName, imageMimeType } from './attachment-service';
 import { Database } from './database';
 import { projectDirectoryName } from '../../shared/project-references';
 
@@ -75,7 +75,7 @@ export class AttachmentPipeline {
       const encoded: string[] = [];
       for (const image of images) {
         if (signal.aborted) throw new DOMException('Attachment preparation cancelled', 'AbortError');
-        try { encoded.push((await readFile(image.storageRef)).toString('base64')); }
+        try { encoded.push(`data:${imageMimeType(image.filename)};base64,${(await readFile(image.storageRef)).toString('base64')}`); }
         catch (error) { throw new Error(`Не удалось подготовить ${attachmentDisplayName(image)} для нативного vision: ${error instanceof Error ? error.message : String(error)}`); }
       }
       prepared.push({ ...message, images: encoded });

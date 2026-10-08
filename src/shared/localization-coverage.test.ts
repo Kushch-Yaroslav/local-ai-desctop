@@ -1,3 +1,5 @@
+import ts from 'typescript';
+import { english } from './translations';
 import assert from 'node:assert/strict';
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
@@ -52,3 +54,23 @@ export function runLocalizationCoverageRegression(): void {
 }
 
 if (require.main === module) runLocalizationCoverageRegression();
+
+// The renderer keeps source strings centralized through t/tr; every rendered
+// Russian literal must have an English counterpart (protocol/history excluded).
+if (require.main === module) {
+  const missing = new Set<string>();
+  for (const file of sources.filter(path => path.includes(join('src', 'renderer')))) {
+    const source = ts.createSourceFile(file, readFileSync(file, 'utf8'), ts.ScriptTarget.Latest, true, file.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS);
+    const visit = (node: import('typescript').Node) => {
+      if (ts.isCallExpression(node) && node.expression.getText(source) === 't' && node.arguments[0] && ts.isStringLiteral(node.arguments[0])) {
+        const key = node.arguments[0].text.trim(); if (cyrillic.test(key) && !english[key]) missing.add(key);
+      }
+      if (ts.isTaggedTemplateExpression(node) && node.tag.getText(source) === 'tr' && ts.isTemplateExpression(node.template)) {
+        const key = node.template.head.text + node.template.templateSpans.map((part, index) => `{${index}}${part.literal.text}`).join('');
+        if (!english[key]) missing.add(key);
+      }
+      ts.forEachChild(node, visit);
+    }; visit(source);
+  }
+  assert.deepEqual([...missing], [], 'Rendered labels need English translations');
+}

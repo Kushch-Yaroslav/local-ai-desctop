@@ -92,6 +92,7 @@ pub enum Event {
     AgentStatus {
         content: String,
     },
+    HostToolCall { id: String, name: String, arguments: Value },
     ToolCallStarted {
         id: String,
         name: String,

@@ -31,6 +31,9 @@ function safeFilename(filename: string): string {
   const result = basename(filename).replace(/[^\p{L}\p{N}._ -]/gu, '_').slice(0, 180);
   return result || 'attachment';
 }
+export function imageMimeType(filename: string): string {
+  return ({ '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp' } as Record<string, string>)[extname(filename).toLowerCase()] ?? 'application/octet-stream';
+}
 function hasExpectedImageSignature(filename: string, bytes: Buffer): boolean {
   const ext = extname(filename).toLowerCase();
   if (ext === '.png') return bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
@@ -62,7 +65,7 @@ export class AttachmentService {
     await mkdir(directory, { recursive: true }); await writeFile(storageRef, bytes, { flag: 'wx' });
     try {
       const imageNumber = kind === 'image' ? this.database.listAttachments(input.messageId).filter((item) => item.kind === 'image').length + 1 : undefined;
-      return this.database.createAttachment({ id, messageId: input.messageId, index: input.index, kind, mimeType: input.mimeType || 'application/octet-stream', filename, size: bytes.length, storageRef, metadata: { originalSize: bytes.length, ...(imageNumber ? { imageNumber } : {}) } });
+      return this.database.createAttachment({ id, messageId: input.messageId, index: input.index, kind, mimeType: kind === 'image' ? imageMimeType(filename) : input.mimeType || 'application/octet-stream', filename, size: bytes.length, storageRef, metadata: { originalSize: bytes.length, ...(imageNumber ? { imageNumber } : {}) } });
     } catch (error) { await rm(storageRef, { force: true }); throw error; }
   }
 

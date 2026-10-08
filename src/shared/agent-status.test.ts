@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { agentStatus, isStatusSnapshot } from './agent-status';
-import { agentStatusText, deliverableStatusLabel } from './localization';
+import { agentStatus, showAgentStatus, isStatusSnapshot } from './agent-status';
+import { agentStatusText } from './localization';
 import { AgentStatusPanel } from '../renderer/components/AgentStatusPanel';
 import { useAppStore } from '../renderer/store/app-store';
 import type { AgentPlan, Conversation } from './types';
@@ -18,13 +18,13 @@ async function run(): Promise<void> {
   const plan: AgentPlan = { taskMemory: memory };
   const markup = renderToStaticMarkup(createElement(AgentStatusPanel, { plan, running: true }));
   assert.equal((markup.match(/class="agent-status-panel"/g) ?? []).length, 1);
-  assert.match(markup, /aria-expanded="true"/); assert.match(markup, /aria-current="step"/);
+  assert.match(markup, /aria-expanded="false"/); assert(!markup.includes('aria-current="step"'));
   assert.match(markup, /1\/3/); assert.match(markup, /1\/4/);
-  for (const label of [agentStatusText.plan, agentStatusText.deliverables, deliverableStatusLabel.implemented, deliverableStatusLabel.verified, deliverableStatusLabel.blocked, deliverableStatusLabel.dropped]) assert(markup.includes(label));
+  for (const label of [agentStatusText.plan, agentStatusText.result]) assert(markup.includes(label));
   assert.equal(renderToStaticMarkup(createElement(AgentStatusPanel, { plan: null })), '');
   const stoppedMarkup = renderToStaticMarkup(createElement(AgentStatusPanel, { plan, running: false }));
   assert(stoppedMarkup.includes(agentStatusText.saved));
-  assert(stoppedMarkup.includes(agentStatusText.unfinishedStep));
+  assert(!stoppedMarkup.includes(agentStatusText.unfinishedStep), 'details start collapsed');
   assert(!stoppedMarkup.includes('aria-current="step"'));
   assert(!markup.includes(agentStatusText.saved));
   const workBudget = { used: 140, limit: 160, maximum: 256, extensions: 1, decision: 'extended', reason: 'changed_code_check_passed' };
@@ -40,9 +40,9 @@ async function run(): Promise<void> {
     { id: 'ev-warning', kind: 'test', class: 'functional', subject: 'project suite', pass: false, epoch: 2, turn: 2, baseline_failure: 'ev-baseline', detail: 'independent assertion' },
   ] } } };
   const evidenceMarkup = renderToStaticMarkup(createElement(AgentStatusPanel, { plan: evidencePlan }));
-  assert(evidenceMarkup.includes('browser interaction — Пройдена'));
-  assert(evidenceMarkup.includes(agentStatusText.warnings) && evidenceMarkup.includes(agentStatusText.preExisting));
-  assert(evidenceMarkup.includes('independent assertion'));
+  assert(evidenceMarkup.includes(agentStatusText.result));
+  assert(evidenceMarkup.includes(agentStatusText.warnings));
+  assert(!evidenceMarkup.includes('independent assertion'), 'warning details start collapsed');
   assert.equal(agentStatus(evidencePlan).warnings.length, 1, 'stale baseline is not an active duplicate warning');
   evidencePlan.taskMemory!.verification!.records.push({ id: 'ev-resolved', kind: 'test', class: 'functional', subject: 'project suite', pass: true, epoch: 2, turn: 3 });
   assert.equal(agentStatus(evidencePlan).warnings.length, 0, 'a successful retry resolves the displayed warning');
@@ -101,3 +101,12 @@ async function run(): Promise<void> {
   console.log('Agent Status projection, localization, live plan/results, chat isolation, pause/Continue/completion/failure regressions passed');
 }
 void run().catch((error: unknown) => { console.error(error); process.exitCode = 1; });
+
+const initialBudget = { used: 2, limit: 128, maximum: 256, extensions: 0, decision: 'initial', reason: 'initial' };
+assert.equal(showAgentStatus({ workBudget: initialBudget }), false);
+assert.equal(showAgentStatus({ workBudget: initialBudget }, true), true);
+assert.equal(showAgentStatus(null, true), false);
+assert.equal(showAgentStatus({ workBudget: { ...initialBudget, used: 112 } }), true);
+assert.equal(showAgentStatus({ workBudget: { ...initialBudget, extensions: 1, limit: 160 } }), true);
+assert.equal(showAgentStatus({ workBudget: initialBudget, taskMemory: { entries: [], verification: { code_changed: true, records: [] } } }), true);
+assert.equal(showAgentStatus({ taskMemory: { entries: [{ id: '1', finding: 'read only' }] } }), false);

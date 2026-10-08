@@ -1,3 +1,5 @@
+import { useLocale } from '../use-locale';
+import { t } from '../../shared/locale';
 import { memo, useEffect, useId, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -47,6 +49,7 @@ function correctRenderedLabelContrast(svg: SVGSVGElement, underlayColor: string)
 }
 
 function MermaidBlock({ source }: { source: string }) {
+  useLocale();
   const id = useId().replace(/[^a-zA-Z0-9]/g, '');
   const block = useRef<HTMLDivElement>(null);
   const viewport = useRef<HTMLDivElement>(null);
@@ -131,7 +134,7 @@ function MermaidBlock({ source }: { source: string }) {
           }
         }
       } catch {
-        if (!cancelled) setError('Не удалось отобразить диаграмму. Проверьте исходный Mermaid-код.');
+        if (!cancelled) setError(t("Не удалось отобразить диаграмму. Проверьте исходный Mermaid-код."));
       } finally {
         scratch.remove();
       }
@@ -157,16 +160,16 @@ function MermaidBlock({ source }: { source: string }) {
 
   return <div className={`mermaid-block mermaid-${theme}${expanded ? ' mermaid-expanded' : ''}`} ref={block}>
     <div className="mermaid-toolbar">
-      <span className="mermaid-title">Диаграмма</span>
-      <div className="mermaid-controls" role="group" aria-label="Управление диаграммой">
-        <button type="button" aria-label="Уменьшить диаграмму" disabled={!svg || zoom <= .5} onClick={() => setZoom(value => Math.max(.5, value - .25))}>−</button>
-        <output aria-label="Масштаб">{Math.round(zoom * 100)}%</output>
-        <button type="button" aria-label="Увеличить диаграмму" disabled={!svg || zoom >= 3} onClick={() => setZoom(value => Math.min(3, value + .25))}>+</button>
-        <button type="button" disabled={!svg} onClick={reset}>Сбросить</button>
-        <button type="button" aria-expanded={expanded} onClick={() => setExpanded(value => !value)}>{expanded ? 'Свернуть' : 'Развернуть'}</button>
+      <span className="mermaid-title">{t("Диаграмма")}</span>
+      <div className="mermaid-controls" role="group" aria-label={t("Управление диаграммой")}>
+        <button type="button" aria-label={t("Уменьшить диаграмму")} disabled={!svg || zoom <= .5} onClick={() => setZoom(value => Math.max(.5, value - .25))}>−</button>
+        <output aria-label={t("Масштаб")}>{Math.round(zoom * 100)}%</output>
+        <button type="button" aria-label={t("Увеличить диаграмму")} disabled={!svg || zoom >= 3} onClick={() => setZoom(value => Math.min(3, value + .25))}>+</button>
+        <button type="button" disabled={!svg} onClick={reset}>{t("Сбросить")}</button>
+        <button type="button" aria-expanded={expanded} onClick={() => setExpanded(value => !value)}>{expanded ? t("Свернуть") : t("Развернуть")}</button>
       </div>
     </div>
-    <div className="mermaid-viewport" ref={viewport} tabIndex={0} role="region" aria-label="Диаграмма Mermaid. Для перемещения используйте прокрутку или перетаскивание." aria-busy={!svg && !error}
+    <div className="mermaid-viewport" ref={viewport} tabIndex={0} role="region" aria-label={t("Диаграмма Mermaid. Для перемещения используйте прокрутку или перетаскивание.")} aria-busy={!svg && !error}
       onPointerDown={event => {
         if (event.button !== 0 || event.pointerType !== 'mouse' || !svg) return;
         drag.current = { x: event.clientX, y: event.clientY, left: event.currentTarget.scrollLeft, top: event.currentTarget.scrollTop };
@@ -184,13 +187,13 @@ function MermaidBlock({ source }: { source: string }) {
       onPointerCancel={() => { drag.current = null; }}
       onLostPointerCapture={() => { drag.current = null; }}>
       {svg ? <div className="mermaid-canvas" style={{ width: `${zoom * 100}%`, minWidth: naturalWidth ? `${naturalWidth * zoom}px` : undefined }} dangerouslySetInnerHTML={{ __html: svg }} />
-        : <p className="mermaid-status" role="status">{error || 'Отрисовка диаграммы…'}</p>}
+        : <p className="mermaid-status" role="status">{error || t("Отрисовка диаграммы…")}</p>}
     </div>
     <details className="mermaid-source" open={error ? true : undefined}>
-      <summary>Исходный Mermaid-код</summary>
+      <summary>{t("Исходный Mermaid-код")}</summary>
       <div className="mermaid-source-actions">
-        <button type="button" onClick={copy}>{copied ? 'Скопировано' : 'Копировать код'}</button>
-        {copyError && <span role="status">Не удалось скопировать. Выделите код ниже.</span>}
+        <button type="button" onClick={copy}>{copied ? t("Скопировано") : t("Копировать код")}</button>
+        {copyError && <span role="status">{t("Не удалось скопировать. Выделите код ниже.")}</span>}
       </div>
       <pre><code>{source}</code></pre>
     </details>
@@ -209,11 +212,12 @@ function extractText(node: React.ReactNode): string {
 }
 
 function CodeBlock({ children, className }: { children?: React.ReactNode; className?: string }) {
+  useLocale();
   const [copied, setCopied] = useState(false);
   const text = extractText(children).replace(/\n$/, '');
-  const language = className?.replace('language-', '') ?? 'код';
+  const language = className?.replace('language-', '') ?? t("код");
   const copy = async () => { await navigator.clipboard.writeText(text); setCopied(true); window.setTimeout(() => setCopied(false), 1500); };
-  return <div className="code-block"><div className="code-title"><span>{language}</span><button onClick={copy}>{copied ? 'Скопировано' : 'Копировать'}</button></div><pre><code className={className}>{children}</code></pre></div>;
+  return <div className="code-block"><div className="code-title"><span>{language}</span><button onClick={copy}>{copied ? t("Скопировано") : t("Копировать")}</button></div><pre><code className={className}>{children}</code></pre></div>;
 }
 
 function streamingSections(source: string): string[] {
@@ -228,6 +232,7 @@ function streamingSections(source: string): string[] {
 }
 
 const MarkdownDocument = memo(function MarkdownDocument({ children }: { children: string }) {
+  useLocale();
   return <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]} components={{
     pre: ({ children: child }) => <>{child}</>,
     code: ({ className, children: child, ...props }) => className?.split(/\s+/).includes('language-mermaid')
@@ -245,6 +250,7 @@ const MarkdownDocument = memo(function MarkdownDocument({ children }: { children
  */
 const NEAR_VIEWPORT = '1500px 0px';
 const LazyMarkdown = memo(function LazyMarkdown({ children }: { children: string }) {
+  useLocale();
   const host = useRef<HTMLDivElement>(null);
   const [near, setNear] = useState(() => typeof IntersectionObserver === 'undefined');
   useEffect(() => {
@@ -259,6 +265,7 @@ const LazyMarkdown = memo(function LazyMarkdown({ children }: { children: string
 
 /** Completed Markdown sections remain mounted; only the live tail is reparsed and revealed. */
 export function Markdown({ children, streaming = false, lazy = false }: { children: string; streaming?: boolean; lazy?: boolean }) {
+  useLocale();
   if (!streaming) return lazy ? <LazyMarkdown>{children}</LazyMarkdown> : <MarkdownDocument>{children}</MarkdownDocument>;
   const sections = streamingSections(children);
   return <div className="markdown-stream">{sections.map((section, index) => {

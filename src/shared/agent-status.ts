@@ -22,3 +22,12 @@ export function agentStatus(plan: AgentPlan | null): { steps: AgentStatusStep[];
 /** Successful status snapshots belong in the current panel, not a repeated timeline card.
  * Errors remain chronological so a rejected planning operation is still visible. */
 export const isStatusSnapshot = (activity: ToolActivity): boolean => activity.kind === 'planning' && (activity.detail === 'plan' || activity.detail === 'deliverables');
+
+/** Runtime semantics, not tool counts, determine whether task telemetry is useful. */
+export function showAgentStatus(plan: AgentPlan | null, recovery = false): boolean {
+  const { steps, deliverables, warnings } = agentStatus(plan);
+  const budget = plan?.workBudget;
+  return Boolean(steps.length || deliverables.length || warnings.length || (recovery && budget)
+    || (budget && plan?.taskMemory?.verification?.code_changed)
+    || (budget && (budget.extensions > 0 || budget.decision === 'denied' || budget.used >= budget.limit - 16)));
+}

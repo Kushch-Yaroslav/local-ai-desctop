@@ -15,6 +15,7 @@ use std::{
 
 #[derive(Clone)]
 struct Control {
+    external: Arc<local_ai_agent_runtime::tools::web::HostTools>,
     cancelled: Arc<AtomicBool>,
     steering: Arc<Mutex<Vec<String>>>,
     pause_requested: Arc<AtomicBool>,
@@ -54,14 +55,18 @@ fn main() {
                 endpoint,
                 model,
                 system,
+                ui_language,
                 user,
+                user_images,
+                user_image_refs,
+                web_tools,
                 project_root,
                 secondary_project_root,
                 context_limit,
                 reasoning_mode,
                 supports_reasoning,
                 reasoning_options,
-                web_mode: _,
+                web_mode,
                 policy,
                 history,
                 evidence_dir,
@@ -80,6 +85,7 @@ fn main() {
                     continue;
                 }
                 let control = Control {
+                    external: Arc::new(Default::default()),
                     cancelled: Arc::new(AtomicBool::new(false)),
                     steering: Arc::new(Mutex::new(Vec::new())),
                     pause_requested: Arc::new(AtomicBool::new(false)),
@@ -93,7 +99,12 @@ fn main() {
                         endpoint,
                         model,
                         system,
+                        ui_language,
                         user,
+                        user_images,
+                        user_image_refs,
+                        web_tools: if web_mode == "auto" { web_tools } else { Vec::new() },
+                        host_tools: Some(control.external),
                         root: project_root,
                         secondary_root: secondary_project_root,
                         workspace_roots,
@@ -118,6 +129,9 @@ fn main() {
                     });
                     control.finished.store(true, Ordering::Relaxed);
                 });
+            }
+            Request::HostToolResult { run_id, id, result } => {
+                if let Some(control) = controls.get(&run_id) { control.external.reply(&id, result); }
             }
             Request::Cancel { run_id } => {
                 if let Some(control) = controls.get(&run_id) {

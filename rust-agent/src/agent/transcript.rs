@@ -11,6 +11,7 @@ pub struct Transcript {
     evidence_base: Option<PathBuf>,
     project_root: Option<PathBuf>,
     storage_error: Option<String>,
+    ui_language: Option<String>,
 }
 
 impl Default for Transcript {
@@ -21,6 +22,7 @@ impl Default for Transcript {
             evidence_base: None,
             project_root: None,
             storage_error: None,
+            ui_language: None,
         }
     }
 }
@@ -34,6 +36,7 @@ impl Clone for Transcript {
             evidence_base: None,
             project_root: self.project_root.clone(),
             storage_error: None,
+            ui_language: self.ui_language.clone(),
         }
     }
 }
@@ -147,6 +150,7 @@ impl Transcript {
             evidence_base: Some(base.to_path_buf()),
             project_root: root.and_then(|path| Path::new(path).canonicalize().ok()),
             storage_error: None,
+            ui_language: None,
         };
         if transcript.entries.is_empty() {
             for message in history {
@@ -195,6 +199,9 @@ impl Transcript {
         self.storage_error.as_deref()
     }
     pub fn has_current_run_user(&self, content: &str) -> bool {
+        self.has_current_run_input(content, &[])
+    }
+    pub fn has_current_run_input(&self, content: &str, image_refs: &[String]) -> bool {
         let completed = self
             .entries
             .iter()
@@ -205,7 +212,8 @@ impl Transcript {
             .rev()
             .find_map(|(i, entry)| match entry {
                 Entry::RunUser(message) if completed.is_none_or(|done| i > done) => {
-                    Some(message.get("content").and_then(Value::as_str) == Some(content))
+                    let refs: Vec<String> = message.get("image_refs").and_then(Value::as_array).map(|refs| refs.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default();
+                    Some(message.get("content").and_then(Value::as_str) == Some(content) && refs == image_refs)
                 }
                 _ => None,
             })
@@ -301,7 +309,11 @@ impl Transcript {
                     _ => None,
                 })
                 .collect::<Vec<_>>();
-            store.finish(base, history, user, &steering, final_text)
+            let image_refs: Vec<String> = self.entries.iter().rev().find_map(|entry| match entry {
+                Entry::RunUser(value) => Some(value.get("image_refs").and_then(Value::as_array).map(|refs| refs.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default()),
+                _ => None,
+            }).unwrap_or_default();
+            store.finish(base, history, user, &image_refs, &steering, final_text)
         } else {
             Ok(())
         }
@@ -319,7 +331,16 @@ impl Transcript {
         self.record(Entry::LanguagePreference(language));
     }
 
+    pub fn set_ui_language(&mut self, language: Option<&str>) {
+        self.ui_language = match language {
+            Some("ru") => Some("Russian".into()),
+            Some("en") => Some("English".into()),
+            _ => None,
+        };
+    }
+
     pub fn language_preference(&self) -> String {
+        if let Some(language) = &self.ui_language { return language.clone(); }
         let last_user = self
             .entries
             .iter()

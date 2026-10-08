@@ -1,9 +1,12 @@
+import { getLanguage } from '../../shared/locale';
+import { modelLanguageDirective } from '../../shared/model-language';
 import { createInterface } from 'node:readline';
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { agentRuntimePath, paths } from './paths';
 import { agentEvidenceDir } from './agent-evidence';
 import type { AgentPlan, AgentPlanStepStatus, ChatMessage, ModelTodo, ReasoningMode, StreamEvent, SteeringIntent, TerminalExecution, ToolActivity, WebMode, WorkBudget } from '../../shared/types';
+import { WebBrowserService, webToolDefinitions, activityForWebTool, type WebBrowserSession } from '../web/web-tools';
 import { maxOutputTokens } from '../models/model-registry';
 
 /** Project identity is a transport value, not an orchestration subsystem. */
@@ -24,7 +27,7 @@ type RuntimeEvent = {
   knowledge_reads?: number; knowledge_writes?: number; cache_hits?: number; stale_source_entries?: number; bytes_injected?: number;
 };
 type RuntimeRequest = {
-  type: 'run'; run_id: string; endpoint: string; model: string; system: string; user: string;
+  type: 'run'; run_id: string; endpoint: string; model: string; system: string; ui_language?: 'ru' | 'en'; user: string; user_images?: string[]; user_image_refs?: string[]; web_tools?: unknown[];
   project_root?: string; secondary_project_root?: string; context_limit: number; reasoning_mode: ReasoningMode;
   supports_reasoning: boolean; reasoning_options?: Record<string, Record<string, unknown>>;
   web_mode: WebMode; policy: 'auto' | 'safe'; history: unknown[]; task_memory?: AgentPlan['taskMemory']; provider_max_output?: number;
@@ -49,10 +52,14 @@ export function runtimeTextEvent(event: Pick<RuntimeEvent, 'type' | 'content'>, 
 }
 
 /** The latest actual user node owns an Agent run. */
-export function splitAgentRunHistory(history: ChatMessage[]): { user: string; prior: ChatMessage[] } {
+export function splitAgentRunHistory(history: ChatMessage[]): { user: string; images: string[]; imageRefs: string[]; prior: ChatMessage[] } {
   const currentIndex = history.map((message) => message.role).lastIndexOf('user');
   if (currentIndex < 0 || !history[currentIndex].content.trim()) throw new Error('В запросе агента нет текущего сообщения пользователя.');
-  return { user: history[currentIndex].content, prior: history.slice(0, currentIndex) };
+  return { user: history[currentIndex].content, images: history[currentIndex].images ?? [], imageRefs: imageReferences(history[currentIndex]), prior: history.slice(0, currentIndex) };
+}
+
+function imageReferences(message: ChatMessage): string[] {
+  return (message.attachments ?? []).filter(attachment => attachment.kind === 'image').map(attachment => attachment.id);
 }
 
 const status = (value: unknown): AgentPlanStepStatus => value === 'completed' || value === 'abandoned' || value === 'in_progress' ? value : 'pending';
@@ -121,7 +128,7 @@ export function taskPlan(value: unknown): AgentPlan {
  * immediately; `final` is metadata, not a delayed text transport. */
 export class RustAgentRuntime {
   private readonly steering = new Map<string, (content: string, intent?: SteeringIntent) => Promise<void>>();
-  constructor(private readonly endpoint: string, private readonly binary = agentRuntimePath()) {}
+  constructor(private readonly endpoint: string, private readonly binary = agentRuntimePath(), private readonly web = new WebBrowserService()) {}
 
   steer(runId: string, content: string, intent?: SteeringIntent): Promise<void> {
     const send = this.steering.get(runId);
@@ -130,6 +137,7 @@ export class RustAgentRuntime {
   }
 
   async *stream(model: string, history: ChatMessage[], projects: AgentProject[], signal: AbortSignal, contextLimit: number, reasoningMode: ReasoningMode, webMode: WebMode, runId: string, persistedTaskMemory?: AgentPlan['taskMemory'], conversationId?: string, supportsReasoning = true, reasoningOptions?: Record<string, Record<string, unknown>>, workspaceRoots: readonly string[] = []): AsyncIterable<StreamEvent> {
+    if (signal.aborted) { yield { type: 'cancelled' }; return; }
     if (!existsSync(this.binary)) throw new Error(`Rust Agent Runtime V2 не собран: ${this.binary}. Выполните cargo build в rust-agent.`);
     const child = spawn(this.binary, [], { stdio: 'pipe' });
     const lines = createInterface({ input: child.stdout });
@@ -146,6 +154,9 @@ export class RustAgentRuntime {
         child.stdin.write(`${JSON.stringify({ type: 'steer', run_id: runId, content, ...(intent ? { intent } : {}) })}\n`);
       });
     });
+    let session: Promise<WebBrowserSession> | undefined;
+    const closeWeb = () => { void session?.then((browser) => browser.close(), () => undefined); };
+    signal.addEventListener('abort', closeWeb, { once: true });
     let stopped = false;
     const stop = () => {
       if (stopped || !child.stdin.writable) return;
@@ -157,10 +168,11 @@ export class RustAgentRuntime {
     const current = splitAgentRunHistory(history);
     const request: RuntimeRequest = {
       type: 'run', run_id: runId, endpoint: this.endpoint, model,
-      system: `You are Local AI Desktop Agent. Work autonomously inside the scope described below. Use tools only with complete valid JSON arguments.\n${projects.map((project) => `Project ${project.slot}: ${project.label}; identity=${project.id}; root=${project.root}`).join('\n')}`,
-      user: current.user, project_root: projects[0]?.root, secondary_project_root: projects[1]?.root, ...(workspaceRoots.length ? { workspace_roots: [...workspaceRoots] } : {}),
+      ui_language: getLanguage(),
+      system: `${modelLanguageDirective()}\nYou are Local AI Desktop Agent. Work autonomously inside the scope described below. Use tools only with complete valid JSON arguments.\n${projects.map((project) => `Project ${project.slot}: ${project.label}; identity=${project.id}; root=${project.root}`).join('\n')}`,
+      user: current.user, user_images: current.images, user_image_refs: current.imageRefs, web_tools: webMode === 'auto' ? webToolDefinitions : [], project_root: projects[0]?.root, secondary_project_root: projects[1]?.root, ...(workspaceRoots.length ? { workspace_roots: [...workspaceRoots] } : {}),
       context_limit: contextLimit, reasoning_mode: reasoningMode, supports_reasoning: supportsReasoning, reasoning_options: reasoningOptions, web_mode: webMode, policy: 'auto',
-      history: current.prior.filter((message) => !message.agentError && !message.agentCancelled).map((message) => ({ role: message.role, content: message.content })),
+      history: current.prior.filter((message) => !message.agentError && !message.agentCancelled).map((message) => ({ role: message.role, content: message.content, ...(imageReferences(message).length ? { image_refs: imageReferences(message) } : {}), ...(message.images?.length ? { images: message.images } : {}) })),
       ...(conversationId ? { evidence_dir: agentEvidenceDir(paths.userData, conversationId) } : {}),
       ...(persistedTaskMemory ? { task_memory: persistedTaskMemory } : {}),
       provider_max_output: maxOutputTokens,
@@ -178,6 +190,19 @@ export class RustAgentRuntime {
       for await (const line of lines) {
         let event: RuntimeEvent;
         try { event = JSON.parse(line) as RuntimeEvent; } catch { continue; }
+        if (event.type === 'host_tool_call') {
+          let result: unknown;
+          try {
+            if (signal.aborted) throw new Error('Web request cancelled');
+            if (webMode !== 'auto' || !webToolDefinitions.some((tool) => tool.function.name === event.name)) throw new Error('Web tool is unavailable');
+            session ??= this.web.openSession();
+            const browser = await session;
+            if (signal.aborted) { await browser.close(); throw new Error('Web request cancelled'); }
+            result = JSON.parse(await browser.execute({ name: event.name!, arguments: event.arguments ?? {} }));
+          } catch (error) { result = { error: error instanceof Error ? error.message : String(error) }; }
+          if (!signal.aborted && child.stdin.writable) child.stdin.write(`${JSON.stringify({ type: 'host_tool_result', run_id: runId, id: event.id, result })}\n`);
+          continue;
+        }
         if (event.type === 'steering_accepted' || event.type === 'steering_rejected') {
           const next = pending.shift();
           if (event.type === 'steering_accepted') next?.resolve();
@@ -258,6 +283,8 @@ export class RustAgentRuntime {
       if (!signal.aborted && terminalFinal) yield { type: 'done', finishReason: terminalFinishReason };
       else if (!signal.aborted && !terminalFailure && !terminalStopped) yield { type: 'error', message: 'Rust Agent Runtime V2 ended without a terminal final response', details: processError ? String(processError) : stderr.trim() || 'The runtime closed before emitting a final event.' };
     } finally {
+      signal.removeEventListener('abort', closeWeb);
+      closeWeb();
       this.steering.delete(runId);
       for (const next of pending) next.reject(new Error('Agent завершён до принятия уточнения.'));
       signal.removeEventListener('abort', stop);
@@ -268,10 +295,11 @@ export class RustAgentRuntime {
 }
 
 function activityLabel(name?: string): string {
+  if (name?.startsWith('web_')) return activityForWebTool({ name, arguments: {} }).label;
   return ({ list_directory: 'Просмотр структуры проекта', read_file: 'Чтение файла', write_file: 'Изменение файла', replace_text: 'Изменение файла', create_file: 'Создание файла', apply_patch: 'Изменение проекта', delete_file: 'Удаление файла', run_terminal: 'Запуск terminal', task_memory: 'Task Memory', deliverables: 'Требуемый результат', plan: 'План выполнения', project_knowledge_index: 'Индекс знаний проекта', project_knowledge_read: 'Чтение знаний проекта', project_knowledge_update: 'Обновление знаний проекта' } as Record<string, string>)[name ?? ''] ?? 'Действие агента';
 }
 function activityKind(name?: string): NonNullable<import('../../shared/types').ToolActivity['kind']> {
-  return name === 'run_terminal' ? 'terminal' : name === 'deliverables' || name === 'plan' ? 'planning' : name === 'task_memory' || name === 'project_knowledge_read' || name === 'project_knowledge_index' ? 'file_read' : name === 'read_file' ? 'file_read' : name === 'list_directory' ? 'directory' : 'mutation';
+  return name?.startsWith('web_') ? 'web' : name === 'run_terminal' ? 'terminal' : name === 'deliverables' || name === 'plan' ? 'planning' : name === 'task_memory' || name === 'project_knowledge_read' || name === 'project_knowledge_index' ? 'file_read' : name === 'read_file' ? 'file_read' : name === 'list_directory' ? 'directory' : 'mutation';
 }
 function timestamp(value: number | undefined): string | undefined { return typeof value === 'number' && Number.isFinite(value) ? new Date(value).toISOString() : undefined; }
 function terminalResult(raw: string | undefined): TerminalExecution | undefined {

@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer, type Server } from 'node:http';
 import { once } from 'node:events';
-import { LlamaCppBackend, LlamaCppContextExhaustedError, LlamaCppRequestError, validateLlamaMessageSequence } from './llama-cpp-backend';
+import { nativeImageUrl, LlamaCppBackend, LlamaCppContextExhaustedError, LlamaCppRequestError, validateLlamaMessageSequence } from './llama-cpp-backend';
 import type { ToolMessage } from './types';
 import { llamaReasoningForInput, llamaRuntimeProfiles } from '../models/llama-runtime-policy';
 import { builtinModelCatalog } from '../models/model-catalog';
@@ -208,9 +208,13 @@ export async function runLlamaCppBackendRegression(): Promise<void> {
     try {
       const history: ChatMessage[] = [{ id: 'user', conversationId: 'chat', role: 'user', content: 'Stream this response.', createdAt: new Date().toISOString() }];
       const events = [] as import('../../shared/types').StreamEvent[];
+      const imageUrls = ['data:image/png;base64,iVBORw==', 'data:image/jpeg;base64,/9j/', 'data:image/webp;base64,UklGRg=='];
+      history[history.length - 1].images = imageUrls;
       for await (const event of new LlamaCppBackend(url).streamChat(model, history, new AbortController().signal, 65_536, 'deep')) events.push(event);
       assert.equal(events.find((event) => event.type === 'diagnostics')?.diagnostics?.evalCount, 7, 'usage emitted after finish_reason was not retained for message statistics');
       assert.equal(events.find((event) => event.type === 'diagnostics')?.diagnostics?.tokensPerSecond, 14, 'late timing data was not retained for message statistics');
+      const wireMessages = scenario.requestBodies[0].messages as Array<{ role: string; content: Array<{ image_url?: { url: string } }> }>;
+      assert.deepEqual(wireMessages.find((message) => message.role === 'user')!.content.filter((part) => part.image_url).map((part) => part.image_url!.url), imageUrls);
       assert.deepEqual(events.filter((event) => event.type === 'thinking').map((event) => event.content), ['Reasoning. '], 'real reasoning stream was not forwarded');
     } finally { await stop(server); }
   }
@@ -325,3 +329,13 @@ export async function runLlamaCppBackendRegression(): Promise<void> {
 }
 
 if (require.main === module) void runLlamaCppBackendRegression().catch((error: unknown) => { console.error(error); process.exitCode = 1; });
+
+for (const [mime, bytes] of [
+  ['image/png', Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])],
+  ['image/jpeg', Buffer.from([255, 216, 255, 224, 12])],
+  ['image/webp', Buffer.from('RIFF0000WEBPbytes')],
+] as const) {
+  const raw = bytes.toString('base64');
+  assert.equal(nativeImageUrl(raw), `data:${mime};base64,${raw}`);
+  assert.equal(nativeImageUrl(`data:${mime};base64,${raw}`), `data:${mime};base64,${raw}`);
+}

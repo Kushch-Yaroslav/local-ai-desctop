@@ -19,7 +19,7 @@ const api: LocalAiApi = {
   analysis: { list: (conversationId) => ipcRenderer.invoke('analysis:list', conversationId) },
   models: { list: () => ipcRenderer.invoke('models:list') },
   runtime: { state: () => ipcRenderer.invoke('runtime:state') },
-  settings: { get: () => ipcRenderer.invoke('settings:get'), save: (config) => ipcRenderer.invoke('settings:save', config), dismissSetup: () => ipcRenderer.invoke('settings:dismissSetup') },
+  settings: { onLanguageChanged: (listener) => { const callback = (_: unknown, language: 'ru' | 'en') => listener(language); ipcRenderer.on('settings:language', callback); return () => ipcRenderer.removeListener('settings:language', callback); }, get: () => ipcRenderer.invoke('settings:get'), save: (config) => ipcRenderer.invoke('settings:save', config), dismissSetup: () => ipcRenderer.invoke('settings:dismissSetup') },
   hardware: { get: () => ipcRenderer.invoke('hardware:get') },
   contextEstimate: (modelId) => ipcRenderer.invoke('context:estimate', modelId),
   contextDiscover: (modelId) => ipcRenderer.invoke('context:discover', modelId),

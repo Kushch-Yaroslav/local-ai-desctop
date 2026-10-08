@@ -85,5 +85,5 @@ const alwaysAvailableAgentTools = ['observation_index', 'observation_read', 'tas
 export function enabledAgentTools(mode: 'chat' | 'agent', scope: { hasProject: boolean; workspaceRootCount: number }, webMode: 'off' | 'auto'): string[] {
   if (mode !== 'agent') return webMode === 'auto' ? ['web'] : [];
   const scoped = scope.hasProject ? [...executionTools, ...knowledgeTools] : scope.workspaceRootCount > 0 ? executionTools : [];
-  return [...scoped, ...alwaysAvailableAgentTools].sort();
+  return [...scoped, ...alwaysAvailableAgentTools, ...(webMode === 'auto' ? ['web_search', 'web_open', 'web_read', 'web_follow_link', 'web_back'] : [])].sort();
 }

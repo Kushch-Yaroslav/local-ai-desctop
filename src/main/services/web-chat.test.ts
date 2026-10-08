@@ -1,3 +1,4 @@
+import { setLanguage } from '../../shared/locale';
 import assert from 'node:assert/strict';
 import type { ChatMessage, StreamEvent } from '../../shared/types';
 import type { LlmBackend, ToolCallingBackend, ToolMessage } from '../backends/types';
@@ -34,8 +35,12 @@ export async function runWebChatRegression(): Promise<void> {
   const languageRule = 'Если пользователь явно общается на одном языке';
   assert.equal((direct[0]?.content.match(new RegExp(languageRule, 'g')) ?? []).length, 1, 'Fast Chat must receive the language-consistency rule exactly once');
   assert.match(direct[0]?.content ?? '', /цитаты или исходного текста, кода, идентификаторов, имён, URL/, 'Fast Chat language rule must preserve multilingual quotations and technical text');
+  setLanguage('en');
   const events: StreamEvent[] = [];
   for await (const event of new WebChatService(backend, web).stream('qwen3.8:27b-q4_K_M', history, new AbortController().signal, 65_536, 'deep')) events.push(event);
+  assert.equal((finalMessages[0].content.match(/Interface language: English/g) ?? []).length, 1);
+  assert.match(routingRequests[0][0].content, /Interface language: English/);
+  setLanguage('ru');
   assert.equal(decisionCalls, 2, 'Web Auto did not continue after the web tool result');
   assert.equal(decisionReasoningMode, 'fast', 'Web Auto did not keep its internal routing decision lightweight');
   assert.equal(finalStreamCalls, 1, 'Web Auto did not use the backend final stream');

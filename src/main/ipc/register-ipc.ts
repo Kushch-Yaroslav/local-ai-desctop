@@ -1,3 +1,4 @@
+import { VisionDeviceController, type VisionDevice } from '../services/vision-device-controller';
 import { BrowserWindow, dialog, ipcMain } from 'electron';
 import { randomUUID } from 'node:crypto';
 import type { AnalysisRun, ApprovalDecision, ApprovalStatus, ChatRequest, Conversation, ProjectReference, ProjectSuggestion, RiskCategory, SteeringIntent, ThinkingTimelineEvent } from '../../shared/types';
@@ -12,8 +13,8 @@ import { LlamaCppBackend } from '../backends/llama-cpp-backend';
 import { LlamaRuntimeController, type LlamaRuntimeState } from '../services/llama-runtime-controller';
 import { RustAgentRuntime, taskPlan, type AgentProject } from '../services/rust-agent-runtime';
 import { paths } from '../services/paths';
-import { dismissRuntimeSetup, normalizeConfiguration, runtimeSetup, saveRuntimeConfiguration } from '../services/runtime-settings';
-import { discardAgentEvidence } from '../services/agent-evidence';
+import { effectiveRuntimeConfiguration, dismissRuntimeSetup, saveImageProcessingDevice, normalizeConfiguration, runtimeSetup, saveRuntimeConfiguration } from '../services/runtime-settings';
+import { archiveAgentEvidence, discardAgentEvidence } from '../services/agent-evidence';
 import { log } from '../services/logger';
 import { getModelProfile } from '../models/model-registry';
 import { agentReasoningOptions, llamaContextPresets, llamaRuntimeProfile, reasoningCapability } from '../models/llama-runtime-policy';
@@ -22,7 +23,7 @@ import { WebBrowserService } from '../web/web-tools';
 import { WebChatService } from '../services/web-chat';
 import { chatMessagesWithSystemPrefix, chatSystemContext } from '../services/capabilities';
 import { ReadonlyProjectTools, type ApprovalResult } from '../tools/project-tools';
-import { AttachmentService } from '../services/attachment-service';
+import { imageMimeType, AttachmentService } from '../services/attachment-service';
 import { AttachmentPipeline } from '../services/attachment-pipeline';
 import { readFile } from 'node:fs/promises';
 import { saveGenerationDiagnosticsBestEffort } from '../services/generation-diagnostics';
@@ -47,7 +48,7 @@ const backend = llamaCpp;
 // A live/stale launcher document is not an explicit selection in this Electron process.
 let modelSelectedThisProcess = false;
 const web = new WebBrowserService();
-const rustAgent = new RustAgentRuntime(process.env.LOCAL_AI_AGENT_ENDPOINT ?? `${llamaCppUrl.replace(/\/$/, '')}/v1/chat/completions`);
+const rustAgent = new RustAgentRuntime(process.env.LOCAL_AI_AGENT_ENDPOINT ?? `${llamaCppUrl.replace(/\/$/, '')}/v1/chat/completions`, undefined, web);
 const webChat = new WebChatService(backend, web);
 const attachments = new AttachmentService(database);
 const attachmentPipeline = new AttachmentPipeline(database, attachments);
@@ -75,6 +76,38 @@ const discoveredContextOptions = new Map<string, { option: ContextDiscoveryOptio
 let contextDiscoveryBusy = false;
 let savedDiscoveryAttempted: string | null = null;
 let runtimeSelectionBusy = false;
+let runtimeShuttingDown = false;
+let deviceChanged = () => {};
+export function onImageProcessingDeviceChanged(listener: () => void): void { deviceChanged = listener; }
+const visionDevice = new VisionDeviceController({
+  busy: () => runtimeShuttingDown || activeGenerations.size > 0 || contextDiscoveryBusy || runtimeSelectionBusy,
+  state: () => llamaRuntime.state(),
+  save: saveImageProcessingDevice,
+  supportsProjector: state => {
+    const profile = state.modelId ? llamaRuntimeProfile(state.modelId) : undefined;
+    return Boolean(profile?.mmprojPath && (state.speculativeMode !== 'mtp' || profile.visionWithMtp !== false));
+  },
+  restart: async (state, device) => {
+    runtimeSelectionBusy = true;
+    try {
+      const result = await llamaRuntime.switchTo(state.modelId!, state.contextWindow!, state.kvCacheType, state.kvOffload, device);
+      await syncLlamaBackend();
+      return result;
+    } finally { runtimeSelectionBusy = false; }
+  },
+  changed: () => deviceChanged(),
+});
+export async function selectImageProcessingDevice(device: VisionDevice): Promise<void> {
+  await visionDevice.select(device);
+}
+export async function imageProcessingDeviceSelection(): Promise<VisionDevice> {
+  const state = await llamaRuntime.state();
+  const config = effectiveRuntimeConfiguration();
+  if (state.status === 'ready' && state.projectorDevice) return state.projectorDevice;
+  if (visionDevice.pending) return visionDevice.pending;
+  return config.imageProcessingDevice ?? (config.models.find(model => model.id === state.modelId)?.projectorDevice === 'gpu' ? 'gpu' : 'cpu');
+}
+
 let contextDiscoveryProgress: ContextDiscoveryProgress = { busy: false, modelId: null, stage: '', probeCount: 0 };
 const discoveryKey = (modelId: string, contextWindow: number, kvCacheType: 'f16' | 'q8_0', kvOffload: boolean) => `${modelId}:${contextWindow}:${kvCacheType}:${kvOffload ? 'gpu' : 'ram'}`;
 function currentDiscoveryHeadroomFits(option: ContextDiscoveryOption, current: RuntimeContextEstimate): boolean {
@@ -158,7 +191,7 @@ async function currentLlamaRuntime(): Promise<LlamaRuntimeState> {
     const health = await llamaCpp.getStatus();
     if (!health.available) return { status: 'offline', modelId: null, contextWindow: null, error: `llama-server не отвечает: ${health.message ?? 'health check failed'}` };
   }
-  return state;
+  return { ...state, ...(visionDevice.pending ? { pendingProjectorDevice: visionDevice.pending } : {}), ...(visionDevice.error ? { deviceError: visionDevice.error } : {}) };
 }
 async function syncLlamaBackend(): Promise<LlamaRuntimeState> {
   const state = await currentLlamaRuntime();
@@ -318,6 +351,7 @@ async function discoverModelContexts(modelId: string): Promise<ContextDiscoveryR
     throw error;
   } finally {
     contextDiscoveryBusy = false;
+    void visionDevice.flush();
   }
 }
 async function verifyContextProbeInference(modelId: string): Promise<void> {
@@ -393,6 +427,7 @@ const waitFor = (promise: Promise<void>, timeoutMs: number): Promise<void> => ne
 
 /** Called by Electron's main lifecycle before process exit, never by a renderer. */
 export async function shutdownRuntime(): Promise<void> {
+  runtimeShuttingDown = true;
   const active = [...activeGenerations.values()];
   log('runtime.shutdown.started', { backend: 'llama-cpp', activeGenerations: active.length });
   for (const generation of active) generation.abort.abort();
@@ -496,12 +531,14 @@ export function registerIpc(): void {
     return database.getConversation(id) ?? updated;
     } finally {
       runtimeSelectionBusy = false;
+      deviceChanged();
+      void visionDevice.flush();
     }
   });
   ipcMain.handle('conversations:delete', async (_event, id: string) => {
     if (activeGenerations.has(id)) throw new Error('Нельзя удалить чат с активной генерацией.');
     sessionApprovals.delete(id); await attachments.removeManagedFiles(database.deleteConversation(id));
-    await discardAgentEvidence(paths.userData, id);
+    await discardAgentEvidence(paths.userData, id, true);
   });
   ipcMain.handle('messages:list', (_event, conversationId: string) => database.listMessages(conversationId));
   ipcMain.handle('agent-plan:get', (_event, conversationId: string) => database.getAgentPlan(conversationId));
@@ -521,7 +558,7 @@ export function registerIpc(): void {
     const before = database.listAttachmentsForConversation(message.conversationId);
     await cancelGeneration(message.conversationId);
     const retained = database.regenerateUserMessageAndTruncate(message.id);
-    await discardAgentEvidence(paths.userData, message.conversationId);
+    await archiveAgentEvidence(paths.userData, message.conversationId);
     const kept = new Set(database.listAttachmentsForConversation(message.conversationId).map((attachment) => attachment.id));
     await attachments.removeManagedFiles(before.filter((attachment) => !kept.has(attachment.id)));
     return retained;
@@ -540,7 +577,7 @@ export function registerIpc(): void {
   ipcMain.handle('attachments:list', (_event, messageId: string) => database.listAttachments(messageId));
   ipcMain.handle('attachments:dataUrl', async (_event, id: string) => {
     const attachment = database.getAttachment(id); if (!attachment || attachment.kind !== 'image') return null;
-    const data = await readFile(attachment.storageRef); return `data:${attachment.mimeType};base64,${data.toString('base64')}`;
+    const data = await readFile(attachment.storageRef); return `data:${imageMimeType(attachment.filename)};base64,${data.toString('base64')}`;
   });
   ipcMain.handle('analysis:list', (_event, conversationId: string) => database.listAnalysisRuns(conversationId));
   ipcMain.handle('models:list', async () => {
@@ -559,13 +596,15 @@ export function registerIpc(): void {
   ipcMain.handle('settings:save', async (_event, config: unknown) => {
     if (activeGenerations.size || contextDiscoveryBusy || runtimeSelectionBusy) throw new Error('Дождитесь завершения генерации, выбора модели или поиска контекста.');
     const next = normalizeConfiguration(config);
+    // Native menu owns this preference; an older open setup form must not revert it.
+    next.imageProcessingDevice = effectiveRuntimeConfiguration().imageProcessingDevice;
     const active = await llamaRuntime.state();
     if (active.status === 'ready' && active.modelId) {
       const prior = runtimeSetup().config;
       const before = prior.models.find((model) => model.id === active.modelId);
       const after = next.models.find((model) => model.id === active.modelId);
       const sameActive = before && after && before.modelPath === after.modelPath && before.mmprojPath === after.mmprojPath
-        && before.gpuLayers === after.gpuLayers && before.speculative === after.speculative;
+        && before.gpuLayers === after.gpuLayers && before.speculative === after.speculative && (before.projectorDevice ?? 'auto') === (after.projectorDevice ?? 'auto');
       if (!sameActive || prior.llamaServerPath !== next.llamaServerPath || prior.gpuLayers !== next.gpuLayers) {
         throw new Error('Сначала выберите другую модель или перезапустите приложение, чтобы изменить настройки активной модели/runtime.');
       }
@@ -827,6 +866,7 @@ export function registerIpc(): void {
         if (abort.signal.aborted) event.sender.send('chat:stream', { type: 'cancelled', conversationId: request.conversationId, generationId: generation.id });
       }
       generation.finish();
+      void visionDevice.flush();
     }
   });
 }

@@ -696,7 +696,9 @@ impl Workspace {
             endpoint: endpoint.into(),
             model: "scripted".into(),
             system: "system".into(),
+            ui_language: None,
             user: user.into(),
+            user_images: Vec::new(), user_image_refs: Vec::new(), web_tools: Vec::new(), host_tools: None,
             root: Some(self.root.to_string_lossy().into_owned()),
             secondary_root: None,
             workspace_roots: Vec::new(),
@@ -3415,4 +3417,114 @@ fn adaptive_pause_continue_and_new_completed_task_have_correct_budget_identity()
     let regenerated = Provider::start(|_, _| Reply::Text("Regenerated.".into()));
     run(workspace.config(&regenerated.endpoint, "task"));
     assert_eq!(saved_work_budget(&workspace).used, 1);
+}
+
+#[test]
+fn native_images_reach_provider_with_mime_and_original_payload() {
+    let fixture = Workspace::new(&[("fixture.txt", "fixture")]);
+    let images = vec!["data:image/png;base64,iVBORw==", "data:image/jpeg;base64,/9j/", "data:image/webp;base64,UklGRg=="];
+    let expected = images.clone();
+    let provider = Provider::start(move |request, _| {
+        let messages = request["messages"].as_array().unwrap();
+        let user = messages.iter().find(|m| m["role"] == "user").unwrap();
+        let parts = user["content"].as_array().unwrap();
+        assert!(parts[0]["text"].as_str().unwrap().contains("Describe images"));
+        assert_eq!(parts.iter().filter(|part| part["type"] == "image_url").map(|part| part["image_url"]["url"].as_str().unwrap()).collect::<Vec<_>>(), expected);
+        assert!(user.get("images").is_none());
+        Reply::Text("Images received".into())
+    });
+    let mut config = fixture.config(&provider.endpoint, "Describe images");
+    config.user_images = images.into_iter().map(str::to_owned).collect();
+    run(config);
+    assert!(!provider.requests().is_empty());
+}
+
+#[test]
+fn web_schema_exposure_is_host_opt_in() {
+    for enabled in [false, true] {
+        let fixture = Workspace::new(&[("fixture.txt", "fixture")]);
+        let provider = Provider::start(move |request, _| {
+            assert_eq!(tool_names(request).contains(&"web_open".to_owned()), enabled);
+            assert!(!tool_names(request).contains(&"unrestricted_fetch".to_owned()));
+            Reply::Text("Done".into())
+        });
+        let mut config = fixture.config(&provider.endpoint, "Read a public page");
+        config.web_tools = vec![json!({"type":"function","function":{"name":"web_open","parameters":{"type":"object","properties":{"url":{"type":"string"}}}}}), json!({"type":"function","function":{"name":"unrestricted_fetch"}})];
+        if enabled { config.host_tools = Some(Arc::new(local_ai_agent_runtime::tools::web::HostTools::default())); }
+        run(config);
+        assert!(!provider.requests().is_empty());
+    }
+}
+
+#[test]
+fn host_web_result_is_an_ordinary_auditable_observation() {
+    let fixture = Workspace::new(&[("fixture.txt", "fixture")]);
+    let provider = Provider::start(|request, turn| {
+        if turn == 0 { return Reply::Tools(vec![("web_open", json!({"url":"https://example.com"}))]); }
+        let result = last_tool_result(request);
+        assert!(result.contains("Public fixture"));
+        assert!(result.contains("obs-"), "web output bypassed observation ledger");
+        Reply::Text("Read the page".into())
+    });
+    let host = Arc::new(local_ai_agent_runtime::tools::web::HostTools::default());
+    let host_thread = host.clone();
+    let reply = std::thread::spawn(move || {
+        for _ in 0..500 {
+            host_thread.reply("host-1", json!({"title":"Public fixture","content":"Fixture page","links":[]}));
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    });
+    let mut config = fixture.config(&provider.endpoint, "Read the public fixture page");
+    config.host_tools = Some(host);
+    config.web_tools = vec![json!({"type":"function","function":{"name":"web_open","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}})];
+    run(config); reply.join().unwrap();
+    assert_eq!(provider.requests().len(), 2);
+}
+
+#[test]
+fn native_image_history_resumes_without_resending_blobs_to_a_text_only_request() {
+    let fixture = Workspace::new(&[("fixture.txt", "fixture")]);
+    let first = Provider::start(|_, _| Reply::Text("Image described".into()));
+    let mut initial = fixture.config(&first.endpoint, "Describe image");
+    initial.user_images = vec!["data:image/jpeg;base64,/9j/".into()]; initial.user_image_refs = vec!["image-1".into()];
+    run(initial);
+    let next = Provider::start(|request, _| {
+        let messages = request["messages"].as_array().unwrap();
+        assert!(messages.iter().any(|message| message["content"].as_str().is_some_and(|text| text.contains("Image described"))));
+        assert!(messages.iter().all(|message| !message["content"].is_array()), "old native images reached a text-only request");
+        Reply::Text("Continued".into())
+    });
+    let mut continued = fixture.config(&next.endpoint, "Continue with text");
+    continued.history = vec![json!({"role":"user","content":"Describe image","image_refs":["image-1"]}), json!({"role":"assistant","content":"Image described"})];
+    run(continued);
+    assert_eq!(next.requests().len(), 1);
+    let journal = fixture.journal_or_empty();
+    assert!(journal.iter().any(|entry| entry.to_string().contains("image_refs")));
+}
+
+#[test]
+fn fresh_and_regenerated_requests_deliver_russian_preference_and_current_thinking() {
+    let fixture = Workspace::new(&[("placeholder.txt", "fixture")]);
+    for enabled in [false, true] {
+        let provider = Provider::start(move |request, _| {
+            let prompt = request["messages"][0]["content"].as_str().unwrap();
+            assert!(prompt.contains("Язык интерфейса: русский"));
+            assert!(prompt.contains("Russian (default; explicit user language requests take priority)"));
+            assert!(!prompt.contains("English (default"));
+            assert_eq!(request["chat_template_kwargs"]["enable_thinking"], enabled);
+            Reply::Text("Ответ модели".into())
+        });
+        let mut config = fixture.config(&provider.endpoint, "Объясни принцип работы");
+        config.root = None;
+        config.ui_language = Some("ru".into());
+        config.system = "Язык интерфейса: русский. Предпочитай русский для ответов и рассуждений; явная просьба пользователя имеет приоритет.".into();
+        config.reasoning_options = Some(json!({"main":{"chat_template_kwargs":{"enable_thinking":enabled}}}));
+        run(config);
+        assert!(!provider.requests().is_empty());
+        // Regenerate retains the previous raw lineage outside the active path.
+        if !enabled {
+            std::fs::rename(fixture.base.join("evidence"), fixture.base.join("archived-attempt")).unwrap();
+        }
+    }
+    assert!(fixture.base.join("archived-attempt").exists());
 }

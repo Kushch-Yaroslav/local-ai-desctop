@@ -9,7 +9,15 @@ pub enum Request {
         endpoint: String,
         model: String,
         system: String,
+        #[serde(default)]
+        ui_language: Option<String>,
         user: String,
+        #[serde(default)]
+        user_images: Vec<String>,
+        #[serde(default)]
+        user_image_refs: Vec<String>,
+        #[serde(default)]
+        web_tools: Vec<Value>,
         project_root: Option<String>,
         secondary_project_root: Option<String>,
         /// Directories the user named explicitly (absolute, canonical). They
@@ -37,6 +45,7 @@ pub enum Request {
         #[serde(default)]
         provider_max_output: Option<usize>,
     },
+    HostToolResult { run_id: String, id: String, result: Value },
     Cancel {
         run_id: String,
     },

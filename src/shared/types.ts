@@ -206,6 +206,9 @@ export interface HardwareStats {
 }
 
 export interface RuntimeConfiguration {
+  language?: 'ru' | 'en';
+  /** Explicit global menu selection overrides legacy per-model placement. */
+  imageProcessingDevice?: 'cpu' | 'gpu';
   schemaVersion: 2;
   llamaServerPath: string | null;
   modelsPath: string;
@@ -218,6 +221,7 @@ export interface RuntimeModelConfiguration {
   displayName: string;
   modelPath: string;
   mmprojPath: string;
+  projectorDevice?: 'auto' | 'gpu' | 'cpu';
   gpuLayers: number | null;
   supportsTools: boolean;
   speculative: 'mtp' | 'none';
@@ -229,7 +233,7 @@ export interface AppSettings {
   llamaServerPath: string | null;
   llamaRuntimeModelId?: string;
   /** Live state of the launcher-managed llama-server; the authority on what is running. */
-  llamaRuntime?: { status: 'idle' | 'starting' | 'ready' | 'switching' | 'offline' | 'stopped'; modelId: string | null; contextWindow: number | null; kvCacheType?: LlamaKvCacheType; kvOffload?: boolean; speculativeMode?: 'mtp' | 'eagle3' | 'none'; error?: string; rolledBack?: boolean };
+  llamaRuntime?: { status: 'idle' | 'starting' | 'ready' | 'switching' | 'offline' | 'stopped'; modelId: string | null; contextWindow: number | null; kvCacheType?: LlamaKvCacheType; kvOffload?: boolean; speculativeMode?: 'mtp' | 'eagle3' | 'none'; projectorDevice?: 'cpu' | 'gpu'; pendingProjectorDevice?: 'cpu' | 'gpu'; deviceError?: string; error?: string; rolledBack?: boolean };
   modelsPath: string;
 }
 
@@ -398,7 +402,7 @@ export interface LocalAiApi {
   analysis: { list(conversationId: string): Promise<AnalysisRun[]> };
   models: { list(): Promise<ModelInfo[]> };
   runtime: { state(): Promise<NonNullable<AppSettings['llamaRuntime']>> };
-  settings: { get(): Promise<AppSettings>; save(config: RuntimeConfiguration): Promise<AppSettings>; dismissSetup(): Promise<AppSettings> };
+  settings: { onLanguageChanged(listener: (language: 'ru' | 'en') => void): () => void; get(): Promise<AppSettings>; save(config: RuntimeConfiguration): Promise<AppSettings>; dismissSetup(): Promise<AppSettings> };
   hardware: { get(): Promise<HardwareStats> };
   contextEstimate(modelId: string): Promise<RuntimeContextEstimate>;
   contextDiscover(modelId: string): Promise<ContextDiscoveryResult>;

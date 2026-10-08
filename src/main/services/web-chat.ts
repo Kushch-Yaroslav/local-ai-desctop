@@ -1,3 +1,4 @@
+import { modelLanguageDirective } from '../../shared/model-language';
 import { randomUUID } from 'node:crypto';
 import type { ChatMessage, StreamEvent } from '../../shared/types';
 import { reasoningModeOf, type ReasoningInput } from '../../shared/reasoning-controls';
@@ -32,6 +33,7 @@ export class WebChatService {
     const results = toolResults.filter((message) => message.role === 'tool').map((message) => `Инструмент ${message.tool_name ?? 'web'} вернул:\n${message.content}`).join('\n\n');
     const finalMessages = chatMessagesWithSystemPrefix(history, [
       chatCompletionGuidance(reasoningModeOf(reasoningMode) === 'deep' ? 'deep' : 'fast'),
+      modelLanguageDirective(),
       ...(results ? [`Доступны следующие результаты web-инструментов. Используй их как evidence и сформулируй итоговый ответ без новых вызовов инструментов:\n\n${results}`] : []),
     ], history[0]?.conversationId ?? 'web-final', randomUUID());
     yield* this.backend.streamChat(model, finalMessages, signal, contextWindow, reasoningMode);
@@ -49,7 +51,7 @@ export class WebChatService {
     // This is a narrow routing step. Keep it out of the user-visible reasoning
     // and avoid spending the selected final-answer reasoning budget deciding
     // whether a web lookup is needed.
-    const messages: ToolMessage[] = chatMessagesWithSystemPrefix(history, [`${capabilitySystemContext({ webAvailable: true })}\n${webDecisionInstruction}`], history[0]?.conversationId ?? 'web-routing', randomUUID()).map(({ role, content, images }) => ({ role, content, ...(images?.length ? { images } : {}) }));
+    const messages: ToolMessage[] = chatMessagesWithSystemPrefix(history, [`${capabilitySystemContext({ webAvailable: true })}\n${webDecisionInstruction}\n${modelLanguageDirective()}`], history[0]?.conversationId ?? 'web-routing', randomUUID()).map(({ role, content, images }) => ({ role, content, ...(images?.length ? { images } : {}) }));
     try {
       for (let actionCount = 0; !signal.aborted && actionCount < maxWebActions; actionCount += 1) {
         const response = await this.backend.chatWithTools(model, messages, webToolDefinitions, signal, contextWindow, 'fast');

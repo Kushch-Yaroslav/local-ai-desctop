@@ -1,4 +1,7 @@
-import { app, BrowserWindow, dialog } from 'electron';
+import { applicationMenu } from './services/application-menu';
+import { setLanguage, t, localizeMessage } from '../shared/locale';
+import { effectiveRuntimeConfiguration, saveLanguage } from './services/runtime-settings';
+import { app, BrowserWindow, dialog, Menu } from 'electron';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { ensureAppDirectories, paths } from './services/paths';
@@ -19,6 +22,16 @@ app.setPath('logs', paths.logs);
 if (!app.requestSingleInstanceLock()) app.exit(0);
 app.on('second-instance', () => { mainWindow?.show(); mainWindow?.focus(); });
 process.env.LOCAL_AI_LLAMA_CPP_URL ??= `http://127.0.0.1:${process.env.LOCAL_AI_LLAMA_PORT ?? '8081'}`;
+
+let menuDevice: 'cpu' | 'gpu' = 'cpu';
+function updateMenu(): void {
+  Menu.setApplicationMenu(Menu.buildFromTemplate(applicationMenu((language) => {
+    try { saveLanguage(language); setLanguage(language); updateMenu(); BrowserWindow.getAllWindows().forEach((window) => window.webContents.send('settings:language', language)); }
+    catch (error) { dialog.showErrorBox('Local AI Desktop', localizeMessage(String(error))); }
+  }, () => { void dialog.showMessageBox({ title: 'Local AI Desktop', message: 'Local AI Desktop', detail: t('Локальный AI-клиент для Linux') }); }, menuDevice, device => {
+    void import('./ipc/register-ipc').then(ipc => ipc.selectImageProcessingDevice(device)).catch(error => dialog.showErrorBox('Local AI Desktop', localizeMessage(String(error))));
+  })));
+}
 
 function createWindow(): void {
   const preloadPath = join(__dirname, '../preload/index.js');
@@ -58,9 +71,14 @@ function createWindow(): void {
 }
 
 app.whenReady().then(async () => {
+  setLanguage(effectiveRuntimeConfiguration().language ?? 'ru'); updateMenu();
   await startRuntimeSupervisor();
   const { registerIpc } = await import('./ipc/register-ipc');
-  registerIpc(); createWindow(); log('application.started');
+  registerIpc();
+  const ipc = await import('./ipc/register-ipc');
+  const refreshDeviceMenu = () => { void ipc.imageProcessingDeviceSelection().then(device => { menuDevice = device; updateMenu(); }); };
+  ipc.onImageProcessingDeviceChanged(refreshDeviceMenu);
+  refreshDeviceMenu(); createWindow(); log('application.started');
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 });
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });

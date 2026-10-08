@@ -3,7 +3,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSyn
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { applicationPaths, expandPath } from './paths';
-import { dismissRuntimeSetup, loadRuntimeConfiguration, modelPaths, normalizeConfiguration, runtimeSetup, saveRuntimeConfiguration } from './runtime-settings';
+import { saveImageProcessingDevice, saveLanguage, dismissRuntimeSetup, loadRuntimeConfiguration, modelPaths, normalizeConfiguration, runtimeSetup, saveRuntimeConfiguration } from './runtime-settings';
 import { getModelProfile, registeredModelProfiles } from '../models/model-registry';
 import { llamaRuntimeProfilesList } from '../models/llama-runtime-policy';
 import { builtinModelCatalog } from '../models/model-catalog';
@@ -19,6 +19,24 @@ function gguf(architecture = 'fixture', context = 65_536, mtp = false): Buffer {
 
 const root = mkdtempSync(join(tmpdir(), 'linux setup space '));
 try {
+  const freshDeviceFile = join(root, 'fresh-settings.json');
+  assert.equal(loadRuntimeConfiguration(freshDeviceFile).imageProcessingDevice, 'cpu');
+  const legacyVisionFile = join(root, 'legacy-vision.json');
+  const fresh = loadRuntimeConfiguration(freshDeviceFile);
+  delete fresh.imageProcessingDevice;
+  fresh.models[0].projectorDevice = 'gpu';
+  writeFileSync(legacyVisionFile, JSON.stringify(fresh));
+  const legacyVision = loadRuntimeConfiguration(legacyVisionFile);
+  assert.equal(legacyVision.imageProcessingDevice, undefined);
+  assert.equal(llamaRuntimeProfilesList(legacyVision)[0].projectorDevice, 'gpu');
+  saveImageProcessingDevice('cpu', legacyVisionFile);
+  const cpu = loadRuntimeConfiguration(legacyVisionFile);
+  assert.equal(llamaRuntimeProfilesList(cpu)[0].projectorDevice, 'cpu');
+  assert.equal(cpu.models[0].projectorDevice, 'gpu', 'global menu does not delete legacy model overrides');
+  saveImageProcessingDevice('gpu', legacyVisionFile);
+  saveLanguage('en', legacyVisionFile);
+  assert.equal(loadRuntimeConfiguration(legacyVisionFile).imageProcessingDevice, 'gpu');
+  assert.equal(loadRuntimeConfiguration(legacyVisionFile).language, 'en');
   const home = join(root, 'new user'), app = join(root, 'relocated application');
   const defaults = applicationPaths(app, home, {}, () => false);
   assert.equal(defaults.dataRoot, join(home, '.local/share/local-ai-desktop'));
@@ -136,5 +154,15 @@ try {
   const firstRun = runtimeSetup(freshFile);
   assert.equal(firstRun.ready, false); assert.equal(firstRun.autoOpen, true);
   assert(firstRun.models.every((model) => model.status === 'missing-model'));
+  const cpuConfig = loadRuntimeConfiguration(freshFile);
+  cpuConfig.models[0].projectorDevice = 'cpu'; saveRuntimeConfiguration(cpuConfig, freshFile);
+  assert.equal(loadRuntimeConfiguration(freshFile).models[0].projectorDevice, 'cpu');
+  assert.equal(loadRuntimeConfiguration(freshFile).language, 'ru');
+  const beforeLanguage = loadRuntimeConfiguration(legacyFile);
+  saveLanguage('en', legacyFile);
+  assert.equal(loadRuntimeConfiguration(legacyFile).language, 'en');
+  assert.deepEqual(loadRuntimeConfiguration(legacyFile).models, beforeLanguage.models);
+  saveLanguage('ru', legacyFile); assert.equal(loadRuntimeConfiguration(legacyFile).language, 'ru');
+  assert.throws(() => normalizeConfiguration({ ...beforeLanguage, language: 'other' }), /language/);
   console.log('Linux model registry: first-run defaults, legacy migration/idempotence, known identities/capabilities, custom add/edit/delete, readiness, invalid GGUF, corruption backup, dismissal, XDG/tilde/spaces and persistence passed');
 } finally { rmSync(root, { recursive: true, force: true }); }

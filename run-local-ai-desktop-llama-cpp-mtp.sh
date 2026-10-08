@@ -37,6 +37,7 @@ ACTIVE_CONTEXT=""
 ACTIVE_KV_TYPE="f16"
 ACTIVE_KV_OFFLOAD="1"
 ACTIVE_SPECULATIVE_MODE="none"
+ACTIVE_PROJECTOR_DEVICE=""
 LAUNCH_ERROR=""
 REQUEST_CONTEXT_FOR_ERROR=""
 VARIANT=""; MODEL=""; MMPROJ=""; RUNTIME_MODEL_ID=""; RUNTIME_LABEL=""; DEFAULT_LLAMA_CONTEXT=""; MAX_LLAMA_CONTEXT=""; MODEL_GPU_LAYERS=""
@@ -69,8 +70,8 @@ json_escape() {
 write_state() {
   local status="$1" request_id="${2:-}" error="${3:-}" rolled_back="${4:-false}"
   local tmp="$STATE_FILE.$$.tmp"
-  printf '{"status":"%s","requestId":"%s","modelId":"%s","contextWindow":%s,"kvCacheType":"%s","kvOffload":%s,"speculativeMode":"%s","serverPid":%s,"launcherPid":%s,"error":"%s","rolledBack":%s,"updatedAt":"%s"}\n' \
-    "$status" "$(json_escape "$request_id")" "$(json_escape "$ACTIVE_MODEL")" "${ACTIVE_CONTEXT:-0}" "$ACTIVE_KV_TYPE" "$([[ "$ACTIVE_KV_OFFLOAD" == "1" ]] && echo true || echo false)" "$ACTIVE_SPECULATIVE_MODE" "${SERVER_PID:-0}" "$$" \
+  printf '{"status":"%s","requestId":"%s","modelId":"%s","contextWindow":%s,"kvCacheType":"%s","kvOffload":%s,"speculativeMode":"%s","projectorDevice":"%s","serverPid":%s,"launcherPid":%s,"error":"%s","rolledBack":%s,"updatedAt":"%s"}\n' \
+    "$status" "$(json_escape "$request_id")" "$(json_escape "$ACTIVE_MODEL")" "${ACTIVE_CONTEXT:-0}" "$ACTIVE_KV_TYPE" "$([[ "$ACTIVE_KV_OFFLOAD" == "1" ]] && echo true || echo false)" "$ACTIVE_SPECULATIVE_MODE" "$ACTIVE_PROJECTOR_DEVICE" "${SERVER_PID:-0}" "$$" \
     "$(json_escape "$error")" "$rolled_back" "$(timestamp)" > "$tmp"
   mv -f "$tmp" "$STATE_FILE"
 }
@@ -133,7 +134,25 @@ build_server_args() {
   # A projector must reserve its compute buffers at startup: Max Context
   # requires measured vision allocations before it can safely probe candidates.
   if [[ -n "$MMPROJ" ]]; then
-    server_args+=(--mmproj "$MMPROJ" --no-mmproj-offload)
+    server_args+=(--mmproj "$MMPROJ")
+    local projector_device="${REQUESTED_PROJECTOR_DEVICE:-${PROJECTOR_PREFERENCE:-${LOCAL_AI_MMPROJ_DEVICE:-${PROJECTOR_DEVICE:-auto}}}}"
+    case "$projector_device" in
+      cpu) server_args+=(--no-mmproj-offload) ;;
+      gpu)
+        if [[ -z "${LLAMA_BIN:-}" ]] || ! timeout 10 "$LLAMA_BIN" --list-devices 2>/dev/null | grep -Eq 'CUDA|Vulkan|ROCm|SYCL'; then
+          LAUNCH_ERROR="GPU projector unavailable: llama-server reports no supported GPU device. Select CPU."
+          return 1
+        fi
+        server_args+=(--mmproj-offload) ;;
+      auto)
+        if [[ "$gpu_layers" != "0" ]] && command -v nvidia-smi >/dev/null && nvidia-smi --query-gpu=name --format=csv,noheader >/dev/null 2>&1 \
+          && [[ -n "${LLAMA_BIN:-}" ]] && timeout 10 "$LLAMA_BIN" --list-devices 2>/dev/null | grep -q CUDA; then
+          server_args+=(--mmproj-offload)
+        else
+          server_args+=(--no-mmproj-offload)
+        fi ;;
+      *) LAUNCH_ERROR="Invalid projector device: $projector_device"; return 1 ;;
+    esac
   else
     server_args+=(--no-warmup)
   fi
@@ -153,6 +172,7 @@ build_server_args() {
 # context exists. Anything else stops the process and leaves LAUNCH_ERROR.
 launch_server() {
   local model_id="$1" context="$2" kv_type="${3:-f16}" kv_offload="${4:-1}"
+  local REQUESTED_PROJECTOR_DEVICE="${5:-}"
   LAUNCH_ERROR=""; REQUEST_CONTEXT_FOR_ERROR="$context"
   select_variant "$model_id" --verify || return 1
   valid_context "$context" || { LAUNCH_ERROR="Неподдерживаемый размер контекста llama.cpp: $context"; return 1; }
@@ -171,7 +191,7 @@ launch_server() {
   : > "$SERVER_LOG"
   log "llama-server.start variant=$VARIANT runtime_model_id=$RUNTIME_MODEL_ID ctx_size=$context kv_type=$kv_type kv_offload=$kv_offload model=$MODEL mmproj=${MMPROJ:-none}"
   local server_args=() printed_command
-  build_server_args "$context" "$gpu_layers"
+  build_server_args "$context" "$gpu_layers" || return 1
   printf -v printed_command '%q ' "$LLAMA_BIN" "${server_args[@]}"
   log "llama-server.command=${printed_command% }"
   "$LLAMA_BIN" "${server_args[@]}" >> "$SERVER_LOG" 2>&1 &
@@ -230,6 +250,11 @@ launch_server() {
     stop_llama_server "$SERVER_PID"; SERVER_PID=""; rm -f "$SERVER_PID_FILE"
     return 1
   fi
+  ACTIVE_PROJECTOR_DEVICE=""
+  if [[ -n "$MMPROJ" ]]; then
+    ACTIVE_PROJECTOR_DEVICE="gpu"
+    for arg in "${server_args[@]}"; do [[ "$arg" == "--no-mmproj-offload" ]] && ACTIVE_PROJECTOR_DEVICE="cpu"; done
+  fi
   ACTIVE_MODEL="$RUNTIME_MODEL_ID"; ACTIVE_CONTEXT="$context"; ACTIVE_KV_TYPE="$kv_type"; ACTIVE_KV_OFFLOAD="$kv_offload"; ACTIVE_SPECULATIVE_MODE="$SPECULATIVE_MODE"
   log "runtime.ready model=$ACTIVE_MODEL context=$ACTIVE_CONTEXT kv_type=$ACTIVE_KV_TYPE kv_offload=$ACTIVE_KV_OFFLOAD pid=$SERVER_PID"
   return 0
@@ -255,16 +280,18 @@ trap 'CLEANUP_REASON="SIGTERM"; exit 143' TERM
 
 # Electron asked for another model/context. Transaction, with rollback.
 switch_runtime() {
-  local REQUEST_ID="" MODEL_ID="" CONTEXT="" KV_TYPE="f16" KV_OFFLOAD="1"
+  local REQUEST_ID="" MODEL_ID="" CONTEXT="" KV_TYPE="f16" KV_OFFLOAD="1" REQUEST_PROJECTOR_DEVICE=""
   if [[ ! -r "$REQUEST_FILE" ]]; then log "runtime.switch ignored=no-request-file"; return 0; fi
   # The file is written by Electron from allow-listed values; parse it as data.
   while IFS='=' read -r key value; do
-    case "$key" in REQUEST_ID) REQUEST_ID="$value" ;; MODEL_ID) MODEL_ID="$value" ;; CONTEXT) CONTEXT="$value" ;; KV_TYPE) KV_TYPE="$value" ;; KV_OFFLOAD) KV_OFFLOAD="$value" ;; esac
+    case "$key" in REQUEST_ID) REQUEST_ID="$value" ;; MODEL_ID) MODEL_ID="$value" ;; CONTEXT) CONTEXT="$value" ;; KV_TYPE) KV_TYPE="$value" ;; KV_OFFLOAD) KV_OFFLOAD="$value" ;; PROJECTOR_DEVICE) REQUEST_PROJECTOR_DEVICE="$value" ;; esac
   done < "$REQUEST_FILE"
   rm -f "$REQUEST_FILE"
+  [[ -z "$REQUEST_PROJECTOR_DEVICE" || "$REQUEST_PROJECTOR_DEVICE" == "cpu" || "$REQUEST_PROJECTOR_DEVICE" == "gpu" ]] || { log "runtime.switch invalid-projector-device"; return 1; }
+  local previous_device="$ACTIVE_PROJECTOR_DEVICE"
   local previous_model="$ACTIVE_MODEL" previous_context="$ACTIVE_CONTEXT" previous_kv_type="$ACTIVE_KV_TYPE" previous_kv_offload="$ACTIVE_KV_OFFLOAD"
   log "runtime.switch request=$REQUEST_ID from=${previous_model:-none}/${previous_context:-0}/${previous_kv_type}/${previous_kv_offload} to=$MODEL_ID/$CONTEXT/$KV_TYPE/$KV_OFFLOAD electron_pid=${ELECTRON_PID:-none}"
-  if [[ "$MODEL_ID" == "$previous_model" && "$CONTEXT" == "$previous_context" && "$KV_TYPE" == "$previous_kv_type" && "$KV_OFFLOAD" == "$previous_kv_offload" && -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null && curl --silent --fail "$URL/health" >/dev/null 2>&1; then
+  if [[ ( -z "$REQUEST_PROJECTOR_DEVICE" || "$REQUEST_PROJECTOR_DEVICE" == "$ACTIVE_PROJECTOR_DEVICE" ) && "$MODEL_ID" == "$previous_model" && "$CONTEXT" == "$previous_context" && "$KV_TYPE" == "$previous_kv_type" && "$KV_OFFLOAD" == "$previous_kv_offload" && -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null && curl --silent --fail "$URL/health" >/dev/null 2>&1; then
     write_state ready "$REQUEST_ID"
     log "runtime.switch request=$REQUEST_ID result=already-active"
     return 0
@@ -272,7 +299,7 @@ switch_runtime() {
   write_state switching "$REQUEST_ID"
   stop_llama_server "$SERVER_PID"; SERVER_PID=""; rm -f "$SERVER_PID_FILE"
   ACTIVE_MODEL=""; ACTIVE_CONTEXT=0
-  if launch_server "$MODEL_ID" "$CONTEXT" "$KV_TYPE" "$KV_OFFLOAD"; then
+  if launch_server "$MODEL_ID" "$CONTEXT" "$KV_TYPE" "$KV_OFFLOAD" "$REQUEST_PROJECTOR_DEVICE"; then
     write_state ready "$REQUEST_ID"
     log "runtime.switch request=$REQUEST_ID result=ready"
     return 0
@@ -281,7 +308,7 @@ switch_runtime() {
   log "runtime.switch request=$REQUEST_ID result=failed error=$failure"
   if [[ -n "$previous_model" ]]; then
     log "runtime.switch request=$REQUEST_ID rollback=$previous_model/$previous_context"
-    if launch_server "$previous_model" "$previous_context" "$previous_kv_type" "$previous_kv_offload"; then
+    if launch_server "$previous_model" "$previous_context" "$previous_kv_type" "$previous_kv_offload" "$previous_device"; then
       write_state ready "$REQUEST_ID" "$failure" true
       log "runtime.switch request=$REQUEST_ID rollback=ready"
       return 0

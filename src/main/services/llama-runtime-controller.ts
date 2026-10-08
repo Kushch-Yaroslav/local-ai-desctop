@@ -16,6 +16,9 @@ export type LlamaRuntimeState = {
   kvCacheType?: LlamaKvCacheType;
   kvOffload?: boolean;
   speculativeMode?: 'mtp' | 'eagle3' | 'none';
+  projectorDevice?: 'cpu' | 'gpu';
+  pendingProjectorDevice?: 'cpu' | 'gpu';
+  deviceError?: string;
   error?: string;
   requestId?: string;
   /** The requested runtime failed to start and the previous one was restored. */
@@ -67,6 +70,7 @@ export function parseLlamaRuntimeState(raw: string): LlamaRuntimeState | null {
       ...(value.kvCacheType === 'f16' || value.kvCacheType === 'q8_0' ? { kvCacheType: value.kvCacheType } : {}),
       ...(typeof value.kvOffload === 'boolean' ? { kvOffload: value.kvOffload } : {}),
       ...(value.speculativeMode === 'mtp' || value.speculativeMode === 'eagle3' || value.speculativeMode === 'none' ? { speculativeMode: value.speculativeMode } : {}),
+      ...(value.projectorDevice === 'cpu' || value.projectorDevice === 'gpu' ? { projectorDevice: value.projectorDevice } : {}),
       ...(typeof value.error === 'string' && value.error ? { error: value.error } : {}),
       ...(typeof value.requestId === 'string' && value.requestId ? { requestId: value.requestId } : {}),
       ...(value.rolledBack === true ? { rolledBack: true } : {}),
@@ -98,17 +102,23 @@ export class LlamaRuntimeController {
     if (!parsed) return { status: 'offline', modelId: null, contextWindow: null, error: 'Состояние llama.cpp не читается' };
     // A state file outlives its launcher; only a live launcher can vouch for it.
     if (parsed.launcherPid !== undefined && !(await this.deps.readText(`/proc/${parsed.launcherPid}/cmdline`).then((text) => text.includes('run-local-ai-desktop-llama-cpp-mtp.sh'), () => false))) return gone;
+    if (parsed.status === 'ready' && !parsed.projectorDevice && parsed.serverPid) {
+      // Older launchers did not publish projector placement. Inspect only the live
+      // command line so upgrading does not require an otherwise redundant restart.
+      const args = (await this.deps.readText(`/proc/${parsed.serverPid}/cmdline`).catch(() => '')).split('\0');
+      if (args.includes('--mmproj')) parsed.projectorDevice = args.includes('--no-mmproj-offload') ? 'cpu' : 'gpu';
+    }
     return parsed;
   }
 
   /** Switches are serialized: two concurrent requests would otherwise race on one request file. */
-  switchTo(modelId: string, contextWindow: number, kvCacheType: LlamaKvCacheType = 'f16', kvOffload = true): Promise<LlamaSwitchResult> {
-    const run = this.chain.then(() => this.perform(modelId, contextWindow, kvCacheType, kvOffload));
+  switchTo(modelId: string, contextWindow: number, kvCacheType: LlamaKvCacheType = 'f16', kvOffload = true, projectorDevice?: 'cpu' | 'gpu'): Promise<LlamaSwitchResult> {
+    const run = this.chain.then(() => this.perform(modelId, contextWindow, kvCacheType, kvOffload, projectorDevice));
     this.chain = run.catch(() => undefined);
     return run;
   }
 
-  private async perform(modelId: string, contextWindow: number, kvCacheType: LlamaKvCacheType, kvOffload: boolean): Promise<LlamaSwitchResult> {
+  private async perform(modelId: string, contextWindow: number, kvCacheType: LlamaKvCacheType, kvOffload: boolean, projectorDevice?: 'cpu' | 'gpu'): Promise<LlamaSwitchResult> {
     const profile = llamaRuntimeProfile(modelId);
     if (!profile) return { ok: false, state: await this.state(), error: `Модель ${modelId} не поддерживается llama.cpp runtime` };
     if (!Number.isSafeInteger(contextWindow) || contextWindow < 4_096 || contextWindow > await this.deps.capabilityLimit(modelId) || contextWindow % 4_096 !== 0) return { ok: false, state: await this.state(), error: `Контекст ${contextWindow} не поддерживается для ${modelId}` };
@@ -121,7 +131,7 @@ export class LlamaRuntimeController {
     const requestId = randomUUID();
     await mkdir(dirname(this.files.requestFile), { recursive: true });
     const temporary = `${this.files.requestFile}.${process.pid}.tmp`;
-    await writeFile(temporary, `REQUEST_ID=${requestId}\nMODEL_ID=${modelId}\nCONTEXT=${contextWindow}\nKV_TYPE=${kvCacheType}\nKV_OFFLOAD=${kvOffload ? 1 : 0}\n`, 'utf8');
+    await writeFile(temporary, `REQUEST_ID=${requestId}\nMODEL_ID=${modelId}\nCONTEXT=${contextWindow}\nKV_TYPE=${kvCacheType}\nKV_OFFLOAD=${kvOffload ? 1 : 0}\n${projectorDevice ? `PROJECTOR_DEVICE=${projectorDevice}\n` : ''}`, 'utf8');
     await rename(temporary, this.files.requestFile);
     try { this.deps.signal(launcherPid); }
     catch (error) {
@@ -133,7 +143,7 @@ export class LlamaRuntimeController {
     while (this.deps.now() < deadline) {
       const state = await this.state();
       if (state.requestId === requestId && (state.status === 'ready' || state.status === 'offline')) {
-        if (state.status === 'ready' && !state.error && state.modelId === modelId && state.contextWindow === contextWindow && state.kvCacheType === kvCacheType && state.kvOffload === kvOffload) return { ok: true, state };
+        if (state.status === 'ready' && !state.error && state.modelId === modelId && state.contextWindow === contextWindow && state.kvCacheType === kvCacheType && state.kvOffload === kvOffload && (!projectorDevice || state.projectorDevice === projectorDevice)) return { ok: true, state };
         return { ok: false, state, error: state.error ?? 'llama.cpp не подтвердил запрошенную модель' };
       }
       await this.deps.sleep(500);

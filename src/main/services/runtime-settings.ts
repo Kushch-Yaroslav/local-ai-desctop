@@ -39,12 +39,14 @@ function normalizeModel(raw: unknown, modelsPath: string): RuntimeModelConfigura
   if (value.mmprojPath !== undefined && typeof value.mmprojPath !== 'string') throw new Error(`Некорректный путь projector для «${displayName}».`);
   const gpuLayers = value.gpuLayers === undefined || value.gpuLayers === null ? null : Number(value.gpuLayers);
   if (gpuLayers !== null && (!Number.isInteger(gpuLayers) || gpuLayers < 0 || gpuLayers > 999)) throw new Error(`Число GPU-слоёв для «${displayName}» должно быть от 0 до 999.`);
+  const projectorDevice = value.projectorDevice ?? 'auto';
+  if (!['auto', 'gpu', 'cpu'].includes(String(projectorDevice))) throw new Error('Некорректное устройство projector.');
   const supportsTools = builtin ? builtin.supportsTools : value.supportsTools === true;
   const speculative = value.speculative === 'none' ? 'none' : builtin || value.speculative === 'mtp' ? 'mtp' : 'none';
   if (value.speculative !== undefined && value.speculative !== 'none' && value.speculative !== 'mtp') throw new Error(`Некорректный режим MTP для «${displayName}».`);
   return { id, displayName, modelPath: expandPath(value.modelPath, modelsPath),
     mmprojPath: value.mmprojPath ? expandPath(String(value.mmprojPath), modelsPath) : '',
-    gpuLayers, supportsTools, speculative, builtin: Boolean(builtin) };
+    gpuLayers, projectorDevice: projectorDevice as 'auto' | 'gpu' | 'cpu', supportsTools, speculative, builtin: Boolean(builtin) };
 }
 
 function normalizeModels(raw: unknown, modelsPath: string): RuntimeModelConfiguration[] {
@@ -62,6 +64,8 @@ export function normalizeConfiguration(raw: unknown): RuntimeConfiguration {
   if (value.llamaServerPath !== null && typeof value.llamaServerPath !== 'string') throw new Error('Укажите путь к llama-server или оставьте поле пустым.');
   if (!Number.isInteger(value.gpuLayers) || Number(value.gpuLayers) < 0 || Number(value.gpuLayers) > 999) throw new Error('Число GPU-слоёв должно быть целым от 0 до 999 (0 — CPU).');
   if (value.setupDismissed !== undefined && typeof value.setupDismissed !== 'boolean') throw new Error('Некорректное состояние окна первой настройки.');
+  if (value.imageProcessingDevice !== undefined && value.imageProcessingDevice !== 'cpu' && value.imageProcessingDevice !== 'gpu') throw new Error('Invalid image processing device');
+  if (value.language !== undefined && value.language !== 'ru' && value.language !== 'en') throw new Error('Invalid language');
   const modelsPath = expandPath(value.modelsPath);
   let models: RuntimeModelConfiguration[];
   if (Array.isArray(value.models)) {
@@ -85,14 +89,14 @@ export function normalizeConfiguration(raw: unknown): RuntimeConfiguration {
   const server = typeof value.llamaServerPath === 'string' ? value.llamaServerPath.trim() : '';
   return { llamaServerPath: server ? (server.includes('/') || server.startsWith('~') ? expandPath(server) : server) : null,
     modelsPath, gpuLayers: Number(value.gpuLayers), setupDismissed: value.setupDismissed === true,
-    schemaVersion: 2, models } as RuntimeConfiguration;
+    schemaVersion: 2, language: value.language ?? 'ru', ...(value.imageProcessingDevice ? { imageProcessingDevice: value.imageProcessingDevice } : {}), models } as RuntimeConfiguration;
 }
 
 export function loadRuntimeConfiguration(file = settingsFile): RuntimeConfiguration {
   const legacyServer = resolve(paths.root, '../llama.cpp/build-cuda/bin/llama-server');
   const defaults = { llamaServerPath: process.env.LOCAL_AI_LLAMA_SERVER_PATH ?? (existsSync(legacyServer) ? legacyServer : null),
     modelsPath: paths.models, gpuLayers: 999, setupDismissed: false, models: seededModels(paths.models) };
-  if (!existsSync(file)) return normalizeConfiguration({ ...defaults, schemaVersion: 2 });
+  if (!existsSync(file)) return normalizeConfiguration({ ...defaults, schemaVersion: 2, imageProcessingDevice: 'cpu' });
   try {
     const saved: unknown = JSON.parse(readFileSync(file, 'utf8'));
     if (!saved || typeof saved !== 'object' || Array.isArray(saved)) throw new Error('ожидается объект настроек');
@@ -192,4 +196,25 @@ if (require.main === module) {
     try { server = executablePath(server); } catch { /* Idle UI must open before setup. */ }
     process.stdout.write(Object.entries({ LLAMA_BIN: server, STATE_DIR: paths.dataRoot, LOG_DIR: paths.logs, GPU_LAYERS: String(config.gpuLayers) }).map(([key, value]) => `${key}=${quote(value)}`).join('\n') + '\n');
   } catch (error) { process.stderr.write(`${(error as Error).message}\n`); process.exitCode = 1; }
+}
+
+export function saveLanguage(language: 'ru' | 'en', file = settingsFile): void {
+  if (language !== 'ru' && language !== 'en') throw new Error('Invalid language');
+  const config = loadRuntimeConfiguration(file);
+  config.language = language;
+  mkdirSync(dirname(file), { recursive: true });
+  const temporary = `${file}.${process.pid}.tmp`;
+  writeFileSync(temporary, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
+  renameSync(temporary, file);
+}
+
+/** Preserve legacy per-model choices until a user explicitly selects the menu preference. */
+export function saveImageProcessingDevice(device: 'cpu' | 'gpu', file = settingsFile): void {
+  if (device !== 'cpu' && device !== 'gpu') throw new Error('Invalid image processing device');
+  const config = loadRuntimeConfiguration(file);
+  config.imageProcessingDevice = device;
+  mkdirSync(dirname(file), { recursive: true });
+  const temporary = `${file}.${process.pid}.tmp`;
+  writeFileSync(temporary, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
+  renameSync(temporary, file);
 }

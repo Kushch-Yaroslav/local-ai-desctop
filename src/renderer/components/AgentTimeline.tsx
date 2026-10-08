@@ -1,3 +1,5 @@
+import { useLocale } from '../use-locale';
+import { t, tr, localizeMessage } from '../../shared/locale';
 import { memo, useState } from 'react';
 import type { ChatMessage, DeliverableItem, PlanStepItem, TerminalExecution, ThinkingTimelineEvent, ToolActivity } from '../../shared/types';
 import { Markdown } from './Markdown';
@@ -11,7 +13,7 @@ const elapsed = (start?: string, end?: string, now = Date.now()) => {
   if (!start) return null; const seconds = Math.max(0, Math.round(((end ? new Date(end).getTime() : now) - new Date(start).getTime()) / 1000));
   return formatDuration(seconds);
 };
-const actionTitle = (activity: ToolActivity) => ({ file_read: 'Чтение', directory: 'Просмотр структуры проекта', mutation: activity.label, terminal: '$ Терминал', web: 'Браузер', context: 'Контекст сжат' } as Record<string, string>)[activity.kind ?? ''] ?? activity.label;
+const actionTitle = (activity: ToolActivity) => ({ file_read: t("Чтение"), directory: t("Просмотр структуры проекта"), mutation: localizeMessage(activity.label), terminal: t("$ Терминал"), web: t("Браузер"), context: t("Контекст сжат") } as Record<string, string>)[activity.kind ?? ''] ?? localizeMessage(activity.label);
 
 type StructuredEntry = { path?: unknown; name?: unknown; id?: unknown; status?: unknown; truncated?: unknown; message?: unknown };
 const text = (value: unknown): string | undefined => typeof value === 'string' && value.trim() ? value : undefined;
@@ -23,7 +25,7 @@ function entryLine(entry: unknown): string {
   const label = text(value.path) ?? text(value.name) ?? text(value.id) ?? 'entry';
   const status = text(value.status);
   const message = text(value.message);
-  return [label, status && status !== 'ok' ? status : undefined, value.truncated === true ? 'обрезано' : undefined, message].filter(Boolean).join(' · ');
+  return [label, status && status !== 'ok' ? status : undefined, value.truncated === true ? t("обрезано") : undefined, message].filter(Boolean).join(' · ');
 }
 function structuredEntries(result: unknown): unknown[] | undefined {
   return result && typeof result === 'object' && !Array.isArray(result) && Array.isArray((result as { entries?: unknown }).entries) ? (result as { entries: unknown[] }).entries : undefined;
@@ -38,8 +40,8 @@ export function deliverablesChecklist(output: string | undefined): { lines: stri
     const items = (JSON.parse(output) as { deliverables?: { items?: DeliverableItem[] } }).deliverables?.items;
     if (!Array.isArray(items)) return undefined;
     const live = items.filter((item) => item.status !== 'dropped');
-    const note = (item: DeliverableItem) => item.status === 'blocked' && item.reason ? ` — не выполнено: ${item.reason}`
-      : (item.status === 'implemented' || item.status === 'done') ? ` — реализовано, не проверено${item.failing ? `; проверка не прошла: ${item.failing}` : ''}` : '';
+    const note = (item: DeliverableItem) => item.status === 'blocked' && item.reason ? tr` — не выполнено: ${localizeMessage(item.reason)}`
+      : (item.status === 'implemented' || item.status === 'done') ? tr` — реализовано, не проверено${item.failing ? tr`; проверка не прошла: ${item.failing}` : ''}` : '';
     return {
       lines: live.map((item) => `${deliverableMarker[item.status] ?? '○'} ${item.text}${note(item)}`),
       verified: live.filter((item) => item.status === 'verified').length,
@@ -59,17 +61,17 @@ export function planChecklist(output: string | undefined): { lines: string[]; co
 }
 export function toolResultSummary(activity: ToolActivity): string | undefined {
   const checklist = activity.detail === 'deliverables' ? deliverablesChecklist(activity.output) : undefined;
-  if (checklist) return `проверено ${checklist.verified} из ${checklist.total}${checklist.implemented ? ` · реализовано, не проверено ${checklist.implemented}` : ''}${checklist.open ? ` · осталось ${checklist.open}` : ''}`;
+  if (checklist) return tr`проверено ${checklist.verified} из ${checklist.total}${checklist.implemented ? tr` · реализовано, не проверено ${checklist.implemented}` : ''}${checklist.open ? tr` · осталось ${checklist.open}` : ''}`;
   const plan = activity.detail === 'plan' ? planChecklist(activity.output) : undefined;
-  if (plan) return `шагов выполнено ${plan.completed} из ${plan.total}`;
+  if (plan) return tr`шагов выполнено ${plan.completed} из ${plan.total}`;
   if (activity.detail === 'project_knowledge_read') {
     try {
       const entries = structuredEntries(JSON.parse(activity.output ?? ''));
-      if (entries) return `${entries.length} ${pluralRu(entries.length, 'запись', 'записи', 'записей')} знаний${entries.length ? ` · ${entries.slice(0, 2).map(entryLine).join(', ')}` : ''}`;
+      if (entries) return tr`${entries.length} ${pluralRu(entries.length, t("запись"), t("записи"), t("записей"))} знаний${entries.length ? ` · ${entries.slice(0, 2).map(entryLine).join(', ')}` : ''}`;
     } catch { /* Fall through to the event detail. */ }
   }
   if (activity.kind === 'directory') {
-    try { const entries = structuredEntries(JSON.parse(activity.output ?? '')); return entries ? `${entries.length} ${pluralRu(entries.length, 'элемент', 'элемента', 'элементов')}` : activity.detail; } catch { return activity.detail; }
+    try { const entries = structuredEntries(JSON.parse(activity.output ?? '')); return entries ? `${entries.length} ${pluralRu(entries.length, t("элемент"), t("элемента"), t("элементов"))}` : activity.detail; } catch { return activity.detail; }
   }
   return activity.detail;
 }
@@ -81,7 +83,7 @@ export function displayToolResult(activity: ToolActivity): string | undefined {
   if (plan) return plan.lines.join('\n');
   try {
     const result = JSON.parse(activity.output) as { command?: string; stdout?: string; stderr?: string; exit_code?: number; status?: string; timed_out?: boolean; cancelled?: boolean; content?: string };
-    if (activity.kind === 'terminal') return `${result.command ? `$ ${result.command}\n` : ''}${result.status === 'partial_success' ? '✓ частичный результат поиска (следующая команда закрыла канал после вывода)' : result.exit_code === 0 ? '✓ код выхода 0' : result.exit_code !== undefined ? `✗ код выхода ${result.exit_code}` : ''}${result.timed_out ? ' · превышено время' : ''}${result.cancelled ? ' · отменено' : ''}${result.stdout ? `\n${result.stdout}` : ''}${result.stderr ? `\n${result.stderr}` : ''}`.trim();
+    if (activity.kind === 'terminal') return `${result.command ? `$ ${result.command}\n` : ''}${result.status === 'partial_success' ? t("✓ частичный результат поиска (следующая команда закрыла канал после вывода)") : result.exit_code === 0 ? t("✓ код выхода 0") : result.exit_code !== undefined ? tr`✗ код выхода ${result.exit_code}` : ''}${result.timed_out ? t(" · превышено время") : ''}${result.cancelled ? t(" · отменено") : ''}${result.stdout ? `\n${result.stdout}` : ''}${result.stderr ? `\n${result.stderr}` : ''}`.trim();
     if (typeof result.content === 'string') return result.content;
     const entries = structuredEntries(result);
     if (entries) return entries.map(entryLine).join('\n');
@@ -91,17 +93,19 @@ export function displayToolResult(activity: ToolActivity): string | undefined {
 }
 
 function TerminalDetails({ terminal, fallback }: { terminal?: TerminalExecution; fallback?: string }) {
-  if (!terminal) return fallback ? <><h4>Диагностика</h4><pre>{fallback}</pre></> : null;
-  const status = terminal.status === 'completed' ? '✓ завершено' : terminal.status === 'partial_success' ? '✓ частичный результат поиска (следующая команда закрыла канал после вывода)' : terminal.status === 'cancelled' ? 'Отменено' : terminal.status === 'timed_out' ? 'Превышено время' : terminal.status === 'error' ? 'Ошибка' : 'Выполняется';
+  useLocale();
+  if (!terminal) return fallback ? <><h4>{t("Диагностика")}</h4><pre>{fallback}</pre></> : null;
+  const status = terminal.status === 'completed' ? t("✓ завершено") : terminal.status === 'partial_success' ? t("✓ частичный результат поиска (следующая команда закрыла канал после вывода)") : terminal.status === 'cancelled' ? t("Отменено") : terminal.status === 'timed_out' ? t("Превышено время") : terminal.status === 'error' ? t("Ошибка") : t("Выполняется");
   return <>
-    {terminal.command && <><h4>Команда</h4><pre>{terminal.command}</pre></>}
-    <h4>Диагностика</h4><pre>{[terminal.cwd && `каталог: ${terminal.cwd}`, terminal.pid && `pid: ${terminal.pid} · pgid: ${terminal.pgid ?? '—'} · сессия: ${terminal.sessionId ?? '—'}`, terminal.startedAt && `начато: ${terminal.startedAt}`, terminal.finishedAt && `завершено: ${terminal.finishedAt}`, `статус: ${status}`, terminal.exitCode !== null && terminal.exitCode !== undefined && `код выхода: ${terminal.exitCode}`, terminal.timedOut && 'превышено время: да', terminal.cancelled && 'отменено: да'].filter(Boolean).join('\n')}</pre>
-    {terminal.stdout && <><h4>Стандартный вывод</h4><pre>{terminal.stdout}</pre></>}
-    {terminal.stderr && <><h4>Вывод ошибок</h4><pre>{terminal.stderr}</pre></>}
+    {terminal.command && <><h4>{t("Команда")}</h4><pre>{terminal.command}</pre></>}
+    <h4>{t("Диагностика")}</h4><pre>{[terminal.cwd && tr`каталог: ${terminal.cwd}`, terminal.pid && tr`pid: ${terminal.pid} · pgid: ${terminal.pgid ?? '—'} · сессия: ${terminal.sessionId ?? '—'}`, terminal.startedAt && tr`начато: ${terminal.startedAt}`, terminal.finishedAt && tr`завершено: ${terminal.finishedAt}`, tr`статус: ${status}`, terminal.exitCode !== null && terminal.exitCode !== undefined && tr`код выхода: ${terminal.exitCode}`, terminal.timedOut && t("превышено время: да"), terminal.cancelled && t("отменено: да")].filter(Boolean).join('\n')}</pre>
+    {terminal.stdout && <><h4>{t("Стандартный вывод")}</h4><pre>{terminal.stdout}</pre></>}
+    {terminal.stderr && <><h4>{t("Вывод ошибок")}</h4><pre>{terminal.stderr}</pre></>}
   </>;
 }
 
 const Action = memo(function Action({ activity }: { activity: ToolActivity }) {
+  useLocale();
   // A logical tool row is mounted on `started` then updated in place. Starting
   // it expanded made completed directory/read outputs remain giant cards; only
   // errors open themselves automatically.
@@ -111,15 +115,18 @@ const Action = memo(function Action({ activity }: { activity: ToolActivity }) {
   const output = displayToolResult(activity);
   const summary = toolResultSummary(activity);
   const hasBody = Boolean(output || diff || activity.terminal);
-  return <section className={`agent-timeline-action ${activity.kind ?? 'other'} ${activity.state ?? 'running'} ${expanded ? 'expanded' : ''}`}><button type="button" className="agent-timeline-action-head" onClick={() => hasBody && setExpanded((value) => !value)} aria-expanded={hasBody ? expanded : undefined}><b>{state} {actionTitle(activity)}</b>{summary && <span>{summary}</span>}{activity.state === 'running' && <em>выполняется…</em>}</button>{expanded && <div className="agent-timeline-action-body">{activity.kind === 'terminal' ? <TerminalDetails terminal={activity.terminal} fallback={output} /> : output && <pre>{output}</pre>}{typeof diff === 'string' && <details><summary>Изменения</summary><pre>{diff}</pre></details>}</div>}</section>;
+  return <section className={`agent-timeline-action ${activity.kind ?? 'other'} ${activity.state ?? 'running'} ${expanded ? 'expanded' : ''}`}><button type="button" className="agent-timeline-action-head" onClick={() => hasBody && setExpanded((value) => !value)} aria-expanded={hasBody ? expanded : undefined}><b>{state} {actionTitle(activity)}</b>{summary && <span>{summary}</span>}{activity.state === 'running' && <em>{t("выполняется…")}</em>}</button>{expanded && <div className="agent-timeline-action-body">{activity.kind === 'terminal' ? <TerminalDetails terminal={activity.terminal} fallback={output} /> : output && <pre>{output}</pre>}{typeof diff === 'string' && <details><summary>{t("Изменения")}</summary><pre>{diff}</pre></details>}</div>}</section>;
 });
 
 /** A finished thought never changes, so memoization on its primitive props skips it on every later frame. */
 const Thought = memo(function Thought({ content, live, title, duration }: { content: string; live: boolean; title: string; duration: string | null }) {
-  return <section className="agent-timeline-thought"><header><b>{title}</b>{live && duration && <span>· {duration}</span>}</header><Markdown streaming={live} lazy>{content}</Markdown></section>;
+  useLocale();
+  const [expanded, setExpanded] = useState(true);
+  return <section className="agent-timeline-thought"><header><button type="button" className="agent-timeline-action-head" aria-expanded={expanded} onClick={() => setExpanded(value => !value)}><b>{title}</b>{live && duration && <span>· {duration}</span>}</button></header>{expanded && <Markdown streaming={live} lazy>{content}</Markdown>}</section>;
 });
 
 export const AgentTimeline = memo(function AgentTimeline({ timeline, activities, messages, reasoning, streaming, now, error, cancelled }: Props) {
+  useLocale();
   const items = thinkingTimeline(reasoning, activities, streaming, timeline, messages);
   if (!items.length && !error && !cancelled) return null;
   return <div className="agent-timeline">{items.map((item) => {
@@ -128,10 +135,10 @@ export const AgentTimeline = memo(function AgentTimeline({ timeline, activities,
       const duration = elapsed(item.startedAt, item.completedAt, now);
       // Only the paragraph still being written is live; later paragraphs of a finished thought carry no completion time.
       const live = streaming && item.live;
-      return <Thought key={item.id} content={item.content} live={live} title={live ? 'Размышляет' : duration ? `Размышлял ${duration}` : 'Размышление'} duration={live ? duration : null} />;
+      return <Thought key={item.id} content={item.content} live={live} title={live ? t("Размышляет") : duration ? tr`Размышлял ${duration}` : t("Размышление")} duration={live ? duration : null} />;
     }
-    if (item.kind === 'steering') return <section className={`agent-timeline-steering ${item.status}`} key={item.id}><header><b>{item.status === 'applied' ? 'Уточнение передано модели' : 'Уточнение в очереди'}</b>{item.status === 'accepted' && <span> — будет передано модели на следующем шаге</span>}</header><p>{item.message.content}</p></section>;
-    if (item.kind === 'paused') return <section className="agent-timeline-steering paused" key={item.id}><header><b>Работа на паузе</b></header><p>Состояние и список невыполненного сохранены. Напишите «Продолжить», чтобы возобновить работу.</p></section>;
+    if (item.kind === 'steering') return <section className={`agent-timeline-steering ${item.status}`} key={item.id}><header><b>{item.status === 'applied' ? t("Уточнение передано модели") : t("Уточнение в очереди")}</b>{item.status === 'accepted' && <span> {t(" — будет передано модели на следующем шаге")}</span>}</header><p>{item.message.content}</p></section>;
+    if (item.kind === 'paused') return <section className="agent-timeline-steering paused" key={item.id}><header><b>{t("Работа на паузе")}</b></header><p>{t("Состояние и список невыполненного сохранены. Напишите «Продолжить», чтобы возобновить работу.")}</p></section>;
     return isStatusSnapshot(item.activity) && item.activity.state !== 'error' ? null : <Action key={item.id} activity={item.activity} />;
-  })}{error && <section className="agent-timeline-terminal error" role="status"><b>Агент остановлен из-за ошибки</b><span>{error}</span></section>}{cancelled && <section className="agent-timeline-terminal cancelled" role="status"><b>Агент остановлен</b></section>}</div>;
+  })}{error && <section className="agent-timeline-terminal error" role="status"><b>{t("Агент остановлен из-за ошибки")}</b><span>{localizeMessage(error)}</span></section>}{cancelled && <section className="agent-timeline-terminal cancelled" role="status"><b>{t("Агент остановлен")}</b></section>}</div>;
 });

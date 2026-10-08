@@ -51,7 +51,12 @@ pub struct Config {
     pub endpoint: String,
     pub model: String,
     pub system: String,
+    pub ui_language: Option<String>,
     pub user: String,
+    pub user_images: Vec<String>,
+    pub user_image_refs: Vec<String>,
+    pub web_tools: Vec<Value>,
+    pub host_tools: Option<Arc<crate::tools::web::HostTools>>,
     pub root: Option<String>,
     pub secondary_root: Option<String>,
     /// Directories the user named explicitly. File tools may use absolute paths
@@ -142,7 +147,7 @@ const AGENT_GUIDANCE: &str = r#"
 - For substantial tasks, reason about an approach before acting, adapt as you learn, use tools for concrete evidence, avoid broad rereads, and continue until the user's task is complete.
 - Plan = your own short list of steps for non-trivial work (plan tool: set if useful, then update at meaningful milestones or when the approach changes; skip it for a trivial request). It is not the user's deliverables and finishing its steps proves nothing. Do not narrate plan updates or restate the plan in prose; no update is required after every action.
 - Agent runtime state belongs to the harness, not to the human. Accepted updates stay beside the tool substep that produced them; the latest value of each section supersedes earlier values. A cleared section is no longer active. Continue the next action without treating these updates as new user instructions.
-- Use the latest user's language for all user-visible natural-language text: streamed reasoning/progress, tool preambles, brief status updates, and the final answer. Follow an explicit language request if present. Keep code, paths, identifiers, commands, API/tool syntax, and literal source quotations in their original form. Do not translate protocol fields.
+- Use the configured interface language as a default when supplied, otherwise use the latest user's language, for all user-visible natural-language text: streamed reasoning/progress, tool preambles, brief status updates, and the final answer. Follow an explicit language request if present. Keep code, paths, identifiers, commands, API/tool syntax, and literal source quotations in their original form. Do not translate protocol fields.
 - For non-trivial architecture relationships, use a compact multiline Mermaid flowchart when it improves readability, or a properly indented multiline tree. Do not compress a diagram into one long arrow chain; avoid decorative box art.
 - Task Memory = durable semantic continuity for this task. Record meaningful findings, decisions, blockers, and next actions, and cite the observation IDs (obs-…) a finding rests on in its evidence field. After compaction, trust a precise Task Memory finding from an unchanged inspected file; reread only for a missing fact, ambiguity, possible change, exact detail, or targeted verification.
 - Set Task Memory status and evidence as JSON fields, not prose inside finding. Confirmed entries require evidence containing an observation ID or exact inspected source path from this transcript. A valid reference does not prove the claim; use inferred or unknown for unverified conclusions.
@@ -237,6 +242,14 @@ fn wire_messages(messages: &[Value]) -> Vec<Value> {
         .cloned()
         .map(|mut message| {
             if let Some(object) = message.as_object_mut() {
+                if let Some(images) = object.remove("images").and_then(|v| v.as_array().cloned()) {
+                    if !images.is_empty() {
+                        let mut parts = vec![json!({"type":"text", "text":object.get("content").and_then(Value::as_str).unwrap_or("")})];
+                        parts.extend(images.into_iter().filter_map(|image| image.as_str().map(|url| json!({"type":"image_url", "image_url":{"url":url}}))));
+                        object.insert("content".into(), json!(parts));
+                    }
+                }
+                object.remove("image_refs");
                 object.remove("_observation_id");
                 object.remove("_result_policy");
                 object.remove("_rehydration");
@@ -285,7 +298,16 @@ fn request_payload_for_phase(
         stripped = without_replayed_reasoning(messages);
         stripped.as_slice()
     };
-    let wire_messages = crate::context::message_sequence::normalize(&wire_messages(messages));
+    // The trusted host only prepares arrays when the current backend supports
+    // native vision. Durable transcripts may retain earlier vision turns;
+    // never replay those blobs to a text-only or unrelated-image request.
+    let native_images = !config.user_images.is_empty() || config.history.iter().any(|message|
+        message.get("images").and_then(Value::as_array).is_some_and(|images| !images.is_empty()));
+    let projected = messages.iter().cloned().map(|mut message| {
+        if !native_images { if let Some(object) = message.as_object_mut() { object.remove("images"); } }
+        message
+    }).collect::<Vec<_>>();
+    let wire_messages = crate::context::message_sequence::normalize(&wire_messages(&projected));
     let mut payload = json!({
         "model": config.model,
         "messages": wire_messages,
@@ -335,14 +357,27 @@ fn learn_token_calibration(estimated: usize, actual: usize) {
 }
 
 fn estimate_tokens(value: &Value) -> usize {
-    // Conservative enough for JSON-heavy local tool prompts. Provider-reported
-    // usage remains authoritative telemetry.
-    serde_json::to_string(value)
-        .unwrap_or_default()
-        .chars()
-        .count()
-        / 3
-        + 8
+    // Image base64 is transport, not tokenized text. Reserve a conservative
+    // image allowance; provider-reported usage remains authoritative. Keeping
+    // binary size here would force compaction before ordinary vision requests.
+    fn projected(value: &Value, images: &mut usize) -> Value {
+        match value {
+            Value::Object(object) if object.get("type").and_then(Value::as_str) == Some("image_url") => {
+                *images += 1; json!({"type":"image_url"})
+            }
+            Value::Object(object) => Value::Object(object.iter().map(|(key, value)| {
+                if key == "images" && object.get("role").and_then(Value::as_str) == Some("user") {
+                    *images += value.as_array().map_or(0, Vec::len);
+                    (key.clone(), json!([]))
+                } else { (key.clone(), projected(value, images)) }
+            }).collect()),
+            Value::Array(array) => Value::Array(array.iter().map(|value| projected(value, images)).collect()),
+            _ => value.clone(),
+        }
+    }
+    let mut images = 0;
+    let text = projected(value, &mut images);
+    serde_json::to_string(&text).unwrap_or_default().chars().count() / 3 + 8 + images * 4096
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -508,7 +543,11 @@ fn stable_prefix(config: &Config) -> String {
     );
     prefix.push_str(&format!(
         "\nPreferred visible prose language for this run: {}.",
-        crate::agent::transcript::preferred_visible_language(&config.user)
+        match config.ui_language.as_deref() {
+            Some("ru") => "Russian (default; explicit user language requests take priority)".into(),
+            Some("en") => "English (default; explicit user language requests take priority)".into(),
+            _ => crate::agent::transcript::preferred_visible_language(&config.user),
+        }
     ));
     if let Some(root) = &config.root {
         prefix.push_str("\n<working_directory>");
@@ -3318,6 +3357,11 @@ fn run_scoped_tool(
     if let Some(absent) = absent_reference_knowledge(config, tool) {
         return Ok((absent, None));
     }
+    if crate::tools::web::is_web_tool(&tool.name) {
+        if !config.web_tools.iter().any(|schema| tool_name(schema) == tool.name) { return Err("Web tool is unavailable".into()); }
+        let result = config.host_tools.as_ref().ok_or("Web host is unavailable")?.execute(&config.run_id, &tool.name, &tool.arguments, &config.cancelled)?;
+        return if result.get("error").is_some() || result.get("blocked_reason").is_some() { Err(result.to_string()) } else { Ok((result, None)) };
+    }
     match tool.name.as_str() {
         "project_knowledge_index" => {
             let root = config
@@ -4118,10 +4162,14 @@ pub fn run(config: Config) {
     let previous_budget = transcript.entries().iter().rev().find_map(|entry| {
         if let crate::agent::transcript::Entry::WorkBudget(budget) = entry { Some(budget.clone()) } else { None }
     }).unwrap_or_default();
-    let new_request = !transcript.has_current_run_user(&config.user);
+    let new_request = !transcript.has_current_run_input(&config.user, &config.user_image_refs);
     if new_request {
-        transcript.push_run_user(json!({"role":"user", "content":config.user}));
+        let mut user = json!({"role":"user", "content":config.user});
+        if !config.user_images.is_empty() { user["images"] = json!(config.user_images); }
+        if !config.user_image_refs.is_empty() { user["image_refs"] = json!(config.user_image_refs); }
+        transcript.push_run_user(user);
     }
+    transcript.set_ui_language(config.ui_language.as_deref());
     let mut state = AgentState::default();
     state.work_budget = if previous_budget.closed && new_request { Default::default() } else { previous_budget };
     state.strategy = Strategy::from_mode(&config.reasoning_mode);
@@ -4153,6 +4201,9 @@ pub fn run(config: Config) {
     let stable = stable_prefix(&config);
     transcript.set_secondary_project_root(config.secondary_root.as_deref().map(Path::new));
     let mut schemas = tool_schemas_for_request(config.tool_scope(), config.policy, &config.user);
+    if config.host_tools.is_some() {
+        schemas.extend(config.web_tools.iter().filter(|schema| crate::tools::web::is_web_tool(tool_name(schema))).cloned());
+    }
     if config.secondary_root.is_some() {
         for schema in &mut schemas {
             if !matches!(
@@ -5877,7 +5928,9 @@ mod tests {
             endpoint: "http://localhost/v1/chat/completions".into(),
             model: "test".into(),
             system: "system".into(),
+            ui_language: None,
             user: "audit".into(),
+            user_images: Vec::new(), user_image_refs: Vec::new(), web_tools: Vec::new(), host_tools: None,
             root: None,
             secondary_root: None,
             workspace_roots: Vec::new(),
@@ -6311,6 +6364,32 @@ mod tests {
         assert!(wire[0].get("_result_policy").is_none());
         assert!(wire[0].get("_rehydration").is_none());
         assert_eq!(wire[0]["content"], "result");
+    }
+
+    #[test]
+    fn ui_language_preference_survives_compaction_without_changing_history() {
+        let mut config = test_config(65_536);
+        config.user = "Проверь код".into();
+        config.ui_language = Some("en".into());
+        assert!(stable_prefix(&config).contains("English (default; explicit user language requests take priority)"));
+        let mut transcript = Transcript::default();
+        transcript.push_run_user(json!({"role":"user", "content":config.user}));
+        let before = transcript.entries().len();
+        transcript.set_ui_language(Some("en"));
+        assert_eq!(transcript.language_preference(), "English");
+        assert_eq!(transcript.clone().language_preference(), "English");
+        assert_eq!(transcript.entries().len(), before, "language settings are not conversation messages");
+        let covered = transcript.entries().len();
+        transcript.compact("Untranslated summary".into(), covered);
+        assert_eq!(transcript.language_preference(), "English");
+        transcript.set_ui_language(Some("ru"));
+        assert_eq!(transcript.language_preference(), "Russian");
+        assert!(transcript.pending_tail("").contains("Preferred language for visible prose: Russian."));
+        let checkpoint = continuation_checkpoint(&transcript, "Established work: retained.\nCurrent focus: continue.".into());
+        assert!(checkpoint.contains("Preferred visible prose language: Russian."));
+        assert!(!checkpoint.contains("Preferred visible prose language: English."));
+        config.ui_language = Some("ru".into());
+        assert!(stable_prefix(&config).contains("Russian (default; explicit user language requests take priority)"));
     }
 
     #[test]
@@ -7269,5 +7348,22 @@ mod tests {
         assert!(!state.task_memory.entries[0].invalidated);
         assert!(!state.task_memory.entries[1].invalidated);
         std::fs::remove_dir_all(base).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod multimodal_regressions {
+    use super::*;
+    #[test]
+    fn image_projection_preserves_transcript_and_does_not_count_base64_as_text() {
+        let input = json!({"role":"user","content":"describe","images":[format!("data:image/jpeg;base64,{}", "A".repeat(100_000))]});
+        let before = input.clone();
+        let wire = wire_messages(&[input.clone()]);
+        assert_eq!(wire[0]["content"][1]["image_url"]["url"], input["images"][0]);
+        assert!(wire[0].get("images").is_none());
+        assert_eq!(input, before);
+        assert!(estimate_tokens(&input) < 5000);
+        assert!(estimate_tokens(&wire[0]) < 5000);
+        assert!(estimate_tokens(&wire[0]) >= 4096);
     }
 }

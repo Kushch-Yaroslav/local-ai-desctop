@@ -18,7 +18,7 @@ export async function runAgentWorkspaceRegression(): Promise<void> {
   assert.deepEqual(enabledAgentTools('agent', { hasProject: false, workspaceRootCount: 0 }, 'off'), always, 'an unscoped Agent must not receive execution tools');
   assert.deepEqual(enabledAgentTools('agent', { hasProject: false, workspaceRootCount: 1 }, 'off'), [...execution, ...always].sort(), 'a named directory must unlock execution tools, not project knowledge');
   assert.deepEqual(enabledAgentTools('agent', { hasProject: true, workspaceRootCount: 0 }, 'off'), [...execution, ...knowledge, ...always].sort());
-  assert.deepEqual(enabledAgentTools('agent', { hasProject: true, workspaceRootCount: 3 }, 'auto'), enabledAgentTools('agent', { hasProject: true, workspaceRootCount: 0 }, 'off'), 'extra directories and web mode must not change a project run\'s tools');
+  assert.deepEqual(enabledAgentTools('agent', { hasProject: true, workspaceRootCount: 3 }, 'auto'), [...enabledAgentTools('agent', { hasProject: true, workspaceRootCount: 0 }, 'off'), 'web_search', 'web_open', 'web_read', 'web_follow_link', 'web_back'].sort(), 'web mode adds only the native web tools');
   // Switching Chat -> Agent -> Chat is stateless: the same inputs always give the same tools.
   const scope = { hasProject: true, workspaceRootCount: 0 };
   const sequence = [enabledAgentTools('chat', scope, 'off'), enabledAgentTools('agent', scope, 'off'), enabledAgentTools('chat', scope, 'off'), enabledAgentTools('agent', scope, 'off')];

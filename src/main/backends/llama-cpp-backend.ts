@@ -53,6 +53,14 @@ function responseTextShape(value: unknown): Record<string, unknown> {
   };
 }
 
+export function nativeImageUrl(image: string): string {
+  if (image.startsWith('data:')) return image;
+  const header = Buffer.from(image.slice(0, 32), 'base64');
+  const mime = header[0] === 0xff && header[1] === 0xd8 ? 'image/jpeg'
+    : header.subarray(0, 4).toString() === 'RIFF' && header.subarray(8, 12).toString() === 'WEBP' ? 'image/webp' : 'image/png';
+  return `data:${mime};base64,${image}`;
+}
+
 export class LlamaCppRequestError extends Error {
   constructor(readonly request: RequestDiagnostics) { super(`llama.cpp отклонил запрос (HTTP ${request.status})${request.userMessage ? `: ${request.userMessage}` : ''}`); this.name = 'LlamaCppRequestError'; }
 }
@@ -220,7 +228,7 @@ export class LlamaCppBackend implements LlmBackend, ToolCallingBackend {
   private messages(messages: Array<ChatMessage | ToolMessage>): unknown[] {
     return messages.map((message) => {
       const tool = message as ToolMessage;
-      if (tool.images?.length) return { role: message.role, content: [{ type: 'text', text: message.content }, ...tool.images.map((image) => ({ type: 'image_url', image_url: { url: image.startsWith('data:') ? image : `data:image/png;base64,${image}` } }))] };
+      if (tool.images?.length) return { role: message.role, content: [{ type: 'text', text: message.content }, ...tool.images.map((image) => ({ type: 'image_url', image_url: { url: nativeImageUrl(image) } }))] };
       return { role: message.role, content: message.content, ...(tool.tool_calls ? { tool_calls: tool.tool_calls.map((call) => ({ type: 'function', ...call, function: { ...call.function, arguments: typeof call.function.arguments === 'string' ? call.function.arguments : JSON.stringify(call.function.arguments) } })) } : {}), ...(tool.tool_name ? { name: tool.tool_name } : {}), ...(tool.tool_call_id ? { tool_call_id: tool.tool_call_id } : {}) };
     });
   }

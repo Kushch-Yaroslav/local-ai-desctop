@@ -1,8 +1,10 @@
+import { useLocale } from '../use-locale';
+import { t, tr } from '../../shared/locale';
 import { memo, useId, useState } from 'react';
 import { ChevronDown } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import type { AgentPlan } from '../../shared/types';
-import { agentStatus } from '../../shared/agent-status';
+import { agentStatus, showAgentStatus } from '../../shared/agent-status';
 import { agentStatusText, deliverableStatusLabel, planStatusLabel, budgetReasonLabel } from '../../shared/localization';
 import { useAppStore } from '../store/app-store';
 
@@ -11,16 +13,19 @@ const resultMarker = { pending: '○', implemented: '◐', done: '◐', verified
 
 /** Subscribes only to the current chat's planning projection, never token/clock updates. */
 export function CurrentAgentStatus() {
-  const { activeId, plan, agent, running } = useAppStore(useShallow((state) => ({ activeId: state.activeId, plan: state.agentPlan, running: state.isGenerating, agent: state.conversations.find((chat) => chat.id === state.activeId)?.mode === 'agent' })));
-  return agent && activeId ? <AgentStatusPanel plan={plan} running={running} /> : null;
+  useLocale();
+  const { activeId, plan, agent, running, recovery } = useAppStore(useShallow((state) => ({ activeId: state.activeId, plan: state.agentPlan, running: state.isGenerating, recovery: state.messages.at(-1)?.thinkingTimeline?.at(-1)?.kind === 'paused' || state.generationState === 'cancelled' || state.generationState === 'error' || state.analysisRuns.filter(run => run.conversationId === state.activeId).at(-1)?.status === 'interrupted', agent: state.conversations.find((chat) => chat.id === state.activeId)?.mode === 'agent' })));
+  return agent && activeId ? <AgentStatusPanel plan={plan} running={running} recovery={recovery} /> : null;
 }
 
-export const AgentStatusPanel = memo(function AgentStatusPanel({ plan, running = false }: { plan: AgentPlan | null; running?: boolean }) {
-  const [expanded, setExpanded] = useState(true);
+export const AgentStatusPanel = memo(function AgentStatusPanel({ plan, running = false, recovery = false }: { plan: AgentPlan | null; running?: boolean; recovery?: boolean }) {
+  useLocale();
+  const [expanded, setExpanded] = useState(false);
   const contentId = useId();
   const { steps, deliverables, checks, warnings } = agentStatus(plan);
   const budget = plan?.workBudget;
-  if (!steps.length && !deliverables.length && !warnings.length && !budget) return null;
+  const budgetImportant = budget && (budget.extensions > 0 || budget.decision === 'denied' || budget.used >= budget.limit - 16);
+  if (!showAgentStatus(plan, recovery)) return null;
   const completed = steps.filter((step) => step.status === 'completed').length;
   const verified = deliverables.filter((item) => item.status === 'verified').length;
   const total = deliverables.filter((item) => item.status !== 'dropped').length;
@@ -28,14 +33,15 @@ export const AgentStatusPanel = memo(function AgentStatusPanel({ plan, running =
     <button type="button" className="agent-status-toggle" aria-expanded={expanded} aria-controls={contentId} onClick={() => setExpanded((value) => !value)}>
       <ChevronDown size={16} aria-hidden="true" />
       {!running && <span>{agentStatusText.saved}</span>}
-      {budget && <span title={`Максимум ${budget.maximum}; продлений: ${budget.extensions}. ${budgetReasonLabel[budget.reason] ?? budget.reason}`}><strong>Рабочие ходы</strong> {budget.used}/{budget.limit}{budget.extensions > 0 ? ` · продлений: ${budget.extensions}` : ''}{budget.decision === 'denied' ? ' · Лимит' : ''}</span>}
+      {budgetImportant && budget && <span title={tr`Максимум ${budget.maximum}; продлений: ${budget.extensions}. ${budgetReasonLabel[budget.reason] ?? budget.reason}`}><strong>{t("Рабочие ходы")}</strong> {budget.used}/{budget.limit}{budget.extensions > 0 ? tr` · продлений: ${budget.extensions}` : ''}{budget.decision === 'denied' ? t(" · Лимит") : ''}</span>}
+      {!steps.length && !deliverables.length && !warnings.length && !budgetImportant && <span>{t("Работа над задачей")}</span>}
       {steps.length > 0 && <span><strong>{agentStatusText.plan}</strong> {completed}/{steps.length}</span>}
       {steps.length > 0 && deliverables.length > 0 && <span aria-hidden="true">·</span>}
       {deliverables.length > 0 && <span><strong>{agentStatusText.result}</strong> {verified}/{total}</span>}
       {warnings.length > 0 && <span>{agentStatusText.warnings}: {warnings.length}</span>}
     </button>
     {expanded && <div id={contentId} className="agent-status-content">
-      {budget && <small>Максимум {budget.maximum} · продлений: {budget.extensions} · {budgetReasonLabel[budget.reason] ?? budget.reason}</small>}
+      {budget && <small>{t("Рабочие ходы")} {budget.used}/{budget.limit} · {t("Максимум ")}{budget.maximum} {t(" · продлений: ")}{budget.extensions} · {budgetReasonLabel[budget.reason] ?? budget.reason}</small>}
       {steps.length > 0 && <section aria-label={agentStatusText.plan}><h3>{agentStatusText.plan}<small>{completed}/{steps.length}</small></h3>
         <ol>{steps.map((step) => <li key={step.id} className={step.status} aria-current={running && step.status === 'in_progress' ? 'step' : undefined}>
           <i aria-hidden="true">{planMarker[step.status]}</i><span>{step.text}{step.note && <small>{step.note}</small>}</span><small className="agent-status-label">{!running && step.status === 'in_progress' ? agentStatusText.unfinishedStep : planStatusLabel[step.status]}</small>

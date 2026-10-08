@@ -19,6 +19,25 @@ export async function runAttachmentPipelineRegression(): Promise<void> {
   assert(secondSelection.value.includes('Please inspect  after this') && !secondSelection.value.includes('@Input'), 'sequential reference selection did not preserve surrounding text');
   const database = new Database(); const chat = database.createConversation('qwen3.8:27b-q4_K_M'); const message = database.addMessage(chat.id, 'user', 'Inspect attachments'); const service = new AttachmentService(database);
   try {
+    const formats = [
+      ['a.png', 'image/png', png],
+      ['b.JPG', 'image/jpeg', new Uint8Array([255, 216, 255, 224, 12])],
+      ['c.jpeg', 'image/jpeg', new Uint8Array([255, 216, 255, 225, 13])],
+      ['d.webp', 'image/webp', new Uint8Array(Buffer.from('RIFF0000WEBPbytes'))],
+    ] as const;
+    const formatTurn = database.addMessage(chat.id, 'user', 'Inspect these images');
+    for (const [filename, mimeType, data] of formats) {
+      const imported = await service.import({ messageId: formatTurn.id, index: 0, filename, mimeType: 'image/png', data });
+      assert(imported.mimeType === mimeType, 'original format MIME was lost');
+    }
+    const formatPipeline = new AttachmentPipeline(database, service);
+    const restored = database.listMessages(chat.id).find((entry) => entry.id === formatTurn.id)!;
+    const nativeFormats = await formatPipeline.prepareNativeImages([restored], new AbortController().signal);
+    assert(nativeFormats[0].images?.length === 4, 'multiple images missing after history restore');
+    for (let index = 0; index < formats.length; index++) {
+      const [, mime, data] = formats[index];
+      assert(nativeFormats[0].images![index] === `data:${mime};base64,${Buffer.from(data).toString('base64')}`, 'MIME or original image bytes changed');
+    }
     const images = [];
     for (let index = 0; index < MAX_IMAGES_PER_MESSAGE; index += 1) images.push(await service.import({ messageId: message.id, index, filename: `${index}.png`, mimeType: 'image/png', data: png }));
     await service.import({ messageId: message.id, index: 10, filename: 'eleven.png', mimeType: 'image/png', data: png }).then(() => { throw new Error('11th image was accepted'); }, (error: Error) => assert(error.message.includes('10'), '11th image returned the wrong error'));

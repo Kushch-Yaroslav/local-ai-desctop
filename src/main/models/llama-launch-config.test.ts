@@ -81,3 +81,6 @@ async function run() {
   console.log('generic speculative configuration regression passed (local profiles, OFF/ON, future family, verified/invalid/missing/corrupt draft, runtime state)');
 }
 void run().catch((error: unknown) => { console.error(error); process.exitCode = 1; });
+
+assert.match(launchProfileEnvironment({ ...llamaRuntimeProfiles[0], projectorDevice: 'cpu' }), /PROJECTOR_DEVICE='cpu'/);
+assert.match(launchProfileEnvironment({ ...llamaRuntimeProfiles[0], projectorDevice: 'gpu' }), /PROJECTOR_DEVICE='gpu'/);

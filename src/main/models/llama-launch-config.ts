@@ -71,7 +71,7 @@ export function launchProfileEnvironment(profile: LlamaRuntimeProfile, enabled?:
   const mmproj = profile.mmprojPath && (mode !== 'mtp' || profile.visionWithMtp !== false) ? profile.mmprojPath : '';
   if (profile.speculativeDraftTokens !== undefined && (!Number.isInteger(profile.speculativeDraftTokens) || profile.speculativeDraftTokens < 1)) throw new Error('Некорректное число токенов embedded MTP.');
   const values = {
-    VARIANT: profile.id, MODEL: profile.modelPath, MMPROJ: mmproj, RUNTIME_MODEL_ID: profile.id,
+    PROJECTOR_PREFERENCE: profile.projectorPreference ?? '', PROJECTOR_DEVICE: profile.projectorDevice ?? 'auto', VARIANT: profile.id, MODEL: profile.modelPath, MMPROJ: mmproj, RUNTIME_MODEL_ID: profile.id,
     RUNTIME_LABEL: getModelProfile(profile.id)?.displayName ?? profile.id, DEFAULT_LLAMA_CONTEXT: String(profile.normalContext?.initialContextWindow ?? 32_768), MAX_LLAMA_CONTEXT: String(profile.maxContext),
     SPECULATIVE_MODE: mode, DRAFT_MODEL: draft?.path ?? '', DRAFT_KV_SHARED: draft?.kvCache === 'shared' ? '1' : '0',
     DRAFT_N_MAX: draft ? String(draft.maxDraftTokens) : mode === 'mtp' && profile.speculativeDraftTokens ? String(profile.speculativeDraftTokens) : '',
