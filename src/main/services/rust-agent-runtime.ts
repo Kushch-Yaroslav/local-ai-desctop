@@ -1,8 +1,7 @@
 import { createInterface } from 'node:readline';
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { resolve } from 'node:path';
-import { paths } from './paths';
+import { agentRuntimePath, paths } from './paths';
 import { agentEvidenceDir } from './agent-evidence';
 import type { AgentPlan, AgentPlanStepStatus, ChatMessage, ModelTodo, ReasoningMode, StreamEvent, SteeringIntent, TerminalExecution, ToolActivity, WebMode, WorkBudget } from '../../shared/types';
 import { maxOutputTokens } from '../models/model-registry';
@@ -122,7 +121,7 @@ export function taskPlan(value: unknown): AgentPlan {
  * immediately; `final` is metadata, not a delayed text transport. */
 export class RustAgentRuntime {
   private readonly steering = new Map<string, (content: string, intent?: SteeringIntent) => Promise<void>>();
-  constructor(private readonly endpoint: string, private readonly binary = process.env.LOCAL_AI_AGENT_RUNTIME ?? resolve(process.cwd(), 'rust-agent', 'target', 'debug', 'local-ai-agent-runtime')) {}
+  constructor(private readonly endpoint: string, private readonly binary = agentRuntimePath()) {}
 
   steer(runId: string, content: string, intent?: SteeringIntent): Promise<void> {
     const send = this.steering.get(runId);

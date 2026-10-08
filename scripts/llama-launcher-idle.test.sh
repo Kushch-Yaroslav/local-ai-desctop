@@ -24,9 +24,9 @@ printf 'unexpected model allocation\n' > "$fixture/unexpected-launch"
 exit 1
 SHIM
 chmod +x "$fixture/server"
-sed "s|^LLAMA_BIN=.*|LLAMA_BIN=\"$fixture/server\"|" "$root/run-local-ai-desktop-llama-cpp-mtp.sh" > "$fixture/launcher.sh"
+cp "$root/run-local-ai-desktop-llama-cpp-mtp.sh" "$fixture/launcher.sh"
 for previous_model in qwen3.8:27b-q4_K_M huihui-qwen3.8:27b-ud-dw-q4_k_m devstral-small-2:24b-q4_k_m gemma4:31b-it-q4_k_m; do
-  LOCAL_AI_RUNTIME_ROOT="$fixture" LOCAL_AI_LAUNCHER_HEADLESS=1 LOCAL_AI_LLAMA_PORT=18091 \
+  LOCAL_AI_APP_DIR="$root" LOCAL_AI_LLAMA_SERVER_PATH="$fixture/server" LOCAL_AI_RUNTIME_ROOT="$fixture" LOCAL_AI_LAUNCHER_HEADLESS=1 LOCAL_AI_LLAMA_PORT=18091 \
     LOCAL_AI_LLAMA_MODEL_ID="$previous_model" LOCAL_AI_LLAMA_CONTEXT=81920 \
     bash "$fixture/launcher.sh" > "$fixture/stdout" 2> "$fixture/stderr" &
   launcher_pid=$!

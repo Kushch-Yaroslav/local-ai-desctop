@@ -1,4 +1,5 @@
 import { existsSync } from 'node:fs';
+import { modelPaths } from '../services/runtime-settings';
 import { ggufArtifactPaths } from '../services/gguf-artifacts';
 import type { ModelInfo } from '../../shared/types';
 import { contextPresetsFor } from './model-registry';
@@ -59,12 +60,12 @@ const qwen38Reasoning: LlamaReasoningProfile = { thinkingKwarg: 'enable_thinking
 
 /** Model capability is separate from the currently loaded server context. */
 export const llamaRuntimeProfiles: readonly LlamaRuntimeProfile[] = [
-  { id: 'qwen3.8:27b-q4_K_M', maxContext: 262_144, modelPath: '/media/yaroslav/DATA/llama-models/qwen3.8-27b-q4_K_M.gguf', mmprojPath: '/media/yaroslav/DATA/llama-models/qwen3.8-27b-mmproj.gguf', speculative: 'mtp', vision: true, visionWithMtp: true, reasoning: qwen38Reasoning },
+  { id: 'qwen3.8:27b-q4_K_M', maxContext: 262_144, get modelPath() { return modelPaths(this.id).modelPath; }, get mmprojPath() { return modelPaths(this.id).mmprojPath; }, speculative: 'mtp', vision: true, visionWithMtp: true, reasoning: qwen38Reasoning },
   {
     id: 'qwen3.6:35b-a3b-ud-q4_k_m',
     maxContext: 262_144,
-    modelPath: '/media/yaroslav/DATA/llama-models/Qwen3.6-35B-A3B-Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf',
-    mmprojPath: '/media/yaroslav/DATA/llama-models/Qwen3.6-35B-A3B-Q4_K_M/mmproj-BF16.gguf',
+    get modelPath() { return modelPaths(this.id).modelPath; },
+    get mmprojPath() { return modelPaths(this.id).mmprojPath; },
     speculative: 'mtp',
     speculativeDraftTokens: 2,
     vision: true,
@@ -74,7 +75,7 @@ export const llamaRuntimeProfiles: readonly LlamaRuntimeProfile[] = [
     hostResidentBudgetBytes: 8 * 1024 ** 3,
     normalContext: { initialContextWindow: 65_536, kvCacheType: 'q8_0' },
   },
-  { id: 'huihui-qwen3.8:27b-ud-dw-q4_k_m', maxContext: 262_144, modelPath: '/media/yaroslav/DATA/llama-models/Huihui-Qwen3.8-27B-abliterated-UD-DW-Q4_K_M.gguf', mmprojPath: '/media/yaroslav/DATA/llama-models/huihui-qwen3.8-27b-mmproj-bf16.gguf', speculative: 'mtp', vision: true, visionWithMtp: true, reasoning: qwen38Reasoning },
+  { id: 'huihui-qwen3.8:27b-ud-dw-q4_k_m', maxContext: 262_144, get modelPath() { return modelPaths(this.id).modelPath; }, get mmprojPath() { return modelPaths(this.id).mmprojPath; }, speculative: 'mtp', vision: true, visionWithMtp: true, reasoning: qwen38Reasoning },
 
 ];
 

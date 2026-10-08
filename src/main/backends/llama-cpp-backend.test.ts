@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { createServer, type Server } from 'node:http';
 import { once } from 'node:events';
 import { LlamaCppBackend, LlamaCppContextExhaustedError, LlamaCppRequestError, validateLlamaMessageSequence } from './llama-cpp-backend';
@@ -62,6 +65,19 @@ const toolSchema = [{ type: 'function', function: { name: 'read_file', descripti
 const call = (backend: LlamaCppBackend, messages: ToolMessage[], tools: unknown[] | undefined = toolSchema) => backend.chatWithTools(model, messages, tools, new AbortController().signal, 65_536, 'deep');
 
 export async function runLlamaCppBackendRegression(): Promise<void> {
+  // Availability/context tests use tiny synthetic metadata, never a
+  // developer's multi-GB weights or directory structure.
+  const fixture = mkdtempSync(join(tmpdir(), 'llama backend models '));
+  const originalPaths = llamaRuntimeProfiles.map((profile) => Object.getOwnPropertyDescriptor(profile, 'modelPath')!);
+  const u32 = (n: number) => { const b = Buffer.alloc(4); b.writeUInt32LE(n); return b; };
+  const u64 = (n: number) => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(n)); return b; };
+  const text = (s: string) => Buffer.concat([u64(Buffer.byteLength(s)), Buffer.from(s)]);
+  for (const [index, profile] of llamaRuntimeProfiles.entries()) {
+    const path = join(fixture, `model${index}.gguf`);
+    writeFileSync(path, Buffer.concat([Buffer.from('GGUF'), u32(3), u64(0), u64(2), text('general.architecture'), u32(8), text('fixture'), text('fixture.context_length'), u32(4), u32(262_144)]));
+    Object.defineProperty(profile, 'modelPath', { get: () => path, configurable: true });
+  }
+  try {
   {
     const originalFetch = globalThis.fetch;
     let requests = 0;
@@ -122,7 +138,7 @@ export async function runLlamaCppBackendRegression(): Promise<void> {
         backend: 'llama-cpp',
         modelId: model,
         activeContextTokens: 16_384,
-        modelPath: '/media/yaroslav/DATA/llama-models/qwen3.8-27b-q4_K_M.gguf',
+        modelPath: llamaRuntimeProfiles[0].modelPath,
         modelTrainContextTokens: 262_144,
         modelFileSizeBytes: 16_799_719_424,
         kvCacheType: 'f16',
@@ -287,6 +303,7 @@ export async function runLlamaCppBackendRegression(): Promise<void> {
       assert(!serialized.includes('activity-trace-only') && !serialized.includes('raw-cache-only'), 'activity telemetry or raw cache leaked into the inference request');
     } finally { await stop(server); }
   }
+  } finally { llamaRuntimeProfiles.forEach((profile, index) => Object.defineProperty(profile, 'modelPath', originalPaths[index])); rmSync(fixture, { recursive: true, force: true }); }
 }
 
 if (require.main === module) void runLlamaCppBackendRegression().catch((error: unknown) => { console.error(error); process.exitCode = 1; });

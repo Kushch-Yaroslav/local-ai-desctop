@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
+fixture="$(mktemp -d)"
+trap 'rm -r -- "$fixture"' EXIT
+export LOCAL_AI_RUNTIME_ROOT="$fixture"
+mkdir -p "$fixture/app-data" "$fixture/models"
+node - "$fixture" <<'NODE'
+const fs = require('node:fs'), path = require('node:path');
+const root = process.argv[2], modelsPath = path.join(root, 'models');
+fs.writeFileSync(path.join(modelsPath, 'mmproj-BF16.gguf'), 'GGUF');
+fs.writeFileSync(path.join(root, 'app-data/runtime-settings.json'), JSON.stringify({ modelsPath, models: { 'qwen3.6:35b-a3b-ud-q4_k_m': { mmprojPath: 'mmproj-BF16.gguf' } } }));
+NODE
 # Evaluate only pure configuration functions, never launcher lifecycle/inference.
 eval "$(sed -n '/^select_variant() {/,/^}/p' "$root/run-local-ai-desktop-llama-cpp-mtp.sh")"
 eval "$(sed -n '/^build_server_args() {/,/^}/p' "$root/run-local-ai-desktop-llama-cpp-mtp.sh")"

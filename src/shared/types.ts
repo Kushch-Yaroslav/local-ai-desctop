@@ -205,7 +205,14 @@ export interface HardwareStats {
   available: boolean;
 }
 
+export interface RuntimeConfiguration {
+  llamaServerPath: string | null;
+  modelsPath: string;
+  gpuLayers: number;
+  models: Record<string, { modelPath?: string; mmprojPath?: string }>;
+}
 export interface AppSettings {
+  setup?: { config: RuntimeConfiguration; server: string | null; models: Array<{ id: string; name: string; modelPath: string; mmprojPath?: string; installed: boolean }>; issues: string[]; configPath: string; dataDirectory: string };
   llamaServerPath: string | null;
   llamaRuntimeModelId?: string;
   /** Live state of the launcher-managed llama-server; the authority on what is running. */
@@ -377,12 +384,12 @@ export interface LocalAiApi {
   };
   analysis: { list(conversationId: string): Promise<AnalysisRun[]> };
   models: { list(): Promise<ModelInfo[]> };
-  settings: { get(): Promise<AppSettings> };
+  settings: { get(): Promise<AppSettings>; save(config: RuntimeConfiguration): Promise<AppSettings> };
   hardware: { get(): Promise<HardwareStats> };
   contextEstimate(modelId: string): Promise<RuntimeContextEstimate>;
   contextDiscover(modelId: string): Promise<ContextDiscoveryResult>;
   contextDiscoveryStatus(modelId?: string | null): Promise<import('./context-estimator').ContextDiscoveryProgress>;
-  dialog: { chooseDirectory(initialDirectory?: string | null): Promise<string | null> };
+  dialog: { chooseDirectory(initialDirectory?: string | null): Promise<string | null>; chooseFile(): Promise<string | null> };
   chat: {
     send(request: ChatRequest): Promise<void>;
     steer(conversationId: string, generationId: string, content: string, intent?: SteeringIntent): Promise<ChatMessage>;

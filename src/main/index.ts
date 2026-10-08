@@ -1,16 +1,24 @@
-import { app, BrowserWindow } from 'electron';
+import { app, BrowserWindow, dialog } from 'electron';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { ensureAppDirectories, paths } from './services/paths';
 import { log } from './services/logger';
+import { startRuntimeSupervisor, stopRuntimeSupervisor } from './services/runtime-supervisor';
 
 let mainWindow: BrowserWindow | null = null;
 let shutdownStarted = false;
 
-ensureAppDirectories();
+try { ensureAppDirectories(); }
+catch (error) {
+  dialog.showErrorBox('Local AI Desktop — каталог данных', `Не удалось создать каталоги данных: ${String(error)}. Укажите доступный каталог через LOCAL_AI_RUNTIME_ROOT.`);
+  app.exit(1);
+}
 app.setPath('userData', paths.userData);
 app.setPath('cache', paths.cache);
 app.setPath('logs', paths.logs);
+if (!app.requestSingleInstanceLock()) app.exit(0);
+app.on('second-instance', () => { mainWindow?.show(); mainWindow?.focus(); });
+process.env.LOCAL_AI_LLAMA_CPP_URL ??= `http://127.0.0.1:${process.env.LOCAL_AI_LLAMA_PORT ?? '8081'}`;
 
 function createWindow(): void {
   const preloadPath = join(__dirname, '../preload/index.js');
@@ -50,6 +58,7 @@ function createWindow(): void {
 }
 
 app.whenReady().then(async () => {
+  await startRuntimeSupervisor();
   const { registerIpc } = await import('./ipc/register-ipc');
   registerIpc(); createWindow(); log('application.started');
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
@@ -63,6 +72,7 @@ app.on('before-quit', (event) => {
   shutdownStarted = true;
   void import('./ipc/register-ipc')
     .then(({ shutdownRuntime }) => shutdownRuntime())
+    .then(() => stopRuntimeSupervisor())
     .catch((error: unknown) => log('runtime.shutdown.failed', error instanceof Error ? { message: error.message } : { error: String(error) }))
     .finally(() => {
       log('application.stopped');

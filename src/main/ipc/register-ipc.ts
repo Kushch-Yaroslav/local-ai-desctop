@@ -12,6 +12,7 @@ import { LlamaCppBackend } from '../backends/llama-cpp-backend';
 import { LlamaRuntimeController, type LlamaRuntimeState } from '../services/llama-runtime-controller';
 import { RustAgentRuntime, taskPlan, type AgentProject } from '../services/rust-agent-runtime';
 import { paths } from '../services/paths';
+import { runtimeSetup, saveRuntimeConfiguration } from '../services/runtime-settings';
 import { discardAgentEvidence } from '../services/agent-evidence';
 import { log } from '../services/logger';
 import { getModelProfile } from '../models/model-registry';
@@ -546,9 +547,16 @@ export function registerIpc(): void {
     try { await syncLlamaBackend(); return await backend.getModels(); }
     catch (error) { log('backend.models.failed', { backend: 'llama-cpp', message: error instanceof Error ? error.message : String(error) }); return []; }
   });
-  ipcMain.handle('settings:get', async () => {
+  const getSettings = async () => {
     const llama = await syncLlamaBackend();
-    return { llamaServerPath: process.env.LOCAL_AI_LLAMA_SERVER_PATH ?? null, llamaRuntimeModelId: llama.modelId ?? undefined, llamaRuntime: llama, modelsPath: paths.models };
+    const setup = runtimeSetup();
+    return { llamaServerPath: setup.server, llamaRuntimeModelId: llama.modelId ?? undefined, llamaRuntime: llama, modelsPath: setup.config.modelsPath, setup };
+  };
+  ipcMain.handle('settings:get', getSettings);
+  ipcMain.handle('settings:save', async (_event, config: unknown) => {
+    if (activeGenerations.size || contextDiscoveryBusy || runtimeSelectionBusy || (await llamaRuntime.state()).status === 'ready') throw new Error('Перед изменением runtime перезапустите приложение и не загружайте модель.');
+    saveRuntimeConfiguration(config);
+    return getSettings();
   });
   ipcMain.handle('hardware:get', getHardwareStats);
   ipcMain.handle('context:estimate', async (_event, modelId: string): Promise<RuntimeContextEstimate> => {
@@ -568,6 +576,10 @@ export function registerIpc(): void {
     return result.canceled ? null : result.filePaths[0] ?? null;
   });
   ipcMain.handle('chat:stop', async (_event, conversationId: string, generationId?: string) => { await cancelGeneration(conversationId, generationId, 'user_stop'); });
+  ipcMain.handle('dialog:chooseFile', async () => {
+    const result = await dialog.showOpenDialog(BrowserWindow.getFocusedWindow()!, { properties: ['openFile'] });
+    return result.canceled ? null : result.filePaths[0] ?? null;
+  });
   ipcMain.handle('chat:steer', async (event, conversationId: string, generationId: string, content: string, intent?: SteeringIntent) => {
     const generation = activeGenerations.get(conversationId);
     if (!generation || generation.id !== generationId || generation.abort.signal.aborted || generation.mode !== 'agent') throw new Error('Уточнения доступны только во время активного Agent run.');

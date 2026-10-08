@@ -144,3 +144,17 @@
 .agent-status-content li i { font-style: normal; text-align: center; }.agent-status-content li > span { overflow-wrap: anywhere; }.agent-status-content li > span small { display: block; margin-top: 3px; color: var(--text-subtle); }.agent-status-label { max-width: 130px; text-align: right; font-size: 10px; line-height: 1.5; }
 .agent-status-content li.in_progress { background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--accent); }.agent-status-content li.completed, .agent-status-content li.verified { color: #9ec99a; }.agent-status-content li.implemented, .agent-status-content li.done { color: #dec38a; }.agent-status-content li.blocked { color: #edaaa2; }.agent-status-content li.dropped, .agent-status-content li.abandoned { opacity: .65; }.agent-status-content li.dropped > span, .agent-status-content li.abandoned > span { text-decoration: line-through; }
 .truncation-notice { margin: 2px 0 14px 10px; padding: 7px 10px; border-left: 2px solid #c89c57; color: #d9bb84; background: rgb(104 79 36 / 14%); font-size: 12px; }
+
+.runtime-setup-backdrop { position: fixed; inset: 0; z-index: 100; background: #0009; display: grid; place-items: center; padding: 20px; }
+.runtime-setup { width: min(800px, 100%); max-height: 90vh; overflow: auto; padding: 22px; background: var(--surface); border: 1px solid var(--border); border-radius: 12px; color: var(--text); }
+.runtime-setup header { display: flex; justify-content: space-between; align-items: center; }
+.runtime-setup h2 { margin: 0; }
+.runtime-setup p, .runtime-setup small { color: var(--text-muted); overflow-wrap: anywhere; }
+.runtime-setup label { display: block; margin: 10px 0; font-size: 13px; }
+.runtime-setup input { color: var(--text); background: var(--surface-muted); border: 1px solid var(--border); padding: 8px; min-width: 0; font: inherit; }
+.runtime-setup button { background: var(--surface-raised); border: 1px solid var(--border); border-radius: 5px; padding: 8px; }
+.setup-path { display: flex; gap: 8px; margin-top: 4px; }
+.setup-path input { flex: 1; }
+.runtime-setup fieldset { border: 1px solid var(--border); border-radius: 6px; margin: 14px 0; }
+.runtime-setup footer { margin-top: 16px; }
+button.sidebar-footer { background: transparent; border: 0; text-align: left; }

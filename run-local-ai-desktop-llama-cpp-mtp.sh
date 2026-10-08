@@ -1,33 +1,32 @@
 #!/usr/bin/env bash
 # Local AI Desktop launcher for llama.cpp.
 #
-# Owns exactly two things: one llama-server and one Electron process. A model or
+# Owns one llama-server and, for source launches, one Electron process. A model or
 # context change is a transaction on the server only:
 #   current healthy runtime -> stop -> start requested runtime -> verify it
 #   stays alive, is healthy and reports the requested alias and n_ctx -> publish.
 # A failed start is published with its real cause and the previous runtime is
 # restored when possible. Electron is never restarted by a runtime change.
 #
-# Protocol files (runtime/):
+# Protocol files (resolved application data directory):
 #   llama-cpp-runtime-request.env  written by Electron: REQUEST_ID, MODEL_ID, CONTEXT, KV_TYPE, KV_OFFLOAD
 #   llama-cpp-runtime-state.json   written here: the only authority on what runs
 set -euo pipefail
 
-APP_DIR="/media/yaroslav/DATA/local-ai-desktop"
-LLAMA_BIN="/media/yaroslav/DATA/llama.cpp/build-cuda/bin/llama-server"
-ELECTRON_BIN="$APP_DIR/node_modules/electron/dist/electron"
+APP_DIR="${LOCAL_AI_APP_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}"
+ELECTRON_BIN="${LOCAL_AI_ELECTRON_BIN:-$APP_DIR/node_modules/electron/dist/electron}"
+# The same persisted settings/path resolver used by Electron also configures
+# this supervisor. Missing llama-server/models are allowed until selection.
+eval "$(ELECTRON_RUN_AS_NODE=1 "$ELECTRON_BIN" "$APP_DIR/dist/main/services/runtime-settings.js")"
 PORT="${LOCAL_AI_LLAMA_PORT:-8081}"
 [[ "$PORT" =~ ^[0-9]+$ ]] && (( PORT >= 1 && PORT <= 65535 )) || { printf 'Invalid LOCAL_AI_LLAMA_PORT: %s\n' "$PORT" >&2; exit 2; }
 URL="http://127.0.0.1:${PORT}"
-STATE_DIR="${LOCAL_AI_RUNTIME_ROOT:-$APP_DIR/runtime}"
-LOG_DIR="$STATE_DIR/logs"
 LOG_FILE="$LOG_DIR/llama-cpp-mtp-launcher.log"
 SERVER_LOG="$LOG_DIR/llama-cpp-mtp-server.log"
 SERVER_PID_FILE="$STATE_DIR/llama-cpp-mtp-server.pid"
 LAUNCHER_PID_FILE="$STATE_DIR/llama-cpp-mtp-launcher.pid"
 REQUEST_FILE="$STATE_DIR/llama-cpp-runtime-request.env"
 STATE_FILE="$STATE_DIR/llama-cpp-runtime-state.json"
-SANDBOX_HELPER="/opt/google/chrome/chrome-sandbox"
 HEALTH_TIMEOUT_SECONDS=150
 
 SERVER_PID=""
@@ -46,7 +45,7 @@ PROFILE_SERVER_ARGS=()
 
 mkdir -p "$LOG_DIR"
 INITIAL_PATH="${PATH:-}"
-export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH="${PATH:-/usr/local/bin:/usr/bin:/bin}"
 timestamp() { date --iso-8601=seconds; }
 log() { printf '%s %s\n' "$(timestamp)" "$*" >> "$LOG_FILE"; }
 
@@ -83,7 +82,7 @@ show_failure() {
   elif command -v notify-send >/dev/null 2>&1; then notify-send "Local AI Desktop — llama.cpp ${RUNTIME_LABEL:-}" "$message\nЛог: $LOG_FILE" || true; fi
 }
 fail() { local message="$1"; CLEANUP_REASON="startup failure: $message"; log "launcher.error=$message"; ACTIVE_MODEL=""; ACTIVE_CONTEXT=0; ACTIVE_SPECULATIVE_MODE="none"; write_state offline "" "$message" || true; show_failure "$message"; exit 1; }
-same_llama_process() { [[ -n "$1" && -r "/proc/$1/exe" && "$(readlink -f "/proc/$1/exe")" == "$LLAMA_BIN" ]]; }
+same_llama_process() { [[ -n "$1" && -r "/proc/$1/exe" && "$(readlink -f "/proc/$1/exe")" == "$(readlink -f "$LLAMA_BIN")" ]]; }
 
 stop_llama_server() {
   local pid="$1"
@@ -163,7 +162,7 @@ launch_server() {
   [[ -f "$MODEL" ]] || { LAUNCH_ERROR="Не найден GGUF выбранной модели: $MODEL"; return 1; }
   [[ -z "$MMPROJ" || -f "$MMPROJ" ]] || { LAUNCH_ERROR="Не найден vision projector: $MMPROJ"; return 1; }
 
-  local context_args=(--cache-type-k "$kv_type" --cache-type-v "$kv_type") gpu_layers=999
+  local context_args=(--cache-type-k "$kv_type" --cache-type-v "$kv_type") gpu_layers="${GPU_LAYERS:-999}"
   if [[ "$SPECULATIVE_MODE" != "none" ]]; then context_args+=(--cache-type-k-draft "$kv_type" --cache-type-v-draft "$kv_type"); fi
   if [[ "$kv_offload" == "0" ]]; then context_args+=(--no-kv-offload); else context_args+=(--kv-offload); fi
   log "context.policy variant=$VARIANT ctx_size=$context kv_type=$kv_type kv_offload=$kv_offload gpu_layers=$gpu_layers"
@@ -303,9 +302,10 @@ log "cwd=$(pwd) project_root=$APP_DIR initial_path=$INITIAL_PATH effective_path=
 log "electron=$ELECTRON_BIN llama_server=$LLAMA_BIN port=$PORT startup_selection=none"
 
 [[ -x "$ELECTRON_BIN" && -f "$APP_DIR/dist/main/index.js" && -f "$APP_DIR/dist/preload/index.js" && -f "$APP_DIR/dist/renderer/index.html" ]] || fail "Не найден production build или Electron: $ELECTRON_BIN"
-source "$APP_DIR/scripts/electron-sandbox.sh"
-prepare_electron_sandbox "$ELECTRON_BIN" "$SANDBOX_HELPER" || fail "Не удалось настроить system Chrome sandbox helper: $SANDBOX_HELPER"
-log "electron.sandbox helper=$CHROME_DEVEL_SANDBOX bundled=retired"
+if [[ "${LOCAL_AI_LAUNCHER_HEADLESS:-}" != "1" ]]; then
+  source "$APP_DIR/scripts/electron-sandbox.sh"
+  select_electron_sandbox "$ELECTRON_BIN" || fail "Не удалось настроить Chrome sandbox helper. См. документацию по установке Linux."
+fi
 rm -f "$REQUEST_FILE"
 
 if curl --silent --fail "$URL/health" >/dev/null 2>&1; then
@@ -318,13 +318,11 @@ if curl --silent --fail "$URL/health" >/dev/null 2>&1; then
   fi
 fi
 
-export NPM_CONFIG_CACHE="$APP_DIR/local-cache/npm"
-export XDG_CACHE_HOME="$STATE_DIR/cache"
-export XDG_CONFIG_HOME="$STATE_DIR/app-data"
 export ELECTRON_ENABLE_LOGGING=1
 export LOCAL_AI_LLAMA_CPP_URL="$URL"
 export LOCAL_AI_LLAMA_SERVER_PATH="$LLAMA_BIN"
 export LOCAL_AI_LLAMA_SERVER_LOG="$SERVER_LOG"
+export LOCAL_AI_LAUNCHER_MANAGED=1
 unset LOCAL_AI_DEV_SERVER_URL VITE_DEV_SERVER_URL
 cd "$APP_DIR"
 printf '%s\n' "$$" > "$LAUNCHER_PID_FILE"
@@ -338,7 +336,8 @@ if [[ "${LOCAL_AI_LAUNCHER_HEADLESS:-}" == "1" ]]; then
   # opening a window. Ends on SIGTERM/SIGINT like the normal launcher.
   log "headless=true state=idle electron=skipped"
   while true; do
-    sleep 3600 &
+    if [[ -n "${LOCAL_AI_PARENT_PID:-}" ]] && ! kill -0 "$LOCAL_AI_PARENT_PID" 2>/dev/null; then CLEANUP_REASON="Electron owner exited"; exit 0; fi
+    sleep 1 &
     sleeper=$!
     wait "$sleeper" || true
     kill "$sleeper" 2>/dev/null || true
