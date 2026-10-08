@@ -11,11 +11,11 @@ const resultMarker = { pending: '○', implemented: '◐', done: '◐', verified
 
 /** Subscribes only to the current chat's planning projection, never token/clock updates. */
 export function CurrentAgentStatus() {
-  const { activeId, plan, agent } = useAppStore(useShallow((state) => ({ activeId: state.activeId, plan: state.agentPlan, agent: state.conversations.find((chat) => chat.id === state.activeId)?.mode === 'agent' })));
-  return agent && activeId ? <AgentStatusPanel plan={plan} /> : null;
+  const { activeId, plan, agent, running } = useAppStore(useShallow((state) => ({ activeId: state.activeId, plan: state.agentPlan, running: state.isGenerating, agent: state.conversations.find((chat) => chat.id === state.activeId)?.mode === 'agent' })));
+  return agent && activeId ? <AgentStatusPanel plan={plan} running={running} /> : null;
 }
 
-export const AgentStatusPanel = memo(function AgentStatusPanel({ plan }: { plan: AgentPlan | null }) {
+export const AgentStatusPanel = memo(function AgentStatusPanel({ plan, running = false }: { plan: AgentPlan | null; running?: boolean }) {
   const [expanded, setExpanded] = useState(true);
   const contentId = useId();
   const { steps, deliverables, checks, warnings } = agentStatus(plan);
@@ -26,6 +26,7 @@ export const AgentStatusPanel = memo(function AgentStatusPanel({ plan }: { plan:
   return <section className="agent-status-panel" aria-label={agentStatusText.panel}>
     <button type="button" className="agent-status-toggle" aria-expanded={expanded} aria-controls={contentId} onClick={() => setExpanded((value) => !value)}>
       <ChevronDown size={16} aria-hidden="true" />
+      {!running && <span>{agentStatusText.saved}</span>}
       {steps.length > 0 && <span><strong>{agentStatusText.plan}</strong> {completed}/{steps.length}</span>}
       {steps.length > 0 && deliverables.length > 0 && <span aria-hidden="true">·</span>}
       {deliverables.length > 0 && <span><strong>{agentStatusText.result}</strong> {verified}/{total}</span>}
@@ -33,8 +34,8 @@ export const AgentStatusPanel = memo(function AgentStatusPanel({ plan }: { plan:
     </button>
     {expanded && <div id={contentId} className="agent-status-content">
       {steps.length > 0 && <section aria-label={agentStatusText.plan}><h3>{agentStatusText.plan}<small>{completed}/{steps.length}</small></h3>
-        <ol>{steps.map((step) => <li key={step.id} className={step.status} aria-current={step.status === 'in_progress' ? 'step' : undefined}>
-          <i aria-hidden="true">{planMarker[step.status]}</i><span>{step.text}{step.note && <small>{step.note}</small>}</span><small className="agent-status-label">{planStatusLabel[step.status]}</small>
+        <ol>{steps.map((step) => <li key={step.id} className={step.status} aria-current={running && step.status === 'in_progress' ? 'step' : undefined}>
+          <i aria-hidden="true">{planMarker[step.status]}</i><span>{step.text}{step.note && <small>{step.note}</small>}</span><small className="agent-status-label">{!running && step.status === 'in_progress' ? agentStatusText.unfinishedStep : planStatusLabel[step.status]}</small>
         </li>)}</ol>
       </section>}
       {deliverables.length > 0 && <section aria-label={agentStatusText.deliverables}><h3>{agentStatusText.deliverables}<small>{verified}/{total}</small></h3>

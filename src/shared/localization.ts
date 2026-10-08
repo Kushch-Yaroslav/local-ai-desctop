@@ -21,7 +21,7 @@ export const reasoningControlText = {
 } as const;
 export const chatModeLabel = { chat: 'Чат', agent: 'Агент' } as const;
 
-export const agentStatusText = { panel: 'План и результат', plan: 'План', deliverables: 'Требуемый результат', result: 'Результат', warnings: 'Предупреждения проекта', preExisting: 'Сбой наблюдался до изменений', baseline: 'Проверка до изменений', failed: 'Не прошла', passed: 'Пройдена' } as const;
+export const agentStatusText = { panel: 'План и результат', plan: 'План', deliverables: 'Требуемый результат', result: 'Результат', warnings: 'Предупреждения проекта', preExisting: 'Сбой наблюдался до изменений', baseline: 'Проверка до изменений', failed: 'Не прошла', passed: 'Пройдена', saved: 'Сохранённое состояние', unfinishedStep: 'Незавершённый шаг' } as const;
 export const planStatusLabel = { pending: 'Предстоит', in_progress: 'Текущий шаг', completed: 'Выполнено', blocked: 'Заблокировано', abandoned: 'Исключено' } as const;
 export const deliverableStatusLabel = { pending: 'Ожидает', implemented: 'Реализовано, не проверено', done: 'Реализовано, не проверено', verified: 'Проверено', blocked: 'Заблокировано', dropped: 'Исключено' } as const;
 

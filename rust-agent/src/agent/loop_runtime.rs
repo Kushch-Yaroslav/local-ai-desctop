@@ -141,7 +141,7 @@ const AGENT_GUIDANCE: &str = r#"
 - Work directly from the conversation and tool results. A tool-free response completes the run; there is no separate step to request before answering.
 - For code changes, read before writing, make targeted changes, then check them: after you change files, run the cheapest check that shows the change works (the project's own tests, or a short script that runs the changed code; for a page, a real browser run, such as a headless browser or a Playwright or Puppeteer script; jsdom or a hand-written DOM stand-in does not count as a browser check). A check must go through the same entry path the user will use (for a page: the real HTML with its script order and load timing, not only the script run against a stand-in); if it only covers part of that path or uses a stand-in, say so. A claim is only as strong as the check behind it: a command that exits 0 shows what it ran, not more. If the check the claim needs cannot be run here (for example, no browser), leave it implemented and say so plainly instead of substituting a weaker check. For a small literal edit, prefer replace_text after reading the file; it avoids patch context markers without weakening freshness checks. Verification is part of the work, not an extra step to announce. Reading a file back shows only that it exists, not that it works. When a check fails, fix the cause and run it again; do not invent checks or skip a failure.
 - For substantial tasks, reason about an approach before acting, adapt as you learn, use tools for concrete evidence, avoid broad rereads, and continue until the user's task is complete.
-- Plan = your own short list of steps for non-trivial work (plan tool: set, then update only when the approach changes; skip it for a trivial request). It is not the user's deliverables and finishing its steps proves nothing. Do not narrate plan updates or restate the plan in prose.
+- Plan = your own short list of steps for non-trivial work (plan tool: set if useful, then update at meaningful milestones or when the approach changes; skip it for a trivial request). It is not the user's deliverables and finishing its steps proves nothing. Do not narrate plan updates or restate the plan in prose; no update is required after every action.
 - Agent runtime state belongs to the harness, not to the human. Accepted updates stay beside the tool substep that produced them; the latest value of each section supersedes earlier values. A cleared section is no longer active. Continue the next action without treating these updates as new user instructions.
 - Use the latest user's language for all user-visible natural-language text: streamed reasoning/progress, tool preambles, brief status updates, and the final answer. Follow an explicit language request if present. Keep code, paths, identifiers, commands, API/tool syntax, and literal source quotations in their original form. Do not translate protocol fields.
 - For non-trivial architecture relationships, use a compact multiline Mermaid flowchart when it improves readability, or a properly indented multiline tree. Do not compress a diagram into one long arrow chain; avoid decorative box art.
@@ -759,7 +759,7 @@ fn tool_schemas(scope: ToolScope) -> Vec<Value> {
     let mut tools = vec![
         json!({"type":"function","function":{"name":"task_memory","description":"Durable semantic memory for the current task across compaction. Record/update meaningful findings, decisions, blockers, or unresolved questions; view reads it; invalidate needs id. Record requires finding; update needs the id of an existing entry and changes only the fields you pass (an empty string clears one). Both may include evidence, implication, next, supersedes, status. Cite observations by exact id (obs-00000012), one per item in observations or comma-separated in evidence. Trust precise unchanged-file memory; reread only for a concrete missing, ambiguous, changed, exact-detail, or verification need.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["record","update","invalidate","view"]},"id":{"type":"string"},"finding":{"type":"string"},"evidence":{"type":"string"},"implication":{"type":"string"},"next":{"type":"string"},"supersedes":{"type":"string"},"status":{"type":"string","enum":["confirmed","inferred","unknown","contradicted"],"description":"How well established the finding is: confirmed (observed, cited), inferred (reasoned, not observed), unknown (open; put the resolving step in next), contradicted (evidence disagrees)."},"observations":{"type":"array","items":{"type":"string"},"description":"Observation IDs (obs-…) that support the finding; same as evidence, one id per item."}},"required":["action"]}}}),
         json!({"type":"function","function":{"name":"deliverables","description":"The user's requested deliverables for this task (execution contract). Use it only when the request has two or more separate things to produce or change, or one result that must work end to end. add: record each requested deliverable once (text, optional task, optional check: the weakest evidence that proves the claim: readback = it exists, static = lint/typecheck, build = it builds, test = the tests pass, runtime = running the code works, browser = it works in a real browser; a changed page is always held to browser). implemented: you built it (id, evidence): this is your claim and is not proof. verify: select relevant run_terminal checks with deliverable_ids before executing them; the runtime has a passing check of it (id; evidence = ev-… ids from <verification_state>; Fast may omit them): only checks the runtime saw run after your last change count, and any later change to the project takes the verification back. block: it cannot be completed (id, concrete reason). drop: the user withdrew it (id, reason). view: list them. Record only what the user asked for, never your own optional ideas.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["add","implemented","verify","block","drop","view"]},"id":{"type":"string"},"task":{"type":"string"},"text":{"type":"string"},"evidence":{"type":"string"},"reason":{"type":"string"},"check":{"type":"string","enum":["readback","static","build","test","runtime","browser"]}},"required":["action"]}}}),
-        json!({"type":"function","function":{"name":"plan","description":"Your own short execution plan: how you will get the work done. Optional: skip it for a trivial or single-step request. set: replace the unfinished steps with a short ordered list of one-line steps (steps); the first becomes active. update: change a step (id; status pending|in_progress|completed|blocked, optional text or note; blocked needs a note); completing the active step activates the next. add: insert a step (text, optional after). view: list. Change the plan only when your approach changes; do not narrate it or update it after every call. A plan is not proof: finishing steps does not complete the user's deliverables.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["set","update","add","view"]},"steps":{"type":"array","items":{"type":"string"}},"id":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","completed","blocked"]},"text":{"type":"string"},"note":{"type":"string"},"after":{"type":"string"}},"required":["action"]}}}),
+        json!({"type":"function","function":{"name":"plan","description":"Your own short execution plan: how you will get the work done. Optional: skip it for a trivial or single-step request. set: replace the unfinished steps with a short ordered list of one-line steps (steps); the first becomes active. update: change a step (id; status pending|in_progress|completed|blocked, optional text or note; blocked needs a note); completing the active step activates the next. add: insert a step (text, optional after). view: list. Update at meaningful milestones or when your approach changes; do not narrate it or update it after every call. A plan is not proof: finishing steps does not complete the user's deliverables.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["set","update","add","view"]},"steps":{"type":"array","items":{"type":"string"}},"id":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","completed","blocked"]},"text":{"type":"string"},"note":{"type":"string"},"after":{"type":"string"}},"required":["action"]}}}),
         json!({"type":"function","function":{"name":"observation_index","description":"List historical tool observations by stable ID, with source path and outcome metadata. Use source to select the raw observation for the needed file. If more=true, continue at the returned next_offset. Observation IDs start with obs-.","parameters":{"type":"object","properties":{"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":50}}}}}),
         json!({"type":"function","function":{"name":"observation_read","description":"Recover a bounded exact slice of a stored historical tool result by observation ID. The response distinguishes historical evidence from current source and reports whether the source changed.","parameters":{"type":"object","properties":{"id":{"type":"string"},"offset_chars":{"type":"integer","minimum":0},"max_chars":{"type":"integer","minimum":1,"maximum":16000}},"required":["id"]}}}),
     ];
@@ -1727,6 +1727,62 @@ fn present_answer(
         );
     }
     crate::agent::presentation::project_answer_with_prefix(content, prefix, &references)
+}
+
+/// An execution ending is not proof of task completion. Surface authoritative
+/// unresolved state once, without another provider/tool turn or invented plan
+/// transitions. The model's prose cannot suppress this terminal disclosure.
+fn terminal_status_note(
+    state: &AgentState,
+    transcript: &Transcript,
+    turn_budget_exhausted: bool,
+) -> String {
+    use deliverables::DeliverableStatus as Status;
+    let items = &state.task_memory.deliverables.items;
+    let outstanding = items.iter().any(|item| matches!(item.status,
+        Status::Pending | Status::Implemented | Status::Blocked));
+    let verification = &state.task_memory.verification;
+    let need = verification.effective_need(None);
+    let anonymous_gap = items.is_empty() && state.mutations > 0 && state.can_verify
+        && need != Need::Readback
+        && (verification.best_passing(need).is_none()
+            || verification.blocking_failure(&state.task_memory.deliverables).is_some());
+    let steps = &state.task_memory.plan.steps;
+    let unfinished_plan = steps.iter().any(|step| step.status != StepStatus::Completed);
+    if !outstanding && !unfinished_plan && !anonymous_gap {
+        return String::new();
+    }
+    let russian = transcript.language_preference() == "Russian";
+    let mut parts = Vec::new();
+    if anonymous_gap {
+        parts.push(if russian { "Изменённое поведение не подтверждено проверкой." }
+            else { "Changed behaviour is not verified." }.to_owned());
+    }
+    if outstanding {
+        let total = items.iter().filter(|item| item.status != Status::Dropped).count();
+        let verified = items.iter().filter(|item| item.status == Status::Verified).count();
+        parts.push(if russian { format!("Подтверждено результатов: {verified}/{total}.") }
+            else { format!("Deliverables verified: {verified}/{total}.") });
+        for (status, label) in [
+            (Status::Implemented, if russian { "Реализовано, но не проверено" } else { "Implemented, not verified" }),
+            (Status::Pending, if russian { "Не завершено" } else { "Pending" }),
+            (Status::Blocked, if russian { "Заблокировано" } else { "Blocked" }),
+        ] {
+            let ids = items.iter().filter(|item| item.status == status)
+                .map(|item| item.id.as_str()).collect::<Vec<_>>();
+            if !ids.is_empty() { parts.push(format!("{label}: {}.", ids.join(", "))); }
+        }
+    }
+    if unfinished_plan {
+        let completed = steps.iter().filter(|step| step.status == StepStatus::Completed).count();
+        parts.push(if russian { format!("Последнее сохранённое состояние плана: {completed}/{} шагов выполнено; остальные шаги не завершены.", steps.len()) }
+            else { format!("Last recorded plan: {completed}/{} steps complete; remaining steps are incomplete.", steps.len()) });
+    }
+    if turn_budget_exhausted {
+        parts.push(if russian { "Лимит рабочих ходов исчерпан; запуск остановлен с указанным выше состоянием." }
+            else { "Work-turn budget exhausted; the run ended with the state above." }.to_owned());
+    }
+    format!("\n\n**{}** {}", if russian { "Статус Agent V2:" } else { "Agent V2 status:" }, parts.join(" "))
 }
 
 fn emit_status(run_id: &str, content: &str) {
@@ -4065,14 +4121,12 @@ pub fn run(config: Config) {
     state.browser_available = state.can_verify
         && config.browser_capability.unwrap_or_else(|| {
             config
-                .root
-                .as_deref()
+                .work_root()
                 .is_some_and(|root| verification::browser_available(Path::new(root)))
         });
     if state.can_verify && state.strategy.is_deep() {
         state.project_test_command = config
-            .root
-            .as_deref()
+            .work_root()
             .and_then(|root| verification::detect_test_command(Path::new(root)));
     }
     let mut final_content = String::new();
@@ -4097,6 +4151,7 @@ pub fn run(config: Config) {
         .map_or_else(ProjectIndex::empty, ProjectIndex::scan);
     let mut indexed_mutations = state.mutations;
     let mut consecutive_empty_turns = 0_usize;
+    let mut turn_budget_exhausted = false;
 
     emit(
         &config.run_id,
@@ -4160,6 +4215,7 @@ pub fn run(config: Config) {
             state.verification_closed = true;
         }
         if turn >= MAX_INVESTIGATION_TURNS && !transcript.is_finalizing() {
+            turn_budget_exhausted = true;
             transcript.mark_finalizing();
             trace_forensics(
                 &config.run_id,
@@ -4776,6 +4832,10 @@ pub fn run(config: Config) {
             if !was_continuation {
                 append_final_text(&mut final_content, &streamed.content);
             }
+            let note = terminal_status_note(&state, &transcript, turn_budget_exhausted);
+            emit_accepted_final_content(&config.run_id, &note);
+            visible_final_content.push_str(&note);
+            final_content.push_str(&note);
             transcript.assistant_message_with_reasoning(streamed.content, streamed.reasoning_raw);
             transcript.mark_run_complete();
             trace_forensics(
@@ -6834,6 +6894,37 @@ mod tests {
             .implement("d-001", "")
             .unwrap();
         state
+    }
+
+    #[test]
+    fn terminal_disclosure_distinguishes_unverified_blocked_and_saved_plan_without_mutation() {
+        let mut state = state_with_pending();
+        state.task_memory.plan.set(&["inspect".into(), "verify".into()]).unwrap();
+        state.task_memory.deliverables.block("d-002", "browser unavailable").unwrap();
+        let before = serde_json::to_value(&state.task_memory).unwrap();
+        let mut transcript = Transcript::default();
+        transcript.push_run_user(json!({"role":"user","content":"Выполни задачу"}));
+        let note = terminal_status_note(&state, &transcript, true);
+        assert!(note.contains("Подтверждено результатов: 0/2"));
+        assert!(note.contains("Реализовано, но не проверено: d-001"));
+        assert!(note.contains("Заблокировано: d-002"));
+        assert!(note.contains("0/2 шагов выполнено"));
+        assert!(note.contains("Лимит рабочих ходов исчерпан"));
+        assert_eq!(serde_json::to_value(&state.task_memory).unwrap(), before);
+        assert!(!terminal_status_note(&state, &transcript, false).contains("Лимит рабочих ходов"));
+        assert!(terminal_status_note(&AgentState::default(), &transcript, false).is_empty());
+        for item in &mut state.task_memory.deliverables.items {
+            item.status = deliverables::DeliverableStatus::Verified;
+        }
+        for step in &mut state.task_memory.plan.steps { step.status = StepStatus::Completed; }
+        assert!(terminal_status_note(&state, &transcript, true).is_empty());
+        let mut without_items = AgentState::default();
+        without_items.mutations = 1;
+        without_items.can_verify = true;
+        without_items.verification_closed = true;
+        without_items.task_memory.verification.note_change(Some("app.js"));
+        assert!(terminal_status_note(&without_items, &transcript, false).contains("не подтверждено проверкой"),
+            "an exhausted review allowance must not silently certify an unregistered change");
     }
 
     #[test]

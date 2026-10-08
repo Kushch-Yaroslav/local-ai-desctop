@@ -100,11 +100,22 @@ try {
   await page.getByRole('button', { name: /Other task/ }).click(); await panel.waitFor({ state: 'detached' });
   await page.getByRole('button', { name: /Current task/ }).click(); await panel.waitFor();
   assert.match(await panel.innerText(), /Результат 2\/3/);
+  memory.plan.steps[2].status = 'in_progress';
+  await page.evaluate((memory) => window.statusFixture.update(memory), memory);
+  await panel.locator('[aria-current="step"]').waitFor();
+  assert(!(await panel.innerText()).includes('Сохранённое состояние'));
   await page.evaluate(() => window.statusFixture.finish()); await page.waitForSelector('.send-button:not(.stop)');
   assert.equal(await panel.count(), 1, 'completion must retain the panel');
+  await panel.getByText('Сохранённое состояние').waitFor();
+  assert((await panel.innerText()).includes('Незавершённый шаг'));
+  assert.equal(await panel.locator('[aria-current]').count(), 0, 'terminal state must not present a saved step as running');
+  assert.match(await panel.innerText(), /План 2\/3/, 'terminal presentation must preserve the saved progress');
   await send('Continue'); assert.equal(await panel.count(), 1);
+  await panel.locator('[aria-current="step"]').waitFor();
+  assert(!(await panel.innerText()).includes('Сохранённое состояние'));
   await page.evaluate(() => window.statusFixture.finish(true)); await page.waitForSelector('.send-button:not(.stop)');
   assert.equal(await panel.count(), 1, 'failure must retain the panel');
+  await panel.getByText('Сохранённое состояние').waitFor();
   await page.getByRole('button', { name: /Other task/ }).click(); await page.getByRole('button', { name: /Current task/ }).click();
   await panel.waitFor(); assert.match(await panel.innerText(), /Результат 2\/3/);
   await page.reload(); await panel.waitFor({ state: 'detached' }); // Fixture starts a separate empty process/view.

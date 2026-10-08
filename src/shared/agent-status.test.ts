@@ -16,12 +16,18 @@ async function run(): Promise<void> {
     { id: '3', text: 'Bot', status: 'pending' }, { id: '4', text: 'Browser', status: 'blocked', reason: 'Unavailable' }, { id: '5', text: 'Old request', status: 'dropped' },
   ] } };
   const plan: AgentPlan = { taskMemory: memory };
-  const markup = renderToStaticMarkup(createElement(AgentStatusPanel, { plan }));
+  const markup = renderToStaticMarkup(createElement(AgentStatusPanel, { plan, running: true }));
   assert.equal((markup.match(/class="agent-status-panel"/g) ?? []).length, 1);
   assert.match(markup, /aria-expanded="true"/); assert.match(markup, /aria-current="step"/);
   assert.match(markup, /1\/3/); assert.match(markup, /1\/4/);
   for (const label of [agentStatusText.plan, agentStatusText.deliverables, deliverableStatusLabel.implemented, deliverableStatusLabel.verified, deliverableStatusLabel.blocked, deliverableStatusLabel.dropped]) assert(markup.includes(label));
   assert.equal(renderToStaticMarkup(createElement(AgentStatusPanel, { plan: null })), '');
+  const stoppedMarkup = renderToStaticMarkup(createElement(AgentStatusPanel, { plan, running: false }));
+  assert(stoppedMarkup.includes(agentStatusText.saved));
+  assert(stoppedMarkup.includes(agentStatusText.unfinishedStep));
+  assert(!stoppedMarkup.includes('aria-current="step"'));
+  assert(!markup.includes(agentStatusText.saved));
+  assert.equal(memory.plan!.steps[1].status, 'in_progress', 'terminal presentation must not mutate the saved plan or invent completion');
   const evidencePlan: AgentPlan = { taskMemory: { entries: [], deliverables: { items: [
     { id: 'runtime', text: 'Automatic response', status: 'verified', proof: ['ev-pass'], verification_scope: 'acceptance' },
   ] }, verification: { epoch: 2, records: [

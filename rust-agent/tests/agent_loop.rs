@@ -1021,6 +1021,75 @@ fn exhausting_the_turn_budget_withdraws_tools_and_still_answers() {
     assert!(tool_names(&requests[MAX_INVESTIGATION_TURNS - 1]).contains(&"read_file".to_owned()));
 }
 
+/// Incident structure: optional plan left at 1/5, all six outcomes implemented,
+/// selected suite FAIL, then the hard work-turn limit. The run may end, but its
+/// persisted visible answer must expose the actual state even if prose lies.
+#[test]
+fn budget_exit_discloses_unverified_results_and_preserves_unreconciled_plan() {
+    let mut files = APP.to_vec();
+    files.push(("test.js", "console.error('FAIL: project suite assertion'); process.exit(1);\n"));
+    let workspace = Workspace::new(&files);
+    let provider = Provider::start(|request, n| {
+        if request.get("tools").is_none() {
+            assert!(user_turn_context(request).contains("MODE: FINALIZING"));
+            return Reply::Text("Everything works and is fully verified.".into());
+        }
+        match n {
+            0 => {
+                let mut calls = vec![plan(json!({"action":"set","steps":["inspect","implement","test","browser","regression"]}))];
+                for id in 1..=6 {
+                    calls.push(deliverable("add", json!({"id":format!("d{id}"),"text":format!("Outcome {id}"),"check":if id <= 3 { "browser" } else { "test" }})));
+                }
+                Reply::Tools(calls)
+            }
+            1 => {
+                let mut calls = vec![edit_app(BAD), plan(json!({"action":"update","id":"s1","status":"completed"}))];
+                for id in 1..=6 {
+                    calls.push(deliverable("implemented", json!({"id":format!("d{id}"),"evidence":"source changed"})));
+                }
+                Reply::Tools(calls)
+            }
+            2 => Reply::Tools(vec![("run_terminal",json!({"command":"node test.js","deliverable_ids":["d4","d5","d6"]}))]),
+            _ => Reply::Tools(vec![("list_directory",json!({"path":"."}))]),
+        }
+    });
+    let user = "Implement the six outcomes and verify them.";
+    run(workspace.config(&provider.endpoint, user));
+    let requests = provider.requests();
+    assert_eq!(requests.len(), MAX_INVESTIGATION_TURNS + 1, "terminal disclosure must not add a provider call");
+    assert_eq!(withheld_drafts(&workspace.journal()), 0, "budget exit remains bounded");
+    let last = requests.last().unwrap();
+    let plan = latest_runtime_section(last, "plan");
+    assert!(plan.contains("[x] s1") && plan.contains("[>] s2") && plan.contains("[ ] s5"));
+    let results = latest_runtime_section(last, "deliverables");
+    assert_eq!(results.matches("[implemented]").count(), 6);
+    assert!(!results.contains("[verified]"));
+    let shown = "Everything works and is fully verified.\n\n**Agent V2 status:** Deliverables verified: 0/6. Implemented, not verified: d1, d2, d3, d4, d5, d6. Last recorded plan: 1/5 steps complete; remaining steps are incomplete. Work-turn budget exhausted; the run ended with the state above.";
+    let active: Value = serde_json::from_slice(&std::fs::read(workspace.base.join("evidence/active.json")).unwrap()).unwrap();
+    let expected = local_ai_agent_runtime::agent::evidence::history_hash(&[
+        json!({"role":"user","content":user}), json!({"role":"assistant","content":shown}),
+    ]);
+    assert_eq!(active["expected_history_hash"], expected, "the UI answer and Continue history must include the runtime disclosure");
+    assert!(completed(&workspace.journal()));
+
+    // Continue must resume the same journal when the persisted assistant text
+    // includes the disclosure, while starting a new work phase.
+    let resumed_provider = Provider::start(|request, _| {
+        let plan = latest_runtime_section(request, "plan");
+        assert!(plan.contains("[x] s1") && plan.contains("[>] s2") && plan.contains("[ ] s5"));
+        assert_eq!(latest_runtime_section(request, "deliverables").matches("[implemented]").count(), 6);
+        Reply::Text("Still implemented, not verified; no additional check ran.".into())
+    });
+    let mut resumed = workspace.config(&resumed_provider.endpoint, "Continue");
+    resumed.history = vec![json!({"role":"user","content":user}), json!({"role":"assistant","content":shown})];
+    run(resumed);
+    assert!(tool_names(&resumed_provider.requests()[0]).contains(&"read_file".to_owned()),
+        "Continue must leave synthesis and restore work tools; historical finalizing state remains in the journal");
+    assert!(resumed_provider.requests().len() <= 3, "Continue reviews remain bounded");
+    let resumed_active: Value = serde_json::from_slice(&std::fs::read(workspace.base.join("evidence/active.json")).unwrap()).unwrap();
+    assert_eq!(resumed_active["run_dir"], active["run_dir"], "the disclosure must not fork the durable history on Continue");
+}
+
 /// A provider that keeps calling tools during synthesis gets an explicit
 /// instruction instead of silently looping, and the run stays bounded.
 #[test]
@@ -1406,6 +1475,40 @@ fn explicit_directory_without_a_project_exposes_execution_tools_and_really_execu
         !granted.join(".ai-framework").exists() && !workspace.root.join(".ai-framework").exists(),
         "a workspace run must not create a project knowledge cache"
     );
+}
+
+/// Availability discovery must use the terminal's effective directory, even
+/// when the user granted a path without selecting a persisted project. Finding
+/// a driver is capability discovery, never passing browser evidence.
+#[test]
+fn explicit_workspace_discovers_browser_capability_without_fabricating_proof() {
+    for mode in ["fast", "deep"] {
+        let workspace = Workspace::new(&[("node_modules/puppeteer/package.json", "{}")]);
+        let provider = Provider::start(|request, n| match n {
+            0 => Reply::Tools(vec![deliverable("add", json!({"text":"page responds to interaction","check":"browser"}))]),
+            1 => Reply::Tools(vec![
+                ("create_file", json!({"path":"index.html","content":"<button>test</button>"})),
+                deliverable("implemented", json!({"id":"d-001","evidence":"page created"})),
+            ]),
+            2 => Reply::Tools(vec![verify("d-001", None)]),
+            _ => {
+                let context = user_turn_context(request);
+                assert!(!context.contains("none available"), "{context}");
+                assert!(context.contains("not verified"));
+                assert!(!latest_runtime_section(request, "deliverables").contains("[verified]"));
+                Reply::Text("Implemented, not verified: no browser interaction ran.".into())
+            }
+        });
+        let mut config = workspace.config(&provider.endpoint, "create and check the page");
+        config.root = None;
+        config.workspace_roots = vec![workspace.root.to_string_lossy().into_owned()];
+        config.browser_capability = None;
+        config.reasoning_mode = mode.into();
+        run(config);
+        assert_eq!(provider.requests().len(), if mode == "deep" { 6 } else { 5 });
+        assert_eq!(withheld_drafts(&workspace.journal()), if mode == "deep" { 2 } else { 1 });
+        assert!(completed(&workspace.journal()));
+    }
 }
 
 /// Neither a project nor a named directory: no execution tools, and the model
