@@ -18,7 +18,7 @@ const api: LocalAiApi = {
   },
   analysis: { list: (conversationId) => ipcRenderer.invoke('analysis:list', conversationId) },
   models: { list: () => ipcRenderer.invoke('models:list') },
-  settings: { get: () => ipcRenderer.invoke('settings:get'), save: (config) => ipcRenderer.invoke('settings:save', config) },
+  settings: { get: () => ipcRenderer.invoke('settings:get'), save: (config) => ipcRenderer.invoke('settings:save', config), dismissSetup: () => ipcRenderer.invoke('settings:dismissSetup') },
   hardware: { get: () => ipcRenderer.invoke('hardware:get') },
   contextEstimate: (modelId) => ipcRenderer.invoke('context:estimate', modelId),
   contextDiscover: (modelId) => ipcRenderer.invoke('context:discover', modelId),

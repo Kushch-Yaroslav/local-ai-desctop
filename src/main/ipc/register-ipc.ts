@@ -12,7 +12,7 @@ import { LlamaCppBackend } from '../backends/llama-cpp-backend';
 import { LlamaRuntimeController, type LlamaRuntimeState } from '../services/llama-runtime-controller';
 import { RustAgentRuntime, taskPlan, type AgentProject } from '../services/rust-agent-runtime';
 import { paths } from '../services/paths';
-import { runtimeSetup, saveRuntimeConfiguration } from '../services/runtime-settings';
+import { dismissRuntimeSetup, normalizeConfiguration, runtimeSetup, saveRuntimeConfiguration } from '../services/runtime-settings';
 import { discardAgentEvidence } from '../services/agent-evidence';
 import { log } from '../services/logger';
 import { getModelProfile } from '../models/model-registry';
@@ -554,10 +554,23 @@ export function registerIpc(): void {
   };
   ipcMain.handle('settings:get', getSettings);
   ipcMain.handle('settings:save', async (_event, config: unknown) => {
-    if (activeGenerations.size || contextDiscoveryBusy || runtimeSelectionBusy || (await llamaRuntime.state()).status === 'ready') throw new Error('Перед изменением runtime перезапустите приложение и не загружайте модель.');
-    saveRuntimeConfiguration(config);
+    if (activeGenerations.size || contextDiscoveryBusy || runtimeSelectionBusy) throw new Error('Дождитесь завершения генерации, выбора модели или поиска контекста.');
+    const next = normalizeConfiguration(config);
+    const active = await llamaRuntime.state();
+    if (active.status === 'ready' && active.modelId) {
+      const prior = runtimeSetup().config;
+      const before = prior.models.find((model) => model.id === active.modelId);
+      const after = next.models.find((model) => model.id === active.modelId);
+      const sameActive = before && after && before.modelPath === after.modelPath && before.mmprojPath === after.mmprojPath
+        && before.gpuLayers === after.gpuLayers && before.speculative === after.speculative;
+      if (!sameActive || prior.llamaServerPath !== next.llamaServerPath || prior.gpuLayers !== next.gpuLayers) {
+        throw new Error('Сначала выберите другую модель или перезапустите приложение, чтобы изменить настройки активной модели/runtime.');
+      }
+    }
+    saveRuntimeConfiguration(next);
     return getSettings();
   });
+  ipcMain.handle('settings:dismissSetup', async () => { dismissRuntimeSetup(); return getSettings(); });
   ipcMain.handle('hardware:get', getHardwareStats);
   ipcMain.handle('context:estimate', async (_event, modelId: string): Promise<RuntimeContextEstimate> => {
     if (typeof modelId !== 'string' || !modelId) throw new Error('Не указана модель для оценки контекста');

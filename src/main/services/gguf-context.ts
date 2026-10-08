@@ -77,5 +77,7 @@ export async function ggufTrainContext(path: string): Promise<number> {
 export async function llamaCapabilityLimit(modelId: string): Promise<number> {
   const profile = llamaRuntimeProfile(modelId);
   if (!profile) throw new Error(`Неизвестная модель llama.cpp: ${modelId}.`);
-  return Math.min(profile.maxContext, profile.modelPath ? await ggufTrainContext(profile.modelPath) : profile.maxContext);
+  if (!profile.modelPath) return profile.maxContext;
+  try { return Math.min(profile.maxContext, await ggufTrainContext(profile.modelPath)); }
+  catch { return profile.maxContext; }
 }

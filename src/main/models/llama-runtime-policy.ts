@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs';
-import { modelPaths } from '../services/runtime-settings';
+import { effectiveRuntimeConfiguration, isValidGgufModel, modelPaths } from '../services/runtime-settings';
 import { ggufArtifactPaths } from '../services/gguf-artifacts';
 import type { ModelInfo } from '../../shared/types';
 import { contextPresetsFor } from './model-registry';
@@ -53,6 +53,7 @@ export type LlamaRuntimeProfile = {
   /** Conservative host allocation envelope, excluding the existing discovery host reserve. */
   hostResidentBudgetBytes?: number;
   normalContext?: ModelInfo['normalContext'];
+  gpuLayers?: number | null;
 };
 
 /** Verified in both embedded Qwen templates: the Huihui high alias adds no separate effort level. */
@@ -86,8 +87,20 @@ const genericRuntimeProfiles: readonly LlamaRuntimeProfile[] = [
   { id: 'gpt-oss:20b', maxContext: 131_072, speculative: 'none', vision: false, reasoning: { efforts: { low: 'low', medium: 'medium', high: 'high' }, final: { reasoning_effort: 'low' } } },
 ];
 
-export function llamaRuntimeProfile(id: string): LlamaRuntimeProfile | undefined { return [...llamaRuntimeProfiles, ...genericRuntimeProfiles].find((profile) => profile.id === id); }
-export function llamaRuntimeInstalled(profile: LlamaRuntimeProfile): boolean { return Boolean(profile.modelPath && ggufArtifactPaths(profile.modelPath).every((path) => existsSync(path))); }
+export function llamaRuntimeProfilesList(config = effectiveRuntimeConfiguration()): LlamaRuntimeProfile[] {
+  const known = new Map(llamaRuntimeProfiles.map((profile) => [profile.id, profile]));
+  return config.models.map((model) => {
+    const builtin = known.get(model.id);
+    if (builtin) return { ...builtin, speculative: model.speculative, ...modelPaths(model.id, config), vision: Boolean(model.mmprojPath && existsSync(model.mmprojPath)), gpuLayers: model.gpuLayers };
+    return { id: model.id, maxContext: 32_768, ...modelPaths(model.id, config), speculative: model.speculative,
+      vision: Boolean(model.mmprojPath && existsSync(model.mmprojPath)), visionWithMtp: false,
+      gpuLayers: model.gpuLayers };
+  });
+}
+export function llamaRuntimeProfile(id: string): LlamaRuntimeProfile | undefined {
+  return llamaRuntimeProfilesList().find((profile) => profile.id === id) ?? genericRuntimeProfiles.find((profile) => profile.id === id);
+}
+export function llamaRuntimeInstalled(profile: LlamaRuntimeProfile): boolean { return Boolean(profile.modelPath && isValidGgufModel(profile.modelPath) && ggufArtifactPaths(profile.modelPath).every((path) => existsSync(path))); }
 export function llamaContextPresets(id: string, trainedContext?: number): number[] {
   const profile = llamaRuntimeProfile(id);
   return profile ? contextPresetsFor(Math.min(profile.maxContext, trainedContext ?? profile.maxContext)) : [];

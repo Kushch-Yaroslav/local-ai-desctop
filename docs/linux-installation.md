@@ -22,6 +22,11 @@ helper are included; **llama.cpp, model weights and GPU drivers are external**.
 Package dependencies include Electron's desktop libraries and the Bash/curl
 supervisor dependencies. Install through the package manager rather than copying
 the executable alone: its libraries, resources and sandbox helper belong together.
+The executable is installed under `/opt/local-ai-desktop/` so its path is safe
+for Chromium's sandbox even when the user-facing app name contains spaces. The
+package carries Electron's sandbox helper and its post-install script applies
+the supported ownership/mode based on the host's user-namespace policy. The
+desktop menu still displays **Local AI Desktop**.
 
 The actual `.deb` payload was extracted and launched with Electron during
 validation. A privileged package-manager installation and a fresh OS installation
@@ -88,14 +93,17 @@ hosts; the supported `.deb` preserves sandboxing instead.
 
 ## Set up llama.cpp and models
 
-Open **«Настройка runtime»** in the sidebar footer. Missing binaries or models
-appear as setup issues while the application remains usable in an idle state.
-The panel is the normal configuration entry point; no source edits or example
-configuration file are needed.
+Open **«Настроить модели»** in the highlighted sidebar footer. On first launch,
+the panel opens automatically if no usable model is configured; dismissing it is
+remembered. The footer stops drawing attention once a readable GGUF and an
+executable `llama-server` are available. Missing files and runtime tools appear
+with plain-language status while the application remains usable in an idle state.
+No source edits or example configuration file are needed.
 
 1. Choose an executable `llama-server`, or leave the field blank to search `PATH`.
 2. Choose an existing directory for models.
-3. Choose a main GGUF for at least one of the three existing model profiles.
+3. Select **«Добавить GGUF»**, browse to any compatible model file and give it a
+   display name. Existing built-in profiles can also be edited or removed.
 4. Optionally choose the matching vision projector. Leave it blank for text only.
 5. Set GPU layers (`999` means all available layers; `0` requests CPU placement).
 6. Save, **restart the application**, then select the installed model at the top.
@@ -129,7 +137,13 @@ builds follow upstream instructions but were not exercised in this feature.
 Local AI Desktop starts the server with the existing per-model arguments; it is
 not necessary to start a second server manually.
 
-The selector still contains exactly these supported profiles:
+Three profiles are included as convenient starting points. You can add any
+compatible GGUF; unknown models use conservative defaults (no assumed reasoning
+template, tool calling or MTP). Set tool support only if the model reliably emits
+llama.cpp-compatible tool calls. Custom models start with a conservative 32K
+context ceiling, further reduced when a smaller context is recorded in their GGUF.
+A projector is optional and
+enables image input only when that model/runtime supports it.
 
 | Profile | GGUF setup |
 | --- | --- |
@@ -142,8 +156,9 @@ parts together, and respect their licenses. Each profile's GGUF field accepts
 the downloaded filename; renaming downloads to match defaults is unnecessary.
 For the baseline Qwen3.8, verify that the chosen conversion retains MTP tensors;
 the previous local baseline came from an existing installation rather than a
-fresh download validated in this change. This feature does not add arbitrary
-models or certify other quantizations. The retired Coder-Next profile is absent.
+fresh download validated in this change. These examples do not certify other
+quantizations. The retired Coder-Next profile is absent; users can still add a
+compatible GGUF under a custom profile.
 
 The existing Thinking/MTP controls and restrictions remain in force. For example,
 the Qwen3.6 MTP-on path is text only; its projector is used with MTP off, as recorded
@@ -214,8 +229,8 @@ value. Do not set launcher-owned internal variables for ordinary installation.
   service or launch with `LOCAL_AI_LLAMA_PORT=8082`; app and supervisor share this
   port. Do not run two independent launchers against the same data directory.
 - **Corrupt settings:** the setup panel reports the file and permits recovery.
-  With the app closed, back up/rename only `runtime-settings.json`, then reopen and
-  configure it again. Do not delete the conversation database.
+  Saving repaired settings preserves the malformed file as
+  `runtime-settings.json.invalid-*.bak`. Do not delete the conversation database.
 - **Data directory denied/read-only:** use a writable XDG location or
   `LOCAL_AI_RUNTIME_ROOT`; a startup dialog identifies directory-creation errors.
 - **Chromium sandbox startup failure:** use the installed `.deb` helper or a

@@ -39,7 +39,7 @@ ACTIVE_KV_OFFLOAD="1"
 ACTIVE_SPECULATIVE_MODE="none"
 LAUNCH_ERROR=""
 REQUEST_CONTEXT_FOR_ERROR=""
-VARIANT=""; MODEL=""; MMPROJ=""; RUNTIME_MODEL_ID=""; RUNTIME_LABEL=""; DEFAULT_LLAMA_CONTEXT=""; MAX_LLAMA_CONTEXT=""
+VARIANT=""; MODEL=""; MMPROJ=""; RUNTIME_MODEL_ID=""; RUNTIME_LABEL=""; DEFAULT_LLAMA_CONTEXT=""; MAX_LLAMA_CONTEXT=""; MODEL_GPU_LAYERS=""
 SPECULATIVE_MODE="none"; DRAFT_MODEL=""; DRAFT_KV_SHARED="0"; DRAFT_N_MAX=""
 PROFILE_SERVER_ARGS=()
 
@@ -162,7 +162,7 @@ launch_server() {
   [[ -f "$MODEL" ]] || { LAUNCH_ERROR="Не найден GGUF выбранной модели: $MODEL"; return 1; }
   [[ -z "$MMPROJ" || -f "$MMPROJ" ]] || { LAUNCH_ERROR="Не найден vision projector: $MMPROJ"; return 1; }
 
-  local context_args=(--cache-type-k "$kv_type" --cache-type-v "$kv_type") gpu_layers="${GPU_LAYERS:-999}"
+  local context_args=(--cache-type-k "$kv_type" --cache-type-v "$kv_type") gpu_layers="${MODEL_GPU_LAYERS:-${GPU_LAYERS:-999}}"
   if [[ "$SPECULATIVE_MODE" != "none" ]]; then context_args+=(--cache-type-k-draft "$kv_type" --cache-type-v-draft "$kv_type"); fi
   if [[ "$kv_offload" == "0" ]]; then context_args+=(--no-kv-offload); else context_args+=(--kv-offload); fi
   log "context.policy variant=$VARIANT ctx_size=$context kv_type=$kv_type kv_offload=$kv_offload gpu_layers=$gpu_layers"

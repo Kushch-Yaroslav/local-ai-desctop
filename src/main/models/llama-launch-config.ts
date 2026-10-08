@@ -75,6 +75,7 @@ export function launchProfileEnvironment(profile: LlamaRuntimeProfile, enabled?:
     RUNTIME_LABEL: getModelProfile(profile.id)?.displayName ?? profile.id, DEFAULT_LLAMA_CONTEXT: String(profile.normalContext?.initialContextWindow ?? 32_768), MAX_LLAMA_CONTEXT: String(profile.maxContext),
     SPECULATIVE_MODE: mode, DRAFT_MODEL: draft?.path ?? '', DRAFT_KV_SHARED: draft?.kvCache === 'shared' ? '1' : '0',
     DRAFT_N_MAX: draft ? String(draft.maxDraftTokens) : mode === 'mtp' && profile.speculativeDraftTokens ? String(profile.speculativeDraftTokens) : '',
+    MODEL_GPU_LAYERS: profile.gpuLayers === null || profile.gpuLayers === undefined ? '' : String(profile.gpuLayers),
   };
   return [...Object.entries(values).map(([key, value]) => `${key}=${quote(value)}`), `PROFILE_SERVER_ARGS=(${placementArguments(profile).map(quote).join(' ')})`].join('\n');
 }

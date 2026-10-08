@@ -73,8 +73,8 @@
     "npm": ">=10 <12"
   },
   "build": {
+    "productName": "local-ai-desktop",
     "appId": "io.github.local-ai-desktop",
-    "productName": "Local AI Desktop",
     "asar": false,
     "directories": {
       "output": "release"
@@ -87,6 +87,12 @@
       "scripts/electron-sandbox.sh",
       "package.json",
       "assets/ATTRIBUTION.md"
+    ],
+    "extraFiles": [
+      {
+        "from": "node_modules/electron/dist/chrome-sandbox.disabled",
+        "to": "chrome-sandbox"
+      }
     ],
     "extraResources": [
       {
@@ -102,7 +108,14 @@
       "category": "Development",
       "icon": "assets/fluent-bot-sparkle-cyan.png",
       "maintainer": "Local AI Desktop contributors",
-      "syncDesktopName": true
+      "syncDesktopName": true,
+      "desktop": {
+        "entry": {
+          "Name": "Local AI Desktop",
+          "Name[ru]": "Local AI Desktop",
+          "Comment": "Локальный AI-клиент для llama.cpp"
+        }
+      }
     },
     "npmRebuild": false,
     "deb": {

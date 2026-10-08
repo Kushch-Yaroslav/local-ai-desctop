@@ -206,13 +206,26 @@ export interface HardwareStats {
 }
 
 export interface RuntimeConfiguration {
+  schemaVersion: 2;
   llamaServerPath: string | null;
   modelsPath: string;
   gpuLayers: number;
-  models: Record<string, { modelPath?: string; mmprojPath?: string }>;
+  setupDismissed: boolean;
+  models: RuntimeModelConfiguration[];
+}
+export interface RuntimeModelConfiguration {
+  id: string;
+  displayName: string;
+  modelPath: string;
+  mmprojPath: string;
+  gpuLayers: number | null;
+  supportsTools: boolean;
+  speculative: 'mtp' | 'none';
+  /** Null inherits the global GPU layer count; a number overrides it for this model. */
+  builtin: boolean;
 }
 export interface AppSettings {
-  setup?: { config: RuntimeConfiguration; server: string | null; models: Array<{ id: string; name: string; modelPath: string; mmprojPath?: string; installed: boolean }>; issues: string[]; configPath: string; dataDirectory: string };
+  setup?: { config: RuntimeConfiguration; server: string | null; ready: boolean; autoOpen: boolean; models: Array<{ id: string; name: string; modelPath: string; mmprojPath?: string; installed: boolean; status: 'ready' | 'missing-model' | 'missing-server' | 'invalid-projector'; issue?: string; builtin: boolean }>; issues: string[]; configPath: string; dataDirectory: string };
   llamaServerPath: string | null;
   llamaRuntimeModelId?: string;
   /** Live state of the launcher-managed llama-server; the authority on what is running. */
@@ -384,7 +397,7 @@ export interface LocalAiApi {
   };
   analysis: { list(conversationId: string): Promise<AnalysisRun[]> };
   models: { list(): Promise<ModelInfo[]> };
-  settings: { get(): Promise<AppSettings>; save(config: RuntimeConfiguration): Promise<AppSettings> };
+  settings: { get(): Promise<AppSettings>; save(config: RuntimeConfiguration): Promise<AppSettings>; dismissSetup(): Promise<AppSettings> };
   hardware: { get(): Promise<HardwareStats> };
   contextEstimate(modelId: string): Promise<RuntimeContextEstimate>;
   contextDiscover(modelId: string): Promise<ContextDiscoveryResult>;

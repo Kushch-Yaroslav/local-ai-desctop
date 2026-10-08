@@ -30,7 +30,7 @@ function createWindow(): void {
   if (!devServerUrl && !existsSync(rendererPath)) throw new Error(`Не найден production renderer: ${rendererPath}`);
   if (!existsSync(preloadPath)) throw new Error(`Не найден preload: ${preloadPath}`);
   mainWindow = new BrowserWindow({
-    width: 1440, height: 920, minWidth: 980, minHeight: 640,
+    title: 'Local AI Desktop', width: 1440, height: 920, minWidth: 980, minHeight: 640,
     backgroundColor: '#111318',
     webPreferences: { preload: preloadPath, contextIsolation: true, nodeIntegration: false, sandbox: true },
   });

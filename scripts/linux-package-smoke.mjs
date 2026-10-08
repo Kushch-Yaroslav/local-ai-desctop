@@ -9,6 +9,10 @@ import { createServer } from 'node:http';
 import { _electron as electron } from 'playwright-core';
 
 const release = resolve('release');
+const u32 = (n) => { const b = Buffer.alloc(4); b.writeUInt32LE(n); return b; };
+const u64 = (n) => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(n)); return b; };
+const ggufText = (s) => Buffer.concat([u64(Buffer.byteLength(s)), Buffer.from(s)]);
+const ggufFixture = () => Buffer.concat([Buffer.from('GGUF'), u32(3), u64(0), u64(2), ggufText('general.architecture'), u32(8), ggufText('fixture'), ggufText('fixture.context_length'), u32(4), u32(32_768)]);
 const name = (await readdir(release)).find((name) => name.endsWith('_amd64.deb'));
 assert(name, 'Build npm run package:linux first');
 const fixture = await mkdtemp(join(tmpdir(), 'linux package smoke space '));
@@ -16,8 +20,26 @@ let application, provider;
 try {
   const payload = join(fixture, 'payload');
   execFileSync('dpkg-deb', ['-x', join(release, name), payload]);
+  const control = join(fixture, 'control'); await mkdir(control);
+  execFileSync('dpkg-deb', ['-e', join(release, name), control]);
+  const postInstall = await readFile(join(control, 'postinst'), 'utf8');
+  assert(postInstall.includes("chmod 4755 '/opt/local-ai-desktop/chrome-sandbox'"));
+  assert(postInstall.includes("chmod 0755 '/opt/local-ai-desktop/chrome-sandbox'"));
+  assert(!postInstall.includes('/opt/Local AI Desktop/'));
+  assert(!postInstall.includes('--no-sandbox'), 'the package installation must retain Chromium sandboxing');
+  const packageIndex = execFileSync('dpkg-deb', ['-c', join(release, name)], { encoding: 'utf8', maxBuffer: 12 * 1024 * 1024 });
+  const sandboxEntry = packageIndex.split('\n').find((line) => line.endsWith('./opt/local-ai-desktop/chrome-sandbox'));
+  assert(sandboxEntry, 'the Electron chrome-sandbox helper must ship in the package');
+  assert.match(sandboxEntry, /^-rwxr-xr-x 0\/0 /, 'the package must install a root-owned executable helper before the SUID post-install choice');
+  const desktopDirectory = join(payload, 'usr/share/applications');
+  const desktopFile = join(desktopDirectory, (await readdir(desktopDirectory))[0]);
+  const desktopEntry = await readFile(desktopFile, 'utf8');
+  assert(desktopEntry.includes('Name=Local AI Desktop'));
+  assert(desktopEntry.includes('Exec=/opt/local-ai-desktop/local-ai-desktop %U'));
   const opt = join(payload, 'opt');
-  const installation = join(opt, (await readdir(opt))[0]);
+  const installationName = (await readdir(opt))[0];
+  assert.equal(installationName, 'local-ai-desktop', 'the installed executable directory must not contain spaces');
+  const installation = join(opt, installationName);
   const executable = join(installation, 'local-ai-desktop');
   // Unprivileged extraction cannot reproduce the installer's root-owned SUID
   // helper/AppArmor policy. Use a trusted configured/system helper here; never
@@ -46,19 +68,49 @@ try {
   assert(first.setup.models.every((model) => !model.installed));
   assert.equal(first.llamaRuntime.status, 'idle'); assert.equal(first.llamaRuntime.modelId, null);
   assert.equal((await page.evaluate(() => window.localAi.models.list())).length, 3);
-  await page.getByRole('button', { name: /Настройка runtime/ }).click();
-  const setup = page.getByRole('dialog'); await setup.waitFor();
-  assert((await setup.innerText()).includes('Модели не установлены'));
+  let setup = page.getByRole('dialog'); await setup.waitFor();
+  assert((await setup.innerText()).includes('Добавьте GGUF'));
+  const setupButton = page.getByRole('button', { name: /Настроить модели/ });
+  await setupButton.waitFor();
+  assert.notEqual(await setupButton.evaluate((element) => getComputedStyle(element).animationName), 'none', 'setup should draw attention before a usable model exists');
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  assert.equal(await setupButton.evaluate((element) => getComputedStyle(element).animationName), 'none', 'reduced motion disables attention pulse');
+  await page.emulateMedia({ reducedMotion: 'no-preference' });
+  await setup.getByRole('button', { name: 'Закрыть настройки' }).click();
+  await setup.waitFor({ state: 'detached' });
+  const dismissed = await page.evaluate(() => window.localAi.settings.dismissSetup());
+  assert.equal(dismissed.setup.config.setupDismissed, true, 'dismissal persists and must not repeatedly reopen setup');
+  await application.close(); application = undefined;
+  page = await launch();
+  assert.equal(await page.getByRole('dialog').count(), 0, 'dismissed incomplete setup stays closed after restart');
+  assert.equal((await page.evaluate(() => window.localAi.settings.get())).setup.autoOpen, false);
+  const openSetupButton = page.getByRole('button', { name: /Настроить модели/ });
+  assert.equal(await openSetupButton.isDisabled(), false, 'incomplete setup entry remains available after dismissal');
+  await openSetupButton.click();
+  setup = page.getByRole('dialog');
+  await setup.waitFor({ timeout: 5_000 });
   const weights = join(fixture, 'models with spaces'); await mkdir(weights);
   const server = join(fixture, "llama server 'fixture'");
   await writeFile(server, '#!/bin/sh\nexit 1\n'); await chmod(server, 0o755);
-  await setup.getByLabel('llama-server (пусто — поиск в PATH)').fill(server);
+  await setup.getByLabel('Путь к llama-server').fill(server);
   await setup.getByLabel('Каталог моделей').fill(weights);
-  await setup.getByLabel('GPU-слои: 0 — CPU, 999 — все доступные').fill('0');
-  await setup.getByRole('button', { name: 'Сохранить', exact: true }).click();
-  await setup.getByRole('status').filter({ hasText: 'Сохранено' }).waitFor();
+  await setup.getByLabel('GPU-слои по умолчанию').fill('0');
+  await setup.getByRole('button', { name: 'Сохранить изменения' }).click();
+  await setup.getByRole('status').filter({ hasText: 'Настройки сохранены' }).waitFor();
   const saved = JSON.parse(await readFile(first.setup.configPath, 'utf8'));
   assert.equal(saved.llamaServerPath, server); assert.equal(saved.modelsPath, weights); assert.equal(saved.gpuLayers, 0);
+  const modelFile = join(weights, 'arbitrary model.gguf'); await writeFile(modelFile, ggufFixture());
+  const customId = `custom:${crypto.randomUUID()}`;
+  const withCustom = await page.evaluate(async ({ modelFile, customId }) => {
+    const current = await window.localAi.settings.get();
+    return window.localAi.settings.save({ ...current.setup.config, models: [...current.setup.config.models, {
+      id: customId, displayName: 'Arbitrary Fixture', modelPath: modelFile, mmprojPath: '', gpuLayers: null,
+      supportsTools: false, speculative: 'none', builtin: false,
+    }] });
+  }, { modelFile, customId });
+  assert.equal(withCustom.setup.ready, true, 'arbitrary custom GGUF plus executable server is ready');
+  assert.equal(withCustom.setup.models.find((model) => model.id === customId)?.status, 'ready');
+  assert((await page.evaluate(() => window.localAi.models.list())).some((model) => model.id === customId));
   const identity = await application.evaluate(({ app }) => ({ packaged: app.isPackaged, cwd: process.cwd(), resources: process.resourcesPath }));
   assert(identity.packaged); assert.equal(identity.cwd, fixture);
   const binary = join(identity.resources, 'agent/local-ai-agent-runtime');
@@ -69,6 +121,10 @@ try {
   page = await launch();
   const restored = await page.evaluate(() => window.localAi.settings.get());
   assert.equal(restored.setup.server, server); assert.equal(restored.setup.config.modelsPath, weights); assert.equal(restored.setup.config.gpuLayers, 0);
+  assert.equal(restored.setup.ready, true); assert.equal(restored.setup.autoOpen, false);
+  const readyButton = page.getByRole('button', { name: /Настройки моделей и runtime/ });
+  assert.equal(await readyButton.evaluate((element) => getComputedStyle(element).animationName), 'none', 'a usable model stops the setup animation');
+  assert((await page.evaluate(() => window.localAi.models.list())).some((model) => model.id === customId));
   assert.equal(restored.llamaRuntime.status, 'idle', 'saved configuration never autoloads a model');
   await application.close(); application = undefined;
   assert(!(await readdir(dataRoot)).includes('llama-cpp-mtp-launcher.pid'), 'owned supervisor must stop on application quit');
@@ -98,7 +154,7 @@ try {
     });
     worker.stdin.write(JSON.stringify({ type: 'run', run_id: 'package-smoke', endpoint: `http://127.0.0.1:${provider.address().port}`, model: 'fixture', system: 'Answer briefly.', user: 'Say hello.', history: [], context_limit: 32_768, reasoning_mode: 'fast', web_mode: 'off', policy: 'auto' })+'\n');
   });
-  console.log('Real Debian payload smoke passed: relocated/spaced path, sandbox retained, Electron/preload/SQLite, first-run missing resources, settings UI/save/restart, three model choices, idle supervisor cleanup and shipped Rust protocol response');
+  console.log('Real Debian payload smoke passed: safe install path, desktop entry, root-owned sandbox helper/postinst SUID choice, Electron/preload/SQLite, first-run setup, persistent custom model, reduced-motion attention state, settings restart and shipped Rust response');
 } finally {
   if (application) await application.close();
   if (provider) await new Promise((done) => provider.close(done));

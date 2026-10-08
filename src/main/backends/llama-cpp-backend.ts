@@ -2,7 +2,7 @@ import type { ChatMessage, FinishReason, ModelInfo, StreamEvent } from '../../sh
 import { createHash } from 'node:crypto';
 import { wholeNanoseconds, type ContextWindow, type InferenceDiagnostics, type LlmBackend, type RuntimeContextEvidence, type ToolCallingBackend, type ToolInferenceRequestContext, type ToolInferenceStreamEvent, type ToolMessage } from './types';
 import { getModelProfile, maxOutputTokens, modelInfo, outputBudget, outputSafetyReserveTokens } from '../models/model-registry';
-import { llamaContextPresets, llamaReasoningForInput, llamaRuntimeInstalled, llamaRuntimeProfile, llamaRuntimeProfiles, reasoningCapability } from '../models/llama-runtime-policy';
+import { llamaContextPresets, llamaReasoningForInput, llamaRuntimeInstalled, llamaRuntimeProfile, llamaRuntimeProfilesList, reasoningCapability } from '../models/llama-runtime-policy';
 import { reasoningModeOf, sameReasoningInput, type ReasoningInput } from '../../shared/reasoning-controls';
 import { log } from '../services/logger';
 import type { LlamaKvCacheType } from '../../shared/types';
@@ -135,7 +135,7 @@ export class LlamaCppBackend implements LlmBackend, ToolCallingBackend {
     } catch { /* offline: only file availability is known */ }
     if (this.runtimeModelId && !getModelProfile(this.runtimeModelId)) throw new Error(`llama.cpp запущен с неизвестной моделью: ${this.runtimeModelId}`);
     const result: ModelInfo[] = [];
-    for (const runtime of llamaRuntimeProfiles) {
+    for (const runtime of llamaRuntimeProfilesList()) {
       const profile = getModelProfile(runtime.id);
       if (!profile) continue;
       const active = runtime.id === this.runtimeModelId;

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -7,6 +8,8 @@ import { once } from 'node:events';
 import { LlamaCppBackend, LlamaCppContextExhaustedError, LlamaCppRequestError, validateLlamaMessageSequence } from './llama-cpp-backend';
 import type { ToolMessage } from './types';
 import { llamaReasoningForInput, llamaRuntimeProfiles } from '../models/llama-runtime-policy';
+import { builtinModelCatalog } from '../models/model-catalog';
+import type { RuntimeConfiguration } from '../../shared/types';
 import type { ChatMessage } from '../../shared/types';
 
 const model = 'qwen3.8:27b-q4_K_M';
@@ -69,14 +72,25 @@ export async function runLlamaCppBackendRegression(): Promise<void> {
   // developer's multi-GB weights or directory structure.
   const fixture = mkdtempSync(join(tmpdir(), 'llama backend models '));
   const originalPaths = llamaRuntimeProfiles.map((profile) => Object.getOwnPropertyDescriptor(profile, 'modelPath')!);
+  const runtimeSettings = createRequire(__filename)('../services/runtime-settings') as typeof import('../services/runtime-settings');
+  const originalConfiguration = Object.getOwnPropertyDescriptor(runtimeSettings, 'effectiveRuntimeConfiguration');
+  const profiles: RuntimeConfiguration['models'] = [];
   const u32 = (n: number) => { const b = Buffer.alloc(4); b.writeUInt32LE(n); return b; };
   const u64 = (n: number) => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(n)); return b; };
   const text = (s: string) => Buffer.concat([u64(Buffer.byteLength(s)), Buffer.from(s)]);
   for (const [index, profile] of llamaRuntimeProfiles.entries()) {
     const path = join(fixture, `model${index}.gguf`);
-    writeFileSync(path, Buffer.concat([Buffer.from('GGUF'), u32(3), u64(0), u64(2), text('general.architecture'), u32(8), text('fixture'), text('fixture.context_length'), u32(4), u32(262_144)]));
+    const contents = Buffer.concat([Buffer.from('GGUF'), u32(3), u64(0), u64(2), text('general.architecture'), u32(8), text('fixture'), text('fixture.context_length'), u32(4), u32(262_144)]);
+    writeFileSync(path, contents);
+    const projector = join(fixture, `projector${index}.gguf`); writeFileSync(projector, contents);
     Object.defineProperty(profile, 'modelPath', { get: () => path, configurable: true });
+    const builtin = builtinModelCatalog.find((entry) => entry.id === profile.id)!;
+    profiles.push({ id: profile.id, displayName: builtin.displayName, modelPath: path, mmprojPath: projector,
+      gpuLayers: null, supportsTools: builtin.supportsTools, speculative: 'mtp', builtin: true });
   }
+  const fixtureConfiguration: RuntimeConfiguration = { schemaVersion: 2, llamaServerPath: null, modelsPath: fixture,
+    gpuLayers: 999, setupDismissed: true, models: profiles };
+  Object.defineProperty(runtimeSettings, 'effectiveRuntimeConfiguration', { configurable: true, value: () => fixtureConfiguration });
   try {
   {
     const originalFetch = globalThis.fetch;
@@ -303,7 +317,11 @@ export async function runLlamaCppBackendRegression(): Promise<void> {
       assert(!serialized.includes('activity-trace-only') && !serialized.includes('raw-cache-only'), 'activity telemetry or raw cache leaked into the inference request');
     } finally { await stop(server); }
   }
-  } finally { llamaRuntimeProfiles.forEach((profile, index) => Object.defineProperty(profile, 'modelPath', originalPaths[index])); rmSync(fixture, { recursive: true, force: true }); }
+  } finally {
+    llamaRuntimeProfiles.forEach((profile, index) => Object.defineProperty(profile, 'modelPath', originalPaths[index]));
+    if (originalConfiguration) Object.defineProperty(runtimeSettings, 'effectiveRuntimeConfiguration', originalConfiguration);
+    rmSync(fixture, { recursive: true, force: true });
+  }
 }
 
 if (require.main === module) void runLlamaCppBackendRegression().catch((error: unknown) => { console.error(error); process.exitCode = 1; });
