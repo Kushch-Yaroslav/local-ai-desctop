@@ -17,6 +17,7 @@ pub struct TailCandidateAttempt {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
+    WorkBudget { budget: super::work_budget::BudgetView },
     AgentStarted {
         run_id: String,
     },

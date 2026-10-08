@@ -438,6 +438,7 @@ impl EvidenceStore {
                 Entry::Finalizing => "finalizing",
                 Entry::CloseoutRequested => "closeout_requested",
                 Entry::RunComplete => "run_complete",
+                Entry::WorkBudget(_) => "work_budget",
                 Entry::LanguagePreference(_) => "language_preference",
                 Entry::Evidence(_) => "established_evidence",
                 Entry::EvidenceRejection { .. } => "evidence_rejection",

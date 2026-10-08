@@ -1,6 +1,6 @@
 import { activeConversationModel } from '../../shared/model-selection';
 import { create } from 'zustand';
-import type { ActionApproval, AgentPlan, AgentTelemetry, AnalysisProgress, AnalysisRun, AppSettings, Attachment, AttachmentStatus, ApprovalDecision, ApprovalStatus, ChatMessage, Conversation, FinishReason, GenerationDiagnostics, HardwareStats, ModelInfo, ProjectReference, SteeringIntent, ToolActivity } from '../../shared/types';
+import type { ActionApproval, AgentPlan, AgentTelemetry, WorkBudget, AnalysisProgress, AnalysisRun, AppSettings, Attachment, AttachmentStatus, ApprovalDecision, ApprovalStatus, ChatMessage, Conversation, FinishReason, GenerationDiagnostics, HardwareStats, ModelInfo, ProjectReference, SteeringIntent, ToolActivity } from '../../shared/types';
 import { isCurrentGenerationEvent } from '../../shared/generation-guard';
 import { pinLegacyReasoning, revertRefusedPatch, type ModeTransition } from '../../shared/conversation-settings';
 import { appendPausedMarker, appendReasoningFragments, applySteeringEvent } from '../../shared/thinking-timeline';
@@ -46,7 +46,7 @@ type State = {
   editMessage: (message: ChatMessage, content: string) => Promise<boolean>;
   regenerateMessage: (message: ChatMessage) => Promise<boolean>;
   stop: () => Promise<void>;
-  handleStream: (event: { type: string; content?: string; message?: string; userMessage?: ChatMessage; details?: string; activity?: ToolActivity; memory?: NonNullable<AgentPlan['taskMemory']>; run?: AnalysisRun; progress?: AnalysisProgress; requested?: number; active?: number; supported?: number; used?: number; maximum?: number; timelinePosition?: number; telemetry?: Partial<AgentTelemetry>; conversationId: string; generationId: string; modelId?: string; assistant?: ChatMessage | null; finishReason?: FinishReason; diagnostics?: Omit<GenerationDiagnostics, 'generationId' | 'conversationId' | 'createdAt'>; actionId?: string; approval?: ActionApproval; approvalId?: string; status?: Exclude<ApprovalStatus, 'pending'> | AttachmentStatus | 'accepted' | 'applied' }) => void;
+  handleStream: (event: { type: string; content?: string; message?: string; userMessage?: ChatMessage; details?: string; activity?: ToolActivity; memory?: NonNullable<AgentPlan['taskMemory']>; budget?: WorkBudget; run?: AnalysisRun; progress?: AnalysisProgress; requested?: number; active?: number; supported?: number; used?: number; maximum?: number; timelinePosition?: number; telemetry?: Partial<AgentTelemetry>; conversationId: string; generationId: string; modelId?: string; assistant?: ChatMessage | null; finishReason?: FinishReason; diagnostics?: Omit<GenerationDiagnostics, 'generationId' | 'conversationId' | 'createdAt'>; actionId?: string; approval?: ActionApproval; approvalId?: string; status?: Exclude<ApprovalStatus, 'pending'> | AttachmentStatus | 'accepted' | 'applied' }) => void;
 };
 
 const assistantId = (generationId: string) => `stream-${generationId}`;
@@ -354,11 +354,12 @@ export const useAppStore = create<State>((rawSet, rawGet) => {
     });
     if (event.type === 'approval-request' && event.actionId && event.approval) set((state) => ({ generationState: 'waiting-for-approval', pendingApproval: { actionId: event.actionId!, approval: event.approval! }, approvalSubmitting: false, toolActivities: state.toolActivities.map((activity) => activity.id === event.actionId ? { ...activity, approval: event.approval } : activity) }));
     if (event.type === 'approval-resolved' && event.actionId && event.approvalId && event.status) { const approvalStatus = event.status as Exclude<ApprovalStatus, 'pending'>; set((state) => ({ generationState: state.generationState === 'waiting-for-approval' ? 'using-tool' : state.generationState, pendingApproval: state.pendingApproval?.approval.approvalId === event.approvalId ? null : state.pendingApproval, approvalSubmitting: false, toolActivities: state.toolActivities.map((activity) => activity.id === event.actionId ? { ...activity, approval: { approvalId: event.approvalId!, category: activity.approval?.category ?? 'system_command', status: approvalStatus } } : activity) })); }
+    if (event.type === 'work-budget' && event.budget) set((state) => ({ agentPlan: { milestones: [], ...state.agentPlan, workBudget: event.budget } }));
     if (event.type === 'task-memory' && event.memory) {
       const prior = get().agentPlan?.taskMemory;
       // Knowledge updates do not redraw unchanged plan/results/evidence.
       if (!prior || JSON.stringify(prior?.plan) !== JSON.stringify(event.memory.plan) || JSON.stringify(prior?.deliverables) !== JSON.stringify(event.memory.deliverables) || JSON.stringify(prior?.verification) !== JSON.stringify(event.memory.verification)) {
-        set({ agentPlan: { milestones: [], taskMemory: { entries: [], plan: event.memory.plan, deliverables: event.memory.deliverables, verification: event.memory.verification } } });
+        set({ agentPlan: { milestones: [], ...(get().agentPlan?.workBudget ? { workBudget: get().agentPlan!.workBudget } : {}), taskMemory: { entries: [], plan: event.memory.plan, deliverables: event.memory.deliverables, verification: event.memory.verification } } });
       }
     }
     if (event.type === 'analysis-run' && event.run) { generationRuns.set(event.generationId, event.run.id); set((state) => adoptRuns(event.generationId, [...state.analysisRuns.filter((run) => run.id !== event.run!.id), event.run!])(state)); }

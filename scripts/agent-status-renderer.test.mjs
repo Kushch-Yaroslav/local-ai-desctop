@@ -29,7 +29,8 @@ try {
     let listener, request, resolveSend;
     const emit = (event) => listener({ conversationId: request.conversationId, generationId: request.generationId, ...event });
     window.statusFixture = {
-      update: (memory) => { plans.set(request.conversationId, { taskMemory: memory }); emit({ type: 'task-memory', memory }); },
+      budget: (budget) => { plans.set(request.conversationId, { ...plans.get(request.conversationId), workBudget: budget }); emit({ type: 'work-budget', budget }); },
+      update: (memory) => { plans.set(request.conversationId, { ...plans.get(request.conversationId), taskMemory: memory }); emit({ type: 'task-memory', memory }); },
       action: (activity) => emit({ type: 'tool', activity }),
       thinking: (text, position) => emit({ type: 'thinking', content: text, timelinePosition: position }),
       finish: (failed = false) => {
@@ -58,6 +59,9 @@ try {
   await page.evaluate((memory) => window.statusFixture.update(memory), memory);
   const panel = page.locator('.agent-status-panel');
   await panel.waitFor(); assert.equal(await panel.count(), 1);
+  await page.evaluate(() => window.statusFixture.budget({ used: 140, limit: 160, maximum: 256, extensions: 1, decision: 'extended', reason: 'changed_code_check_passed' }));
+  assert.match(await panel.innerText(), /140\/160/);
+  assert(await panel.innerText().then((text) => text.includes('Максимум 256') && text.includes('продлений: 1')));
   assert(await panel.locator('.implemented').innerText().then((text) => text.includes('Реализовано, не проверено')));
   assert(await panel.locator('.verified').innerText().then((text) => text.includes('Проверено')));
   memory.deliverables.items[0].proof = ['ev-runtime'];
@@ -85,6 +89,7 @@ try {
     }, { index, memory });
   }
   assert.equal(await page.locator('.conversation .agent-status-panel, .conversation .task-plan-panel').count(), 0);
+  assert.equal(await page.locator('.conversation .agent-timeline-action').filter({ hasText: '140/160' }).count(), 0, 'budget updates must not create timeline cards');
   assert.equal(await page.locator('.agent-timeline-action.planning').count(), 0, 'successful status snapshots must not duplicate into the timeline');
   await page.evaluate(() => {
     for (let index = 0; index < 35; index++) window.statusFixture.thinking(`Reasoning paragraph ${index}.\n\n`, index + 65);

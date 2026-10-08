@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Default)]
 pub struct AgentState {
+    pub work_budget: super::work_budget::WorkBudget,
     /// Durable semantic findings for the current task. This is not a plan.
     pub task_memory: TaskMemory,
     /// Count of successful project mutations, used to refresh derived views.

@@ -83,6 +83,9 @@ export interface GenerationStats {
   inputTokens?: number;
 }
 
+export interface WorkBudget {
+  used: number; limit: number; maximum: number; extensions: number; decision: string; reason: string; basis?: string;
+}
 export interface AgentTelemetry {
   turn: number;
   contextUsed?: number;
@@ -300,6 +303,8 @@ export interface TaskMemoryEntry { id: string; finding: string; evidence?: strin
 /** Persistent agent planning state: stable milestones plus only the active
  * milestone's adaptive Work Plan in the primary UI. */
 export interface AgentPlan {
+  /** Runtime-owned projection; authority remains in the canonical journal. */
+  workBudget?: WorkBudget;
   milestones?: AgentMilestone[];
   activeMilestoneId?: string | null;
   revision?: number;
@@ -335,6 +340,7 @@ export interface AnalysisProgress {
 }
 
 export type StreamEvent =
+  | { type: 'work-budget'; budget: WorkBudget }
   | { type: 'token'; content: string }
   | { type: 'thinking'; content: string; timelinePosition?: number }
   | { type: 'task-memory'; memory: NonNullable<AgentPlan['taskMemory']> }

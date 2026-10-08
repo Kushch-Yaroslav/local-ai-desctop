@@ -23,6 +23,14 @@ export const chatModeLabel = { chat: 'Чат', agent: 'Агент' } as const;
 
 export const agentStatusText = { panel: 'План и результат', plan: 'План', deliverables: 'Требуемый результат', result: 'Результат', warnings: 'Предупреждения проекта', preExisting: 'Сбой наблюдался до изменений', baseline: 'Проверка до изменений', failed: 'Не прошла', passed: 'Пройдена', saved: 'Сохранённое состояние', unfinishedStep: 'Незавершённый шаг' } as const;
 export const planStatusLabel = { pending: 'Предстоит', in_progress: 'Текущий шаг', completed: 'Выполнено', blocked: 'Заблокировано', abandoned: 'Исключено' } as const;
+export const budgetReasonLabel: Record<string, string> = {
+  initial_allowance: 'Начальный бюджет', changed_code_check_passed: 'Изменённый код прошёл проверку',
+  relevant_failure_resolved: 'Исправлен сбой релевантной проверки',
+  bounded_verification_started: 'Начата проверка изменённого кода', no_recent_checked_progress: 'Нет нового подтверждённого прогресса за последние 16 ходов',
+  absolute_maximum: 'Достигнут абсолютный предел 256 ходов',
+  verification_grace_exhausted: 'Продление для проверки использовано; нужна новая успешная проверка',
+  repeated_failed_edits: 'Повторные ошибки изменения файлов без восстановления',
+};
 export const deliverableStatusLabel = { pending: 'Ожидает', implemented: 'Реализовано, не проверено', done: 'Реализовано, не проверено', verified: 'Проверено', blocked: 'Заблокировано', dropped: 'Исключено' } as const;
 
 /** Why a Max Context search stopped at its boundary. */

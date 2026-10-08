@@ -718,7 +718,13 @@ export function registerIpc(): void {
           }
         }
         if (chunk.type === 'task-memory') {
-          database.saveAgentPlan(request.conversationId, { milestones: [], taskMemory: structuredClone(chunk.memory) });
+          const workBudget = database.getAgentPlan(request.conversationId)?.workBudget;
+          database.saveAgentPlan(request.conversationId, { milestones: [], ...(workBudget ? { workBudget } : {}), taskMemory: structuredClone(chunk.memory) });
+          event.sender.send('chat:stream', { ...chunk, conversationId: request.conversationId, generationId: generation.id });
+          continue;
+        }
+        if (chunk.type === 'work-budget') {
+          database.saveAgentPlan(request.conversationId, { milestones: [], ...database.getAgentPlan(request.conversationId), workBudget: structuredClone(chunk.budget) });
           event.sender.send('chat:stream', { ...chunk, conversationId: request.conversationId, generationId: generation.id });
           continue;
         }

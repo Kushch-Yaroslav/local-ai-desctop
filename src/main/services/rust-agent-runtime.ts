@@ -4,13 +4,14 @@ import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { paths } from './paths';
 import { agentEvidenceDir } from './agent-evidence';
-import type { AgentPlan, AgentPlanStepStatus, ChatMessage, ModelTodo, ReasoningMode, StreamEvent, SteeringIntent, TerminalExecution, ToolActivity, WebMode } from '../../shared/types';
+import type { AgentPlan, AgentPlanStepStatus, ChatMessage, ModelTodo, ReasoningMode, StreamEvent, SteeringIntent, TerminalExecution, ToolActivity, WebMode, WorkBudget } from '../../shared/types';
 import { maxOutputTokens } from '../models/model-registry';
 
 /** Project identity is a transport value, not an orchestration subsystem. */
 export type AgentProject = { id: string; slot: 1 | 2; root: string; label: string };
 
 type RuntimeEvent = {
+  budget?: WorkBudget;
   type: string; content?: string; id?: string; name?: string; message?: string; detail?: string; status?: string;
   diff?: string | null; is_error?: boolean; plan?: unknown; memory?: unknown; used?: number; limit?: number;
   before?: number; after?: number; stream?: string; state?: string; index?: number;
@@ -101,6 +102,7 @@ export function taskPlan(value: unknown): AgentPlan {
       ...(typeof raw.active_milestone_id === 'string' ? { activeMilestoneId: raw.active_milestone_id } : typeof raw.activeMilestoneId === 'string' ? { activeMilestoneId: raw.activeMilestoneId } : {}),
       ...(typeof raw.revision === 'number' ? { revision: raw.revision } : {}),
       ...(todo ? { modelTodo: todo } : {}),
+      ...(raw.workBudget ? { workBudget: raw.workBudget as WorkBudget } : {}),
       ...(raw.task_memory && typeof raw.task_memory === 'object' ? { taskMemory: raw.task_memory as AgentPlan['taskMemory'] } : raw.taskMemory && typeof raw.taskMemory === 'object' ? { taskMemory: raw.taskMemory as AgentPlan['taskMemory'] } : {}),
     };
   }
@@ -188,6 +190,7 @@ export class RustAgentRuntime {
         else if (event.type === 'run_paused') yield { type: 'paused' };
         else if (event.type === 'thinking_delta') yield { type: 'thinking', content: event.content ?? '' };
         else if (event.type === 'turn_started') yield { type: 'agent-telemetry', telemetry: { turn: event.index ?? 0 } };
+        else if (event.type === 'work_budget' && event.budget) yield { type: 'work-budget', budget: event.budget };
         else if (event.type === 'content_delta' || event.type === 'final_delta' || event.type === 'agent_status') {
           if (event.type === 'agent_status') statusCount += 1;
           yield runtimeTextEvent(event, runId, statusCount)!;

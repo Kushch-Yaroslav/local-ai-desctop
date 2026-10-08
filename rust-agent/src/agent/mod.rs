@@ -12,3 +12,4 @@ pub mod strategy;
 pub mod task_memory;
 pub mod transcript;
 pub mod verification;
+pub mod work_budget;

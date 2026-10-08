@@ -54,6 +54,8 @@ export function runRustAgentRuntimeRegression(): void {
   assert.equal(deliverablesChecklist('not json'), undefined);
   assert.equal(deliverablesChecklist(JSON.stringify({ other: 1 })), undefined);
   const legacy = taskPlan({ steps: [{ id: 'legacy-task', label: 'Old item', status: 'completed' }] });
+  const budget = { used: 140, limit: 160, maximum: 256, extensions: 1, decision: 'extended', reason: 'changed_code_check_passed' };
+  assert.deepEqual(taskPlan({ milestones: [], workBudget: budget }).workBudget, budget, 'saved budget projection must survive normalization');
   assert.equal(legacy.milestones?.[0]?.workPlan.tasks[0]?.id, 'legacy-task');
 
   const statusAndFinal = [
@@ -84,7 +86,10 @@ const rl = readline.createInterface({ input: process.stdin });
 const seen = [];
 rl.on('line', (line) => {
   const request = JSON.parse(line); seen.push(request);
-  if (request.type === 'run') out({ type: 'thinking_delta', content: 'думаю' });
+  if (request.type === 'run') {
+    out({ type: 'work_budget', budget: { used: 140, limit: 160, maximum: 256, extensions: 1, decision: 'extended', reason: 'changed_code_check_passed' } });
+    out({ type: 'thinking_delta', content: 'думаю' });
+  }
   if (request.type === 'steer') {
     fs.writeFileSync(${JSON.stringify(received)}, JSON.stringify(seen));
     out({ type: 'steering_accepted' }); out({ type: 'steering_applied', content: request.content });
@@ -99,9 +104,10 @@ rl.on('line', (line) => {
     const events: string[] = [];
     for await (const event of runtime.stream('model', [message('user', 'task')], [], controller.signal, 4096, 'fast', 'off', 'run-1', undefined, 'conversation')) {
       events.push(event.type);
+      if (event.type === 'work-budget') assert.equal(event.budget.limit, 160);
       if (event.type === 'thinking') void runtime.steer('run-1', 'Пауза', 'pause');
     }
-    assert.deepEqual(events.filter((type) => type !== 'token'), ['thinking', 'steering', 'paused', 'done']);
+    assert.deepEqual(events.filter((type) => type !== 'token'), ['work-budget', 'thinking', 'steering', 'paused', 'done']);
     const requests = JSON.parse(readFileSync(received, 'utf8')) as Array<{ type: string; intent?: string }>;
     assert.equal(requests.find((request) => request.type === 'steer')?.intent, 'pause', 'the pause intent was not forwarded to the runtime');
   } finally { rmSync(dir, { recursive: true, force: true }); }

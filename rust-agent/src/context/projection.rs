@@ -67,7 +67,7 @@ pub fn project(transcript: &Transcript, stable_prefix: &str, dynamic_tail: &str)
                 }
                 previous_state = Some(content);
             }
-            Entry::Compaction { .. } | Entry::Reminder(_) | Entry::ClearReminders | Entry::Finalizing | Entry::CloseoutRequested | Entry::RunComplete | Entry::LanguagePreference(_) | Entry::Evidence(_) | Entry::EvidenceRejection { .. } | Entry::Frontier(_) | Entry::FrontierDisposition(_) | Entry::Message(_) | Entry::PromptTail(_) => {}
+            Entry::Compaction { .. } | Entry::Reminder(_) | Entry::ClearReminders | Entry::Finalizing | Entry::CloseoutRequested | Entry::RunComplete | Entry::LanguagePreference(_) | Entry::Evidence(_) | Entry::EvidenceRejection { .. } | Entry::Frontier(_) | Entry::FrontierDisposition(_) | Entry::Message(_) | Entry::PromptTail(_) | Entry::WorkBudget(_) => {}
         }
     }
     // Retain an exact current prompt even if an unusually small context made

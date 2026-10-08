@@ -40,6 +40,7 @@ impl Clone for Transcript {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Entry {
+    WorkBudget(super::work_budget::WorkBudget),
     Message(Value),
     RunUser(Value),
     Compaction {
@@ -121,6 +122,9 @@ impl CompactionPlan {
 }
 
 impl Transcript {
+    pub fn checkpoint_work_budget(&mut self, budget: super::work_budget::WorkBudget) {
+        self.record(Entry::WorkBudget(budget));
+    }
     pub fn set_project_root(&mut self, root: Option<&Path>) {
         self.project_root = root.and_then(|path| path.canonicalize().ok());
     }
@@ -563,6 +567,7 @@ impl Transcript {
                 | Entry::Reminder(_)
                 | Entry::ClearReminders
                 | Entry::Finalizing
+                | Entry::WorkBudget(_)
                 | Entry::CloseoutRequested
                 | Entry::RunComplete
                 | Entry::LanguagePreference(_)

@@ -114,10 +114,9 @@ pub const PREFERRED_OUTPUT_HEADROOM_TOKENS: usize = 1_024;
 pub const MIN_USEFUL_OUTPUT_TOKENS: usize = 32;
 pub const APPLICATION_MAX_OUTPUT_TOKENS: usize = 32_768;
 pub const MAX_COMPACTION_ATTEMPTS: usize = 4;
-/// Provider turns available for investigation. When they are exhausted the run
-/// does not end in an error: tools are withdrawn and the next turns are
-/// synthesis-only, so the user always receives an answer.
-pub const MAX_INVESTIGATION_TURNS: usize = 128;
+/// Initial work allowance. The runtime may grant bounded blocks up to the
+/// absolute maximum; denial withdraws tools and requests a partial answer.
+pub const MAX_INVESTIGATION_TURNS: usize = super::work_budget::INITIAL;
 /// Room for a long synthesized answer to continue after `length` stops plus a
 /// few protocol misfires, without ever consuming the investigation budget.
 /// Empty provider responses in a row before tools are withdrawn so the next
@@ -620,7 +619,7 @@ fn dynamic_tail(
             tail.push(format!("<unfinished_deliverables>{}</unfinished_deliverables>\nThe run budget ended before these were completed. In the answer, report each of them plainly as not completed: say what exists, what is missing and why the run stopped. Do not present them as done.", state.task_memory.deliverables.pending_summary()));
         } else if let Some(notice) = run_budget_notice(
             state.turn,
-            MAX_INVESTIGATION_TURNS,
+            state.work_budget.limit,
             &state.task_memory.deliverables.pending_summary(),
         ) {
             tail.push(notice);
@@ -1447,6 +1446,14 @@ fn evidence_ids(arguments: &Value) -> Vec<String> {
     ids
 }
 
+fn checkpoint_work_budget(config: &Config, state: &AgentState, transcript: &mut Transcript) {
+    let changed = transcript.entries().iter().rev().find_map(|entry| {
+        if let crate::agent::transcript::Entry::WorkBudget(budget) = entry { Some(budget.view()) } else { None }
+    }).is_none_or(|previous| previous != state.work_budget.view());
+    transcript.checkpoint_work_budget(state.work_budget.clone());
+    if changed { emit(&config.run_id, Event::WorkBudget { budget: state.work_budget.view() }); }
+}
+
 fn emit_task_memory(config: &Config, state: &AgentState) {
     if let Ok(memory) = serde_json::to_value(&state.task_memory) {
         emit(&config.run_id, Event::TaskMemoryUpdate { memory });
@@ -1495,6 +1502,7 @@ fn record_terminal_effect(
             Some((_, current)) if current == known => {}
             Some((_, current)) => {
                 state.task_memory.verification.note_change(Some(&path));
+                state.work_budget.changed_file(&path, &current);
                 state
                     .task_memory
                     .verification
@@ -1504,6 +1512,7 @@ fn record_terminal_effect(
             }
             None => {
                 state.task_memory.verification.note_deletion(&path);
+                state.work_budget.changed_file(&path, "[deleted]");
                 changed = true;
             }
         }
@@ -1516,6 +1525,7 @@ fn record_terminal_effect(
             match crate::tools::filesystem::file_revision(scope, &path) {
                 Some((_, revision)) => {
                     ledger.note_change(Some(&path));
+                    state.work_budget.changed_file(&path, &revision);
                     ledger.revisions.insert(path, revision);
                 }
                 None => ledger.note_deletion(&path),
@@ -1581,7 +1591,7 @@ fn record_terminal_evidence(
         format!("exit {exit_code}: {tail}")
     };
     let turn = state.turn;
-    state.task_memory.verification.record_outcome(
+    let id = state.task_memory.verification.record_outcome(
         kind,
         command,
         pass,
@@ -1593,6 +1603,9 @@ fn record_terminal_evidence(
         })
         .to_string(),
     );
+    if let Some(record) = state.task_memory.verification.get(&id) {
+        state.work_budget.checked(record, &state.task_memory.verification, &state.task_memory.deliverables);
+    }
     if state.verification_reviews > 0 {
         state.checks_since_review += 1;
     }
@@ -1613,6 +1626,7 @@ fn record_project_change(
     for path in paths {
         if name == "delete_file" {
             state.task_memory.verification.note_deletion(path);
+            state.work_budget.changed_file(path, "[deleted]");
             continue;
         }
         state.task_memory.verification.note_change(Some(path));
@@ -1621,7 +1635,8 @@ fn record_project_change(
                 .task_memory
                 .verification
                 .revisions
-                .insert(path.clone(), revision);
+                .insert(path.clone(), revision.clone());
+            state.work_budget.changed_file(path, &revision);
             let size = std::fs::metadata(&file).map(|meta| meta.len()).unwrap_or(0);
             state.task_memory.verification.record(
                 verification::Kind::Readback,
@@ -1729,9 +1744,32 @@ fn present_answer(
     crate::agent::presentation::project_answer_with_prefix(content, prefix, &references)
 }
 
-/// An execution ending is not proof of task completion. Surface authoritative
-/// unresolved state once, without another provider/tool turn or invented plan
-/// transitions. The model's prose cannot suppress this terminal disclosure.
+fn budget_stop_reason(reason: &str, russian: bool) -> &'static str {
+    match (reason, russian) {
+        ("absolute_maximum", true) => "достигнут абсолютный предел 256 рабочих ходов",
+        ("absolute_maximum", false) => "absolute maximum of 256 work turns reached",
+        ("verification_grace_exhausted", true) => "единственное продление для проверки использовано; нужна новая успешная проверка",
+        ("verification_grace_exhausted", false) => "the single verification extension was spent; a fresh passing check is required",
+        ("repeated_failed_edits", true) => "повторные ошибки изменения файлов без восстановления",
+        ("repeated_failed_edits", false) => "repeated failed edits without recovery",
+        (_, true) => "нет нового подтверждённого прогресса за последние 16 рабочих ходов",
+        (_, false) => "no new checked progress in the last 16 work turns",
+    }
+}
+
+fn anonymous_verification_gap(state: &AgentState) -> bool {
+    let ledger = &state.task_memory.verification;
+    let mut need = ledger.effective_need(None);
+    // A stopped unregistered implementation still needs a check on Continue,
+    // even if the caller has no saved Task Memory projection.
+    if need == Need::Readback && state.work_budget.has_changed_code() { need = Need::Runtime; }
+    state.task_memory.deliverables.is_empty() && (state.mutations > 0 || state.work_budget.has_changed_code())
+        && state.can_verify && need != Need::Readback
+        && (ledger.best_passing(need).is_none() || ledger.blocking_failure(&state.task_memory.deliverables).is_some())
+}
+
+/// Surface authoritative unresolved state without another provider/tool turn
+/// or invented plan transitions. Model prose cannot suppress this disclosure.
 fn terminal_status_note(
     state: &AgentState,
     transcript: &Transcript,
@@ -1741,15 +1779,10 @@ fn terminal_status_note(
     let items = &state.task_memory.deliverables.items;
     let outstanding = items.iter().any(|item| matches!(item.status,
         Status::Pending | Status::Implemented | Status::Blocked));
-    let verification = &state.task_memory.verification;
-    let need = verification.effective_need(None);
-    let anonymous_gap = items.is_empty() && state.mutations > 0 && state.can_verify
-        && need != Need::Readback
-        && (verification.best_passing(need).is_none()
-            || verification.blocking_failure(&state.task_memory.deliverables).is_some());
+    let anonymous_gap = anonymous_verification_gap(state);
     let steps = &state.task_memory.plan.steps;
     let unfinished_plan = steps.iter().any(|step| step.status != StepStatus::Completed);
-    if !outstanding && !unfinished_plan && !anonymous_gap {
+    if !outstanding && !unfinished_plan && !anonymous_gap && !turn_budget_exhausted {
         return String::new();
     }
     let russian = transcript.language_preference() == "Russian";
@@ -1781,6 +1814,10 @@ fn terminal_status_note(
     if turn_budget_exhausted {
         parts.push(if russian { "Лимит рабочих ходов исчерпан; запуск остановлен с указанным выше состоянием." }
             else { "Work-turn budget exhausted; the run ended with the state above." }.to_owned());
+    }
+    if turn_budget_exhausted && state.work_budget.decision == "denied" {
+        parts.push(if russian { format!("Причина: {}.", budget_stop_reason(&state.work_budget.reason, true)) }
+            else { format!("Budget decision: {}.", budget_stop_reason(&state.work_budget.reason, false)) });
     }
     format!("\n\n**{}** {}", if russian { "Статус Agent V2:" } else { "Agent V2 status:" }, parts.join(" "))
 }
@@ -3500,6 +3537,11 @@ fn run_scoped_tool(
                 root: Path::new(root),
                 grants: &grants,
             };
+            if let Some(path) = target.as_deref() {
+                if let Some((_, revision)) = crate::tools::filesystem::file_revision(&file_scope, path) {
+                    state.work_budget.observe_file(path, &revision);
+                }
+            }
             if name == "write_file" {
                 if let Some((file, revision)) = target
                     .as_deref()
@@ -3848,6 +3890,7 @@ fn record_safe_read_effect(
                     if let Some((file, revision)) =
                         crate::tools::filesystem::file_revision(&scope, path)
                     {
+                        state.work_budget.observe_file(path, &revision);
                         state.note_file_revision(file, revision);
                     }
                 }
@@ -4072,10 +4115,15 @@ pub fn run(config: Config) {
         }
         transcript
     };
-    if !transcript.has_current_run_user(&config.user) {
+    let previous_budget = transcript.entries().iter().rev().find_map(|entry| {
+        if let crate::agent::transcript::Entry::WorkBudget(budget) = entry { Some(budget.clone()) } else { None }
+    }).unwrap_or_default();
+    let new_request = !transcript.has_current_run_user(&config.user);
+    if new_request {
         transcript.push_run_user(json!({"role":"user", "content":config.user}));
     }
     let mut state = AgentState::default();
+    state.work_budget = if previous_budget.closed && new_request { Default::default() } else { previous_budget };
     state.strategy = Strategy::from_mode(&config.reasoning_mode);
     state.task_memory = match restore_task_memory(config.task_memory.as_ref(), &transcript) {
         Ok(memory) => memory,
@@ -4151,7 +4199,8 @@ pub fn run(config: Config) {
         .map_or_else(ProjectIndex::empty, ProjectIndex::scan);
     let mut indexed_mutations = state.mutations;
     let mut consecutive_empty_turns = 0_usize;
-    let mut turn_budget_exhausted = false;
+    let mut turn_budget_exhausted = state.work_budget.decision == "denied";
+    let mut synthesis_turns = 0;
 
     emit(
         &config.run_id,
@@ -4165,7 +4214,8 @@ pub fn run(config: Config) {
         emit_task_memory(&config, &state);
     }
     emit_knowledge_diagnostics(&config, &state);
-    for turn in 0..MAX_INVESTIGATION_TURNS + MAX_SYNTHESIS_TURNS {
+    checkpoint_work_budget(&config, &state, &mut transcript);
+    for turn in 0..super::work_budget::MAXIMUM + MAX_SYNTHESIS_TURNS {
         if let Some(error) = transcript.storage_error() {
             emit(
                 &config.run_id,
@@ -4207,21 +4257,31 @@ pub fn run(config: Config) {
                 pause.checkpoint_turns_left -= 1;
             }
         }
-        state.turn = turn;
+        state.turn = state.work_budget.used;
         if !state.verification_closed
             && state.verification_reviews > 0
             && state.checks_since_review >= verification_budget(state.strategy)
         {
             state.verification_closed = true;
         }
-        if turn >= MAX_INVESTIGATION_TURNS && !transcript.is_finalizing() {
-            turn_budget_exhausted = true;
-            transcript.mark_finalizing();
-            trace_forensics(
-                &config.run_id,
-                "lifecycle_transition",
-                json!({"state":"finalizing","reason":"turn_budget_exhausted","turn":turn+1}),
-            );
+        if !transcript.is_finalizing() && state.pause.is_none() {
+            let old_limit = state.work_budget.limit;
+            if !state.work_budget.allow_next() {
+                turn_budget_exhausted = true;
+                transcript.mark_finalizing();
+                trace_forensics(&config.run_id, "lifecycle_transition", json!({
+                    "state":"finalizing", "reason":"turn_budget_exhausted", "turn":turn+1,
+                    "work_turns":state.work_budget.used, "budget_reason":state.work_budget.reason
+                }));
+            }
+            if state.work_budget.limit != old_limit || turn_budget_exhausted {
+                checkpoint_work_budget(&config, &state, &mut transcript);
+                trace_forensics(&config.run_id, "work_budget_decision", serde_json::to_value(state.work_budget.view()).unwrap());
+            }
+        }
+        if transcript.is_finalizing() || state.pause.is_some() {
+            synthesis_turns += 1;
+            if synthesis_turns > MAX_SYNTHESIS_TURNS { break; }
         }
         let offered_schemas = turn_schemas(&schemas, &state, transcript.is_finalizing());
         let request_schemas = &offered_schemas;
@@ -4391,6 +4451,10 @@ pub fn run(config: Config) {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        if !transcript.is_finalizing() && state.pause.is_none() {
+            state.work_budget.start_turn();
+            checkpoint_work_budget(&config, &state, &mut transcript);
+        }
         emit(&config.run_id, Event::TurnStarted { index: turn + 1 });
         state.memory_writes_this_turn = 0;
         emit(
@@ -4837,6 +4901,11 @@ pub fn run(config: Config) {
             visible_final_content.push_str(&note);
             final_content.push_str(&note);
             transcript.assistant_message_with_reasoning(streamed.content, streamed.reasoning_raw);
+            let unresolved = state.task_memory.deliverables.items.iter().any(|item| matches!(item.status,
+                deliverables::DeliverableStatus::Pending | deliverables::DeliverableStatus::Implemented | deliverables::DeliverableStatus::Blocked));
+            let anonymous_gap = anonymous_verification_gap(&state);
+            state.work_budget.closed = state.pause.is_none() && !turn_budget_exhausted && !unresolved && !anonymous_gap;
+            checkpoint_work_budget(&config, &state, &mut transcript);
             transcript.mark_run_complete();
             trace_forensics(
                 &config.run_id,
@@ -5270,6 +5339,7 @@ pub fn run(config: Config) {
                     record_read_evidence(&config, &transcript, tool);
                 }
                 Err(message) => {
+                    if mutation_tool(&tool.name) { state.work_budget.failed_edit(); }
                     let stored_error = if tool.name == "run_terminal" {
                         serde_json::from_str::<Value>(&message)
                             .map(|execution| {
@@ -5299,6 +5369,7 @@ pub fn run(config: Config) {
                 }
             }
         }
+        checkpoint_work_budget(&config, &state, &mut transcript);
     }
     emit(
         &config.run_id,
@@ -6917,7 +6988,8 @@ mod tests {
             item.status = deliverables::DeliverableStatus::Verified;
         }
         for step in &mut state.task_memory.plan.steps { step.status = StepStatus::Completed; }
-        assert!(terminal_status_note(&state, &transcript, true).is_empty());
+        assert!(terminal_status_note(&state, &transcript, false).is_empty());
+        assert!(terminal_status_note(&state, &transcript, true).contains("Лимит рабочих ходов исчерпан"));
         let mut without_items = AgentState::default();
         without_items.mutations = 1;
         without_items.can_verify = true;

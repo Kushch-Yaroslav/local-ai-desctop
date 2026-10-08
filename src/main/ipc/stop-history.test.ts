@@ -57,6 +57,8 @@ async function run(): Promise<void> {
 
     // start Agent → progress/tool events → terminal fails → steering → more events → stalled generation
     script = async function* (signal) {
+      yield { type: 'work-budget', budget: { used: 140, limit: 160, maximum: 256, extensions: 1, decision: 'extended', reason: 'changed_code_check_passed' } };
+      yield { type: 'task-memory', memory: { entries: [] } };
       yield { type: 'thinking', content: 'Inspect the project first.' };
       yield tool('read-1', { kind: 'file_read', state: 'running' });
       yield tool('read-1', { kind: 'file_read', state: 'completed', output: 'board.js' });
@@ -121,6 +123,7 @@ async function run(): Promise<void> {
       yield { type: 'done' };
     };
     await invoke('chat:send', request('continue', [...db.listMessages(chat.id)], 'Continue'));
+    assert.equal(restarted.getAgentPlan(chat.id)?.workBudget?.used, 140, 'budget projection survives Stop/restart/Continue and memory updates');
     const [afterStop, continued] = restarted.listAnalysisRuns(chat.id);
     assert.deepEqual(afterStop, stopped, 'Continue must not alter the stopped run');
     assert.equal(continued.status, 'completed');

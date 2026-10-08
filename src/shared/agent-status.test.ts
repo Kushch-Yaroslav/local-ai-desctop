@@ -27,6 +27,10 @@ async function run(): Promise<void> {
   assert(stoppedMarkup.includes(agentStatusText.unfinishedStep));
   assert(!stoppedMarkup.includes('aria-current="step"'));
   assert(!markup.includes(agentStatusText.saved));
+  const workBudget = { used: 140, limit: 160, maximum: 256, extensions: 1, decision: 'extended', reason: 'changed_code_check_passed' };
+  const budgetMarkup = renderToStaticMarkup(createElement(AgentStatusPanel, { plan: { workBudget }, running: true }));
+  assert.match(budgetMarkup, /140\/160/);
+  assert(budgetMarkup.includes('Максимум 256') && budgetMarkup.includes('продлений: 1'));
   assert.equal(memory.plan!.steps[1].status, 'in_progress', 'terminal presentation must not mutate the saved plan or invent completion');
   const evidencePlan: AgentPlan = { taskMemory: { entries: [], deliverables: { items: [
     { id: 'runtime', text: 'Automatic response', status: 'verified', proof: ['ev-pass'], verification_scope: 'acceptance' },
@@ -85,6 +89,10 @@ async function run(): Promise<void> {
   assert.deepEqual(useAppStore.getState().agentPlan?.taskMemory, changed, 'completion/pause must preserve the current panel');
   await useAppStore.getState().sendMessage('Continue after pause');
   const nextId = useAppStore.getState().generationId!;
+  useAppStore.getState().handleStream({ type: 'work-budget', budget: workBudget, conversationId: 'A', generationId: nextId });
+  useAppStore.getState().handleStream({ type: 'task-memory', memory: { ...changed, plan: { ...changed.plan!, revision: 99 } }, conversationId: 'A', generationId: nextId });
+  assert.deepEqual(useAppStore.getState().agentPlan?.workBudget, workBudget, 'memory updates must preserve the runtime budget projection');
+  useAppStore.getState().handleStream({ type: 'task-memory', memory: changed, conversationId: 'A', generationId: nextId });
   assert.deepEqual(useAppStore.getState().agentPlan?.taskMemory, changed, 'Continue retains canonical planning');
   useAppStore.getState().handleStream({ type: 'error', conversationId: 'A', generationId: nextId, message: 'HTTP 500' });
   assert.deepEqual(useAppStore.getState().agentPlan?.taskMemory, changed, 'terminal failure must keep status visible');
