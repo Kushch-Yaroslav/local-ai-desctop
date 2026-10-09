@@ -55,7 +55,7 @@ try {
       settings: { onLanguageChanged: (listener) => { languageListener = listener; return () => {}; }, get: async () => settings }, hardware: { get: async () => null },
       models: { list: async () => [{ id: 'fixture', name: 'Fixture model', shortName: 'Fixture', installed: true, maxContext: 262144, supportedContextPresets: [32768], reasoning: { thinkingToggle: true, efforts: [] } }] },
       contextEstimate: async () => ({ unknownReasons: [], configuredMaxTokens: 262144 }), contextDiscoveryStatus: async () => ({ busy: false }),
-      chat: { stop: async () => {
+      chat: { onDiagramValidation: () => () => {}, diagramValidationResult: () => {}, stop: async () => {
         const run = { id: `stopped-${request.generationId}`, conversationId: request.conversationId, assistantMessageId: null, reasoningMode: 'fast', status: 'cancelled', actionCount: 1, actions: [{ id: 'stopped-tool', label: 'Stopped attempt tool', kind: 'file_read', state: 'completed', output: 'Stopped attempt observation' }], createdAt: new Date().toISOString(), completedAt: new Date().toISOString(), timeline: [{ id: 'stopped-action', kind: 'activity', activityId: 'stopped-tool', position: 1 }] };
         messages.set(request.conversationId, request.messages); runs.set(request.conversationId, [run]);
         emit({ type: 'analysis-run', run }); emit({ type: 'cancelled' }); resolveSend();

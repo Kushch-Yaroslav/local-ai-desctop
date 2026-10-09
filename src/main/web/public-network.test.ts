@@ -25,6 +25,7 @@ export async function runPinnedTransportRegression() {
   const http = moduleRequire('node:http'), dns = moduleRequire('node:dns/promises');
   const originalRequest = http.request, originalLookup = dns.lookup;
   let lookups = 0, connections = 0;
+  let responseBody = Buffer.from('fixture');
   try {
     dns.lookup = async () => [{ address: ++lookups === 1 ? '93.184.216.34' : '127.0.0.1', family: 4 }];
     http.request = (url: URL, options: { lookup: (host: string, options: object, done: (error: null, address: string, family: number) => void) => void }, callback: (response: unknown) => void) => {
@@ -32,13 +33,16 @@ export async function runPinnedTransportRegression() {
       options.lookup(url.hostname, {}, (_error, address, family) => { assert.equal(address, '93.184.216.34'); assert.equal(family, 4); });
       const request = Object.assign(new EventEmitter(), {
         setTimeout: () => {}, destroy: (error: Error) => { request.emit('error', error); },
-        end: () => { const response = Object.assign(new PassThrough(), { statusCode: 200, headers: { 'content-type': 'text/plain' } }); callback(response); response.end('fixture'); },
+        end: () => { const response = Object.assign(new PassThrough(), { statusCode: 200, headers: { 'content-type': 'text/plain' } }); callback(response); response.end(responseBody); },
       }); return request;
     };
     const result = await fetchPublicResource('http://public.example/', 'GET', {}, new AbortController().signal);
     assert.equal(result.body.toString(), 'fixture'); assert.equal(lookups, 1); assert.equal(connections, 1);
     await assert.rejects(fetchPublicResource('http://public.example/', 'GET', {}, new AbortController().signal), /blocked/);
     assert.equal(connections, 1, 'private rebinding created a connection');
+    dns.lookup = async () => [{ address: '93.184.216.34', family: 4 }];
+    responseBody = Buffer.alloc(128);
+    await assert.rejects(fetchPublicResource('http://public.example/', 'GET', {}, new AbortController().signal, 32), /size limit/i, 'streaming body limit did not stop an oversized resource');
   } finally { http.request = originalRequest; dns.lookup = originalLookup; }
 }
 if (require.main === module) void (async () => { await runPublicNetworkRegression(); await runPinnedTransportRegression(); })().catch(error => { console.error(error); process.exitCode = 1; });

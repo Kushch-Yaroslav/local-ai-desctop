@@ -62,6 +62,11 @@ export function RuntimeSetup({ setup, onClose }: { setup: SetupState; onClose: (
     <label>{t("Каталог для относительных путей")}<div className="setup-path"><input aria-label={t("Каталог моделей")} value={config.modelsPath} onChange={(event) => setConfig({ ...config, modelsPath: event.target.value })} /><button onClick={async () => { try { const path = await window.localAi.dialog.chooseDirectory(config.modelsPath); if (path) setConfig({ ...config, modelsPath: path }); } catch { setMessage(t("Не удалось открыть выбор папки.")); } }}>{t("Обзор…")}</button></div><small>{t("Модели можно хранить в любом месте. Для каждого профиля ниже можно выбрать файл отдельно.")}</small></label>
     <label>{t("GPU-слои по умолчанию")}<input aria-label={t("GPU-слои по умолчанию")} type="number" min="0" max="999" value={config.gpuLayers} onChange={(event) => setConfig({ ...config, gpuLayers: Number(event.target.value) })} /><small>{t("999 отправляет доступные слои на GPU; 0 использует CPU. Объём VRAM зависит от модели.")}</small></label>
 
+    <fieldset><legend>{t('Веб-поиск')}</legend>
+      <label>{t('Поисковый провайдер')}<select aria-label={t('Поисковый провайдер')} value={config.searchProvider ?? 'auto'} onChange={(event) => setConfig({ ...config, searchProvider: event.target.value as RuntimeConfiguration['searchProvider'] })}><option value="auto">{t('Автоматически (DuckDuckGo)')}</option><option value="duckduckgo">DuckDuckGo</option><option value="bing">Bing</option></select></label>
+      <label className="runtime-option"><input type="checkbox" checked={config.allowBingFallback ?? false} onChange={(event) => setConfig({ ...config, allowBingFallback: event.target.checked })} />{t('Разрешить Bing как резервный провайдер')}</label>
+      <small>{t('Поиск работает без API-ключа. Google Search API закрыт для новых клиентов; прямой Google-поиск не поддерживается.')}</small>
+    </fieldset>
     <div className="runtime-model-heading"><div><h3>{t("Мои модели")}</h3><p>{t("Можно добавить любую совместимую GGUF-модель.")}</p></div><button className="runtime-add-model" onClick={addModel}><Plus size={16} /> {t(" Добавить GGUF")}</button></div>
     <ul className="runtime-model-list">{setup.models.map((model) => {
       const profile = config.models.find((item) => item.id === model.id);

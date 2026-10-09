@@ -4,10 +4,11 @@ import { memo, useEffect, useId, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
-import { mermaidLabelColorForContrast, mermaidThemeVariables } from '../../shared/mermaid-theme';
+import { mermaidGitThemeVariables, mermaidLabelColorForContrast, mermaidThemeVariables } from '../../shared/mermaid-theme';
 
-// Mermaid configuration is global; serialize themed renders from different messages.
-let mermaidQueue = Promise.resolve();
+import { downloadSvg } from '../svg-export';
+import { layoutGitLabels } from '../git-label-layout';
+import { queueMermaidTask } from '../mermaid-validation';
 
 function correctRenderedLabelContrast(svg: SVGSVGElement, underlayColor: string) {
   const surfaces = [
@@ -50,6 +51,7 @@ function correctRenderedLabelContrast(svg: SVGSVGElement, underlayColor: string)
 
 function MermaidBlock({ source }: { source: string }) {
   useLocale();
+  const gitGraph = /^\s*gitGraph\b/.test(source);
   const id = useId().replace(/[^a-zA-Z0-9]/g, '');
   const block = useRef<HTMLDivElement>(null);
   const viewport = useRef<HTMLDivElement>(null);
@@ -58,6 +60,7 @@ function MermaidBlock({ source }: { source: string }) {
   const [theme, setTheme] = useState<'dark' | 'light'>('dark');
   const [svg, setSvg] = useState('');
   const [naturalWidth, setNaturalWidth] = useState(0);
+  const [gitDescriptions, setGitDescriptions] = useState<string[]>([]);
   const [error, setError] = useState('');
   const [zoom, setZoom] = useState(1);
   const [copied, setCopied] = useState(false);
@@ -94,7 +97,7 @@ function MermaidBlock({ source }: { source: string }) {
     setNaturalWidth(0);
     setError('');
     setZoom(1);
-    mermaidQueue = mermaidQueue.then(async () => {
+    void queueMermaidTask(async () => {
       if (cancelled) return;
       const scratch = document.createElement('div');
       scratch.style.cssText = 'position:fixed;left:0;top:0;opacity:0;pointer-events:none;z-index:-1';
@@ -108,14 +111,15 @@ function MermaidBlock({ source }: { source: string }) {
           securityLevel: 'strict',
           suppressErrorRendering: true,
           theme: 'base',
-          themeVariables: mermaidThemeVariables(theme),
+          themeVariables: { ...mermaidThemeVariables(theme), ...(gitGraph ? mermaidGitThemeVariables(theme) : {}) },
+          gitGraph: { rotateCommitLabel: false, diagramPadding: 12, parallelCommits: false },
           fontFamily: 'Inter, ui-sans-serif, system-ui, sans-serif',
           flowchart: { htmlLabels: true },
         });
         const result = await mermaid.render(`mermaid-${id}`, source, scratch);
         if (!cancelled) {
           const preview = document.createElement('div');
-          preview.className = `mermaid-block mermaid-${theme}`;
+          preview.className = `mermaid-block mermaid-${theme}${gitGraph ? ' mermaid-git' : ''}`;
           preview.style.cssText = 'position:fixed;left:-10000px;top:0;visibility:hidden;width:1000px';
           const canvas = document.createElement('div');
           canvas.className = 'mermaid-canvas';
@@ -125,7 +129,15 @@ function MermaidBlock({ source }: { source: string }) {
           try {
             const rendered = canvas.querySelector('svg');
             if (!rendered) throw new Error('Mermaid returned SVG without a root element');
+            if (gitGraph) {
+              const colors = mermaidGitThemeVariables(theme) as Record<string, string>;
+              for (const lane of rendered.querySelectorAll<SVGElement>('.branch')) {
+                const index = [...lane.classList].map(value => /^branch(\d+)$/.exec(value)?.[1]).find(value => value !== undefined);
+                if (index !== undefined) lane.style.setProperty('stroke', colors[`git${Number(index) % 8}`], 'important');
+              }
+            }
             correctRenderedLabelContrast(rendered, getComputedStyle(preview).backgroundColor);
+            setGitDescriptions(gitGraph ? layoutGitLabels(rendered) : []);
             const width = Number(rendered.getAttribute('viewBox')?.trim().split(/\s+/)[2]);
             setNaturalWidth(Number.isFinite(width) && width > 0 ? width : 0);
             setSvg(rendered.outerHTML);
@@ -140,7 +152,7 @@ function MermaidBlock({ source }: { source: string }) {
       }
     });
     return () => { cancelled = true; };
-  }, [id, source, theme]);
+  }, [id, source, theme, gitGraph]);
 
   const reset = () => {
     setZoom(1);
@@ -158,13 +170,14 @@ function MermaidBlock({ source }: { source: string }) {
     }
   };
 
-  return <div className={`mermaid-block mermaid-${theme}${expanded ? ' mermaid-expanded' : ''}`} ref={block}>
+  return <div className={`mermaid-block mermaid-${theme}${gitGraph ? ' mermaid-git' : ''}${expanded ? ' mermaid-expanded' : ''}`} ref={block}>
     <div className="mermaid-toolbar">
       <span className="mermaid-title">{t("Диаграмма")}</span>
       <div className="mermaid-controls" role="group" aria-label={t("Управление диаграммой")}>
         <button type="button" aria-label={t("Уменьшить диаграмму")} disabled={!svg || zoom <= .5} onClick={() => setZoom(value => Math.max(.5, value - .25))}>−</button>
         <output aria-label={t("Масштаб")}>{Math.round(zoom * 100)}%</output>
         <button type="button" aria-label={t("Увеличить диаграмму")} disabled={!svg || zoom >= 3} onClick={() => setZoom(value => Math.min(3, value + .25))}>+</button>
+        <button type="button" disabled={!svg} onClick={() => { const rendered = viewport.current?.querySelector('svg'); if (rendered) downloadSvg(rendered, t('Диаграмма'), gitDescriptions.map((label, index) => ({ label: `${index + 1} — ${label}` }))); }}>{t('Экспорт SVG')}</button>
         <button type="button" disabled={!svg} onClick={reset}>{t("Сбросить")}</button>
         <button type="button" aria-expanded={expanded} onClick={() => setExpanded(value => !value)}>{expanded ? t("Свернуть") : t("Развернуть")}</button>
       </div>
@@ -186,9 +199,10 @@ function MermaidBlock({ source }: { source: string }) {
       }}
       onPointerCancel={() => { drag.current = null; }}
       onLostPointerCapture={() => { drag.current = null; }}>
-      {svg ? <div className="mermaid-canvas" style={{ width: `${zoom * 100}%`, minWidth: naturalWidth ? `${naturalWidth * zoom}px` : undefined }} dangerouslySetInnerHTML={{ __html: svg }} />
+      {svg ? <div className="mermaid-canvas" style={{ width: gitGraph && naturalWidth ? `${naturalWidth * zoom}px` : `${zoom * 100}%`, minWidth: naturalWidth ? `${naturalWidth * zoom}px` : undefined }} dangerouslySetInnerHTML={{ __html: svg }} />
         : <p className="mermaid-status" role="status">{error || t("Отрисовка диаграммы…")}</p>}
     </div>
+    {gitDescriptions.length > 0 && <details className="git-commit-descriptions" open><summary>{t('Описания коммитов')}</summary><ol>{gitDescriptions.map((description, index) => <li key={index}>{description}</li>)}</ol></details>}
     <details className="mermaid-source" open={error ? true : undefined}>
       <summary>{t("Исходный Mermaid-код")}</summary>
       <div className="mermaid-source-actions">

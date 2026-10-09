@@ -166,6 +166,36 @@ button.sidebar-footer { background: transparent; border: 0; text-align: left; }
 .runtime-setup-action-copy { display: grid; gap: 2px; text-align: left; }.runtime-setup-action-copy strong { font-size: 13px; color: var(--text); }.runtime-setup-action-copy small { color: var(--text-muted); font-size: 11px; }
 @keyframes setup-attention { 0%, 100% { box-shadow: 0 0 0 0 rgb(201 140 99 / 0%); } 50% { box-shadow: 0 0 13px 2px rgb(201 140 99 / 19%); } }
 @media (prefers-reduced-motion: reduce) { .runtime-setup-action.needs-setup { animation: none; } }
+
+/* Validated rich response blocks stay inside the normal conversation flow. */
+.rich-artifacts { display: grid; gap: 14px; width: min(100%, 920px); margin: 14px 0; }
+.rich-artifacts h2, .rich-artifacts h3, .rich-artifacts p { margin: 0; }
+.rich-report, .rich-metrics, .rich-chart, .rich-table, .rich-gallery, .rich-diagram { min-width: 0; padding: 14px; border: 1px solid var(--border); border-radius: 12px; background: color-mix(in srgb, var(--surface-raised) 88%, var(--bg)); }
+.rich-report { display: grid; gap: 16px; }.rich-report header { display: grid; gap: 6px; }.rich-report h2 { font-size: 20px; }.rich-report p { color: var(--text-muted); line-height: 1.5; }.rich-report ul { margin: 8px 0 0; padding-left: 21px; color: var(--text-muted); }.rich-report li + li { margin-top: 5px; }
+.rich-metric-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 170px), 1fr)); gap: 9px; margin-top: 9px; }.rich-metric { min-width: 0; display: grid; gap: 7px; padding: 13px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface); }.rich-metric > span { color: var(--text-muted); font-size: 12px; }.rich-metric strong { color: var(--text); font-size: 22px; font-weight: 650; overflow-wrap: anywhere; }.rich-metric strong small { color: var(--text-muted); font-size: 13px; font-weight: 500; }.rich-metric em { color: var(--text-muted); font-size: 12px; font-style: normal; }.rich-metric em.positive { color: #72c99a; }.rich-metric em.negative { color: #e58989; }.rich-metric p { color: var(--text-muted); font-size: 12px; line-height: 1.45; }
+.rich-chart > header, .rich-table > header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 8px; }.rich-chart > header h3, .rich-table > header h3 { flex: 1; }.rich-chart button, .rich-table button { border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; color: var(--text-muted); background: var(--surface); cursor: pointer; }.rich-chart button:hover, .rich-table button:hover { color: var(--text); border-color: var(--border-strong); }.rich-chart-canvas { width: 100%; height: clamp(220px, 33vw, 350px); min-height: 220px; color: var(--text); }.rich-source { display: flex; flex-wrap: wrap; gap: 4px 8px; margin-top: 9px; color: var(--text-subtle); font-size: 11px; }.rich-source a, .rich-source-link { color: var(--link-color); }.rich-source small { color: var(--text-subtle); }
+.rich-table-scroll { width: 100%; overflow-x: auto; border: 1px solid var(--border); border-radius: 7px; }.rich-table table { width: 100%; border-collapse: collapse; font-size: 12px; }.rich-table th, .rich-table td { min-width: 90px; padding: 8px 10px; border-bottom: 1px solid var(--border); text-align: left; white-space: pre-wrap; overflow-wrap: anywhere; }.rich-table th { position: sticky; top: 0; background: var(--surface); }.rich-table th button { width: 100%; padding: 0; border: 0; color: var(--text); background: transparent; text-align: inherit; font-weight: 650; }.rich-table td.numeric, .rich-table th.numeric { text-align: right; font-variant-numeric: tabular-nums; }.rich-table tbody tr:last-child td { border-bottom: 0; }.rich-table tbody tr:hover { background: color-mix(in srgb, var(--surface-hover) 55%, transparent); }
+.rich-gallery-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 190px), 1fr)); gap: 10px; margin-top: 10px; }.rich-gallery-item { min-width: 0; display: grid; align-content: start; gap: 6px; font-size: 12px; }.rich-gallery-item strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.rich-gallery-preview { display: grid; width: 100%; aspect-ratio: 4 / 3; place-items: center; overflow: hidden; padding: 0; border: 1px solid var(--border); border-radius: 8px; color: var(--text-muted); background: var(--surface); cursor: zoom-in; }.rich-gallery-preview img { width: 100%; height: 100%; object-fit: cover; }.rich-source-link { padding: 0; border: 0; background: transparent; text-align: left; cursor: pointer; }.rich-image-modal { position: fixed; inset: 0; z-index: 40; display: grid; place-items: center; padding: 4vh 4vw; background: #000d; cursor: zoom-out; }.rich-image-modal img { max-width: 90vw; max-height: 84vh; object-fit: contain; }.rich-image-modal button { position: absolute; top: 16px; right: 16px; padding: 7px 11px; border: 1px solid #ffffff44; border-radius: 7px; color: white; background: #222; cursor: pointer; }
+.rich-diagram { overflow-x: auto; }.rich-diagram h3 { margin-bottom: 8px; }
+@media (max-width: 640px) { .rich-artifacts { gap: 10px; }.rich-report, .rich-metrics, .rich-chart, .rich-table, .rich-gallery, .rich-diagram { padding: 10px; }.rich-metric strong { font-size: 19px; }.rich-chart-canvas { height: 245px; } }
+/* Rich-response polish: compact media previews, neutral change indicators and
+   constrained lightbox layout keep large assets from dominating chat. */
+.rich-metric { align-content: start; background: linear-gradient(145deg, color-mix(in srgb, var(--surface) 92%, var(--accent) 8%), var(--surface)); box-shadow: 0 3px 12px #00000012; }
+.rich-metric > span { line-height: 1.35; overflow-wrap: anywhere; }
+.rich-metric strong { font-size: clamp(19px, 2vw, 24px); font-variant-numeric: tabular-nums; }
+.rich-metric em.neutral { color: var(--text-muted); }
+.rich-gallery-grid.gallery-count-1 { grid-template-columns: minmax(0, min(100%, 560px)); }
+.rich-gallery-grid.gallery-count-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.rich-gallery-grid.gallery-count-3, .rich-gallery-grid.gallery-count-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.rich-gallery-grid.gallery-count-5 { grid-template-columns: repeat(auto-fit, minmax(min(100%, 210px), 1fr)); }
+.rich-gallery-preview { max-height: 280px; }
+.rich-gallery-preview img { object-fit: contain; }
+.rich-image-modal-content { position: relative; display: grid; justify-items: center; gap: 10px; max-width: 92vw; max-height: 92vh; padding: 42px 14px 12px; border: 1px solid #ffffff2b; border-radius: 12px; background: #17191df2; cursor: default; }
+.rich-image-modal-content > button { position: absolute; top: 9px; right: 9px; padding: 7px 11px; border: 1px solid #ffffff44; border-radius: 7px; color: white; background: #222; cursor: pointer; }
+.rich-image-modal-content img { max-width: 88vw; max-height: 78vh; object-fit: contain; }
+.rich-image-modal-content footer { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; width: 100%; color: #eee; font-size: 12px; }
+.rich-image-modal-content footer button { color: #ffc18f; border: 0; background: transparent; cursor: pointer; }
+@media (max-width: 520px) { .rich-gallery-grid.gallery-count-2, .rich-gallery-grid.gallery-count-3, .rich-gallery-grid.gallery-count-4 { grid-template-columns: minmax(0, 1fr); } }
 .runtime-setup { width: min(860px, 100%); }
 .runtime-setup header > div { min-width: 0; }.runtime-setup header p { margin: 4px 0 0; }
 .runtime-readiness { display: grid; gap: 3px; margin: 14px 0; padding: 11px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-muted); }.runtime-readiness.is-ready { border-color: #548460; }.runtime-readiness.is-incomplete { border-color: color-mix(in srgb, var(--accent) 70%, var(--border)); }.runtime-readiness span { color: var(--text-muted); font-size: 12px; }
@@ -173,3 +203,22 @@ button.sidebar-footer { background: transparent; border: 0; text-align: left; }
 .runtime-model-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 20px; }.runtime-model-heading h3 { margin: 0; }.runtime-model-heading p { margin: 4px 0; font-size: 12px; }.runtime-add-model { display: flex; align-items: center; gap: 6px; color: var(--text); }
 .runtime-model-list { display: grid; gap: 6px; margin: 8px 0; padding: 0; list-style: none; }.runtime-model-list li { display: flex; align-items: center; gap: 8px; border: 1px solid var(--border); border-radius: 7px; }.runtime-model-list li.model-ready { border-left: 3px solid #548460; }.runtime-model-list li.model-needs-setup { border-left: 3px solid var(--accent); }.runtime-model-list li > button:last-child { margin-right: 6px; }.runtime-model-select { display: grid; flex: 1; min-width: 0; gap: 3px; text-align: left; background: transparent !important; border: 0 !important; }.runtime-model-select span, .runtime-model-select small { color: var(--text-muted); font-size: 11px; overflow-wrap: anywhere; }
 .runtime-model-editor { padding: 8px 14px; }.runtime-model-editor input:not([type="checkbox"]), .runtime-model-editor select { width: 100%; margin-top: 4px; color: var(--text); background: var(--surface-muted); border: 1px solid var(--border); padding: 8px; font: inherit; }.runtime-model-editor .runtime-option { display: flex; align-items: center; gap: 8px; }.runtime-model-editor .runtime-option input { min-width: auto; }
+
+/* Reserve separate layout rows for axis captions and legends; neither overlays SVG ticks. */
+.rich-chart-legend { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px 18px; list-style: none; margin: 10px 0 0; padding: 0; color: var(--text); font-size: 14px; line-height: 1.45; }
+.rich-chart-legend li { display: flex; align-items: baseline; gap: 7px; min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
+.rich-chart-legend i { width: 10px; height: 10px; border-radius: 3px; flex: 0 0 auto; }
+.rich-chart-legend small { color: var(--text-muted); font-size: 12px; }
+.rich-chart-axis-titles { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 6px 16px; color: var(--text-muted); font-size: 13px; line-height: 1.4; padding: 6px 4px 0; }
+.rich-chart-canvas { min-width: 0; overflow: hidden; }
+.rich-chart-canvas .recharts-tooltip-wrapper { max-width: min(350px, 85vw); font-size: 13px; overflow-wrap: anywhere; }
+.mermaid-git .mermaid-viewport { min-height: 0; padding: 16px; }
+.mermaid-git .mermaid-canvas .arrow { stroke-width: 3px !important; }
+.mermaid-git .mermaid-canvas .branch { stroke-width: 2px !important; stroke-dasharray: none !important; }
+.mermaid-git .mermaid-canvas .branchLabel text, .mermaid-git .mermaid-canvas .branchLabel tspan, .mermaid-git .mermaid-canvas .branchLabel foreignObject div, .mermaid-git .mermaid-canvas .branchLabel foreignObject span { fill: #161513 !important; color: #161513 !important; font-size: 14px; font-weight: 600; }
+.mermaid-git.mermaid-light .mermaid-canvas .branchLabel text, .mermaid-git.mermaid-light .mermaid-canvas .branchLabel tspan, .mermaid-git.mermaid-light .mermaid-canvas .branchLabel foreignObject div, .mermaid-git.mermaid-light .mermaid-canvas .branchLabel foreignObject span { fill: #ffffff !important; color: #ffffff !important; }
+.mermaid-git .mermaid-canvas .commit-label { font-size: 13px; font-weight: 500; }
+
+.git-commit-descriptions { padding: 10px 14px; border-top: 1px solid var(--border); color: var(--text-muted); font-size: 13px; }
+.git-commit-descriptions ol { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 5px 28px; padding-left: 22px; overflow-wrap: anywhere; }
+.rich-response-warning { border-left: 3px solid var(--accent); padding: 8px 12px; color: var(--text-muted); font-size: 13px; }

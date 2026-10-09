@@ -7,11 +7,12 @@ export const runTurnId = (runId: string): string => `run-${runId}`;
  * history: timeline, actions, partial output and terminal state. */
 export function runHistoryTurn(run: AnalysisRun): ChatMessage | null {
   if (run.status === 'running' || run.assistantMessageId) return null;
-  const hasHistory = Boolean(run.timeline?.length || run.actions.length || run.partialOutput?.trim());
+  const hasHistory = Boolean(run.timeline?.length || run.actions.length || run.partialOutput?.trim() || run.richArtifacts?.length);
   if (!hasHistory && run.status !== 'cancelled' && run.status !== 'error') return null;
   return {
     id: runTurnId(run.id), conversationId: run.conversationId, role: 'assistant', content: run.partialOutput ?? '', createdAt: run.createdAt,
     ...(run.timeline?.length ? { thinkingTimeline: run.timeline } : {}),
+    ...(run.richArtifacts?.length ? { richArtifacts: run.richArtifacts } : {}),
     ...(run.status === 'cancelled' ? { agentCancelled: true } : {}),
     ...(run.status === 'error' ? { agentError: run.error ?? 'Генерация завершилась с ошибкой.' } : {}),
     ...(run.completedAt ? { agentFinishedAt: run.completedAt } : {}),

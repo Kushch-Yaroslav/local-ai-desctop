@@ -41,6 +41,7 @@ export interface AttachmentInput {
   /** Bytes are copied to application-managed storage in Electron main, never executed. */
   data: Uint8Array;
 }
+export interface RemoteImageData { mimeType: 'image/png' | 'image/jpeg' | 'image/webp'; dataUrl: string }
 
 export interface ActionApproval {
   approvalId: string;
@@ -186,6 +187,8 @@ export interface ChatMessage {
   taskPlan?: AgentPlan;
   /** Optional for conversations written before per-message generation statistics existed. */
   generationStats?: GenerationStats;
+  /** Validated, versioned data-only visual elements generated for this answer. */
+  richArtifacts?: import('./rich-artifacts').RichArtifact[];
   /** V2 Agent terminal state kept in the flat activity timeline. It is never
    * sent back to a model or persisted as a normal assistant completion. */
   agentError?: string;
@@ -206,6 +209,8 @@ export interface HardwareStats {
 }
 
 export interface RuntimeConfiguration {
+  searchProvider?: import('./search-settings').SearchPreference;
+  allowBingFallback?: boolean;
   language?: 'ru' | 'en';
   /** Explicit global menu selection overrides legacy per-model placement. */
   imageProcessingDevice?: 'cpu' | 'gpu';
@@ -354,6 +359,8 @@ export interface AnalysisRun {
   timeline?: ThinkingTimelineEvent[];
   /** Visible output received before a run ended without a final answer. */
   partialOutput?: string;
+  /** Accepted artifacts checkpointed before completion, scoped to this run. */
+  richArtifacts?: import('./rich-artifacts').RichArtifact[];
   /** Failure text for a run that ended in `error`. */
   error?: string;
 }
@@ -364,9 +371,11 @@ export interface AnalysisProgress {
 }
 
 export type StreamEvent =
+  | { type: 'model-state'; state: 'waiting' | 'streaming' }
   | { type: 'work-budget'; budget: WorkBudget }
   | { type: 'token'; content: string }
   | { type: 'thinking'; content: string; timelinePosition?: number }
+  | { type: 'rich-artifact'; artifact: import('./rich-artifacts').RichArtifact }
   | { type: 'task-memory'; memory: NonNullable<AgentPlan['taskMemory']> }
   | { type: 'steering'; userMessage: ChatMessage; status: 'accepted' | 'applied'; timelinePosition?: number }
   | { type: 'paused'; timelinePosition?: number }
@@ -399,6 +408,7 @@ export interface LocalAiApi {
     list(messageId: string): Promise<Attachment[]>;
     dataUrl(id: string): Promise<string | null>;
   };
+  webImages: { load(url: string): Promise<RemoteImageData>; openSource(url: string): Promise<void> };
   analysis: { list(conversationId: string): Promise<AnalysisRun[]> };
   models: { list(): Promise<ModelInfo[]> };
   runtime: { state(): Promise<NonNullable<AppSettings['llamaRuntime']>> };
@@ -413,6 +423,8 @@ export interface LocalAiApi {
     steer(conversationId: string, generationId: string, content: string, intent?: SteeringIntent): Promise<ChatMessage>;
     stop(conversationId: string, generationId?: string): Promise<void>;
     approve(request: { conversationId: string; generationId: string; approvalId: string; decision: ApprovalDecision }): Promise<boolean>;
+    onDiagramValidation(listener: (request: { id: string; source: string }) => void): () => void;
+    diagramValidationResult(id: string, error?: string): void;
     onStream(listener: (event: StreamEvent & { conversationId: string; generationId: string; modelId?: string }) => void): () => void;
   };
 }

@@ -4,6 +4,7 @@ import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AnalysisRun, ChatMessage, ChatRequest, Conversation, StreamEvent, ThinkingTimelineEvent } from '../../shared/types';
+import { validateRichArtifact, visualArtifactExamples } from '../../shared/rich-artifacts';
 import type { LlamaRuntimeState } from '../services/llama-runtime-controller';
 
 type Sent = StreamEvent & { conversationId: string; generationId?: string };
@@ -29,6 +30,7 @@ async function run(): Promise<void> {
   const { LlamaRuntimeController } = await import('../services/llama-runtime-controller');
   const { LlamaCppBackend } = await import('../backends/llama-cpp-backend');
   const { RustAgentRuntime } = await import('../services/rust-agent-runtime');
+  const { WebChatService } = await import('../services/web-chat');
   const { withRunHistory, runTurnId } = await import('../../shared/run-history');
   const { steeringMessageIds, thinkingTimeline } = await import('../../shared/thinking-timeline');
   let runtime: LlamaRuntimeState = { status: 'idle', modelId: null, contextWindow: null };
@@ -40,6 +42,8 @@ async function run(): Promise<void> {
   let steered!: () => void;
   RustAgentRuntime.prototype.stream = function (...args: unknown[]) { return script(args[3] as AbortSignal); } as typeof RustAgentRuntime.prototype.stream;
   RustAgentRuntime.prototype.steer = async () => { steered(); };
+  WebChatService.prototype.stream = function (...args: unknown[]) { return script(args[2] as AbortSignal); } as typeof WebChatService.prototype.stream;
+  const artifact = validateRichArtifact(visualArtifactExamples.chart, undefined, 'interrupted-chart').artifact!;
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () => new Response(JSON.stringify({ data: [] }), { status: 200 });
   const events: Sent[] = [];
@@ -73,6 +77,8 @@ async function run(): Promise<void> {
       yield tool('term-2', { kind: 'terminal', state: 'running', terminal: { command: 'node bench.js', status: 'running' } });
       yield { type: 'thinking', content: 'The loop is in' };
       yield { type: 'token', content: 'Partial analysis: the capture loop' };
+      yield { type: 'rich-artifact', artifact };
+      yield { type: 'rich-artifact', artifact };
       // Stalled: nothing more arrives until the run is aborted.
       await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), { once: true }));
     };
@@ -81,7 +87,7 @@ async function run(): Promise<void> {
     const steering = await invoke<ChatMessage>('chat:steer', chat.id, 'stalled', 'Focus on captures');
     await waitUntil(() => events.some((event) => event.generationId === 'stalled' && event.type === 'token'), 'stalled stream');
     const liveTimeline = kinds(runsOf('stalled').length ? db.listAnalysisRuns(chat.id)[0].timeline : undefined);
-    assert.deepEqual(liveTimeline, ['reasoning', 'activity:read-1', 'activity:progress-1', 'activity:term-1', 'paused', 'steering', 'reasoning', 'activity:read-2', 'activity:term-2'], 'committed events must be checkpointed before any Stop');
+    assert.deepEqual(liveTimeline, ['reasoning', 'activity:read-1', 'activity:progress-1', 'activity:term-1', 'paused', 'steering', 'reasoning', 'activity:read-2', 'activity:term-2', 'reasoning'], 'committed events must be checkpointed before any Stop');
     await invoke('chat:stop', chat.id, 'stalled');
     await first;
 
@@ -96,6 +102,7 @@ async function run(): Promise<void> {
       assert.deepEqual(kinds(stopped.timeline), expected, `${label}: timeline`);
       assert.equal(stopped.timeline?.filter((entry) => entry.kind === 'reasoning').at(-1)?.kind === 'reasoning' && stopped.timeline?.filter((entry) => entry.kind === 'reasoning').at(-1)?.content, 'The loop is in', `${label}: interrupted reasoning text`);
       assert.equal(stopped.partialOutput, 'Partial analysis: the capture loop', `${label}: partial output`);
+      assert.deepEqual(stopped.richArtifacts, [artifact], `${label}: interrupted artifact persists once`);
       assert.deepEqual(stopped.actions.map((action) => action.id), ['read-1', 'progress-1', 'term-1', 'read-2', 'term-2'], `${label}: actions`);
       assert(!stopped.actions.some((action) => action.state === 'running'), `${label}: no action may stay running after Stop`);
       assert.equal(stopped.actions.find((action) => action.id === 'term-1')?.terminal?.stderr, 'AssertionError', `${label}: terminal failure`);
@@ -105,10 +112,12 @@ async function run(): Promise<void> {
       assert.deepEqual([...steeringMessageIds(rendered)], [steering.id], `${label}: steering keeps its semantic type`);
       const turn = rendered[1];
       assert.equal(turn.agentCancelled, true, `${label}: stopped marker`);
+      assert.deepEqual(turn.richArtifacts, [artifact], `${label}: restored artifact`);
       const items = thinkingTimeline(turn.thinking, stopped.actions, false, turn.thinkingTimeline, rendered);
       assert.equal(items.filter((item) => item.kind === 'steering').length, 1, `${label}: steering rendered once inside the timeline`);
       return stopped;
     };
+    assert.equal(events.filter((event) => event.generationId === 'stalled' && event.type === 'rich-artifact').length, 1, 'artifact emitted live once');
     const stopped = verify(db, 'after Stop');
     // A restart opens the same SQLite file through a new connection and recovers it.
     const restarted = new Database();
@@ -153,6 +162,27 @@ async function run(): Promise<void> {
     assert.deepEqual(afterFailure.map((message) => message.id).slice(-2), ['failed-user', runTurnId(failed.id)]);
     assert.equal(afterFailure.at(-1)?.agentError, 'Rust Agent Runtime V2 error: repetition_loop');
     assert.equal(new Set(afterFailure.map((message) => message.id)).size, afterFailure.length, 'no duplicated turns');
+    // Chat uses the same durable artifact checkpoint, without forcing plans or Agent tools.
+    const simpleChat = await invoke<Conversation>('conversations:create');
+    await invoke('conversations:update', simpleChat.id, { modelId: model, mode: 'chat', webMode: 'off' });
+    const discoveries = new Map(['white', 'pink', 'red', 'yellow'].map(color => [color, { id: color, url: `https://images.example.test/${color}.jpg`, sourceUrl: `https://sources.example.test/${color}`, title: color, alt: color }]));
+    const gallery = validateRichArtifact({ version: 1, type: 'image_gallery', summary: 'Licenses not verified.', images: [...discoveries.keys()].map(discovery_id => ({ discovery_id })) }, discoveries, 'interrupted-gallery').artifact!;
+    script = async function* (signal) {
+      yield { type: 'rich-artifact', artifact };
+      yield { type: 'rich-artifact', artifact: gallery };
+      await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), { once: true }));
+    };
+    const chatRequest = { ...request('chat-stopped', [], 'Demo chart'), conversationId: simpleChat.id };
+    const pendingChat = invoke('chat:send', chatRequest);
+    await waitUntil(() => events.some((event) => event.generationId === 'chat-stopped' && event.type === 'rich-artifact' && event.artifact.id === gallery.id), 'live Chat gallery');
+    assert.deepEqual(restarted.listAnalysisRuns(simpleChat.id)[0].richArtifacts, [artifact, gallery], 'artifact checkpoint exists before Stop');
+    await invoke('chat:stop', simpleChat.id, 'chat-stopped'); await pendingChat;
+    assert.deepEqual(withRunHistory(restarted.listMessages(simpleChat.id), restarted.listAnalysisRuns(simpleChat.id)).at(-1)?.richArtifacts, [artifact, gallery]);
+    // A replacement attempt accepts a new artifact, not the stopped attempt's artifact.
+    const replacement = validateRichArtifact({ ...visualArtifactExamples.chart, title: 'Replacement attempt' }, undefined, 'replacement').artifact!;
+    script = async function* () { yield { type: 'rich-artifact', artifact: replacement }; yield { type: 'done' }; };
+    await invoke('chat:send', { ...chatRequest, generationId: 'chat-regenerated', persistUserMessage: false });
+    assert.deepEqual(restarted.listMessages(simpleChat.id).at(-1)?.richArtifacts, [replacement]);
     restarted.close();
     console.log('stalled Agent → Stop → restart → Continue keeps the full persisted timeline; completion and failure persist once');
   } finally { globalThis.fetch = originalFetch; loader._load = originalLoad; db.close(); rmSync(root, { recursive: true, force: true }); }

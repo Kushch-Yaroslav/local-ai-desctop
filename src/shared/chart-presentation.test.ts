@@ -1,0 +1,14 @@
+import assert from 'node:assert/strict';
+import { chartNumber, showChartLegend } from './chart-presentation';
+import { visualArtifactExamples } from './rich-artifacts';
+assert.equal(chartNumber(51.2, 'ru'), '51,2');
+assert.equal(chartNumber(51.2, 'en'), '51.2');
+assert.equal(chartNumber(51.23456789, 'en'), '51.23456789');
+assert.equal(chartNumber(55000, 'en', true), '55K');
+assert.match(chartNumber(55000, 'ru', true), /55.*тыс/);
+assert.equal(chartNumber(null, 'en'), '');
+assert.equal(showChartLegend(visualArtifactExamples.chart), false);
+assert.equal(showChartLegend({ ...visualArtifactExamples.chart, title: 'Quarterly totals' }), true);
+assert.equal(showChartLegend({ ...visualArtifactExamples.chart, series: [{ key: 'a', name: 'Revenue' }, { key: 'b', name: 'Costs' }] }), true);
+assert.equal(showChartLegend({ ...visualArtifactExamples.chart, chart: 'pie' }), true);
+console.log('Chart presentation: locale, precision, compact axes and legend relevance passed.');

@@ -56,6 +56,8 @@ pub struct Config {
     pub user_images: Vec<String>,
     pub user_image_refs: Vec<String>,
     pub web_tools: Vec<Value>,
+    pub artifact_tools: Vec<Value>,
+    pub attachment_tools: Vec<Value>,
     pub host_tools: Option<Arc<crate::tools::web::HostTools>>,
     pub root: Option<String>,
     pub secondary_root: Option<String>,
@@ -144,11 +146,12 @@ const AGENT_GUIDANCE: &str = r#"
 # Local AI Desktop Agent
 - Work directly from the conversation and tool results. A tool-free response completes the run; there is no separate step to request before answering.
 - For code changes, read before writing, make targeted changes, then check them: after you change files, run the cheapest check that shows the change works (the project's own tests, or a short script that runs the changed code; for a page, a real browser run, such as a headless browser or a Playwright or Puppeteer script; jsdom or a hand-written DOM stand-in does not count as a browser check). A check must go through the same entry path the user will use (for a page: the real HTML with its script order and load timing, not only the script run against a stand-in); if it only covers part of that path or uses a stand-in, say so. A claim is only as strong as the check behind it: a command that exits 0 shows what it ran, not more. If the check the claim needs cannot be run here (for example, no browser), leave it implemented and say so plainly instead of substituting a weaker check. For a small literal edit, prefer replace_text after reading the file; it avoids patch context markers without weakening freshness checks. Verification is part of the work, not an extra step to announce. Reading a file back shows only that it exists, not that it works. When a check fails, fix the cause and run it again; do not invent checks or skip a failure.
+- For an informational answer, use create_visual_artifact only when a chart, table, metric group, Mermaid diagram, real-image gallery, or concise report materially helps. Use actual values and sources present in user inputs or tool observations; explicitly requested fictional/demo data is allowed when labeled fictional. When the user requests an interactive chart or artifact diagram, call the artifact tool: Markdown tables and ASCII sketches are not equivalent. Do not repeat an accepted diagram in Markdown or add a generic fallback diagram. For comparisons and reports, reuse one coherent dataset across metrics, chart, and table; encode unavailable numeric data as null, never as a guessed value or formatted string. For real images, use web_image_search and reference its discovery_id values; never invent URLs or attribution. A selected project does not turn an ordinary question into a coding task. The artifact tool accepts data only, never HTML, CSS, JavaScript, or SVG.
 - For substantial tasks, reason about an approach before acting, adapt as you learn, use tools for concrete evidence, avoid broad rereads, and continue until the user's task is complete.
 - Plan = your own short list of steps for non-trivial work (plan tool: set if useful, then update at meaningful milestones or when the approach changes; skip it for a trivial request). It is not the user's deliverables and finishing its steps proves nothing. Do not narrate plan updates or restate the plan in prose; no update is required after every action.
 - Agent runtime state belongs to the harness, not to the human. Accepted updates stay beside the tool substep that produced them; the latest value of each section supersedes earlier values. A cleared section is no longer active. Continue the next action without treating these updates as new user instructions.
 - Use the configured interface language as a default when supplied, otherwise use the latest user's language, for all user-visible natural-language text: streamed reasoning/progress, tool preambles, brief status updates, and the final answer. Follow an explicit language request if present. Keep code, paths, identifiers, commands, API/tool syntax, and literal source quotations in their original form. Do not translate protocol fields.
-- For non-trivial architecture relationships, use a compact multiline Mermaid flowchart when it improves readability, or a properly indented multiline tree. Do not compress a diagram into one long arrow chain; avoid decorative box art.
+- For non-trivial architecture relationships, use a compact multiline Mermaid flowchart when it improves readability, or a properly indented multiline tree. Use descriptive labels, not generic A/B/C/D nodes. For Git branching show named main/feature branches, checkout, feature commit, and merge. Do not compress a diagram into one long arrow chain; avoid decorative box art.
 - Task Memory = durable semantic continuity for this task. Record meaningful findings, decisions, blockers, and next actions, and cite the observation IDs (obs-…) a finding rests on in its evidence field. After compaction, trust a precise Task Memory finding from an unchanged inspected file; reread only for a missing fact, ambiguity, possible change, exact detail, or targeted verification.
 - Set Task Memory status and evidence as JSON fields, not prose inside finding. Confirmed entries require evidence containing an observation ID or exact inspected source path from this transcript. A valid reference does not prove the claim; use inferred or unknown for unverified conclusions.
 - Investigation state = a mechanical inventory the runtime keeps of this run's tool observations: files read with their observation IDs, listed entries and local files referenced by sources you read that were not opened yet, failed operations, and commands run. It is not a task list and nothing in it is required. Use it to avoid rereading and to notice code you have not seen; follow a reference only when what you are about to claim depends on it. Recover an exact stored body with observation_read.
@@ -2177,6 +2180,8 @@ struct StreamedTurn {
     /// text, is the canonical record that is replayed on the next request.
     reasoning_raw: String,
     reasoning_markup_filter: ReasoningMarkupFilter,
+    content_markup_filter: ContentMarkupFilter,
+    tool_names: Vec<String>,
     thinking_started: bool,
     reasoning_delta_count: usize,
     calls: BTreeMap<usize, Value>,
@@ -2189,6 +2194,107 @@ struct StreamedTurn {
     prompt_ms: Option<f64>,
     predicted_ms: Option<f64>,
     predicted_per_second: Option<f64>,
+}
+
+#[derive(Default)]
+struct ContentMarkupFilter { pending: String, inside_tool_call: bool, candidate: String, hid_markup: bool }
+
+impl ContentMarkupFilter {
+    fn push(&mut self, input: &str, flush: bool, prefix: &str, tool_names: &[String]) -> String {
+        const OPEN: &str = "<tool_call>";
+        const CLOSE: &str = "</tool_call>";
+        self.pending.push_str(input);
+        let mut visible = String::new();
+        loop {
+            let lower = self.pending.to_ascii_lowercase();
+            if self.inside_tool_call {
+                if let Some(end) = lower.find(CLOSE) {
+                    self.candidate.push_str(&self.pending[..end]);
+                    self.pending.drain(..end + CLOSE.len());
+                    let structured = structured_tool_markup(&self.candidate, tool_names);
+                    if !structured { visible.push_str(OPEN); visible.push_str(&self.candidate); visible.push_str(CLOSE); }
+                    else { self.hid_markup = true; }
+                    self.candidate.clear(); self.inside_tool_call = false;
+                    continue;
+                }
+                let keep = suffix_prefix_length(&lower, CLOSE);
+                let safe = self.pending.len() - keep;
+                self.candidate.push_str(&self.pending[..safe]);
+                self.pending = self.pending[safe..].to_owned();
+                break;
+            }
+            if let Some(start) = lower.find(OPEN) {
+                let literal_prefix = format!("{prefix}{visible}{}", &self.pending[..start]);
+                visible.push_str(&self.pending[..start]);
+                if markdown_code_is_open(&literal_prefix) {
+                    visible.push_str(OPEN);
+                    self.pending.drain(..start + OPEN.len());
+                    continue;
+                }
+                self.pending.drain(..start + OPEN.len());
+                self.inside_tool_call = true;
+                continue;
+            }
+            let keep = suffix_prefix_length(&lower, OPEN);
+            let safe = self.pending.len() - keep;
+            visible.push_str(&self.pending[..safe]);
+            self.pending = self.pending[safe..].to_owned();
+            break;
+        }
+        if flush {
+            if self.inside_tool_call {
+                let structured = structured_tool_markup(&self.candidate, tool_names);
+                if !structured { visible.push_str(OPEN); visible.push_str(&self.candidate); }
+                else { self.hid_markup = true; }
+            } else { visible.push_str(&self.pending); }
+            self.pending.clear(); self.candidate.clear(); self.inside_tool_call = false;
+        }
+        visible
+    }
+}
+
+fn structured_tool_markup(body: &str, tool_names: &[String]) -> bool {
+    if let Ok(value) = serde_json::from_str::<Value>(body.trim()) {
+        return value.get("name").and_then(Value::as_str).is_some_and(|name| tool_names.iter().any(|known| known == name))
+            && value.get("arguments").is_some_and(Value::is_object);
+    }
+    if let Some(position) = body.find("\"name\"") {
+        let tail = body[position + 6..].trim_start();
+        if let Some(encoded) = tail.strip_prefix(':').map(str::trim_start).and_then(|tail| tail.strip_prefix('"')) {
+            if let Some(end) = encoded.find('"') {
+                if tool_names.iter().any(|known| known == &encoded[..end]) { return true; }
+            }
+        }
+    }
+    let trimmed = body.trim_start();
+    let Some(rest) = trimmed.strip_prefix("<function=") else { return false; };
+    let Some(name) = rest.split(['>', ' ', '\n', '\r']).next() else { return false; };
+    tool_names.iter().any(|known| known == name)
+}
+
+fn markdown_code_is_open(source: &str) -> bool {
+    let mut in_fence = false;
+    let mut inline = false;
+    let mut index = 0;
+    while index < source.len() {
+        let rest = &source[index..];
+        if rest.starts_with("```") { in_fence = !in_fence; index += 3; continue; }
+        if !in_fence && rest.starts_with('`') { inline = !inline; index += 1; continue; }
+        index += source[index..].chars().next().map(char::len_utf8).unwrap_or(1);
+    }
+    in_fence || inline
+}
+
+fn append_content(turn: &mut StreamedTurn, content: &str, run_id: &str, emit_content: bool) {
+    let prefix_len = turn.content.len();
+    turn.content.push_str(content);
+    let visible = turn.content_markup_filter.push(content, false, &turn.content[..prefix_len], &turn.tool_names);
+    if emit_content && !visible.is_empty() { emit(run_id, Event::ContentDelta { content: visible }); }
+}
+
+fn flush_content(turn: &mut StreamedTurn, run_id: &str, emit_content: bool) {
+    let visible = turn.content_markup_filter.push("", true, &turn.content, &turn.tool_names);
+    if emit_content && !visible.is_empty() { emit(run_id, Event::ContentDelta { content: visible }); }
 }
 
 fn append_reasoning(turn: &mut StreamedTurn, run_id: &str, reasoning: &str, emit_visible: bool) {
@@ -2426,6 +2532,8 @@ fn stream_call(
         }
     }
     let mut turn = StreamedTurn::default();
+    turn.tool_names = payload.get("tools").and_then(Value::as_array).into_iter().flatten()
+        .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str).map(str::to_owned)).collect();
     let mut buffer = String::new();
     if chunked {
         loop {
@@ -2499,6 +2607,7 @@ fn stream_call(
         consume_sse(&mut buffer, &mut turn, run_id, emit_visible, emit_content)?;
     }
     flush_reasoning(&mut turn, run_id, emit_visible);
+    flush_content(&mut turn, run_id, emit_content);
     trace_forensics(
         run_id,
         "assembled_turn",
@@ -2625,15 +2734,7 @@ fn consume_sse(
                     "parsed_content_delta",
                     json!({"chars":content.chars().count()}),
                 );
-                turn.content.push_str(content);
-                if emit_content {
-                    emit(
-                        run_id,
-                        Event::ContentDelta {
-                            content: content.to_owned(),
-                        },
-                    );
-                }
+                append_content(turn, content, run_id, emit_content);
                 check_repetition(
                     &turn.content,
                     &mut turn.content_repetition_checked,
@@ -3346,6 +3447,14 @@ fn run_tool(
         .map(|result| project_result(config, tool, result))
 }
 
+fn tool_call_fingerprint(tool: &ValidatedCall) -> String {
+    format!("{}:{}", tool.name, serde_json::to_string(&tool.arguments).unwrap_or_default())
+}
+
+fn failed_call_retry_exhausted(state: &AgentState, fingerprint: &str) -> bool {
+    state.failed_tool_calls.get(fingerprint).copied().unwrap_or(0) >= 2
+}
+
 fn run_scoped_tool(
     config: &Config,
     state: &mut AgentState,
@@ -3361,6 +3470,16 @@ fn run_scoped_tool(
         if !config.web_tools.iter().any(|schema| tool_name(schema) == tool.name) { return Err("Web tool is unavailable".into()); }
         let result = config.host_tools.as_ref().ok_or("Web host is unavailable")?.execute(&config.run_id, &tool.name, &tool.arguments, &config.cancelled)?;
         return if result.get("error").is_some() || result.get("blocked_reason").is_some() { Err(result.to_string()) } else { Ok((result, None)) };
+    }
+    if tool.name == "create_visual_artifact" {
+        if !config.artifact_tools.iter().any(|schema| tool_name(schema) == tool.name) { return Err("Visual artifact tool is unavailable".into()); }
+        let result = config.host_tools.as_ref().ok_or("Artifact host is unavailable")?.execute(&config.run_id, &tool.name, &tool.arguments, &config.cancelled)?;
+        return if result.get("error").is_some() { Err(result.to_string()) } else { Ok((result, None)) };
+    }
+    if tool.name == "read_attachment_data" {
+        if !config.attachment_tools.iter().any(|schema| tool_name(schema) == tool.name) { return Err("Attachment data tool is unavailable".into()); }
+        let result = config.host_tools.as_ref().ok_or("Attachment host is unavailable")?.execute(&config.run_id, &tool.name, &tool.arguments, &config.cancelled)?;
+        return if result.get("error").is_some() { Err(result.to_string()) } else { Ok((result, None)) };
     }
     match tool.name.as_str() {
         "project_knowledge_index" => {
@@ -4201,6 +4320,8 @@ pub fn run(config: Config) {
     let stable = stable_prefix(&config);
     transcript.set_secondary_project_root(config.secondary_root.as_deref().map(Path::new));
     let mut schemas = tool_schemas_for_request(config.tool_scope(), config.policy, &config.user);
+    schemas.extend(config.artifact_tools.iter().cloned());
+    schemas.extend(config.attachment_tools.iter().cloned());
     if config.host_tools.is_some() {
         schemas.extend(config.web_tools.iter().filter(|schema| crate::tools::web::is_web_tool(tool_name(schema))).cloned());
     }
@@ -4800,7 +4921,7 @@ pub fn run(config: Config) {
                     continue;
                 }
             }
-            if unstructured_tool_call_content(&streamed.content) {
+            if unstructured_tool_call_content(&streamed.content) || streamed.content_markup_filter.hid_markup {
                 transcript.assistant_withheld_draft(
                     streamed.content,
                     "unstructured provider tool-call markup",
@@ -5281,6 +5402,14 @@ pub fn run(config: Config) {
                 transcript.tool_result(&tool.id, &tool.name, concise_tool_error(refusal));
                 continue;
             }
+            let failure_fingerprint = tool_call_fingerprint(tool);
+            if !transcript.is_finalizing() && crate::tools::web::is_host_tool(&tool.name) && failed_call_retry_exhausted(&state, &failure_fingerprint) {
+                let message = "This identical tool call has failed twice without changed arguments. It was not run again. Use a corrected call only if you can change the failing input; otherwise explain the blocker and finish.";
+                emit(&config.run_id, Event::ToolError { id: tool.id.clone(), name: tool.name.clone(), message: message.into() });
+                transcript.tool_result(&tool.id, &tool.name, concise_tool_error(message));
+                transcript.remind("Those hosted tool arguments were rejected twice. Correct the failing input or explain the limitation; corrected calls and other tools remain available within the normal run budget.".into());
+                continue;
+            }
             emit(
                 &config.run_id,
                 Event::RunState {
@@ -5349,6 +5478,7 @@ pub fn run(config: Config) {
             };
             match outcome {
                 Ok((value, diff)) => {
+                    state.failed_tool_calls.remove(&failure_fingerprint);
                     let content = value.to_string();
                     budget.spend(content.chars().count());
                     tool_result_tokens_since_compaction = tool_result_tokens_since_compaction
@@ -5390,6 +5520,8 @@ pub fn run(config: Config) {
                     record_read_evidence(&config, &transcript, tool);
                 }
                 Err(message) => {
+                    let failed = state.failed_tool_calls.entry(failure_fingerprint).or_default();
+                    *failed = failed.saturating_add(1);
                     if mutation_tool(&tool.name) { state.work_budget.failed_edit(); }
                     let stored_error = if tool.name == "run_terminal" {
                         serde_json::from_str::<Value>(&message)
@@ -5797,6 +5929,39 @@ mod tests {
     }
 
     #[test]
+    fn content_filter_hides_only_real_tool_markup_and_preserves_literal_code_examples() {
+        let tools = vec!["create_visual_artifact".to_owned()];
+        let call = r#"<tool_call>{"name":"create_visual_artifact","arguments":{"artifact":{"type":"metric_group"}}}</tool_call>"#;
+        let mut filter = ContentMarkupFilter::default();
+        let mut visible = String::new();
+        for delta in ["Preparing report. <tool_", "call>{\"name\":\"create_visual_", "artifact\",\"arguments\":{\"artifact\":{\"type\":\"metric_group\"}}}</tool_call> Done."] {
+            visible.push_str(&filter.push(delta, false, "", &tools));
+        }
+        visible.push_str(&filter.push("", true, "", &tools));
+        assert_eq!(visible, "Preparing report.  Done.");
+        assert!(filter.hid_markup);
+        assert!(structured_tool_markup("{\"name\":\"create_visual_artifact\",\"arguments\":", &tools), "malformed known tool JSON should be hidden from the visible transcript");
+
+        let mut literal = ContentMarkupFilter::default();
+        let source = format!("Example syntax:\n```json\n{call}\n```\nThis is a literal example.");
+        let mut literal_visible = literal.push(&source, false, "", &tools);
+        literal_visible.push_str(&literal.push("", true, &source, &tools));
+        assert_eq!(literal_visible, source, "code example was mistaken for an executed tool call");
+        assert!(!literal.hid_markup);
+    }
+
+    #[test]
+    fn an_identical_tool_call_is_allowed_two_failed_attempts_then_closes_the_retry_loop() {
+        let mut state = AgentState::default();
+        assert!(!failed_call_retry_exhausted(&state, "web_image_search:{\"query\":\"flowers\"}"));
+        state.failed_tool_calls.insert("web_image_search:{\"query\":\"flowers\"}".into(), 1);
+        assert!(!failed_call_retry_exhausted(&state, "web_image_search:{\"query\":\"flowers\"}"), "one bounded recovery retry should remain");
+        state.failed_tool_calls.insert("web_image_search:{\"query\":\"flowers\"}".into(), 2);
+        assert!(failed_call_retry_exhausted(&state, "web_image_search:{\"query\":\"flowers\"}"), "repeated identical failures should stop re-execution");
+        assert!(!failed_call_retry_exhausted(&state, "web_image_search:{\"query\":\"sunflowers\"}"), "a corrected request must remain available");
+    }
+
+    #[test]
     fn a_checkpoint_cut_at_the_output_limit_says_so() {
         assert_eq!(mark_if_cut_at_output_limit("complete", "stop"), "complete");
         let cut = mark_if_cut_at_output_limit("half a sen", "length");
@@ -5930,7 +6095,7 @@ mod tests {
             system: "system".into(),
             ui_language: None,
             user: "audit".into(),
-            user_images: Vec::new(), user_image_refs: Vec::new(), web_tools: Vec::new(), host_tools: None,
+            user_images: Vec::new(), user_image_refs: Vec::new(), web_tools: Vec::new(), artifact_tools: Vec::new(), attachment_tools: Vec::new(), host_tools: None,
             root: None,
             secondary_root: None,
             workspace_roots: Vec::new(),

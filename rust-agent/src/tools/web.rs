@@ -4,8 +4,9 @@ use std::sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Mutex, Condvar};
 use std::time::{Duration, Instant};
 
 pub fn is_web_tool(name: &str) -> bool {
-    matches!(name, "web_search" | "web_open" | "web_read" | "web_follow_link" | "web_back")
+    matches!(name, "web_search" | "web_image_search" | "web_open" | "web_read" | "web_follow_link" | "web_back")
 }
+pub fn is_host_tool(name: &str) -> bool { is_web_tool(name) || matches!(name, "create_visual_artifact" | "read_attachment_data") }
 
 /// Only the trusted host can answer a pending call. Results still flow through
 /// the ordinary observation ledger; they are never accepted as verification.
@@ -23,7 +24,7 @@ impl HostTools {
         }
     }
     pub fn execute(&self, run_id: &str, name: &str, arguments: &Value, cancelled: &AtomicBool) -> Result<Value, String> {
-        if !is_web_tool(name) { return Err("Unknown web tool".into()); }
+        if !is_host_tool(name) { return Err("Unknown host tool".into()); }
         if cancelled.load(Ordering::Relaxed) { return Err("Web request cancelled".into()); }
         let id = format!("host-{}", self.next_id.fetch_add(1, Ordering::Relaxed) + 1);
         let mut pending = self.pending.lock().unwrap();

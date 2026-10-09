@@ -32,7 +32,9 @@
     "package:linux": "npm run build && cargo build --locked --release --target x86_64-unknown-linux-musl --manifest-path rust-agent/Cargo.toml && electron-builder --linux deb --x64 --publish never",
     "test:linux-setup": "npm run build && node dist/main/services/runtime-settings.test.js && node scripts/renderer-runtime-status.test.mjs && bash scripts/linux-launcher-setup.test.sh",
     "test:linux-package": "node scripts/linux-package-smoke.mjs",
-    "test:vision-web-localization": "npm run build && bash scripts/vision-web-localization.test.sh"
+    "test:vision-web-localization": "npm run build && bash scripts/vision-web-localization.test.sh",
+    "test:rich-responses:renderer": "node scripts/rich-responses-renderer.test.mjs",
+    "test:rich-responses": "npm run build && node dist/shared/rich-artifacts.test.js && node dist/shared/rich-response-acceptance.test.js && node dist/main/web/public-network.test.js && node dist/main/web/web-tools.test.js && node dist/main/web/search-providers.test.js && node dist/shared/generation-progress.test.js && node dist/shared/chart-presentation.test.js && node dist/main/services/diagram-validation.test.js && node dist/main/services/remote-image-service.test.js && node dist/main/services/web-chat.test.js && node dist/main/services/rich-chat-http.test.js && node dist/main/services/rich-agent-http.test.js && node dist/main/services/rich-gallery-agent.test.js && node dist/main/services/attachment-pipeline.test.js && node dist/main/services/database.test.js"
   },
   "dependencies": {
     "@electron/remote": "^2.1.3",
@@ -46,6 +48,7 @@
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "react-markdown": "^10.0.0",
+    "recharts": "^3.10.1",
     "rehype-highlight": "^7.0.2",
     "remark-gfm": "^4.0.1",
     "zustand": "^5.0.2"
