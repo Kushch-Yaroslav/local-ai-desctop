@@ -16,6 +16,7 @@ const api: LocalAiApi = {
     list: (messageId) => ipcRenderer.invoke('attachments:list', messageId),
     dataUrl: (id) => ipcRenderer.invoke('attachments:dataUrl', id),
   },
+  webImages: { load: (url) => ipcRenderer.invoke('web-images:load', url), openSource: (url) => ipcRenderer.invoke('web-images:open-source', url) },
   analysis: { list: (conversationId) => ipcRenderer.invoke('analysis:list', conversationId) },
   models: { list: () => ipcRenderer.invoke('models:list') },
   runtime: { state: () => ipcRenderer.invoke('runtime:state') },
@@ -30,6 +31,8 @@ const api: LocalAiApi = {
     steer: (conversationId, generationId, content, intent) => ipcRenderer.invoke('chat:steer', conversationId, generationId, content, intent),
     stop: (conversationId, generationId) => ipcRenderer.invoke('chat:stop', conversationId, generationId),
     approve: (request) => ipcRenderer.invoke('chat:approve', request),
+    onDiagramValidation: (listener) => { const callback = (_: unknown, request: { id: string; source: string }) => listener(request); ipcRenderer.on('chat:validate-diagram', callback); return () => ipcRenderer.removeListener('chat:validate-diagram', callback); },
+    diagramValidationResult: (id, error) => { void ipcRenderer.invoke('chat:diagram-validation-result', id, error).catch(() => undefined); },
     onStream: (listener) => { const callback = (_: unknown, event: Parameters<typeof listener>[0]) => listener(event); ipcRenderer.on('chat:stream', callback); return () => ipcRenderer.removeListener('chat:stream', callback); },
   },
 };

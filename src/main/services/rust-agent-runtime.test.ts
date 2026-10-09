@@ -126,7 +126,7 @@ require('node:readline').createInterface({input:process.stdin}).on('line', () =>
 });
 `);
     chmodSync(script, 0o755);
-    const events = [];
+    const events: import('../../shared/types').StreamEvent[] = [];
     const runtime = new RustAgentRuntime('http://127.0.0.1:1', script);
     for await (const event of runtime.stream('model', [message('user', 'task')], [], controller.signal, 4096, 'fast', 'off', 'failed-run', undefined, 'conversation')) events.push(event);
     assert.equal(controller.signal.aborted, false, 'fatal runtime events must end the stream without waiting for supervisor EOF');
@@ -157,11 +157,6 @@ export async function runWorkerExitRegression(): Promise<void> {
     }
   } finally { rmSync(dir, { recursive:true, force:true }); }
 }
-if (require.main === module) {
-  runRustAgentRuntimeRegression();
-  void (async () => { await runSteeringBridgeRegression(); await runFatalBridgeRegression(); await runWorkerExitRegression(); })().catch((error: unknown) => {console.error(error); process.exitCode = 1;});
-}
-
 export async function runWebImageBridgeRegression(): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), 'agent-web-images-'));
   try {
@@ -194,15 +189,40 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
       assert.equal(request.run.supports_reasoning, true);
       assert.equal(request.run.ui_language, mode === 'auto' ? 'en' : 'ru');
       assert.match(request.run.system, mode === 'auto' ? /Interface language: English/ : /Язык интерфейса: русский/);
-      assert.equal(request.run.web_tools.length, mode === 'auto' ? 5 : 0);
+      assert.equal(request.run.web_tools.length, mode === 'auto' ? 6 : 0);
+      assert.equal(request.run.artifact_tools.some((tool: { function?: { name?: string } }) => tool.function?.name === 'create_visual_artifact'), true);
       assert.equal(opened, mode === 'auto' ? 1 : 0); assert.equal(closed, opened);
       if (mode === 'auto') assert.equal(request.result.result.content, 'Public page');
       else assert.match(request.result.result.error, /unavailable/);
     }
   } finally { setLanguage('ru'); rmSync(dir, { recursive: true, force: true }); }
 }
-if (require.main === module) void runWebImageBridgeRegression().catch(error => { console.error(error); process.exitCode = 1; });
 
+export async function runAgentRichArtifactBridgeRegression(): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-rich-artifact-'));
+  try {
+    const script = join(dir, 'artifact-worker.js');
+    const received = join(dir, 'artifact-result.json');
+    writeFileSync(script, `#!/usr/bin/env node
+const fs = require('node:fs');
+const out = event => process.stdout.write(JSON.stringify(event)+'\\n');
+require('node:readline').createInterface({input:process.stdin}).on('line', line => {
+ const request = JSON.parse(line);
+ if(request.type === 'run') {
+   if(!request.artifact_tools.some(tool => tool.function.name === 'create_visual_artifact')) process.exit(3);
+   out({type:'host_tool_call', id:'artifact-1', name:'create_visual_artifact', arguments:{artifact:{version:1,type:'chart',chart:'bar',title:'Fixture',xKey:'x',series:[{key:'y',name:'Y'}],data:[{x:'A',y:2}]}}});
+ }
+ if(request.type === 'host_tool_result') { fs.writeFileSync(${JSON.stringify(received)}, JSON.stringify(request)); out({type:'final',content:'Chart generated.'}); }
+});`);
+    chmodSync(script, 0o755);
+    const runtime = new RustAgentRuntime('http://127.0.0.1:1', script);
+    const events: import('../../shared/types').StreamEvent[] = [];
+    for await (const event of runtime.stream('model', [message('user', 'Chart this fixture')], [], new AbortController().signal, 4096, 'fast', 'off', 'artifact-run')) events.push(event);
+    const artifact = events.find((event) => event.type === 'rich-artifact');
+    assert(artifact?.type === 'rich-artifact' && artifact.artifact.type === 'chart', 'Agent host bridge did not emit validated chart data');
+    assert.deepEqual(JSON.parse(readFileSync(received, 'utf8')), { type: 'host_tool_result', run_id: 'artifact-run', id: 'artifact-1', result: { accepted: true, artifact_id: artifact.artifact.id, type: 'chart', stage: 'emitted_to_ui', presentation: 'Artifact accepted and emitted to the conversation UI. This is not a renderer acknowledgement. Do not repeat it in Markdown or claim a failed gallery succeeded.' } }, 'Agent bridge did not return structured artifact acceptance');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}
 export async function runWebCancellationRegression() {
   const dir = mkdtempSync(join(tmpdir(), 'agent-web-cancel-'));
   try {
@@ -231,4 +251,14 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
     assert.deepEqual(early, ['cancelled']);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
-if (require.main === module) void runWebCancellationRegression().catch(error => { console.error(error); process.exitCode = 1; });
+if (require.main === module) {
+  runRustAgentRuntimeRegression();
+  void (async () => {
+    await runSteeringBridgeRegression();
+    await runFatalBridgeRegression();
+    await runWorkerExitRegression();
+    await runWebImageBridgeRegression();
+    await runAgentRichArtifactBridgeRegression();
+    await runWebCancellationRegression();
+  })().catch((error: unknown) => { console.error(error); process.exitCode = 1; });
+}

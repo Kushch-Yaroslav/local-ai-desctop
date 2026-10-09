@@ -1,5 +1,7 @@
+import { DiagramValidationBridge } from '../services/diagram-validation';
 import { VisionDeviceController, type VisionDevice } from '../services/vision-device-controller';
-import { BrowserWindow, dialog, ipcMain } from 'electron';
+import { t } from '../../shared/locale';
+import { BrowserWindow, dialog, ipcMain, shell } from 'electron';
 import { randomUUID } from 'node:crypto';
 import type { AnalysisRun, ApprovalDecision, ApprovalStatus, ChatRequest, Conversation, ProjectReference, ProjectSuggestion, RiskCategory, SteeringIntent, ThinkingTimelineEvent } from '../../shared/types';
 import { findFreshContextDiscoveryOption, type ContextDiscoveryOption, type ContextDiscoveryResult, type ContextDiscoveryProgress, type RuntimeContextEstimate } from '../../shared/context-estimator';
@@ -21,7 +23,8 @@ import { agentReasoningOptions, llamaContextPresets, llamaRuntimeProfile, reason
 import { reasoningPatchError, resolveReasoningSelection, type ReasoningInput } from '../../shared/reasoning-controls';
 import { WebBrowserService } from '../web/web-tools';
 import { WebChatService } from '../services/web-chat';
-import { chatMessagesWithSystemPrefix, chatSystemContext } from '../services/capabilities';
+import { RemoteImageService } from '../services/remote-image-service';
+import { richArtifactFingerprint } from '../../shared/rich-artifacts';
 import { ReadonlyProjectTools, type ApprovalResult } from '../tools/project-tools';
 import { imageMimeType, AttachmentService } from '../services/attachment-service';
 import { AttachmentPipeline } from '../services/attachment-pipeline';
@@ -47,10 +50,14 @@ const llamaCpp = new LlamaCppBackend(llamaCppUrl, 32_768, false, null);
 const backend = llamaCpp;
 // A live/stale launcher document is not an explicit selection in this Electron process.
 let modelSelectedThisProcess = false;
-const web = new WebBrowserService();
-const rustAgent = new RustAgentRuntime(process.env.LOCAL_AI_AGENT_ENDPOINT ?? `${llamaCppUrl.replace(/\/$/, '')}/v1/chat/completions`, undefined, web);
-const webChat = new WebChatService(backend, web);
+const remoteImages = new RemoteImageService();
+const web = new WebBrowserService(undefined, remoteImages);
 const attachments = new AttachmentService(database);
+const rustAgent = new RustAgentRuntime(process.env.LOCAL_AI_AGENT_ENDPOINT ?? `${llamaCppUrl.replace(/\/$/, '')}/v1/chat/completions`, undefined, web, (args) => {
+  if (typeof args.attachment_id !== 'string') throw new Error(t('Выберите вложенную таблицу или CSV по ID.'));
+  return attachments.readStructuredRows(args.attachment_id, typeof args.sheet_name === 'string' ? args.sheet_name : undefined, typeof args.start_row === 'number' ? args.start_row : 0, typeof args.max_rows === 'number' ? args.max_rows : 50);
+});
+const webChat = new WebChatService(backend, web);
 const attachmentPipeline = new AttachmentPipeline(database, attachments);
 type ActiveGeneration = {
   id: string;
@@ -60,6 +67,7 @@ type ActiveGeneration = {
   mode?: 'chat' | 'agent';
   followups?: Array<{ message: import('../../shared/types').ChatMessage; applied: boolean }>;
   thinkingTimeline: ThinkingTimelineEvent[];
+  richArtifacts: import('../../shared/rich-artifacts').RichArtifact[];
   activityTimelinePositions: Map<string, number>;
   timelinePosition: number;
   lastTimelineKind: ThinkingTimelineEvent['kind'] | null;
@@ -454,6 +462,8 @@ async function cancelGeneration(conversationId: string, generationId?: string, r
 }
 
 export function registerIpc(): void {
+  const diagramValidation = new DiagramValidationBridge();
+  ipcMain.handle('chat:diagram-validation-result', (event, id: unknown, error: unknown) => diagramValidation.reply(event.sender.id, id, error));
   const interruptedRuns = database.recoverInterruptedRuns();
   if (interruptedRuns) log('generation.interrupted-recovered', { runs: interruptedRuns });
   ipcMain.handle('conversations:list', () => database.listConversations());
@@ -579,6 +589,15 @@ export function registerIpc(): void {
     const attachment = database.getAttachment(id); if (!attachment || attachment.kind !== 'image') return null;
     const data = await readFile(attachment.storageRef); return `data:${imageMimeType(attachment.filename)};base64,${data.toString('base64')}`;
   });
+  ipcMain.handle('web-images:load', async (_event, url: string) => {
+    if (typeof url !== 'string' || url.length > 2_000) throw new Error(t('Некорректный URL изображения.'));
+    return remoteImages.load(url);
+  });
+  ipcMain.handle('web-images:open-source', async (_event, url: string) => {
+    if (typeof url !== 'string' || url.length > 2_000) throw new Error(t('Некорректный URL источника.'));
+    const safe = await remoteImages.validateSource(url);
+    await shell.openExternal(safe);
+  });
   ipcMain.handle('analysis:list', (_event, conversationId: string) => database.listAnalysisRuns(conversationId));
   ipcMain.handle('models:list', async () => {
     try { await syncLlamaBackend(); return await backend.getModels(); }
@@ -663,12 +682,14 @@ export function registerIpc(): void {
     return true;
   });
   ipcMain.handle('chat:send', async (event, request: ChatRequest) => {
+    const requestStarted = performance.now();
+    log('rich.request.lifecycle', { generationId: request.generationId, stage: 'submitted', monotonicMs: requestStarted });
     if (contextDiscoveryBusy) throw new Error('Дождитесь завершения Max Context discovery перед генерацией.');
     if (runtimeSelectionBusy) throw new Error('Дождитесь завершения переключения runtime перед генерацией.');
     // Claim the process-wide inference slot synchronously, before any await.
     if (activeGenerations.size) throw new Error('Уже выполняется генерация в другом чате. Дождитесь завершения или остановите её.');
     const abort = new AbortController(); let finish!: () => void;
-    const generation: ActiveGeneration = { id: request.generationId, abort, settled: new Promise<void>((resolve) => { finish = resolve; }), finish, thinkingTimeline: [], activityTimelinePositions: new Map(), timelinePosition: 0, lastTimelineKind: null };
+    const generation: ActiveGeneration = { id: request.generationId, abort, settled: new Promise<void>((resolve) => { finish = resolve; }), finish, thinkingTimeline: [], richArtifacts: [], activityTimelinePositions: new Map(), timelinePosition: 0, lastTimelineKind: null };
     activeGenerations.set(request.conversationId, generation);
     const current = () => activeGenerations.get(request.conversationId) === generation && !abort.signal.aborted;
     let run: AnalysisRun | null = null;
@@ -678,12 +699,12 @@ export function registerIpc(): void {
     // The timeline is checkpointed at stable boundaries (steering, pause, tool
     // start/finish), never per token, so a Stop, failure or crash keeps every
     // event the live view already committed.
-    const checkpoint = () => { if (run) database.saveAnalysisRunTimeline(run.id, thinkingTimeline); };
+    const checkpoint = () => { if (run) database.saveAnalysisRunTimeline(run.id, thinkingTimeline, generation.richArtifacts); };
     const closeReasoning = () => { if (generation.lastTimelineKind === 'reasoning') { const prior = thinkingTimeline.at(-1); if (prior?.kind === 'reasoning' && !prior.completedAt) prior.completedAt = new Date().toISOString(); } };
     const finishRun = (status: AnalysisRun['status'], assistantMessageId: string | null = null) => {
       if (!run) return null;
       closeReasoning();
-      return database.finishAnalysisRun(run.id, status, assistantMessageId, { timeline: thinkingTimeline, ...(status === 'completed' ? {} : { partialOutput: output, ...(failure ? { error: failure } : {}) }) });
+      return database.finishAnalysisRun(run.id, status, assistantMessageId, { timeline: thinkingTimeline, richArtifacts: generation.richArtifacts, ...(status === 'completed' ? {} : { partialOutput: output, ...(failure ? { error: failure } : {}) }) });
     };
     const sendRun = (finished: AnalysisRun | null) => { if (finished) event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run: finished }); };
     try {
@@ -744,11 +765,14 @@ export function registerIpc(): void {
       const reasoningCapabilityForModel = reasoningCapability(llamaRuntimeProfile(request.model));
       const reasoningSelection = resolveReasoningSelection(reasoningCapabilityForModel, conversation.reasoningMode, conversation);
       const reasoningInput: ReasoningInput = reasoningCapabilityForModel ? { mode: conversation.reasoningMode, selection: reasoningSelection } : conversation.reasoningMode;
+      const validateDiagram = (source: string, signal: AbortSignal) => diagramValidation.validate(event.sender, source, signal);
       const stream = mode === 'agent'
-        ? rustAgent.stream(request.model, history, agentProjects, abort.signal, context.active, conversation.reasoningMode, conversation.webMode, generation.id, persistedTaskMemory, request.conversationId, agentSupportsReasoning, agentReasoningOptions(request.model, reasoningSelection), workspaceRoots)
-        : conversation.webMode === 'auto'
-          ? webChat.stream(request.model, history, abort.signal, context.active, reasoningInput)
-          : backend.streamChat(request.model, chatMessagesWithSystemPrefix(history, [chatSystemContext({ webAvailable: false }, conversation.reasoningMode === 'deep' ? 'deep' : 'fast')], request.conversationId, `capability-${request.conversationId}`), abort.signal, context.active, reasoningInput);
+        ? rustAgent.stream(request.model, history, agentProjects, abort.signal, context.active, conversation.reasoningMode, conversation.webMode, generation.id, persistedTaskMemory, request.conversationId, agentSupportsReasoning, agentReasoningOptions(request.model, reasoningSelection), workspaceRoots, validateDiagram)
+        : webChat.stream(request.model, history, abort.signal, context.active, reasoningInput, conversation.webMode === 'auto', (args) => {
+          const allowed = new Set(history.flatMap((message) => message.attachments ?? []).map((attachment) => attachment.id));
+          if (typeof args.attachment_id !== 'string' || !allowed.has(args.attachment_id)) throw new Error(t('Выберите структурированное вложение из этого диалога.'));
+          return attachments.readStructuredRows(args.attachment_id, typeof args.sheet_name === 'string' ? args.sheet_name : undefined, typeof args.start_row === 'number' ? args.start_row : 0, typeof args.max_rows === 'number' ? args.max_rows : 50);
+        }, validateDiagram, generation.id);
       for await (let chunk of stream) {
         if (!current()) break;
         if (chunk.type === 'steering') {
@@ -808,11 +832,22 @@ export function registerIpc(): void {
           event.sender.send('chat:stream', { type: 'diagnostics', conversationId: request.conversationId, generationId: generation.id, diagnostics });
           continue;
         }
+        if (chunk.type === 'rich-artifact') {
+          if (generation.richArtifacts.length >= 16 || generation.richArtifacts.some((item) => richArtifactFingerprint(item) === richArtifactFingerprint(chunk.artifact))) continue;
+          generation.richArtifacts.push(chunk.artifact);
+          // Chat only needs a durable run when it accepts an artifact; ordinary Chat stays unchanged.
+          run ??= database.createAnalysisRun(request.conversationId, conversation.reasoningMode);
+          checkpoint();
+          log('rich.request.lifecycle', { generationId: generation.id, stage: 'artifact_sent', artifactId: chunk.artifact.id, elapsedMs: Math.round(performance.now() - requestStarted) });
+          event.sender.send('chat:stream', { ...chunk, conversationId: request.conversationId, generationId: generation.id });
+          continue;
+        }
         if (chunk.type === 'done') { completed = true; finishReason = chunk.finishReason === 'length' ? 'length' : 'stop'; continue; }
         // Terminal events are delivered only after the run's history is final,
         // so the renderer always reconciles against the persisted state.
         if (chunk.type === 'error') { failed = true; failure ??= chunk.details ? `${chunk.message}: ${chunk.details}` : chunk.message; continue; }
         if (chunk.type === 'cancelled') { cancelled = true; continue; }
+        if (!run && chunk.type === 'tool' && chunk.activity.metadata?.artifactType === 'image_gallery') run = database.createAnalysisRun(request.conversationId, conversation.reasoningMode);
         if (run && chunk.type === 'tool') {
           closeReasoning();
           const existingPosition = activityTimelinePositions.get(chunk.activity.id);
@@ -849,7 +884,7 @@ export function registerIpc(): void {
         ...(messageDiagnostics.timeToFirstTokenMs !== undefined ? { timeToFirstTokenMs: messageDiagnostics.timeToFirstTokenMs } : {}),
         ...(inputTokens !== undefined ? { inputTokens } : {}),
       };
-      const assistant = output ? database.addMessage(request.conversationId, 'assistant', output, undefined, [], { ...(thinking.trim() ? { thinking } : {}), ...(thinkingTimeline.length ? { thinkingTimeline } : {}), ...(generationStats ? { generationStats } : {}) }) : null;
+      const assistant = output || generation.richArtifacts.length ? database.addMessage(request.conversationId, 'assistant', output, undefined, [], { ...(thinking.trim() ? { thinking } : {}), ...(thinkingTimeline.length ? { thinkingTimeline } : {}), ...(generationStats ? { generationStats } : {}), ...(generation.richArtifacts.length ? { richArtifacts: generation.richArtifacts } : {}) }) : null;
       sendRun(finishRun('completed', assistant?.id ?? null));
       event.sender.send('chat:stream', { type: 'done', conversationId: request.conversationId, generationId: generation.id, assistant, finishReason });
     } catch (error) {

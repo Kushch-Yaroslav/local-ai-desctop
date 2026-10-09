@@ -5,6 +5,7 @@ import type { ActionApproval, AgentPlan, AgentTelemetry, WorkBudget, AnalysisPro
 import { isCurrentGenerationEvent } from '../../shared/generation-guard';
 import { pinLegacyReasoning, revertRefusedPatch, type ModeTransition } from '../../shared/conversation-settings';
 import { appendPausedMarker, appendReasoningFragments, applySteeringEvent } from '../../shared/thinking-timeline';
+import { richArtifactFingerprint } from '../../shared/rich-artifacts';
 
 type State = {
   conversations: Conversation[];
@@ -18,7 +19,7 @@ type State = {
   generationConversationId: string | null;
   /** Process-wide inference ownership token; per-chat view state stays separate. */
   generationOwnerId: string | null;
-  generationState: 'idle' | 'thinking' | 'using-tool' | 'running-terminal' | 'waiting-for-approval' | 'generating' | 'stopping' | 'cancelled' | 'error';
+  generationState: 'idle' | 'thinking' | 'reasoning' | 'using-tool' | 'running-terminal' | 'waiting-for-approval' | 'generating' | 'stopping' | 'cancelled' | 'error';
   error: string | null;
   toolActivities: ToolActivity[];
   toolActivityCount: number;
@@ -48,7 +49,7 @@ type State = {
   editMessage: (message: ChatMessage, content: string) => Promise<boolean>;
   regenerateMessage: (message: ChatMessage) => Promise<boolean>;
   stop: () => Promise<void>;
-  handleStream: (event: { type: string; content?: string; message?: string; userMessage?: ChatMessage; details?: string; activity?: ToolActivity; memory?: NonNullable<AgentPlan['taskMemory']>; budget?: WorkBudget; run?: AnalysisRun; progress?: AnalysisProgress; requested?: number; active?: number; supported?: number; used?: number; maximum?: number; timelinePosition?: number; telemetry?: Partial<AgentTelemetry>; conversationId: string; generationId: string; modelId?: string; assistant?: ChatMessage | null; finishReason?: FinishReason; diagnostics?: Omit<GenerationDiagnostics, 'generationId' | 'conversationId' | 'createdAt'>; actionId?: string; approval?: ActionApproval; approvalId?: string; status?: Exclude<ApprovalStatus, 'pending'> | AttachmentStatus | 'accepted' | 'applied' }) => void;
+  handleStream: (event: { type: string; state?: 'waiting' | 'streaming'; content?: string; artifact?: import('../../shared/rich-artifacts').RichArtifact; message?: string; userMessage?: ChatMessage; details?: string; activity?: ToolActivity; memory?: NonNullable<AgentPlan['taskMemory']>; budget?: WorkBudget; run?: AnalysisRun; progress?: AnalysisProgress; requested?: number; active?: number; supported?: number; used?: number; maximum?: number; timelinePosition?: number; telemetry?: Partial<AgentTelemetry>; conversationId: string; generationId: string; modelId?: string; assistant?: ChatMessage | null; finishReason?: FinishReason; diagnostics?: Omit<GenerationDiagnostics, 'generationId' | 'conversationId' | 'createdAt'>; actionId?: string; approval?: ActionApproval; approvalId?: string; status?: Exclude<ApprovalStatus, 'pending'> | AttachmentStatus | 'accepted' | 'applied' }) => void;
 };
 
 const assistantId = (generationId: string) => `stream-${generationId}`;
@@ -347,18 +348,20 @@ export const useAppStore = create<State>((rawSet, rawGet) => {
         },
       } : {});
     }
+    if (event.type === 'model-state') set({ generationState: event.state === 'waiting' ? 'thinking' : 'reasoning' });
     if (event.type === 'thinking') {
       pendingThinking.set(event.generationId, [...(pendingThinking.get(event.generationId) ?? []), { content: event.content ?? '', timelinePosition: event.timelinePosition }]);
       if (animationFrame === null) animationFrame = window.requestAnimationFrame(() => drainStream());
-      if (get().generationState !== 'thinking') set({ generationState: 'thinking' });
+      if (event.content && get().generationState !== 'reasoning') set({ generationState: 'reasoning' });
     }
+    if (event.type === 'rich-artifact' && event.artifact) { performance.mark(`rich.received.${event.artifact.id}`); set((state) => ({ messages: state.messages.map((message) => message.id === assistantId(event.generationId) ? { ...message, richArtifacts: [...(message.richArtifacts ?? []).filter((item) => richArtifactFingerprint(item) !== richArtifactFingerprint(event.artifact!)), event.artifact!] } : message) })); }
     if ((event.type === 'tool' || event.type === 'attachment') && event.activity) set((state) => {
       const priorActivity = state.toolActivities.find((activity) => activity.id === event.activity!.id);
       const exists = Boolean(priorActivity);
       const mergedActivity = mergeToolActivity(priorActivity, event.activity!);
       const attachmentId = event.activity!.id.startsWith('attachment-') ? event.activity!.id.slice('attachment-'.length) : null;
       return {
-        generationState: event.type === 'attachment' && event.activity!.status === 'processing' ? 'using-tool' : event.activity!.kind === 'terminal' ? 'running-terminal' : 'using-tool',
+        generationState: mergedActivity.kind === 'progress' ? state.generationState : mergedActivity.state === 'completed' || mergedActivity.state === 'error' ? 'thinking' : event.type === 'attachment' && event.activity!.status === 'processing' ? 'using-tool' : event.activity!.kind === 'terminal' ? 'running-terminal' : 'using-tool',
         toolActivities: [...state.toolActivities.filter((activity) => activity.id !== event.activity!.id), mergedActivity].slice(-100), toolActivityCount: exists || event.activity!.kind === 'progress' ? state.toolActivityCount : state.toolActivityCount + 1, agentTelemetry: state.agentTelemetry ? { ...state.agentTelemetry, actions: exists || event.activity!.kind === 'progress' ? state.agentTelemetry.actions : state.agentTelemetry.actions + 1 } : null,
         messages: state.messages.map((message) => {
           if (attachmentId) return { ...message, attachments: message.attachments?.map((attachment) => attachment.id === attachmentId ? event.activity!.attachment ?? { ...attachment, status: event.activity!.status ?? attachment.status, error: event.activity!.status === 'error' ? event.activity!.detail : attachment.error, updatedAt: now() } : attachment) };

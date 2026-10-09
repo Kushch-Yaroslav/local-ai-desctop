@@ -1,13 +1,12 @@
+import assert from 'node:assert/strict';
 import { Database } from './database';
-import { AttachmentService, MAX_EXTRACTED_CHARACTERS, MAX_IMAGES_PER_MESSAGE, attachmentDisplayName } from './attachment-service';
+import { AttachmentService, MAX_EXTRACTED_CHARACTERS, MAX_IMAGES_PER_MESSAGE, attachmentDataTool, attachmentDisplayName } from './attachment-service';
 import { AttachmentPipeline, MAX_ATTACHMENT_CONTEXT_CHARACTERS } from './attachment-pipeline';
 import type { ProjectReference } from '../../shared/types';
 import { projectDirectoryName, removeProjectReferenceQuery } from '../../shared/project-references';
 import { existingProjectDirectory } from './project-picker';
 
 const png = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
-function assert(value: unknown, message: string): asserts value { if (!value) throw new Error(message); }
-
 /** Focused persistence/pipeline regression coverage; run with `npm run test:attachments`. */
 export async function runAttachmentPipelineRegression(): Promise<void> {
   assert(projectDirectoryName('/media/yaroslav/DATA/Projects/local-ai-desktop/') === 'local-ai-desktop', 'project selector basename did not trim a POSIX root');
@@ -30,6 +29,21 @@ export async function runAttachmentPipelineRegression(): Promise<void> {
       const imported = await service.import({ messageId: formatTurn.id, index: 0, filename, mimeType: 'image/png', data });
       assert(imported.mimeType === mimeType, 'original format MIME was lost');
     }
+    const csvTurn = database.addMessage(chat.id, 'user', 'Analyze all rows');
+    const csvRows = ['period,revenue,note', ...Array.from({ length: 2_000 }, (_, index) => `${index},${index * 10},"quarter ${index}, actual"`)].join('\n');
+    const csv = await service.import({ messageId: csvTurn.id, index: 0, filename: 'sales.csv', mimeType: 'text/csv', data: new Uint8Array(Buffer.from(csvRows)) });
+    const extractedCsv = await service.preprocess(csv, new AbortController().signal);
+    assert(extractedCsv.metadata?.truncated === true, 'large CSV fixture should exceed the ordinary text preview');
+    const dataTool = attachmentDataTool([extractedCsv]) as { function: { parameters: { properties: { attachment_id: { enum: string[] } } } } };
+    assert.deepEqual(dataTool.function.parameters.properties.attachment_id.enum, [csv.id], 'bounded data tool exposed unrelated attachment IDs');
+    const structuredPage = await service.readStructuredRows(csv.id, undefined, 1_000, 2) as { columns: Array<{ key: string }>; rows: Array<Record<string, unknown>>; next_start_row: number | null; total_rows: number };
+    assert.equal(structuredPage.total_rows, 2_000, 'structured CSV extraction lost the full row count');
+    assert.equal(structuredPage.rows.length, 2, 'structured CSV extraction did not return the requested bounded page');
+    assert.equal(structuredPage.rows[0]?.c1, 1_000, 'CSV numeric values lost their numeric type or offset');
+    assert.equal(structuredPage.rows[0]?.c2, 10_000, 'CSV values beyond the text preview were unavailable');
+    assert.equal(structuredPage.rows[0]?.c3, 'quarter 1000, actual', 'quoted CSV delimiters were parsed incorrectly');
+    assert.equal(structuredPage.next_start_row, 1_002, 'structured CSV pagination metadata is incorrect');
+    await service.readStructuredRows('another-conversation-attachment').then(() => { throw new Error('arbitrary attachment ID was accepted'); }, (error: Error) => assert(error.message.includes('supported structured table'), 'unknown attachment ID returned an unclear error'));
     const formatPipeline = new AttachmentPipeline(database, service);
     const restored = database.listMessages(chat.id).find((entry) => entry.id === formatTurn.id)!;
     const nativeFormats = await formatPipeline.prepareNativeImages([restored], new AbortController().signal);

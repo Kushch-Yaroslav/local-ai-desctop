@@ -1,6 +1,7 @@
 import { accessSync, constants, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import type { RuntimeConfiguration, RuntimeModelConfiguration } from '../../shared/types';
+import { searchPreference } from '../../shared/search-settings';
 import { expandPath, paths } from './paths';
 import { builtinModelCatalog } from '../models/model-catalog';
 import { verifyGgufArtifacts } from './gguf-artifacts';
@@ -89,6 +90,7 @@ export function normalizeConfiguration(raw: unknown): RuntimeConfiguration {
   const server = typeof value.llamaServerPath === 'string' ? value.llamaServerPath.trim() : '';
   return { llamaServerPath: server ? (server.includes('/') || server.startsWith('~') ? expandPath(server) : server) : null,
     modelsPath, gpuLayers: Number(value.gpuLayers), setupDismissed: value.setupDismissed === true,
+    searchProvider: searchPreference(value.searchProvider), allowBingFallback: value.allowBingFallback === true,
     schemaVersion: 2, language: value.language ?? 'ru', ...(value.imageProcessingDevice ? { imageProcessingDevice: value.imageProcessingDevice } : {}), models } as RuntimeConfiguration;
 }
 

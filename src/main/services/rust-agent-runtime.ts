@@ -6,6 +6,8 @@ import { existsSync } from 'node:fs';
 import { agentRuntimePath, paths } from './paths';
 import { agentEvidenceDir } from './agent-evidence';
 import type { AgentPlan, AgentPlanStepStatus, ChatMessage, ModelTodo, ReasoningMode, StreamEvent, SteeringIntent, TerminalExecution, ToolActivity, WebMode, WorkBudget } from '../../shared/types';
+import { ArtifactToolError, artifactFailure, artifactAcknowledgment, validateRichArtifact, visualArtifactTool, withAttachmentProvenance, richArtifactFingerprint, type RichArtifact, type ArtifactSource } from '../../shared/rich-artifacts';
+import { attachmentDataTool } from './attachment-service';
 import { WebBrowserService, webToolDefinitions, activityForWebTool, type WebBrowserSession } from '../web/web-tools';
 import { maxOutputTokens } from '../models/model-registry';
 
@@ -30,7 +32,7 @@ type RuntimeRequest = {
   type: 'run'; run_id: string; endpoint: string; model: string; system: string; ui_language?: 'ru' | 'en'; user: string; user_images?: string[]; user_image_refs?: string[]; web_tools?: unknown[];
   project_root?: string; secondary_project_root?: string; context_limit: number; reasoning_mode: ReasoningMode;
   supports_reasoning: boolean; reasoning_options?: Record<string, Record<string, unknown>>;
-  web_mode: WebMode; policy: 'auto' | 'safe'; history: unknown[]; task_memory?: AgentPlan['taskMemory']; provider_max_output?: number;
+  web_mode: WebMode; policy: 'auto' | 'safe'; history: unknown[]; artifact_tools: unknown[]; attachment_tools: unknown[]; task_memory?: AgentPlan['taskMemory']; provider_max_output?: number;
   evidence_dir?: string; workspace_roots?: string[];
 };
 
@@ -128,7 +130,7 @@ export function taskPlan(value: unknown): AgentPlan {
  * immediately; `final` is metadata, not a delayed text transport. */
 export class RustAgentRuntime {
   private readonly steering = new Map<string, (content: string, intent?: SteeringIntent) => Promise<void>>();
-  constructor(private readonly endpoint: string, private readonly binary = agentRuntimePath(), private readonly web = new WebBrowserService()) {}
+  constructor(private readonly endpoint: string, private readonly binary = agentRuntimePath(), private readonly web = new WebBrowserService(), private readonly readAttachmentData?: (argumentsObject: Record<string, unknown>) => Promise<unknown>) {}
 
   steer(runId: string, content: string, intent?: SteeringIntent): Promise<void> {
     const send = this.steering.get(runId);
@@ -136,7 +138,7 @@ export class RustAgentRuntime {
     return send(content, intent);
   }
 
-  async *stream(model: string, history: ChatMessage[], projects: AgentProject[], signal: AbortSignal, contextLimit: number, reasoningMode: ReasoningMode, webMode: WebMode, runId: string, persistedTaskMemory?: AgentPlan['taskMemory'], conversationId?: string, supportsReasoning = true, reasoningOptions?: Record<string, Record<string, unknown>>, workspaceRoots: readonly string[] = []): AsyncIterable<StreamEvent> {
+  async *stream(model: string, history: ChatMessage[], projects: AgentProject[], signal: AbortSignal, contextLimit: number, reasoningMode: ReasoningMode, webMode: WebMode, runId: string, persistedTaskMemory?: AgentPlan['taskMemory'], conversationId?: string, supportsReasoning = true, reasoningOptions?: Record<string, Record<string, unknown>>, workspaceRoots: readonly string[] = [], validateDiagram?: (source: string, signal: AbortSignal) => Promise<void>): AsyncIterable<StreamEvent> {
     if (signal.aborted) { yield { type: 'cancelled' }; return; }
     if (!existsSync(this.binary)) throw new Error(`Rust Agent Runtime V2 не собран: ${this.binary}. Выполните cargo build в rust-agent.`);
     const child = spawn(this.binary, [], { stdio: 'pipe' });
@@ -166,11 +168,15 @@ export class RustAgentRuntime {
     };
     signal.addEventListener('abort', stop, { once: true });
     const current = splitAgentRunHistory(history);
+    const attachmentTool = attachmentDataTool(history.flatMap((message) => message.attachments ?? []));
+    const usedAttachmentSources = new Map<string, ArtifactSource>();
+    const acceptedArtifacts = new Map<string, RichArtifact>();
+    const galleryFailures = new Map<string, Record<string, unknown>>();
     const request: RuntimeRequest = {
       type: 'run', run_id: runId, endpoint: this.endpoint, model,
       ui_language: getLanguage(),
       system: `${modelLanguageDirective()}\nYou are Local AI Desktop Agent. Work autonomously inside the scope described below. Use tools only with complete valid JSON arguments.\n${projects.map((project) => `Project ${project.slot}: ${project.label}; identity=${project.id}; root=${project.root}`).join('\n')}`,
-      user: current.user, user_images: current.images, user_image_refs: current.imageRefs, web_tools: webMode === 'auto' ? webToolDefinitions : [], project_root: projects[0]?.root, secondary_project_root: projects[1]?.root, ...(workspaceRoots.length ? { workspace_roots: [...workspaceRoots] } : {}),
+      user: current.user, user_images: current.images, user_image_refs: current.imageRefs, web_tools: webMode === 'auto' ? webToolDefinitions : [], artifact_tools: [visualArtifactTool], attachment_tools: attachmentTool ? [attachmentTool] : [], project_root: projects[0]?.root, secondary_project_root: projects[1]?.root, ...(workspaceRoots.length ? { workspace_roots: [...workspaceRoots] } : {}),
       context_limit: contextLimit, reasoning_mode: reasoningMode, supports_reasoning: supportsReasoning, reasoning_options: reasoningOptions, web_mode: webMode, policy: 'auto',
       history: current.prior.filter((message) => !message.agentError && !message.agentCancelled).map((message) => ({ role: message.role, content: message.content, ...(imageReferences(message).length ? { image_refs: imageReferences(message) } : {}), ...(message.images?.length ? { images: message.images } : {}) })),
       ...(conversationId ? { evidence_dir: agentEvidenceDir(paths.userData, conversationId) } : {}),
@@ -194,12 +200,43 @@ export class RustAgentRuntime {
           let result: unknown;
           try {
             if (signal.aborted) throw new Error('Web request cancelled');
-            if (webMode !== 'auto' || !webToolDefinitions.some((tool) => tool.function.name === event.name)) throw new Error('Web tool is unavailable');
-            session ??= this.web.openSession();
-            const browser = await session;
-            if (signal.aborted) { await browser.close(); throw new Error('Web request cancelled'); }
-            result = JSON.parse(await browser.execute({ name: event.name!, arguments: event.arguments ?? {} }));
-          } catch (error) { result = { error: error instanceof Error ? error.message : String(error) }; }
+            if (event.name === 'create_visual_artifact') {
+              const galleryKey = (event.arguments?.artifact as { type?: string })?.type === 'image_gallery' ? richArtifactFingerprint(event.arguments?.artifact as RichArtifact) : undefined;
+              if (galleryKey && galleryFailures.has(galleryKey)) throw new ArtifactToolError({ ...galleryFailures.get(galleryKey), code: 'ARTIFACT_DUPLICATE', retrySameArguments: false, error: 'This gallery request already failed. Correct the reported fields or image ID instead of repeating unchanged arguments.' });
+              const browser = session ? await session : undefined;
+              const attachmentLabels = new Set(history.flatMap((message) => message.attachments ?? []).map((attachment) => attachment.filename));
+              const validated = validateRichArtifact(event.arguments?.artifact, browser?.getImageResults(), undefined, browser?.getKnownSources() ?? new Set(), attachmentLabels);
+              if ('artifact' in validated && validated.artifact) {
+                const artifact = withAttachmentProvenance(validated.artifact, [...usedAttachmentSources.values()]);
+                const fingerprint = richArtifactFingerprint(artifact); const previous = acceptedArtifacts.get(fingerprint);
+                if (!previous) {
+                  if (artifact.type === 'image_gallery') await browser?.verifyGalleryImages?.(artifact, signal);
+                  if (artifact.type === 'diagram' && validateDiagram) await validateDiagram(artifact.mermaid, signal);
+                  if (signal.aborted) throw new Error('Diagram validation cancelled');
+                  acceptedArtifacts.set(fingerprint, artifact); yield { type: 'rich-artifact', artifact };
+                }
+                result = artifactAcknowledgment(previous ?? artifact, Boolean(previous));
+              }
+              else result = artifactFailure(validated);
+            } else if (event.name === 'read_attachment_data') {
+              if (!attachmentTool || !this.readAttachmentData) throw new Error('Attachment data is unavailable in this conversation.');
+              const allowed = new Set(history.flatMap((message) => message.attachments ?? []).map((attachment) => attachment.id));
+              if (typeof event.arguments?.attachment_id !== 'string' || !allowed.has(event.arguments.attachment_id)) throw new Error('Select a structured attachment from this conversation.');
+              result = await this.readAttachmentData(event.arguments);
+              const attachment = history.flatMap((message) => message.attachments ?? []).find((item) => item.id === event.arguments?.attachment_id);
+              if (attachment) {
+                const sheet = result && typeof result === 'object' && typeof (result as { sheet?: unknown }).sheet === 'string' ? ` · ${(result as { sheet: string }).sheet}` : '';
+                usedAttachmentSources.set(attachment.id, { label: attachment.filename, ...(sheet ? { detail: sheet } : {}) });
+              }
+            } else {
+              if (webMode !== 'auto' || !webToolDefinitions.some((tool) => tool.function.name === event.name)) throw new Error('Web tool is unavailable');
+              session ??= this.web.openSession();
+              const browser = await session;
+              if (signal.aborted) { await browser.close(); throw new Error('Web request cancelled'); }
+              result = JSON.parse(await browser.execute({ name: event.name!, arguments: event.arguments ?? {} }));
+            }
+          } catch (error) { result = error instanceof ArtifactToolError ? error.result : { error: error instanceof Error ? error.message : String(error) }; }
+          if (event.name === 'create_visual_artifact' && (event.arguments?.artifact as { type?: string })?.type === 'image_gallery' && result && typeof result === 'object' && 'error' in result) galleryFailures.set(richArtifactFingerprint(event.arguments?.artifact as RichArtifact), result as Record<string, unknown>);
           if (!signal.aborted && child.stdin.writable) child.stdin.write(`${JSON.stringify({ type: 'host_tool_result', run_id: runId, id: event.id, result })}\n`);
           continue;
         }
@@ -213,7 +250,7 @@ export class RustAgentRuntime {
         }
         else if (event.type === 'run_paused') yield { type: 'paused' };
         else if (event.type === 'thinking_delta') yield { type: 'thinking', content: event.content ?? '' };
-        else if (event.type === 'turn_started') yield { type: 'agent-telemetry', telemetry: { turn: event.index ?? 0 } };
+        else if (event.type === 'turn_started') { yield { type: 'model-state', state: 'waiting' }; yield { type: 'agent-telemetry', telemetry: { turn: event.index ?? 0 } }; }
         else if (event.type === 'work_budget' && event.budget) yield { type: 'work-budget', budget: event.budget };
         else if (event.type === 'content_delta' || event.type === 'final_delta' || event.type === 'agent_status') {
           if (event.type === 'agent_status') statusCount += 1;
@@ -221,7 +258,7 @@ export class RustAgentRuntime {
         }
         else if (event.type === 'tool_call_started') {
           const command = event.name === 'run_terminal' && typeof event.arguments?.command === 'string' ? event.arguments.command : undefined;
-          yield { type: 'tool', activity: { id: event.id ?? crypto.randomUUID(), label: activityLabel(event.name), detail: command ?? event.name, kind: activityKind(event.name), state: 'running', ...(command ? { terminal: { command, status: 'running' } } : {}) } };
+          yield { type: 'tool', activity: { id: event.id ?? crypto.randomUUID(), label: activityLabel(event.name), ...(event.name === 'create_visual_artifact' ? { metadata: { artifactType: String((event.arguments?.artifact as { type?: string })?.type ?? '') } } : {}), detail: command ?? event.name, kind: activityKind(event.name), state: 'running', ...(command ? { terminal: { command, status: 'running' } } : {}) } };
         } else if (event.type === 'tool_process_started') {
           yield { type: 'tool', activity: { id: event.id ?? crypto.randomUUID(), label: activityLabel('run_terminal'), detail: event.command ?? 'Terminal', kind: 'terminal', state: 'running', terminal: { command: event.command, cwd: event.cwd, pid: event.pid, pgid: event.pgid, sessionId: event.session_id, startedAt: timestamp(event.started_at), status: 'running' } } };
         } else if (event.type === 'tool_output_delta') {
@@ -296,6 +333,7 @@ export class RustAgentRuntime {
 
 function activityLabel(name?: string): string {
   if (name?.startsWith('web_')) return activityForWebTool({ name, arguments: {} }).label;
+  if (name === 'create_visual_artifact') return 'Подготовка визуального ответа';
   return ({ list_directory: 'Просмотр структуры проекта', read_file: 'Чтение файла', write_file: 'Изменение файла', replace_text: 'Изменение файла', create_file: 'Создание файла', apply_patch: 'Изменение проекта', delete_file: 'Удаление файла', run_terminal: 'Запуск terminal', task_memory: 'Task Memory', deliverables: 'Требуемый результат', plan: 'План выполнения', project_knowledge_index: 'Индекс знаний проекта', project_knowledge_read: 'Чтение знаний проекта', project_knowledge_update: 'Обновление знаний проекта' } as Record<string, string>)[name ?? ''] ?? 'Действие агента';
 }
 function activityKind(name?: string): NonNullable<import('../../shared/types').ToolActivity['kind']> {

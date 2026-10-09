@@ -698,7 +698,7 @@ impl Workspace {
             system: "system".into(),
             ui_language: None,
             user: user.into(),
-            user_images: Vec::new(), user_image_refs: Vec::new(), web_tools: Vec::new(), host_tools: None,
+            user_images: Vec::new(), user_image_refs: Vec::new(), web_tools: Vec::new(), artifact_tools: Vec::new(), attachment_tools: Vec::new(), host_tools: None,
             root: Some(self.root.to_string_lossy().into_owned()),
             secondary_root: None,
             workspace_roots: Vec::new(),

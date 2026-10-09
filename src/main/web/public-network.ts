@@ -4,6 +4,9 @@ import { isIP } from 'node:net';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 
+// Identify the application honestly to public services; no browser impersonation.
+export const publicWebUserAgent = 'Local-AI-Desktop/0.1.0 (https://github.com/Kushch-Yaroslav/local-ai-desctop)';
+
 export function isPublicAddress(address: string): boolean {
   if (isIP(address) === 4) {
     const [a, b, c] = address.split('.').map(Number);
@@ -45,7 +48,7 @@ export async function publicDestination(raw: string, resolve: (host: string, opt
 
 /** Pin the resolved public address to this connection. Browser navigation and
  * redirects go through this again, so a second DNS lookup cannot rebind it. */
-export async function fetchPublicResource(raw: string, method: string, headers: Record<string, string>, signal: AbortSignal) {
+export async function fetchPublicResource(raw: string, method: string, headers: Record<string, string>, signal: AbortSignal, maxBodyBytes = 4 * 1024 * 1024) {
   if (!['GET', 'HEAD'].includes(method)) throw new Error('Web requests are read-only');
   const { url, address, family } = await publicDestination(raw, lookup, signal);
   if (signal.aborted) throw new Error('Web request cancelled');
@@ -56,7 +59,7 @@ export async function fetchPublicResource(raw: string, method: string, headers: 
       const chunks: Buffer[] = []; let size = 0;
       response.on('data', (chunk: Buffer) => {
         size += chunk.length;
-        if (size > 4 * 1024 * 1024) request.destroy(new Error('Web resource exceeds the size limit'));
+        if (size > maxBodyBytes) request.destroy(new Error('Web resource exceeds the size limit'));
         else chunks.push(chunk);
       });
       response.on('error', reject);

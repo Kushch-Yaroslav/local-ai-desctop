@@ -40,6 +40,7 @@ async function run(): Promise<void> {
   LlamaCppBackend.prototype.ensureModelAvailable = async () => {};
   LlamaCppBackend.prototype.resolveContextWindow = async (_model, requested) => ({requested,active:requested,supported:requested});
   LlamaCppBackend.prototype.streamChat = async function* () { yield {type:'token',content:'new chat works'}; yield {type:'done'}; };
+  LlamaCppBackend.prototype.streamWithTools = async function* () { yield { type: 'response', response: { role: 'assistant', content: 'new chat works', finish_reason: 'stop' } }; };
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () => new Response(JSON.stringify({data:[]}), {status:200});
   const events: Array<StreamEvent & {conversationId:string}> = [];

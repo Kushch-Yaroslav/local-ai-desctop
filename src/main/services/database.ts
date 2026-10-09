@@ -5,6 +5,7 @@ import { paths } from './paths';
 import { isReasoningEffort } from '../../shared/reasoning-controls';
 import { isPersistableDiscoveryOption, parseStoredDiscoveryOption } from './context-discovery-persistence';
 import type { ContextDiscoveryOption } from '../../shared/context-estimator';
+import { validatePersistedRichArtifact, type RichArtifact } from '../../shared/rich-artifacts';
 
 type ConversationRow = {
   id: string; title: string; model_id: string | null; mode: ChatMode; working_directory: string | null;
@@ -18,10 +19,10 @@ type ConversationRow = {
   web_mode: WebMode;
   created_at: string; updated_at: string;
 };
-type MessageRow = { id: string; conversation_id: string; role: ChatMessage['role']; content: string; thinking: string | null; thinking_timeline: string | null; task_plan: string | null; generation_stats: string | null; created_at: string };
+type MessageRow = { id: string; conversation_id: string; role: ChatMessage['role']; content: string; thinking: string | null; thinking_timeline: string | null; task_plan: string | null; generation_stats: string | null; rich_artifacts: string | null; created_at: string };
 type ProjectReferenceRow = { id: string; message_id: string; position: number; project_id: string; project_slot: 1 | 2; project_path: string; project_label: string; relative_path: string; kind: ProjectReferenceKind };
 type AttachmentRow = { id: string; message_id: string; position: number; kind: AttachmentKind; mime_type: string; filename: string; size: number; storage_ref: string; status: AttachmentStatus; extracted_text: string | null; structured_data: string | null; vision_analysis: string | null; error: string | null; metadata: string | null; created_at: string; updated_at: string };
-type AnalysisRunRow = { id: string; conversation_id: string; assistant_message_id: string | null; reasoning_mode: ReasoningMode; status: AnalysisRun['status']; action_count: number; created_at: string; completed_at: string | null; timeline?: string | null; partial_output?: string | null; error?: string | null };
+type AnalysisRunRow = { id: string; conversation_id: string; assistant_message_id: string | null; reasoning_mode: ReasoningMode; status: AnalysisRun['status']; action_count: number; created_at: string; completed_at: string | null; timeline?: string | null; partial_output?: string | null; error?: string | null; rich_artifacts?: string | null };
 type AnalysisActionRow = { id: string; run_id: string; label: string; detail: string | null; data: string | null; position: number };
 type AgentPlanRow = { plan: string };
 
@@ -53,6 +54,18 @@ function parseGenerationStats(value: string | null): GenerationStats | undefined
     };
   } catch { return undefined; }
 }
+function parseRichArtifacts(value: string | null): RichArtifact[] | undefined {
+  try {
+    const parsed = value ? JSON.parse(value) as unknown : undefined;
+    if (!Array.isArray(parsed) || parsed.length > 16) return undefined;
+    const artifacts: RichArtifact[] = [];
+    for (const candidate of parsed) {
+      const result = validatePersistedRichArtifact(candidate);
+      if (result.artifact) artifacts.push(result.artifact);
+    }
+    return artifacts.length ? artifacts : undefined;
+  } catch { return undefined; }
+}
 /** Old or damaged timeline metadata remains optional; malformed entries are dropped. */
 const parseTimeline = (value: string | null | undefined): ThinkingTimelineEvent[] | undefined => {
   try {
@@ -65,6 +78,7 @@ const mapMessage = (row: MessageRow, attachments?: Attachment[], projectReferenc
   const generationStats = parseGenerationStats(row.generation_stats);
   let taskPlan: import('../../shared/types').AgentPlan | undefined;
   const thinkingTimeline = parseTimeline(row.thinking_timeline);
+  const richArtifacts = parseRichArtifacts(row.rich_artifacts);
   try {
     const parsed = row.task_plan ? JSON.parse(row.task_plan) as unknown : undefined;
     if (parsed && typeof parsed === 'object' && (Array.isArray((parsed as { milestones?: unknown }).milestones) || Array.isArray((parsed as { steps?: unknown }).steps))) {
@@ -79,6 +93,7 @@ const mapMessage = (row: MessageRow, attachments?: Attachment[], projectReferenc
     ...(thinkingTimeline?.length ? { thinkingTimeline } : {}),
     ...(taskPlan ? { taskPlan } : {}),
     ...(generationStats ? { generationStats } : {}),
+    ...(richArtifacts ? { richArtifacts } : {}),
   };
 };
 const mapRun = (row: AnalysisRunRow, actions: AnalysisActionRow[]): AnalysisRun => ({ id: row.id, conversationId: row.conversation_id, assistantMessageId: row.assistant_message_id, reasoningMode: row.reasoning_mode === 'deep' ? 'deep' : 'fast', status: row.status, actionCount: row.action_count, actions: actions.map((action) => {
@@ -93,9 +108,10 @@ const mapRun = (row: AnalysisRunRow, actions: AnalysisActionRow[]): AnalysisRun 
   const stale = visible.state === 'running' && row.status !== 'running' && row.status !== 'completed';
   return { ...visible, ...(stale ? { state: 'error' as const, ...(visible.terminal && !visible.terminal.finishedAt ? { terminal: { ...visible.terminal, status: row.status === 'error' ? 'error' as const : 'cancelled' as const } } : {}) } : {}), id: typeof stored.id === 'string' ? stored.id : action.id, label: action.label, detail: action.detail ?? undefined };
 }), createdAt: row.created_at, completedAt: row.completed_at, ...runHistory(row) });
-const runHistory = (row: AnalysisRunRow): Pick<AnalysisRun, 'timeline' | 'partialOutput' | 'error'> => {
+const runHistory = (row: AnalysisRunRow): Pick<AnalysisRun, 'timeline' | 'partialOutput' | 'error' | 'richArtifacts'> => {
   const timeline = parseTimeline(row.timeline);
-  return { ...(timeline?.length ? { timeline } : {}), ...(row.partial_output ? { partialOutput: row.partial_output } : {}), ...(row.error ? { error: row.error } : {}) };
+  const richArtifacts = parseRichArtifacts(row.rich_artifacts ?? null);
+  return { ...(timeline?.length ? { timeline } : {}), ...(richArtifacts ? { richArtifacts } : {}), ...(row.partial_output ? { partialOutput: row.partial_output } : {}), ...(row.error ? { error: row.error } : {}) };
 };
 
 export class Database {
@@ -111,7 +127,7 @@ export class Database {
       ) STRICT;
       CREATE TABLE IF NOT EXISTS messages (
         id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-        role TEXT NOT NULL, content TEXT NOT NULL, thinking TEXT, thinking_timeline TEXT, task_plan TEXT, generation_stats TEXT, created_at TEXT NOT NULL
+        role TEXT NOT NULL, content TEXT NOT NULL, thinking TEXT, thinking_timeline TEXT, task_plan TEXT, generation_stats TEXT, rich_artifacts TEXT, created_at TEXT NOT NULL
       ) STRICT;
       CREATE INDEX IF NOT EXISTS messages_conversation_idx ON messages(conversation_id, created_at);
       CREATE TABLE IF NOT EXISTS agent_plans (
@@ -167,6 +183,7 @@ export class Database {
     try { this.db.exec('ALTER TABLE messages ADD COLUMN thinking_timeline TEXT'); } catch { /* Existing databases already have this column. */ }
     try { this.db.exec('ALTER TABLE messages ADD COLUMN task_plan TEXT'); } catch { /* Existing databases already have this column. */ }
     try { this.db.exec('ALTER TABLE messages ADD COLUMN generation_stats TEXT'); } catch { /* Existing databases already have this column. */ }
+    try { this.db.exec('ALTER TABLE messages ADD COLUMN rich_artifacts TEXT'); } catch { /* Existing databases already have this column. */ }
     this.db.exec("UPDATE conversations SET primary_project_id=lower(hex(randomblob(16))) WHERE working_directory IS NOT NULL AND primary_project_id IS NULL");
     try { this.db.exec('ALTER TABLE generation_diagnostics ADD COLUMN prompt_eval_count INTEGER'); } catch { /* Existing databases already have this column. */ }
     try { this.db.exec('ALTER TABLE generation_diagnostics ADD COLUMN prompt_eval_duration INTEGER'); } catch { /* Existing databases already have this column. */ }
@@ -179,6 +196,7 @@ export class Database {
     this.migrateAnalysisRuns();
     try { this.db.exec('ALTER TABLE analysis_runs ADD COLUMN timeline TEXT'); } catch { /* Existing databases already have this column. */ }
     try { this.db.exec('ALTER TABLE analysis_runs ADD COLUMN partial_output TEXT'); } catch { /* Existing databases already have this column. */ }
+    try { this.db.exec('ALTER TABLE analysis_runs ADD COLUMN rich_artifacts TEXT'); } catch { /* Existing databases already have this column. */ }
     try { this.db.exec('ALTER TABLE analysis_runs ADD COLUMN error TEXT'); } catch { /* Existing databases already have this column. */ }
     try { this.db.exec('ALTER TABLE generation_diagnostics ADD COLUMN reasoning_mode TEXT'); } catch { /* Existing databases already have this column. */ }
     // Map values persisted by the removed four-level control once. The legacy
@@ -315,9 +333,9 @@ export class Database {
     return row ? mapMessage(row, this.listAttachments(row.id), this.listProjectReferences(row.id)) : null;
   }
 
-  addMessage(conversationId: string, role: ChatMessage['role'], content: string, id: string = randomUUID(), projectReferences: ProjectReference[] = [], response?: Pick<ChatMessage, 'thinking' | 'thinkingTimeline' | 'taskPlan' | 'generationStats'>): ChatMessage {
-    const message: ChatMessage = { id, conversationId, role, content, createdAt: new Date().toISOString(), ...(response?.thinking?.trim() ? { thinking: response.thinking } : {}), ...(response?.thinkingTimeline?.length ? { thinkingTimeline: response.thinkingTimeline } : {}), ...(response?.taskPlan ? { taskPlan: response.taskPlan } : {}), ...(response?.generationStats ? { generationStats: response.generationStats } : {}) };
-    this.db.prepare('INSERT INTO messages (id, conversation_id, role, content, thinking, thinking_timeline, task_plan, generation_stats, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run(message.id, message.conversationId, message.role, message.content, message.thinking ?? null, message.thinkingTimeline ? JSON.stringify(message.thinkingTimeline) : null, message.taskPlan ? JSON.stringify(message.taskPlan) : null, message.generationStats ? JSON.stringify(message.generationStats) : null, message.createdAt);
+  addMessage(conversationId: string, role: ChatMessage['role'], content: string, id: string = randomUUID(), projectReferences: ProjectReference[] = [], response?: Pick<ChatMessage, 'thinking' | 'thinkingTimeline' | 'taskPlan' | 'generationStats' | 'richArtifacts'>): ChatMessage {
+    const message: ChatMessage = { id, conversationId, role, content, createdAt: new Date().toISOString(), ...(response?.thinking?.trim() ? { thinking: response.thinking } : {}), ...(response?.thinkingTimeline?.length ? { thinkingTimeline: response.thinkingTimeline } : {}), ...(response?.taskPlan ? { taskPlan: response.taskPlan } : {}), ...(response?.generationStats ? { generationStats: response.generationStats } : {}), ...(response?.richArtifacts?.length ? { richArtifacts: response.richArtifacts } : {}) };
+    this.db.prepare('INSERT INTO messages (id, conversation_id, role, content, thinking, thinking_timeline, task_plan, generation_stats, rich_artifacts, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(message.id, message.conversationId, message.role, message.content, message.thinking ?? null, message.thinkingTimeline ? JSON.stringify(message.thinkingTimeline) : null, message.taskPlan ? JSON.stringify(message.taskPlan) : null, message.generationStats ? JSON.stringify(message.generationStats) : null, message.richArtifacts ? JSON.stringify(message.richArtifacts) : null, message.createdAt);
     for (const [position, reference] of projectReferences.entries()) this.db.prepare('INSERT INTO project_references (id, message_id, position, project_id, project_slot, project_path, project_label, relative_path, kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run(reference.id, message.id, position, reference.projectId, reference.projectSlot, reference.projectPath, reference.projectLabel, reference.relativePath, reference.kind);
     this.db.prepare('UPDATE conversations SET updated_at=? WHERE id=?').run(message.createdAt, conversationId);
     return { ...message, projectReferences };
@@ -479,19 +497,19 @@ export class Database {
   }
 
   /** Checkpoints the run's timeline at a stable event boundary (never per token). */
-  saveAnalysisRunTimeline(runId: string, timeline: readonly ThinkingTimelineEvent[]): void {
-    this.db.prepare("UPDATE analysis_runs SET timeline=? WHERE id=? AND status='running'").run(JSON.stringify(timeline), runId);
+  saveAnalysisRunTimeline(runId: string, timeline: readonly ThinkingTimelineEvent[], richArtifacts?: readonly RichArtifact[]): void {
+    this.db.prepare("UPDATE analysis_runs SET timeline=?, rich_artifacts=COALESCE(?, rich_artifacts) WHERE id=? AND status='running'").run(JSON.stringify(timeline), richArtifacts ? JSON.stringify(richArtifacts) : null, runId);
   }
 
   /** Ends a run. A run that ends without a final answer keeps its timeline,
    * any visible partial output and its failure text, and actions still shown
    * as running are closed so the reconstructed history never shows live work. */
-  finishAnalysisRun(runId: string, status: AnalysisRun['status'], assistantMessageId: string | null, history: { timeline?: readonly ThinkingTimelineEvent[]; partialOutput?: string; error?: string } = {}): AnalysisRun {
+  finishAnalysisRun(runId: string, status: AnalysisRun['status'], assistantMessageId: string | null, history: { timeline?: readonly ThinkingTimelineEvent[]; partialOutput?: string; error?: string; richArtifacts?: readonly RichArtifact[] } = {}): AnalysisRun {
     const finishedAt = new Date().toISOString();
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      this.db.prepare('UPDATE analysis_runs SET status=?, assistant_message_id=?, completed_at=?, timeline=COALESCE(?, timeline), partial_output=?, error=? WHERE id=?')
-        .run(status, assistantMessageId, finishedAt, history.timeline ? JSON.stringify(history.timeline) : null, history.partialOutput?.trim() ? history.partialOutput : null, history.error ?? null, runId);
+      this.db.prepare('UPDATE analysis_runs SET status=?, assistant_message_id=?, completed_at=?, timeline=COALESCE(?, timeline), partial_output=?, error=?, rich_artifacts=COALESCE(?, rich_artifacts) WHERE id=?')
+        .run(status, assistantMessageId, finishedAt, history.timeline ? JSON.stringify(history.timeline) : null, history.partialOutput?.trim() ? history.partialOutput : null, history.error ?? null, history.richArtifacts ? JSON.stringify(history.richArtifacts) : null, runId);
       if (status !== 'completed') this.closeRunningActions(runId, status, finishedAt);
       this.db.exec('COMMIT');
     } catch (error) {

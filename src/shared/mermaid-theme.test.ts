@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mermaidLabelColorForContrast, mermaidThemeVariables } from './mermaid-theme';
+import { mermaidGitThemeVariables, mermaidLabelColorForContrast, mermaidThemeVariables } from './mermaid-theme';
 
 function luminance(color: string): number {
   const channels = color.slice(1).match(/.{2}/g)!.map((channel) => parseInt(channel, 16) / 255).map((channel) => channel <= .04045 ? channel / 12.92 : ((channel + .055) / 1.055) ** 2.4);
@@ -34,3 +34,5 @@ assert.equal(mermaidLabelColorForContrast('#f3f4f6', '#2a394b'), null, 'dark-the
 assert.equal(mermaidLabelColorForContrast('#f3f4f6', 'transparent'), null, 'unknown backgrounds should leave the theme label untouched');
 assert.equal(mermaidLabelColorForContrast('#f3f4f6', 'rgba(255, 255, 255, 0.5)', '#f4f6f8'), '#000000', 'translucent light label surfaces should account for their underlay');
 assert.equal(mermaidLabelColorForContrast('#f3f4f6', 'rgba(34, 32, 29, 0.5)', '#141311'), null, 'translucent dark label surfaces should retain light text');
+
+for (const theme of ['dark', 'light'] as const) { const git = mermaidGitThemeVariables(theme) as Record<string, string>; assert.equal(new Set([git.git0, git.git1, git.git2]).size, 3); for (let i=0;i<8;i++) assert(contrast(git[`gitBranchLabel${i}`], git[`git${i}`]) >= 4.5, `Git branch ${i} label contrast (${theme})`); }

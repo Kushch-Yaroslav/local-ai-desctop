@@ -1090,7 +1090,8 @@ mod tests {
     impl Fixture {
         fn new(files: &[(&str, &str)]) -> Self {
             let base = std::env::temp_dir().join(format!(
-                "ledger-test-{}-{}",
+                "ledger-test-{}-{}-{}",
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));

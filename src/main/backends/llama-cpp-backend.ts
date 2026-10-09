@@ -373,7 +373,7 @@ export class LlamaCppBackend implements LlmBackend, ToolCallingBackend {
       const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = '';
       try {
         while (!signal.aborted) {
-          const { done, value } = await reader.read(); buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
+          const { done, value } = await reader.read(); buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done }); buffer = buffer.replace(/\r\n/g, '\n');
           const blocks = buffer.split('\n\n'); buffer = blocks.pop() ?? '';
           for (const raw of blocks) {
             if (!raw.startsWith('data: ')) continue;
@@ -394,7 +394,7 @@ export class LlamaCppBackend implements LlmBackend, ToolCallingBackend {
             if (delta?.content) { first.content ??= Date.now(); text += delta.content; yield { type: 'token', content: delta.content }; }
             for (const rawCall of delta?.tool_calls ?? []) {
               first.tool ??= Date.now(); const index = rawCall.index ?? assembled.size; const current = assembled.get(index) ?? { arguments: '' };
-              if (rawCall.id) current.id = rawCall.id; if (rawCall.type) current.type = rawCall.type; if (rawCall.function?.name) current.name = rawCall.function.name;
+              if (rawCall.id) current.id = rawCall.id; if (rawCall.type) current.type = rawCall.type; if (rawCall.function?.name) { const name = rawCall.function.name; current.name = !current.name || name.startsWith(current.name) ? name : name === current.name ? current.name : current.name + name; }
               const argumentsDelta = rawCall.function?.arguments; if (argumentsDelta) current.arguments += argumentsDelta;
               assembled.set(index, current);
               yield { type: 'tool_call_delta', index, ...(rawCall.id ? { id: rawCall.id } : {}), ...(rawCall.function?.name ? { name: rawCall.function.name } : {}), ...(argumentsDelta ? { argumentsDelta } : {}) };
@@ -431,7 +431,7 @@ export class LlamaCppBackend implements LlmBackend, ToolCallingBackend {
       };
       try {
         while (!signal.aborted) {
-          const { done, value } = await reader.read(); buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
+          const { done, value } = await reader.read(); buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done }); buffer = buffer.replace(/\r\n/g, '\n');
           const blocks = buffer.split('\n\n'); buffer = blocks.pop() ?? '';
           for (const raw of blocks) {
             if (!raw.startsWith('data: ')) continue; const valueText = raw.slice(6).trim();

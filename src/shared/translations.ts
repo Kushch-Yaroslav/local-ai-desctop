@@ -1,5 +1,24 @@
 /** UI text only. Protocol identifiers, model output and saved chat content are never translated. */
 export const english: Record<string, string> = {
+  'Описания коммитов': 'Commit descriptions',
+  'Галерея не создана. Найденные изображения и ссылки не означают, что галерея была показана.': 'Gallery was not created. Discovered images and links do not mean that a gallery was displayed.',
+  'Ожидаю ответ модели…': 'Waiting for model…',
+  'Легенда графика': 'Chart legend',
+  'Веб-поиск': 'Web search',
+  'Поисковый провайдер': 'Search provider',
+  'Автоматически (DuckDuckGo)': 'Automatic (DuckDuckGo)',
+  'Разрешить Bing как резервный провайдер': 'Allow Bing as a fallback provider',
+  'Поиск работает без API-ключа. Google Search API закрыт для новых клиентов; прямой Google-поиск не поддерживается.': 'Search works without an API key. Google Search API is closed to new customers; direct Google search is unsupported.',
+  'Поисковые провайдеры недоступны. Попробуйте позже или измените настройки поиска.': 'Search providers are unavailable. Try again later or change search settings.',
+  'Создаю график': 'Creating chart',
+
+  "Ожидаю ответ модели": "Waiting for model response",
+  "Создаю визуализацию": "Creating visualization",
+  "Подготавливаю данные": "Preparing data",
+
+  "Выберите вложенную таблицу или CSV по ID.": "Select an attached spreadsheet or CSV by ID.", "Некорректный URL изображения.": "Invalid image URL.", "Некорректный URL источника.": "Invalid source URL.", "Выберите структурированное вложение из этого диалога.": "Select a structured attachment from this conversation.",
+  "Экспорт SVG": "Export SVG", "Данные": "Data", "Копировать таблицу": "Copy table", "Скачать CSV": "Download CSV", "Подготовка визуального ответа": "Preparing a visual response",
+  "Изображения из интернета": "Images from the web", "Открыть изображение": "Open image", "Изображение недоступно": "Image unavailable", "Загрузка изображения…": "Loading image…", "Источник": "Source", "Открыть источник": "Open source", "снижение показателя": "unfavorable change", "Просмотр изображения": "Image preview", "Основные выводы": "Key findings", "Рекомендации": "Recommendations", "Поиск изображений": "Image search",
   "Работа над задачей": "Working on the task",
   "Обработка изображений": "Image Processing", "Процессор (CPU)": "CPU", "Видеокарта (GPU)": "GPU",
   "Выберите CPU или GPU в меню «Обработка изображений». Это не меняет GPU-слои модели.": "Choose CPU or GPU in the Image Processing menu. This does not change the model's GPU layers.",

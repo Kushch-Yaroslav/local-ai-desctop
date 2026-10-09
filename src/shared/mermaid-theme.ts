@@ -1,5 +1,12 @@
 export type MermaidTheme = 'dark' | 'light';
 
+/** Git-specific colors; general Mermaid diagrams keep their existing palette. */
+export function mermaidGitThemeVariables(theme: MermaidTheme) {
+  const colors = theme === 'dark' ? ['#ffae75', '#7bd4c3', '#a9b9ff', '#e6c66a', '#d1a5f5', '#ff9bb3', '#a0d28b', '#8acdeb'] : ['#9c481b', '#146658', '#435caa', '#806006', '#7a419e', '#a02f51', '#3b7425', '#206780'];
+  return { ...Object.fromEntries(colors.flatMap((color, index) => [[`git${index}`, color], [`gitBranchLabel${index}`, theme === 'dark' ? '#161513' : '#ffffff']])),
+    commitLabelColor: theme === 'dark' ? '#eee9e2' : '#1d2733', commitLabelBackground: theme === 'dark' ? '#141311' : '#ffffff', commitLabelFontSize: '13px' };
+}
+
 type ColorChannels = [number, number, number, number];
 
 function colorChannels(color: string): ColorChannels | null {

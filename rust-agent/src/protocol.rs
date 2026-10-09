@@ -18,6 +18,10 @@ pub enum Request {
         user_image_refs: Vec<String>,
         #[serde(default)]
         web_tools: Vec<Value>,
+        #[serde(default)]
+        artifact_tools: Vec<Value>,
+        #[serde(default)]
+        attachment_tools: Vec<Value>,
         project_root: Option<String>,
         secondary_project_root: Option<String>,
         /// Directories the user named explicitly (absolute, canonical). They
