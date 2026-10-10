@@ -336,6 +336,10 @@ log "electron=$ELECTRON_BIN llama_server=$LLAMA_BIN port=$PORT startup_selection
 
 [[ -x "$ELECTRON_BIN" && -f "$APP_DIR/dist/main/index.js" && -f "$APP_DIR/dist/preload/index.js" && -f "$APP_DIR/dist/renderer/index.html" ]] || fail "Не найден production build или Electron: $ELECTRON_BIN"
 if [[ "${LOCAL_AI_LAUNCHER_HEADLESS:-}" != "1" ]]; then
+  if [[ -f "$APP_DIR/rust-agent/Cargo.toml" ]]; then
+    source "$APP_DIR/scripts/ensure-rust-agent.sh"
+    ensure_rust_agent "$APP_DIR" >> "$LOG_FILE" 2>&1 || fail "Не удалось собрать Rust Agent Runtime V2. См. $LOG_FILE"
+  fi
   source "$APP_DIR/scripts/electron-sandbox.sh"
   select_electron_sandbox "$ELECTRON_BIN" || fail "Не удалось настроить Chrome sandbox helper. См. документацию по установке Linux."
 fi
