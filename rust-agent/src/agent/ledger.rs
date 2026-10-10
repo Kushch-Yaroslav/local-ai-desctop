@@ -635,7 +635,7 @@ impl Ledger {
                         }
                     }
                 }
-                "write_file" | "create_file" | "delete_file" | "apply_patch" => {
+                "write_file" | "create_file" | "delete_file" | "apply_patch" | "replace_text" => {
                     // Files the run itself wrote are not unexplored code.
                     let mut written = Vec::new();
                     if let Some(path) = arguments.get("path").and_then(Value::as_str) {
@@ -1090,7 +1090,8 @@ mod tests {
     impl Fixture {
         fn new(files: &[(&str, &str)]) -> Self {
             let base = std::env::temp_dir().join(format!(
-                "ledger-test-{}-{}",
+                "ledger-test-{}-{}-{}",
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));

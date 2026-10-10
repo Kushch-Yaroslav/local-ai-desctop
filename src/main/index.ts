@@ -1,16 +1,44 @@
-import { app, BrowserWindow } from 'electron';
+import { applicationMenu } from './services/application-menu';
+import { setLanguage, t, localizeMessage } from '../shared/locale';
+import { effectiveRuntimeConfiguration, saveLanguage } from './services/runtime-settings';
+import { app, BrowserWindow, dialog, Menu, ipcMain } from 'electron';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { ensureAppDirectories, paths } from './services/paths';
 import { log } from './services/logger';
+import { startRuntimeSupervisor, stopRuntimeSupervisor } from './services/runtime-supervisor';
 
 let mainWindow: BrowserWindow | null = null;
 let shutdownStarted = false;
 
-ensureAppDirectories();
+try { ensureAppDirectories(); }
+catch (error) {
+  dialog.showErrorBox('Local AI Desktop — каталог данных', `Не удалось создать каталоги данных: ${String(error)}. Укажите доступный каталог через LOCAL_AI_RUNTIME_ROOT.`);
+  app.exit(1);
+}
 app.setPath('userData', paths.userData);
 app.setPath('cache', paths.cache);
 app.setPath('logs', paths.logs);
+if (!app.requestSingleInstanceLock()) app.exit(0);
+app.on('second-instance', () => { mainWindow?.show(); mainWindow?.focus(); });
+process.env.LOCAL_AI_LLAMA_CPP_URL ??= `http://127.0.0.1:${process.env.LOCAL_AI_LLAMA_PORT ?? '8081'}`;
+
+let menuDevice: 'cpu' | 'gpu' = 'cpu';
+// Both language controls persist through the same preference and notification.
+function selectLanguage(language: 'ru' | 'en'): void {
+  saveLanguage(language);
+  setLanguage(language);
+  updateMenu();
+  BrowserWindow.getAllWindows().forEach((window) => window.webContents.send('settings:language', language));
+}
+function updateMenu(): void {
+  Menu.setApplicationMenu(Menu.buildFromTemplate(applicationMenu((language) => {
+    try { selectLanguage(language); }
+    catch (error) { dialog.showErrorBox('Local AI Desktop', localizeMessage(String(error))); }
+  }, () => { void dialog.showMessageBox({ title: 'Local AI Desktop', message: 'Local AI Desktop', detail: t('Локальный AI-клиент для Linux') }); }, menuDevice, device => {
+    void import('./ipc/register-ipc').then(ipc => ipc.selectImageProcessingDevice(device)).catch(error => dialog.showErrorBox('Local AI Desktop', localizeMessage(String(error))));
+  })));
+}
 
 function createWindow(): void {
   const preloadPath = join(__dirname, '../preload/index.js');
@@ -22,7 +50,7 @@ function createWindow(): void {
   if (!devServerUrl && !existsSync(rendererPath)) throw new Error(`Не найден production renderer: ${rendererPath}`);
   if (!existsSync(preloadPath)) throw new Error(`Не найден preload: ${preloadPath}`);
   mainWindow = new BrowserWindow({
-    width: 1440, height: 920, minWidth: 980, minHeight: 640,
+    title: 'Local AI Desktop', width: 1440, height: 920, minWidth: 980, minHeight: 640,
     backgroundColor: '#111318',
     webPreferences: { preload: preloadPath, contextIsolation: true, nodeIntegration: false, sandbox: true },
   });
@@ -50,8 +78,18 @@ function createWindow(): void {
 }
 
 app.whenReady().then(async () => {
+  setLanguage(effectiveRuntimeConfiguration().language ?? 'en'); updateMenu();
+  ipcMain.handle('settings:setLanguage', (_event, language: unknown) => {
+    if (language !== 'en' && language !== 'ru') throw new Error('Invalid language');
+    selectLanguage(language);
+  });
+  await startRuntimeSupervisor();
   const { registerIpc } = await import('./ipc/register-ipc');
-  registerIpc(); createWindow(); log('application.started');
+  registerIpc();
+  const ipc = await import('./ipc/register-ipc');
+  const refreshDeviceMenu = () => { void ipc.imageProcessingDeviceSelection().then(device => { menuDevice = device; updateMenu(); }); };
+  ipc.onImageProcessingDeviceChanged(refreshDeviceMenu);
+  refreshDeviceMenu(); createWindow(); log('application.started');
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 });
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
@@ -63,6 +101,7 @@ app.on('before-quit', (event) => {
   shutdownStarted = true;
   void import('./ipc/register-ipc')
     .then(({ shutdownRuntime }) => shutdownRuntime())
+    .then(() => stopRuntimeSupervisor())
     .catch((error: unknown) => log('runtime.shutdown.failed', error instanceof Error ? { message: error.message } : { error: String(error) }))
     .finally(() => {
       log('application.stopped');

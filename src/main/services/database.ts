@@ -2,6 +2,10 @@ import { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
 import type { AgentPlan, AnalysisRun, Attachment, AttachmentKind, AttachmentStatus, ChatMessage, ChatMode, Conversation, GenerationDiagnostics, GenerationStats, LlamaKvCacheType, ProjectReference, ProjectReferenceKind, ReasoningMode, ThinkingTimelineEvent, ToolActivity, WebMode } from '../../shared/types';
 import { paths } from './paths';
+import { isReasoningEffort } from '../../shared/reasoning-controls';
+import { isPersistableDiscoveryOption, parseStoredDiscoveryOption } from './context-discovery-persistence';
+import type { ContextDiscoveryOption } from '../../shared/context-estimator';
+import { validatePersistedRichArtifact, type RichArtifact } from '../../shared/rich-artifacts';
 
 type ConversationRow = {
   id: string; title: string; model_id: string | null; mode: ChatMode; working_directory: string | null;
@@ -10,20 +14,21 @@ type ConversationRow = {
   llama_kv_cache_type: LlamaKvCacheType;
   llama_kv_offload: number;
   reasoning_mode: ReasoningMode;
+  thinking_enabled: number | null; reasoning_effort: string | null;
   context_tokens: number | null; context_model_id: string | null;
   web_mode: WebMode;
   created_at: string; updated_at: string;
 };
-type MessageRow = { id: string; conversation_id: string; role: ChatMessage['role']; content: string; thinking: string | null; thinking_timeline: string | null; task_plan: string | null; generation_stats: string | null; created_at: string };
+type MessageRow = { id: string; conversation_id: string; role: ChatMessage['role']; content: string; thinking: string | null; thinking_timeline: string | null; task_plan: string | null; generation_stats: string | null; rich_artifacts: string | null; created_at: string };
 type ProjectReferenceRow = { id: string; message_id: string; position: number; project_id: string; project_slot: 1 | 2; project_path: string; project_label: string; relative_path: string; kind: ProjectReferenceKind };
 type AttachmentRow = { id: string; message_id: string; position: number; kind: AttachmentKind; mime_type: string; filename: string; size: number; storage_ref: string; status: AttachmentStatus; extracted_text: string | null; structured_data: string | null; vision_analysis: string | null; error: string | null; metadata: string | null; created_at: string; updated_at: string };
-type AnalysisRunRow = { id: string; conversation_id: string; assistant_message_id: string | null; reasoning_mode: ReasoningMode; status: AnalysisRun['status']; action_count: number; created_at: string; completed_at: string | null };
+type AnalysisRunRow = { id: string; conversation_id: string; assistant_message_id: string | null; reasoning_mode: ReasoningMode; status: AnalysisRun['status']; action_count: number; created_at: string; completed_at: string | null; timeline?: string | null; partial_output?: string | null; error?: string | null; rich_artifacts?: string | null };
 type AnalysisActionRow = { id: string; run_id: string; label: string; detail: string | null; data: string | null; position: number };
 type AgentPlanRow = { plan: string };
 
 const mapConversation = (row: ConversationRow): Conversation => ({
   id: row.id, title: row.title, modelId: row.model_id, mode: row.mode,
-  workingDirectory: row.working_directory, primaryProjectId: row.primary_project_id ?? null, secondaryWorkingDirectory: row.secondary_working_directory ?? null, secondaryProjectId: row.secondary_project_id ?? null, contextWindow: row.context_window ?? 32_768, llamaKvCacheType: row.llama_kv_cache_type === 'q8_0' ? 'q8_0' : 'f16', llamaKvOffload: row.llama_kv_offload !== 0, reasoningMode: row.reasoning_mode === 'deep' ? 'deep' : 'fast', contextTokens: row.context_tokens ?? null, contextModelId: row.context_model_id ?? null, webMode: row.web_mode ?? 'auto', createdAt: row.created_at, updatedAt: row.updated_at,
+  workingDirectory: row.working_directory, primaryProjectId: row.primary_project_id ?? null, secondaryWorkingDirectory: row.secondary_working_directory ?? null, secondaryProjectId: row.secondary_project_id ?? null, contextWindow: row.context_window ?? 32_768, llamaKvCacheType: row.llama_kv_cache_type === 'q8_0' ? 'q8_0' : 'f16', llamaKvOffload: row.llama_kv_offload !== 0, reasoningMode: row.reasoning_mode === 'deep' ? 'deep' : 'fast', thinkingEnabled: row.thinking_enabled === null || row.thinking_enabled === undefined ? null : row.thinking_enabled !== 0, reasoningEffort: isReasoningEffort(row.reasoning_effort) ? row.reasoning_effort : null, contextTokens: row.context_tokens ?? null, contextModelId: row.context_model_id ?? null, webMode: row.web_mode ?? 'auto', createdAt: row.created_at, updatedAt: row.updated_at,
 });
 const mapAttachment = (row: AttachmentRow): Attachment => ({
   id: row.id, messageId: row.message_id, index: row.position, kind: row.kind, mimeType: row.mime_type, filename: row.filename, size: row.size, storageRef: row.storage_ref, status: row.status,
@@ -49,14 +54,31 @@ function parseGenerationStats(value: string | null): GenerationStats | undefined
     };
   } catch { return undefined; }
 }
+function parseRichArtifacts(value: string | null): RichArtifact[] | undefined {
+  try {
+    const parsed = value ? JSON.parse(value) as unknown : undefined;
+    if (!Array.isArray(parsed) || parsed.length > 16) return undefined;
+    const artifacts: RichArtifact[] = [];
+    for (const candidate of parsed) {
+      const result = validatePersistedRichArtifact(candidate);
+      if (result.artifact) artifacts.push(result.artifact);
+    }
+    return artifacts.length ? artifacts : undefined;
+  } catch { return undefined; }
+}
+/** Old or damaged timeline metadata remains optional; malformed entries are dropped. */
+const parseTimeline = (value: string | null | undefined): ThinkingTimelineEvent[] | undefined => {
+  try {
+    const parsed = value ? JSON.parse(value) as unknown : undefined;
+    if (!Array.isArray(parsed)) return undefined;
+    return parsed.filter((item): item is ThinkingTimelineEvent => Boolean(item) && typeof item === 'object' && typeof item.id === 'string' && typeof item.position === 'number' && ((item.kind === 'reasoning' && typeof item.content === 'string' && (item.startedAt === undefined || typeof item.startedAt === 'string') && (item.completedAt === undefined || typeof item.completedAt === 'string')) || (item.kind === 'activity' && typeof item.activityId === 'string') || (item.kind === 'steering' && typeof item.messageId === 'string' && (item.status === 'accepted' || item.status === 'applied')) || item.kind === 'paused'));
+  } catch { return undefined; }
+};
 const mapMessage = (row: MessageRow, attachments?: Attachment[], projectReferences?: ProjectReference[]): ChatMessage => {
   const generationStats = parseGenerationStats(row.generation_stats);
-  let thinkingTimeline: ThinkingTimelineEvent[] | undefined;
   let taskPlan: import('../../shared/types').AgentPlan | undefined;
-  try {
-    const parsed = row.thinking_timeline ? JSON.parse(row.thinking_timeline) as unknown : undefined;
-    if (Array.isArray(parsed)) thinkingTimeline = parsed.filter((item): item is ThinkingTimelineEvent => Boolean(item) && typeof item === 'object' && typeof item.id === 'string' && typeof item.position === 'number' && ((item.kind === 'reasoning' && typeof item.content === 'string' && (item.startedAt === undefined || typeof item.startedAt === 'string') && (item.completedAt === undefined || typeof item.completedAt === 'string')) || (item.kind === 'activity' && typeof item.activityId === 'string') || (item.kind === 'steering' && typeof item.messageId === 'string' && (item.status === 'accepted' || item.status === 'applied'))));
-  } catch { /* Old or damaged timeline metadata remains optional. */ }
+  const thinkingTimeline = parseTimeline(row.thinking_timeline);
+  const richArtifacts = parseRichArtifacts(row.rich_artifacts);
   try {
     const parsed = row.task_plan ? JSON.parse(row.task_plan) as unknown : undefined;
     if (parsed && typeof parsed === 'object' && (Array.isArray((parsed as { milestones?: unknown }).milestones) || Array.isArray((parsed as { steps?: unknown }).steps))) {
@@ -71,6 +93,7 @@ const mapMessage = (row: MessageRow, attachments?: Attachment[], projectReferenc
     ...(thinkingTimeline?.length ? { thinkingTimeline } : {}),
     ...(taskPlan ? { taskPlan } : {}),
     ...(generationStats ? { generationStats } : {}),
+    ...(richArtifacts ? { richArtifacts } : {}),
   };
 };
 const mapRun = (row: AnalysisRunRow, actions: AnalysisActionRow[]): AnalysisRun => ({ id: row.id, conversationId: row.conversation_id, assistantMessageId: row.assistant_message_id, reasoningMode: row.reasoning_mode === 'deep' ? 'deep' : 'fast', status: row.status, actionCount: row.action_count, actions: actions.map((action) => {
@@ -81,8 +104,15 @@ const mapRun = (row: AnalysisRunRow, actions: AnalysisActionRow[]): AnalysisRun 
   // `analysis_actions.id` is a storage primary key. New rows scope that key by
   // run, while persisted activity data retains the stable per-run ID used by
   // timelines, approval events and the renderer.
-  return { ...visible, id: typeof stored.id === 'string' ? stored.id : action.id, label: action.label, detail: action.detail ?? undefined };
-}), createdAt: row.created_at, completedAt: row.completed_at });
+  // Runs finalized before running actions were closed on Stop/failure must not show live work forever.
+  const stale = visible.state === 'running' && row.status !== 'running' && row.status !== 'completed';
+  return { ...visible, ...(stale ? { state: 'error' as const, ...(visible.terminal && !visible.terminal.finishedAt ? { terminal: { ...visible.terminal, status: row.status === 'error' ? 'error' as const : 'cancelled' as const } } : {}) } : {}), id: typeof stored.id === 'string' ? stored.id : action.id, label: action.label, detail: action.detail ?? undefined };
+}), createdAt: row.created_at, completedAt: row.completed_at, ...runHistory(row) });
+const runHistory = (row: AnalysisRunRow): Pick<AnalysisRun, 'timeline' | 'partialOutput' | 'error' | 'richArtifacts'> => {
+  const timeline = parseTimeline(row.timeline);
+  const richArtifacts = parseRichArtifacts(row.rich_artifacts ?? null);
+  return { ...(timeline?.length ? { timeline } : {}), ...(richArtifacts ? { richArtifacts } : {}), ...(row.partial_output ? { partialOutput: row.partial_output } : {}), ...(row.error ? { error: row.error } : {}) };
+};
 
 export class Database {
   private readonly db: DatabaseSync;
@@ -97,7 +127,7 @@ export class Database {
       ) STRICT;
       CREATE TABLE IF NOT EXISTS messages (
         id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-        role TEXT NOT NULL, content TEXT NOT NULL, thinking TEXT, thinking_timeline TEXT, task_plan TEXT, generation_stats TEXT, created_at TEXT NOT NULL
+        role TEXT NOT NULL, content TEXT NOT NULL, thinking TEXT, thinking_timeline TEXT, task_plan TEXT, generation_stats TEXT, rich_artifacts TEXT, created_at TEXT NOT NULL
       ) STRICT;
       CREATE INDEX IF NOT EXISTS messages_conversation_idx ON messages(conversation_id, created_at);
       CREATE TABLE IF NOT EXISTS agent_plans (
@@ -130,12 +160,19 @@ export class Database {
         eval_count INTEGER, eval_duration INTEGER, tokens_per_second REAL, prompt_tokens_per_second REAL,
         time_to_first_token_ms REAL, created_at TEXT NOT NULL
       ) STRICT;
+      CREATE TABLE IF NOT EXISTS context_discoveries (
+        config_key TEXT NOT NULL, kv_cache_type TEXT NOT NULL, kv_offload INTEGER NOT NULL, model_id TEXT NOT NULL,
+        context_window INTEGER NOT NULL, option TEXT NOT NULL, identity TEXT NOT NULL, saved_at TEXT NOT NULL,
+        PRIMARY KEY (config_key, kv_cache_type, kv_offload)
+      ) STRICT;
       CREATE INDEX IF NOT EXISTS generation_diagnostics_conversation_idx ON generation_diagnostics(conversation_id, created_at DESC);
     `);
     try { this.db.exec('ALTER TABLE conversations ADD COLUMN context_window INTEGER NOT NULL DEFAULT 32768'); } catch { /* Existing databases already have this column. */ }
     try { this.db.exec("ALTER TABLE conversations ADD COLUMN llama_kv_cache_type TEXT NOT NULL DEFAULT 'f16'"); } catch { /* Existing databases already have this column. */ }
     try { this.db.exec('ALTER TABLE conversations ADD COLUMN llama_kv_offload INTEGER NOT NULL DEFAULT 1'); } catch { /* Existing databases already have this column. */ }
     try { this.db.exec('ALTER TABLE conversations ADD COLUMN reasoning_mode TEXT'); } catch { /* Existing databases already have this column. */ }
+    try { this.db.exec('ALTER TABLE conversations ADD COLUMN thinking_enabled INTEGER'); } catch { /* Existing databases already have this column. */ }
+    try { this.db.exec('ALTER TABLE conversations ADD COLUMN reasoning_effort TEXT'); } catch { /* Existing databases already have this column. */ }
     try { this.db.exec('ALTER TABLE conversations ADD COLUMN context_tokens INTEGER'); } catch { /* Existing databases already have this column. */ }
     try { this.db.exec('ALTER TABLE conversations ADD COLUMN context_model_id TEXT'); } catch { /* Existing databases already have this column. */ }
     try { this.db.exec("ALTER TABLE conversations ADD COLUMN web_mode TEXT NOT NULL DEFAULT 'auto'"); } catch { /* Existing databases already have this column. */ }
@@ -146,6 +183,7 @@ export class Database {
     try { this.db.exec('ALTER TABLE messages ADD COLUMN thinking_timeline TEXT'); } catch { /* Existing databases already have this column. */ }
     try { this.db.exec('ALTER TABLE messages ADD COLUMN task_plan TEXT'); } catch { /* Existing databases already have this column. */ }
     try { this.db.exec('ALTER TABLE messages ADD COLUMN generation_stats TEXT'); } catch { /* Existing databases already have this column. */ }
+    try { this.db.exec('ALTER TABLE messages ADD COLUMN rich_artifacts TEXT'); } catch { /* Existing databases already have this column. */ }
     this.db.exec("UPDATE conversations SET primary_project_id=lower(hex(randomblob(16))) WHERE working_directory IS NOT NULL AND primary_project_id IS NULL");
     try { this.db.exec('ALTER TABLE generation_diagnostics ADD COLUMN prompt_eval_count INTEGER'); } catch { /* Existing databases already have this column. */ }
     try { this.db.exec('ALTER TABLE generation_diagnostics ADD COLUMN prompt_eval_duration INTEGER'); } catch { /* Existing databases already have this column. */ }
@@ -156,6 +194,10 @@ export class Database {
     try { this.db.exec('ALTER TABLE generation_diagnostics ADD COLUMN time_to_first_token_ms REAL'); } catch { /* Existing databases already have this column. */ }
     try { this.db.exec('ALTER TABLE analysis_actions ADD COLUMN data TEXT'); } catch { /* Existing databases already have this column. */ }
     this.migrateAnalysisRuns();
+    try { this.db.exec('ALTER TABLE analysis_runs ADD COLUMN timeline TEXT'); } catch { /* Existing databases already have this column. */ }
+    try { this.db.exec('ALTER TABLE analysis_runs ADD COLUMN partial_output TEXT'); } catch { /* Existing databases already have this column. */ }
+    try { this.db.exec('ALTER TABLE analysis_runs ADD COLUMN rich_artifacts TEXT'); } catch { /* Existing databases already have this column. */ }
+    try { this.db.exec('ALTER TABLE analysis_runs ADD COLUMN error TEXT'); } catch { /* Existing databases already have this column. */ }
     try { this.db.exec('ALTER TABLE generation_diagnostics ADD COLUMN reasoning_mode TEXT'); } catch { /* Existing databases already have this column. */ }
     // Map values persisted by the removed four-level control once. The legacy
     // columns stay in place for old SQLite files but are never read again.
@@ -212,10 +254,10 @@ export class Database {
     const id = randomUUID(); const now = new Date().toISOString();
     const title = 'Новый чат';
     this.db.prepare("INSERT INTO conversations (id, title, model_id, mode, working_directory, primary_project_id, secondary_working_directory, secondary_project_id, context_window, llama_kv_cache_type, llama_kv_offload, reasoning_mode, context_tokens, context_model_id, web_mode, created_at, updated_at) VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, 'f16', 1, ?, NULL, NULL, 'auto', ?, ?)").run(id, title, modelId, 'chat', 32_768, 'fast', now, now);
-    return { id, title, modelId, mode: 'chat', workingDirectory: null, primaryProjectId: null, secondaryWorkingDirectory: null, secondaryProjectId: null, contextWindow: 32_768, llamaKvCacheType: 'f16', llamaKvOffload: true, reasoningMode: 'fast', contextTokens: null, contextModelId: null, webMode: 'auto', createdAt: now, updatedAt: now };
+    return { id, title, modelId, mode: 'chat', workingDirectory: null, primaryProjectId: null, secondaryWorkingDirectory: null, secondaryProjectId: null, contextWindow: 32_768, llamaKvCacheType: 'f16', llamaKvOffload: true, reasoningMode: 'fast', thinkingEnabled: null, reasoningEffort: null, contextTokens: null, contextModelId: null, webMode: 'auto', createdAt: now, updatedAt: now };
   }
 
-  updateConversation(id: string, patch: Partial<Pick<Conversation, 'title' | 'modelId' | 'mode' | 'workingDirectory' | 'secondaryWorkingDirectory' | 'contextWindow' | 'llamaKvCacheType' | 'llamaKvOffload' | 'reasoningMode' | 'webMode'>>): Conversation {
+  updateConversation(id: string, patch: Partial<Pick<Conversation, 'title' | 'modelId' | 'mode' | 'workingDirectory' | 'secondaryWorkingDirectory' | 'contextWindow' | 'llamaKvCacheType' | 'llamaKvOffload' | 'reasoningMode' | 'thinkingEnabled' | 'reasoningEffort' | 'webMode'>>): Conversation {
     const current = this.getConversation(id);
     if (!current) throw new Error('Чат не найден');
     const next = { ...current, ...patch, updatedAt: new Date().toISOString() };
@@ -225,13 +267,17 @@ export class Database {
     const llamaKvCacheType: LlamaKvCacheType = next.llamaKvCacheType === 'q8_0' ? 'q8_0' : 'f16';
     const llamaKvOffload = next.llamaKvOffload !== false;
     const reasoningMode: ReasoningMode = next.reasoningMode === 'deep' ? 'deep' : 'fast';
+    const thinkingEnabled = typeof next.thinkingEnabled === 'boolean' ? next.thinkingEnabled : null;
+    const reasoningEffort = isReasoningEffort(next.reasoningEffort) ? next.reasoningEffort : null;
     const webMode: WebMode = next.webMode === 'off' ? 'off' : 'auto';
-    this.db.prepare('UPDATE conversations SET title=?, model_id=?, mode=?, working_directory=?, primary_project_id=?, secondary_working_directory=?, secondary_project_id=?, context_window=?, llama_kv_cache_type=?, llama_kv_offload=?, reasoning_mode=?, web_mode=?, updated_at=? WHERE id=?')
-      .run(next.title, next.modelId, next.mode, next.workingDirectory, next.primaryProjectId, next.secondaryWorkingDirectory, next.secondaryProjectId, contextWindow, llamaKvCacheType, llamaKvOffload ? 1 : 0, reasoningMode, webMode, next.updatedAt, id);
+    this.db.prepare('UPDATE conversations SET title=?, model_id=?, mode=?, working_directory=?, primary_project_id=?, secondary_working_directory=?, secondary_project_id=?, context_window=?, llama_kv_cache_type=?, llama_kv_offload=?, reasoning_mode=?, thinking_enabled=?, reasoning_effort=?, web_mode=?, updated_at=? WHERE id=?')
+      .run(next.title, next.modelId, next.mode, next.workingDirectory, next.primaryProjectId, next.secondaryWorkingDirectory, next.secondaryProjectId, contextWindow, llamaKvCacheType, llamaKvOffload ? 1 : 0, reasoningMode, thinkingEnabled === null ? null : thinkingEnabled ? 1 : 0, reasoningEffort, webMode, next.updatedAt, id);
     next.contextWindow = contextWindow;
     next.llamaKvCacheType = llamaKvCacheType;
     next.llamaKvOffload = llamaKvOffload;
     next.reasoningMode = reasoningMode;
+    next.thinkingEnabled = thinkingEnabled;
+    next.reasoningEffort = reasoningEffort;
     next.webMode = webMode;
     return next;
   }
@@ -287,9 +333,9 @@ export class Database {
     return row ? mapMessage(row, this.listAttachments(row.id), this.listProjectReferences(row.id)) : null;
   }
 
-  addMessage(conversationId: string, role: ChatMessage['role'], content: string, id: string = randomUUID(), projectReferences: ProjectReference[] = [], response?: Pick<ChatMessage, 'thinking' | 'thinkingTimeline' | 'taskPlan' | 'generationStats'>): ChatMessage {
-    const message: ChatMessage = { id, conversationId, role, content, createdAt: new Date().toISOString(), ...(response?.thinking?.trim() ? { thinking: response.thinking } : {}), ...(response?.thinkingTimeline?.length ? { thinkingTimeline: response.thinkingTimeline } : {}), ...(response?.taskPlan ? { taskPlan: response.taskPlan } : {}), ...(response?.generationStats ? { generationStats: response.generationStats } : {}) };
-    this.db.prepare('INSERT INTO messages (id, conversation_id, role, content, thinking, thinking_timeline, task_plan, generation_stats, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run(message.id, message.conversationId, message.role, message.content, message.thinking ?? null, message.thinkingTimeline ? JSON.stringify(message.thinkingTimeline) : null, message.taskPlan ? JSON.stringify(message.taskPlan) : null, message.generationStats ? JSON.stringify(message.generationStats) : null, message.createdAt);
+  addMessage(conversationId: string, role: ChatMessage['role'], content: string, id: string = randomUUID(), projectReferences: ProjectReference[] = [], response?: Pick<ChatMessage, 'thinking' | 'thinkingTimeline' | 'taskPlan' | 'generationStats' | 'richArtifacts'>): ChatMessage {
+    const message: ChatMessage = { id, conversationId, role, content, createdAt: new Date().toISOString(), ...(response?.thinking?.trim() ? { thinking: response.thinking } : {}), ...(response?.thinkingTimeline?.length ? { thinkingTimeline: response.thinkingTimeline } : {}), ...(response?.taskPlan ? { taskPlan: response.taskPlan } : {}), ...(response?.generationStats ? { generationStats: response.generationStats } : {}), ...(response?.richArtifacts?.length ? { richArtifacts: response.richArtifacts } : {}) };
+    this.db.prepare('INSERT INTO messages (id, conversation_id, role, content, thinking, thinking_timeline, task_plan, generation_stats, rich_artifacts, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(message.id, message.conversationId, message.role, message.content, message.thinking ?? null, message.thinkingTimeline ? JSON.stringify(message.thinkingTimeline) : null, message.taskPlan ? JSON.stringify(message.taskPlan) : null, message.generationStats ? JSON.stringify(message.generationStats) : null, message.richArtifacts ? JSON.stringify(message.richArtifacts) : null, message.createdAt);
     for (const [position, reference] of projectReferences.entries()) this.db.prepare('INSERT INTO project_references (id, message_id, position, project_id, project_slot, project_path, project_label, relative_path, kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run(reference.id, message.id, position, reference.projectId, reference.projectSlot, reference.projectPath, reference.projectLabel, reference.relativePath, reference.kind);
     this.db.prepare('UPDATE conversations SET updated_at=? WHERE id=?').run(message.createdAt, conversationId);
     return { ...message, projectReferences };
@@ -361,7 +407,10 @@ export class Database {
     this.db.prepare('DELETE FROM attachments WHERE message_id IN (SELECT id FROM messages WHERE conversation_id=? AND rowid>?)').run(target.conversation_id, target.rowid);
     this.db.prepare('DELETE FROM project_references WHERE message_id IN (SELECT id FROM messages WHERE conversation_id=? AND rowid>?)').run(target.conversation_id, target.rowid);
     this.db.prepare('DELETE FROM messages WHERE conversation_id=? AND rowid>?').run(target.conversation_id, target.rowid);
-    this.db.prepare('UPDATE conversations SET updated_at=? WHERE id=?').run(new Date().toISOString(), target.conversation_id);
+    // Task Memory and the context meter describe the dropped attempt. Their
+    // evidence lives only in that attempt, so they are discarded with it.
+    this.db.prepare('DELETE FROM agent_plans WHERE conversation_id=?').run(target.conversation_id);
+    this.db.prepare('UPDATE conversations SET context_tokens=NULL, context_model_id=NULL, updated_at=? WHERE id=?').run(new Date().toISOString(), target.conversation_id);
     if (commit) this.db.exec('COMMIT');
     return this.listMessages(target.conversation_id);
   }
@@ -401,7 +450,7 @@ export class Database {
       }
       : undefined;
     const data = JSON.stringify({ ...prior, ...activity, ...(terminal ? { terminal } : {}), approval: undefined, attachment: undefined });
-    if (existing) this.db.prepare('UPDATE analysis_actions SET label=?, detail=?, data=? WHERE id=? AND run_id=?').run(activity.label, activity.detail ?? null, data, existing.id, runId);
+    if (existing) this.db.prepare('UPDATE analysis_actions SET label=?, detail=?, data=? WHERE id=? AND run_id=?').run(activity.label, activity.detail ?? prior.detail ?? null, data, existing.id, runId);
     else {
       this.db.prepare('INSERT INTO analysis_actions (id, run_id, label, detail, data, position) VALUES (?, ?, ?, ?, ?, ?)').run(storageId, runId, activity.label, activity.detail ?? null, data, position);
       if (activity.kind !== 'progress') this.db.prepare('UPDATE analysis_runs SET action_count=action_count+1 WHERE id=?').run(runId);
@@ -409,9 +458,77 @@ export class Database {
     return this.getAnalysisRun(runId)!;
   }
 
-  finishAnalysisRun(runId: string, status: AnalysisRun['status'], assistantMessageId: string | null): AnalysisRun {
-    this.db.prepare('UPDATE analysis_runs SET status=?, assistant_message_id=?, completed_at=? WHERE id=?').run(status, assistantMessageId, new Date().toISOString(), runId);
+  /** A run still `running` when the process starts was killed mid-flight: no
+   * live generation can own it. Marking it keeps it distinguishable from a
+   * completed or cancelled run. Its Task Memory and evidence are retained. */
+  recoverInterruptedRuns(): number {
+    const finishedAt = new Date().toISOString();
+    const runs = this.db.prepare("SELECT id FROM analysis_runs WHERE status='running'").all() as unknown as Array<{ id: string }>;
+    for (const run of runs) this.closeRunningActions(run.id, 'interrupted', finishedAt);
+    return Number(this.db.prepare("UPDATE analysis_runs SET status='interrupted', completed_at=? WHERE status='running'").run(finishedAt).changes);
+  }
+
+  /** The last successful Max Context result per stable configuration and KV mode. Only
+   * complete, valid options are written, all-or-nothing, so a failed run never reaches here. */
+  saveContextDiscoveryOptions(configKey: string, identity: string, options: readonly ContextDiscoveryOption[]): number {
+    const valid = options.filter((option) => isPersistableDiscoveryOption(option));
+    if (!valid.length) return 0;
+    const statement = this.db.prepare('INSERT OR REPLACE INTO context_discoveries (config_key, kv_cache_type, kv_offload, model_id, context_window, option, identity, saved_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+    const savedAt = new Date().toISOString();
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const option of valid) {
+        const persisted: Partial<ContextDiscoveryOption> = { ...option };
+        delete persisted.restored;
+        statement.run(configKey, option.kvCacheType, option.kvOffload ? 1 : 0, option.modelId, option.contextWindow, JSON.stringify(persisted), identity, savedAt);
+      }
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+    return valid.length;
+  }
+
+  /** Rows that fail validation are ignored rather than trusted or thrown. */
+  loadContextDiscoveryOptions(configKey: string, modelId: string, hardLimit?: number): ContextDiscoveryOption[] {
+    const rows = this.db.prepare('SELECT kv_cache_type, kv_offload, option FROM context_discoveries WHERE config_key=? AND model_id=?').all(configKey, modelId) as unknown as Array<{ kv_cache_type: string; kv_offload: number; option: string }>;
+    return rows.flatMap((row) => parseStoredDiscoveryOption(row.option, { modelId, kvCacheType: row.kv_cache_type, kvOffload: row.kv_offload === 1, hardLimit }) ?? []);
+  }
+
+  /** Checkpoints the run's timeline at a stable event boundary (never per token). */
+  saveAnalysisRunTimeline(runId: string, timeline: readonly ThinkingTimelineEvent[], richArtifacts?: readonly RichArtifact[]): void {
+    this.db.prepare("UPDATE analysis_runs SET timeline=?, rich_artifacts=COALESCE(?, rich_artifacts) WHERE id=? AND status='running'").run(JSON.stringify(timeline), richArtifacts ? JSON.stringify(richArtifacts) : null, runId);
+  }
+
+  /** Ends a run. A run that ends without a final answer keeps its timeline,
+   * any visible partial output and its failure text, and actions still shown
+   * as running are closed so the reconstructed history never shows live work. */
+  finishAnalysisRun(runId: string, status: AnalysisRun['status'], assistantMessageId: string | null, history: { timeline?: readonly ThinkingTimelineEvent[]; partialOutput?: string; error?: string; richArtifacts?: readonly RichArtifact[] } = {}): AnalysisRun {
+    const finishedAt = new Date().toISOString();
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.prepare('UPDATE analysis_runs SET status=?, assistant_message_id=?, completed_at=?, timeline=COALESCE(?, timeline), partial_output=?, error=?, rich_artifacts=COALESCE(?, rich_artifacts) WHERE id=?')
+        .run(status, assistantMessageId, finishedAt, history.timeline ? JSON.stringify(history.timeline) : null, history.partialOutput?.trim() ? history.partialOutput : null, history.error ?? null, history.richArtifacts ? JSON.stringify(history.richArtifacts) : null, runId);
+      if (status !== 'completed') this.closeRunningActions(runId, status, finishedAt);
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
     return this.getAnalysisRun(runId)!;
+  }
+
+  private closeRunningActions(runId: string, status: AnalysisRun['status'], finishedAt: string): void {
+    const rows = this.db.prepare('SELECT id, data FROM analysis_actions WHERE run_id=?').all(runId) as unknown as Array<{ id: string; data: string | null }>;
+    for (const row of rows) {
+      let data: Partial<ToolActivity>;
+      try { data = row.data ? JSON.parse(row.data) as Partial<ToolActivity> : {}; } catch { continue; }
+      if (data.state !== 'running') continue;
+      const stopped = status !== 'error';
+      const closed: Partial<ToolActivity> = { ...data, state: 'error', ...(data.terminal && !data.terminal.finishedAt ? { terminal: { ...data.terminal, finishedAt, ...(stopped ? { cancelled: true, status: 'cancelled' as const } : { status: 'error' as const }) } } : {}) };
+      this.db.prepare('UPDATE analysis_actions SET data=? WHERE id=? AND run_id=?').run(JSON.stringify(closed), row.id, runId);
+    }
   }
 
   listAnalysisRuns(conversationId: string): AnalysisRun[] { return (this.db.prepare('SELECT * FROM analysis_runs WHERE conversation_id=? ORDER BY created_at ASC').all(conversationId) as unknown as AnalysisRunRow[]).map((row) => mapRun(row, this.db.prepare('SELECT * FROM analysis_actions WHERE run_id=? ORDER BY position ASC').all(row.id) as unknown as AnalysisActionRow[])); }

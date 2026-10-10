@@ -12,49 +12,49 @@ export async function ggufTrainContext(path: string): Promise<number> {
   const file = await open(path, 'r');
   let position = 0;
   const bytes = async (length: number) => {
-    if (!Number.isSafeInteger(length) || length < 0 || position + length > fileStat.size || position + length > 64 * 1024 ** 2) throw new Error('Invalid or excessive GGUF metadata.');
+    if (!Number.isSafeInteger(length) || length < 0 || position + length > fileStat.size || position + length > 64 * 1024 ** 2) throw new Error('Некорректные или слишком большие метаданные GGUF.');
     const buffer = Buffer.alloc(length);
     const result = await file.read(buffer, 0, length, position);
-    if (result.bytesRead !== length) throw new Error('Truncated GGUF metadata.');
+    if (result.bytesRead !== length) throw new Error('Метаданные GGUF обрезаны.');
     position += length;
     return buffer;
   };
   const uint32 = async () => (await bytes(4)).readUInt32LE();
   const uint64 = async () => {
     const value = (await bytes(8)).readBigUInt64LE();
-    if (value > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error('Excessive GGUF metadata length.');
+    if (value > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error('Слишком большая длина метаданных GGUF.');
     return Number(value);
   };
   const text = async () => {
     const length = await uint64();
-    if (length > 4 * 1024 ** 2) throw new Error('Excessive GGUF metadata string.');
+    if (length > 4 * 1024 ** 2) throw new Error('Слишком длинная строка в метаданных GGUF.');
     return (await bytes(length)).toString('utf8');
   };
   const value = async (type: number, depth = 0): Promise<string | number | null> => {
-    if (depth > 1) throw new Error('Invalid nested GGUF metadata array.');
+    if (depth > 1) throw new Error('Некорректный вложенный массив в метаданных GGUF.');
     if (type === 8) return text();
     if (type === 9) {
       const elementType = await uint32();
       const count = await uint64();
-      if (count > 1_000_000) throw new Error('Excessive GGUF metadata array.');
+      if (count > 1_000_000) throw new Error('Слишком большой массив в метаданных GGUF.');
       for (let i = 0; i < count; i += 1) await value(elementType, depth + 1);
       return null;
     }
     const sizes: Record<number, number> = { 0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8 };
     const size = sizes[type];
-    if (!size) throw new Error(`Unknown GGUF metadata type ${type}.`);
+    if (!size) throw new Error(`Неизвестный тип метаданных GGUF: ${type}.`);
     const buffer = await bytes(size);
     if (type === 4) return buffer.readUInt32LE();
     if (type === 10) return Number(buffer.readBigUInt64LE());
     return null;
   };
   try {
-    if ((await bytes(4)).toString('ascii') !== 'GGUF') throw new Error('Model is not GGUF.');
+    if ((await bytes(4)).toString('ascii') !== 'GGUF') throw new Error('Файл модели не в формате GGUF.');
     const version = await uint32();
-    if (version !== 2 && version !== 3) throw new Error(`Unsupported GGUF version ${version}.`);
+    if (version !== 2 && version !== 3) throw new Error(`Неподдерживаемая версия GGUF: ${version}.`);
     await uint64();
     const count = await uint64();
-    if (count > 1_000_000) throw new Error('Excessive GGUF metadata count.');
+    if (count > 1_000_000) throw new Error('Слишком много записей метаданных GGUF.');
     let architecture: string | null = null;
     const contexts = new Map<string, number>();
     for (let i = 0; i < count; i += 1) {
@@ -68,7 +68,7 @@ export async function ggufTrainContext(path: string): Promise<number> {
         return context;
       }
     }
-    throw new Error('GGUF does not report the architecture trained context length.');
+    throw new Error('GGUF не сообщает длину контекста, на которой обучена архитектура.');
   } finally {
     await file.close();
   }
@@ -76,6 +76,8 @@ export async function ggufTrainContext(path: string): Promise<number> {
 
 export async function llamaCapabilityLimit(modelId: string): Promise<number> {
   const profile = llamaRuntimeProfile(modelId);
-  if (!profile) throw new Error(`Unknown llama.cpp model ${modelId}.`);
-  return Math.min(profile.maxContext, profile.modelPath ? await ggufTrainContext(profile.modelPath) : profile.maxContext);
+  if (!profile) throw new Error(`Неизвестная модель llama.cpp: ${modelId}.`);
+  if (!profile.modelPath) return profile.maxContext;
+  try { return Math.min(profile.maxContext, await ggufTrainContext(profile.modelPath)); }
+  catch { return profile.maxContext; }
 }

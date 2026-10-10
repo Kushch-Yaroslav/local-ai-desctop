@@ -3,17 +3,20 @@
 //! The runtime owns transport, capability safety, durable evidence and bounded
 //! recovery. It does not certify evidence, decide exploration coverage, or make
 //! semantic completion decisions for the model; see
-//! `docs/architecture/agent-investigation-state.md`.
+//! `.ai-research/architecture/agent-investigation-state.md`.
 
 use crate::agent::{
+    deliverables,
     events::{Event, TailCandidateAttempt},
     evidence::classify_source_read,
     ledger::{Ledger, ProjectIndex},
+    plan::StepStatus,
     policy::{self, Reasoning, RunPolicy},
     reads::repeated_file_read_decision,
-    state::AgentState,
+    state::{AgentState, PauseState},
     strategy::{self, Strategy},
     transcript::{validate_calls, CompactionPlan, ToolResultPolicy, Transcript, ValidatedCall},
+    verification::{self, Need},
 };
 use crate::context::evidence_projection::{
     apply_folds, attach_historical_index, fold_to_budget, folded_ids,
@@ -31,15 +34,36 @@ use std::sync::{
     Arc, Mutex,
 };
 
+/// What file and terminal tools may act on in this run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolScope {
+    /// No project and no directory named by the user: no execution tools.
+    None,
+    /// Only directories the user named explicitly.
+    Workspace,
+    /// A selected project (optionally plus explicitly named directories).
+    Project,
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub run_id: String,
     pub endpoint: String,
     pub model: String,
     pub system: String,
+    pub ui_language: Option<String>,
     pub user: String,
+    pub user_images: Vec<String>,
+    pub user_image_refs: Vec<String>,
+    pub web_tools: Vec<Value>,
+    pub artifact_tools: Vec<Value>,
+    pub attachment_tools: Vec<Value>,
+    pub host_tools: Option<Arc<crate::tools::web::HostTools>>,
     pub root: Option<String>,
     pub secondary_root: Option<String>,
+    /// Directories the user named explicitly. File tools may use absolute paths
+    /// inside them; without a project the first one is also the terminal's cwd.
+    pub workspace_roots: Vec<String>,
     pub context_limit: usize,
     pub reasoning_mode: String,
     pub supports_reasoning: bool,
@@ -49,9 +73,39 @@ pub struct Config {
     pub evidence_dir: Option<String>,
     pub task_memory: Option<Value>,
     pub provider_max_output: Option<usize>,
+    /// Whether a real browser can be used for checks. `None` looks for one;
+    /// the host or a test may state it.
+    pub browser_capability: Option<bool>,
     pub cancelled: Arc<AtomicBool>,
     pub steering: Arc<Mutex<Vec<String>>>,
     pub steering_closed: Arc<AtomicBool>,
+    /// Set together with a queued steering message that the user marked as a
+    /// pause request (a structured control, not parsed from text).
+    pub pause_requested: Arc<AtomicBool>,
+}
+
+impl Config {
+    pub fn tool_scope(&self) -> ToolScope {
+        if self.root.is_some() {
+            ToolScope::Project
+        } else if !self.workspace_roots.is_empty() {
+            ToolScope::Workspace
+        } else {
+            ToolScope::None
+        }
+    }
+
+    /// Root of file tools and cwd of the terminal: the selected project, else
+    /// the first directory the user named.
+    fn work_root(&self) -> Option<&str> {
+        self.root
+            .as_deref()
+            .or_else(|| self.workspace_roots.first().map(String::as_str))
+    }
+
+    fn grants(&self) -> Vec<PathBuf> {
+        self.workspace_roots.iter().map(PathBuf::from).collect()
+    }
 }
 
 /// Initial values follow Jan's shape but are deliberately configurable at the
@@ -67,10 +121,9 @@ pub const PREFERRED_OUTPUT_HEADROOM_TOKENS: usize = 1_024;
 pub const MIN_USEFUL_OUTPUT_TOKENS: usize = 32;
 pub const APPLICATION_MAX_OUTPUT_TOKENS: usize = 32_768;
 pub const MAX_COMPACTION_ATTEMPTS: usize = 4;
-/// Provider turns available for investigation. When they are exhausted the run
-/// does not end in an error: tools are withdrawn and the next turns are
-/// synthesis-only, so the user always receives an answer.
-pub const MAX_INVESTIGATION_TURNS: usize = 128;
+/// Initial work allowance. The runtime may grant bounded blocks up to the
+/// absolute maximum; denial withdraws tools and requests a partial answer.
+pub const MAX_INVESTIGATION_TURNS: usize = super::work_budget::INITIAL;
 /// Room for a long synthesized answer to continue after `length` stops plus a
 /// few protocol misfires, without ever consuming the investigation budget.
 /// Empty provider responses in a row before tools are withdrawn so the next
@@ -92,14 +145,19 @@ const TOOL_RESULT_TRUNCATION_MARKER: &str =
 const AGENT_GUIDANCE: &str = r#"
 # Local AI Desktop Agent
 - Work directly from the conversation and tool results. A tool-free response completes the run; there is no separate step to request before answering.
-- For code changes, read before writing, make targeted changes, and run the most relevant practical validation or readback. Adapt after errors; do not invent checks.
+- For code changes, read before writing, make targeted changes, then check them: after you change files, run the cheapest check that shows the change works (the project's own tests, or a short script that runs the changed code; for a page, a real browser run, such as a headless browser or a Playwright or Puppeteer script; jsdom or a hand-written DOM stand-in does not count as a browser check). A check must go through the same entry path the user will use (for a page: the real HTML with its script order and load timing, not only the script run against a stand-in); if it only covers part of that path or uses a stand-in, say so. A claim is only as strong as the check behind it: a command that exits 0 shows what it ran, not more. If the check the claim needs cannot be run here (for example, no browser), leave it implemented and say so plainly instead of substituting a weaker check. For a small literal edit, prefer replace_text after reading the file; it avoids patch context markers without weakening freshness checks. Verification is part of the work, not an extra step to announce. Reading a file back shows only that it exists, not that it works. When a check fails, fix the cause and run it again; do not invent checks or skip a failure.
+- For an informational answer, use create_visual_artifact only when a chart, table, metric group, Mermaid diagram, real-image gallery, or concise report materially helps. Use actual values and sources present in user inputs or tool observations; explicitly requested fictional/demo data is allowed when labeled fictional. When the user requests an interactive chart or artifact diagram, call the artifact tool: Markdown tables and ASCII sketches are not equivalent. Do not repeat an accepted diagram in Markdown or add a generic fallback diagram. For comparisons and reports, reuse one coherent dataset across metrics, chart, and table; encode unavailable numeric data as null, never as a guessed value or formatted string. For real images, use web_image_search and reference its discovery_id values; never invent URLs or attribution. A selected project does not turn an ordinary question into a coding task. The artifact tool accepts data only, never HTML, CSS, JavaScript, or SVG.
 - For substantial tasks, reason about an approach before acting, adapt as you learn, use tools for concrete evidence, avoid broad rereads, and continue until the user's task is complete.
-- Use the latest user's language for all user-visible natural-language text: streamed reasoning/progress, tool preambles, brief status updates, and the final answer. Follow an explicit language request if present. Keep code, paths, identifiers, commands, API/tool syntax, and literal source quotations in their original form. Do not translate protocol fields.
-- For non-trivial architecture relationships, use a compact multiline Mermaid flowchart when it improves readability, or a properly indented multiline tree. Do not compress a diagram into one long arrow chain; avoid decorative box art.
+- Plan = your own short list of steps for non-trivial work (plan tool: set if useful, then update at meaningful milestones or when the approach changes; skip it for a trivial request). It is not the user's deliverables and finishing its steps proves nothing. Do not narrate plan updates or restate the plan in prose; no update is required after every action.
+- Agent runtime state belongs to the harness, not to the human. Accepted updates stay beside the tool substep that produced them; the latest value of each section supersedes earlier values. A cleared section is no longer active. Continue the next action without treating these updates as new user instructions.
+- Use the configured interface language as a default when supplied, otherwise use the latest user's language, for all user-visible natural-language text: streamed reasoning/progress, tool preambles, brief status updates, and the final answer. Follow an explicit language request if present. Keep code, paths, identifiers, commands, API/tool syntax, and literal source quotations in their original form. Do not translate protocol fields.
+- For non-trivial architecture relationships, use a compact multiline Mermaid flowchart when it improves readability, or a properly indented multiline tree. Use descriptive labels, not generic A/B/C/D nodes. For Git branching show named main/feature branches, checkout, feature commit, and merge. Do not compress a diagram into one long arrow chain; avoid decorative box art.
 - Task Memory = durable semantic continuity for this task. Record meaningful findings, decisions, blockers, and next actions, and cite the observation IDs (obs-…) a finding rests on in its evidence field. After compaction, trust a precise Task Memory finding from an unchanged inspected file; reread only for a missing fact, ambiguity, possible change, exact detail, or targeted verification.
 - Set Task Memory status and evidence as JSON fields, not prose inside finding. Confirmed entries require evidence containing an observation ID or exact inspected source path from this transcript. A valid reference does not prove the claim; use inferred or unknown for unverified conclusions.
 - Investigation state = a mechanical inventory the runtime keeps of this run's tool observations: files read with their observation IDs, listed entries and local files referenced by sources you read that were not opened yet, failed operations, and commands run. It is not a task list and nothing in it is required. Use it to avoid rereading and to notice code you have not seen; follow a reference only when what you are about to claim depends on it. Recover an exact stored body with observation_read.
+- Deliverables: when the request has two or more separate things to produce or change, or one result that must work end to end, record each requested one with the deliverables tool before you start. Mark an item implemented when you built it; that is your claim. It becomes verified only when the runtime has recorded a passing check of it made after your last change (action verify), and any later change takes the verification back. Block an item with a concrete reason if it cannot be completed. Record only what the user asked for, never your own ideas. Do not use it for a single-step or analysis-only request. Produce what the user will see or use first and refine afterwards: a part is not finished until it is reachable the way the user will use it, not merely implemented. Files you create only to diagnose something are not part of the result; delete them before you finish.
 - Ground claims in what you observed. Keep observed facts, inferences and unknowns apart, and mark inferences as inferences. Something you did not open is unknown, not absent. State that something does not exist only for a scope you actually covered (a complete directory listing, a complete file read, or a search whose scope you can name) and name that scope; otherwise say it was not found in what you inspected. A failed or approval-blocked operation is a blocker, not evidence.
+- Report outcomes from the recorded state, not from intent. Say a deliverable works only if it is verified; otherwise say it is implemented and not verified, and say what failed or was not checked. Never state a count, result or behaviour you did not see in a tool result or check.
 - When the request lists areas or questions, answer each from something you inspected or report it as not inspected. Do not spend further tool calls only to re-verify what you have already read.
 - In the final answer, answer the user's sections directly, distinguish facts from hypotheses, prioritize concrete effects over generic advice, state what remained unexamined, and avoid duplicate points or meta-progress narration. Refer to sources by file path (and line or quoted text), never by observation ID: IDs are internal to this run. Treat claims about how the code was produced conservatively; style alone is weak evidence.
 - For project archaeology with run_terminal, prefer one scoped read-only command such as git -C <project> log --oneline; avoid compound shell wrappers and unsafe pipelines that require approval.
@@ -110,6 +168,14 @@ const AGENT_GUIDANCE: &str = r#"
 
 const SUMMARY_GUIDANCE: &str = r#"Create an AGENT CONTINUATION CHECKPOINT, not a generic conversation summary. Use these concise headings: Established work; Current focus; Findings and evidence (cite obs-… IDs); Blocked or failed operations; Not yet inspected or unresolved; Next useful intent. Preserve explicit user constraints and distinguish verified facts from hypotheses. Do not invent a plan, task IDs, lifecycle, or checklist. Do not repeat raw tool output, token counts, runtime mechanics, generic encouragement, or an activity log."#;
 
+// Context-compaction policy adapted from Jan (Menlo Research), compaction.rs
+// and loop.rs at revision 9925f8b6d9fab968284b4dd11566b9435229b690:
+// reserve-over-ratio budgeting, 80% default, 48,000-character summary input,
+// and ordinary 8 -> 4 -> 2 overflow recovery. Copyright 2025 Menlo Research;
+// Apache-2.0 applies to these adapted portions. Local modifications include
+// checkpoint instructions, dynamic output ceilings and emergency fitting.
+// See THIRD_PARTY_NOTICES.md and licenses/; unrelated runtime code is not covered
+// by this adaptation notice.
 #[derive(Clone, Copy, Debug)]
 pub struct CompactionBudget {
     pub context_window: usize,
@@ -155,6 +221,9 @@ fn request_reasoning(config: &Config, finalizing: bool) -> Option<Value> {
     if let Some(options) = config.reasoning_options.as_ref().and_then(|options| {
         let key = if finalizing {
             "final"
+        } else if options.get("main").is_some_and(Value::is_object) {
+            // The user's explicit thinking/effort choice, resolved by the host. It is independent of the strategy.
+            "main"
         } else {
             match policy::reasoning(&config.reasoning_mode, "agent") {
                 Reasoning::Off | Reasoning::Low => "fast",
@@ -184,6 +253,14 @@ fn wire_messages(messages: &[Value]) -> Vec<Value> {
         .cloned()
         .map(|mut message| {
             if let Some(object) = message.as_object_mut() {
+                if let Some(images) = object.remove("images").and_then(|v| v.as_array().cloned()) {
+                    if !images.is_empty() {
+                        let mut parts = vec![json!({"type":"text", "text":object.get("content").and_then(Value::as_str).unwrap_or("")})];
+                        parts.extend(images.into_iter().filter_map(|image| image.as_str().map(|url| json!({"type":"image_url", "image_url":{"url":url}}))));
+                        object.insert("content".into(), json!(parts));
+                    }
+                }
+                object.remove("image_refs");
                 object.remove("_observation_id");
                 object.remove("_result_policy");
                 object.remove("_rehydration");
@@ -232,7 +309,16 @@ fn request_payload_for_phase(
         stripped = without_replayed_reasoning(messages);
         stripped.as_slice()
     };
-    let wire_messages = wire_messages(messages);
+    // The trusted host only prepares arrays when the current backend supports
+    // native vision. Durable transcripts may retain earlier vision turns;
+    // never replay those blobs to a text-only or unrelated-image request.
+    let native_images = !config.user_images.is_empty() || config.history.iter().any(|message|
+        message.get("images").and_then(Value::as_array).is_some_and(|images| !images.is_empty()));
+    let projected = messages.iter().cloned().map(|mut message| {
+        if !native_images { if let Some(object) = message.as_object_mut() { object.remove("images"); } }
+        message
+    }).collect::<Vec<_>>();
+    let wire_messages = crate::context::message_sequence::normalize(&wire_messages(&projected));
     let mut payload = json!({
         "model": config.model,
         "messages": wire_messages,
@@ -282,14 +368,27 @@ fn learn_token_calibration(estimated: usize, actual: usize) {
 }
 
 fn estimate_tokens(value: &Value) -> usize {
-    // Conservative enough for JSON-heavy local tool prompts. Provider-reported
-    // usage remains authoritative telemetry.
-    serde_json::to_string(value)
-        .unwrap_or_default()
-        .chars()
-        .count()
-        / 3
-        + 8
+    // Image base64 is transport, not tokenized text. Reserve a conservative
+    // image allowance; provider-reported usage remains authoritative. Keeping
+    // binary size here would force compaction before ordinary vision requests.
+    fn projected(value: &Value, images: &mut usize) -> Value {
+        match value {
+            Value::Object(object) if object.get("type").and_then(Value::as_str) == Some("image_url") => {
+                *images += 1; json!({"type":"image_url"})
+            }
+            Value::Object(object) => Value::Object(object.iter().map(|(key, value)| {
+                if key == "images" && object.get("role").and_then(Value::as_str) == Some("user") {
+                    *images += value.as_array().map_or(0, Vec::len);
+                    (key.clone(), json!([]))
+                } else { (key.clone(), projected(value, images)) }
+            }).collect()),
+            Value::Array(array) => Value::Array(array.iter().map(|value| projected(value, images)).collect()),
+            _ => value.clone(),
+        }
+    }
+    let mut images = 0;
+    let text = projected(value, &mut images);
+    serde_json::to_string(&text).unwrap_or_default().chars().count() / 3 + 8 + images * 4096
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -311,7 +410,8 @@ fn request_budget(config: &Config, messages: &[Value], schemas: &[Value]) -> Req
         let content = message.get("content").and_then(Value::as_str).unwrap_or("");
         if content.starts_with("[COMPACTION SUMMARY]") {
             summaries.push(message.clone());
-        } else if content.starts_with("[RUNTIME GUIDANCE — NOT USER CONTENT]")
+        } else if message.get("role").and_then(Value::as_str) == Some("runtime")
+            || content.starts_with("[RUNTIME GUIDANCE — NOT USER CONTENT]")
             || content.starts_with("[IMPORTED SYSTEM CONTEXT — NOT USER CONTENT]")
         {
             dynamic.push(message.clone());
@@ -454,7 +554,11 @@ fn stable_prefix(config: &Config) -> String {
     );
     prefix.push_str(&format!(
         "\nPreferred visible prose language for this run: {}.",
-        crate::agent::transcript::preferred_visible_language(&config.user)
+        match config.ui_language.as_deref() {
+            Some("ru") => "Russian (default; explicit user language requests take priority)".into(),
+            Some("en") => "English (default; explicit user language requests take priority)".into(),
+            _ => crate::agent::transcript::preferred_visible_language(&config.user),
+        }
     ));
     if let Some(root) = &config.root {
         prefix.push_str("\n<working_directory>");
@@ -466,6 +570,24 @@ fn stable_prefix(config: &Config) -> String {
     }
     if let Some(root) = &config.secondary_root {
         prefix.push_str(&format!("\nProject 2 root: {root}. Use project=2 for its tools. Roots are distinct identities; attribute findings to the selected project and do not infer one project's content from the other."));
+    }
+    match config.tool_scope() {
+        ToolScope::Project if !config.workspace_roots.is_empty() => {
+            prefix.push_str(&format!(
+                "\nThe user also named these directories explicitly; file tools accept absolute paths inside them: {}.",
+                config.workspace_roots.join(", ")
+            ));
+        }
+        ToolScope::Workspace => {
+            prefix.push_str(&format!(
+                "\nNo project is selected. The user named these directories explicitly: {}. File tools accept absolute paths inside them, and a relative path resolves against the first one. run_terminal starts in the first one. Project knowledge tools are not available.",
+                config.workspace_roots.join(", ")
+            ));
+        }
+        ToolScope::None => {
+            prefix.push_str("\nNo project is selected and the user has not named a directory, so file and terminal tools are not available in this run. If the task needs them, say so and ask the user to name a directory or select a project. Do not claim an action was performed that no tool performed.");
+        }
+        ToolScope::Project => {}
     }
     prefix
 }
@@ -486,6 +608,33 @@ fn dynamic_tail(
     investigation: &str,
 ) -> String {
     let mut tail = Vec::new();
+    if state.pause.is_some() {
+        let memory = state.task_memory.prompt_for_closeout(objective);
+        if !memory.is_empty() {
+            tail.push(format!("<task_memory>\n{memory}\n</task_memory>"));
+        }
+        let plan = state.task_memory.plan.prompt();
+        if !plan.is_empty() {
+            tail.push(plan);
+        }
+        let deliverables = state.task_memory.deliverables.prompt();
+        if !deliverables.is_empty() {
+            tail.push(deliverables);
+        }
+        let verification = state.task_memory.verification.prompt(
+            &state.task_memory.deliverables,
+            state.verification_closed,
+            state.browser_available,
+        );
+        if !verification.is_empty() {
+            tail.push(verification);
+        }
+        tail.push(PAUSE_DIRECTIVE.to_owned());
+        return tail.join("\n");
+    }
+    if state.pause_offered {
+        tail.push("<steering_options>The user just sent a message while you were working. If, and only if, it clearly asks you to pause or stop at this point, call pause_run. If it asks to continue, check, change or add anything, do not call it: follow the message and keep working.</steering_options>".to_owned());
+    }
     let memory = if transcript.is_finalizing() {
         state.task_memory.prompt_for_closeout(objective)
     } else {
@@ -493,6 +642,52 @@ fn dynamic_tail(
     };
     if !memory.is_empty() {
         tail.push(format!("<task_memory>\n{memory}\n</task_memory>"));
+    }
+    let plan = state.task_memory.plan.prompt();
+    if !plan.is_empty() {
+        tail.push(plan);
+    }
+    let deliverables = state.task_memory.deliverables.prompt();
+    if !deliverables.is_empty() {
+        tail.push(deliverables);
+    }
+    let verification = state.task_memory.verification.prompt(
+        &state.task_memory.deliverables,
+        state.verification_closed,
+        state.browser_available,
+    );
+    if !verification.is_empty() {
+        tail.push(verification);
+    }
+    if !transcript.is_finalizing() && !user_requests_read_only(objective) {
+        if let Some(hint) = contract_hint(state, objective) {
+            tail.push(hint);
+        }
+    }
+    if state.task_memory.deliverables.has_pending() {
+        if transcript.is_finalizing() {
+            tail.push(format!("<unfinished_deliverables>{}</unfinished_deliverables>\nThe run budget ended before these were completed. In the answer, report each of them plainly as not completed: say what exists, what is missing and why the run stopped. Do not present them as done.", state.task_memory.deliverables.pending_summary()));
+        } else if let Some(notice) = run_budget_notice(
+            state.turn,
+            state.work_budget.limit,
+            &state.task_memory.deliverables.pending_summary(),
+        ) {
+            tail.push(notice);
+        }
+    }
+    if !transcript.is_finalizing() && !state.created_files.is_empty() {
+        let listed = state
+            .created_files
+            .iter()
+            .rev()
+            .take(12)
+            .rev()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        tail.push(format!(
+            "<files_created_this_run>{listed}</files_created_this_run>"
+        ));
     }
     if !investigation.is_empty() {
         tail.push(investigation.to_owned());
@@ -513,6 +708,59 @@ fn dynamic_tail(
         }
     }
     tail.join("\n")
+}
+
+/// Number of separate items the user's request itself enumerates (numbered or bulleted lines). Purely structural: it
+/// reads list markers, not words, so it works in any language and for any subject.
+fn enumerated_items(user: &str) -> usize {
+    user.lines()
+        .filter(|line| {
+            let line = line.trim_start();
+            let digits = line.chars().take_while(char::is_ascii_digit).count();
+            let numbered = digits > 0
+                && digits <= 2
+                && line[digits..]
+                    .chars()
+                    .next()
+                    .is_some_and(|marker| marker == '.' || marker == ')')
+                && line[digits + 1..].starts_with(char::is_whitespace);
+            let bulleted = ["- ", "* ", "• "]
+                .iter()
+                .any(|bullet| line.starts_with(bullet));
+            (numbered || bulleted) && line.chars().filter(|c| c.is_alphabetic()).count() >= 6
+        })
+        .count()
+}
+
+/// A short hint, shown only while no deliverables are recorded, that the model is expected to write down what was
+/// asked. It costs no turn and stops after the early part of the run.
+fn contract_hint(state: &AgentState, user: &str) -> Option<String> {
+    const HINT_UNTIL_TURN: usize = 25;
+    if !state.task_memory.deliverables.is_empty() || state.turn >= HINT_UNTIL_TURN {
+        return None;
+    }
+    let items = enumerated_items(user);
+    if items >= 2 {
+        return Some(format!("<deliverables_hint>The request lists {items} separate items. Record each requested one with the deliverables tool (action add) before you start, so none is lost on a long run.</deliverables_hint>"));
+    }
+    (state.mutations > 0).then(|| "<deliverables_hint>You have started changing the project but recorded no deliverables. If the request has two or more separate things to deliver, record them with the deliverables tool now and mark what you have built as implemented. Ignore this for a single-step request.</deliverables_hint>".to_owned())
+}
+
+/// Makes the turn budget visible once it matters, and only while requested
+/// deliverables are still unfinished: the model otherwise has no way to know
+/// that it is spending the last turns on refinements of the first deliverable.
+fn run_budget_notice(turn: usize, budget: usize, pending: &str) -> Option<String> {
+    let used = turn.saturating_add(1);
+    if used * 2 < budget {
+        return None;
+    }
+    let left = budget.saturating_sub(used);
+    let urgency = if used * 100 >= budget * 85 {
+        format!(" Only about {left} turns remain: finish what the user will use, and mark anything you cannot complete as blocked with the reason.")
+    } else {
+        " Put the remaining turns on delivering what the user will see or use first; extra tests and refinements come after it works.".to_owned()
+    };
+    Some(format!("<run_budget>Turn {used} of {budget}. Unfinished deliverables: {pending}.{urgency}</run_budget>"))
 }
 
 fn emit_knowledge_diagnostics(config: &Config, state: &AgentState) {
@@ -554,17 +802,19 @@ fn emit_knowledge_diagnostics(config: &Config, state: &AgentState) {
     );
 }
 
-fn tool_schemas(has_project_root: bool) -> Vec<Value> {
+fn tool_schemas(scope: ToolScope) -> Vec<Value> {
     // Native tool grammars enumerate object-root properties, not union roots.
     // Action-specific requirements are enforced transactionally at dispatch.
     let mut tools = vec![
-        json!({"type":"function","function":{"name":"task_memory","description":"Durable semantic memory for the current task across compaction. Record/update meaningful findings, decisions, blockers, or unresolved questions; view reads it; invalidate needs id. Record/update requires finding and may include evidence, implication, next, id, supersedes, status. Trust precise unchanged-file memory; reread only for a concrete missing, ambiguous, changed, exact-detail, or verification need.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["record","update","invalidate","view"]},"id":{"type":"string"},"finding":{"type":"string"},"evidence":{"type":"string"},"implication":{"type":"string"},"next":{"type":"string"},"supersedes":{"type":"string"},"status":{"type":"string","enum":["confirmed","inferred","unknown","contradicted"],"description":"How well established the finding is: confirmed (observed, cited), inferred (reasoned, not observed), unknown (open; put the resolving step in next), contradicted (evidence disagrees)."}},"required":["action"]}}}),
+        json!({"type":"function","function":{"name":"task_memory","description":"Durable semantic memory for the current task across compaction. Record/update meaningful findings, decisions, blockers, or unresolved questions; view reads it; invalidate needs id. Record requires finding; update needs the id of an existing entry and changes only the fields you pass (an empty string clears one). Both may include evidence, implication, next, supersedes, status. Cite observations by exact id (obs-00000012), one per item in observations or comma-separated in evidence. Trust precise unchanged-file memory; reread only for a concrete missing, ambiguous, changed, exact-detail, or verification need.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["record","update","invalidate","view"]},"id":{"type":"string"},"finding":{"type":"string"},"evidence":{"type":"string"},"implication":{"type":"string"},"next":{"type":"string"},"supersedes":{"type":"string"},"status":{"type":"string","enum":["confirmed","inferred","unknown","contradicted"],"description":"How well established the finding is: confirmed (observed, cited), inferred (reasoned, not observed), unknown (open; put the resolving step in next), contradicted (evidence disagrees)."},"observations":{"type":"array","items":{"type":"string"},"description":"Observation IDs (obs-…) that support the finding; same as evidence, one id per item."}},"required":["action"]}}}),
+        json!({"type":"function","function":{"name":"deliverables","description":"The user's requested deliverables for this task (execution contract). Use it only when the request has two or more separate things to produce or change, or one result that must work end to end. add: record each requested deliverable once (text, optional task, optional check: the weakest evidence that proves the claim: readback = it exists, static = lint/typecheck, build = it builds, test = the tests pass, runtime = running the code works, browser = it works in a real browser; a changed page is always held to browser). implemented: you built it (id, evidence): this is your claim and is not proof. verify: select relevant run_terminal checks with deliverable_ids before executing them; the runtime has a passing check of it (id; evidence = ev-… ids from <verification_state>; Fast may omit them): only checks the runtime saw run after your last change count, and any later change to the project takes the verification back. block: it cannot be completed (id, concrete reason). drop: the user withdrew it (id, reason). view: list them. Record only what the user asked for, never your own optional ideas.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["add","implemented","verify","block","drop","view"]},"id":{"type":"string"},"task":{"type":"string"},"text":{"type":"string"},"evidence":{"type":"string"},"reason":{"type":"string"},"check":{"type":"string","enum":["readback","static","build","test","runtime","browser"]}},"required":["action"]}}}),
+        json!({"type":"function","function":{"name":"plan","description":"Your own short execution plan: how you will get the work done. Optional: skip it for a trivial or single-step request. set: replace the unfinished steps with a short ordered list of one-line steps (steps); the first becomes active. update: change a step (id; status pending|in_progress|completed|blocked, optional text or note; blocked needs a note); completing the active step activates the next. add: insert a step (text, optional after). view: list. Update at meaningful milestones or when your approach changes; do not narrate it or update it after every call. A plan is not proof: finishing steps does not complete the user's deliverables.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["set","update","add","view"]},"steps":{"type":"array","items":{"type":"string"}},"id":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","completed","blocked"]},"text":{"type":"string"},"note":{"type":"string"},"after":{"type":"string"}},"required":["action"]}}}),
         json!({"type":"function","function":{"name":"observation_index","description":"List historical tool observations by stable ID, with source path and outcome metadata. Use source to select the raw observation for the needed file. If more=true, continue at the returned next_offset. Observation IDs start with obs-.","parameters":{"type":"object","properties":{"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":50}}}}}),
         json!({"type":"function","function":{"name":"observation_read","description":"Recover a bounded exact slice of a stored historical tool result by observation ID. The response distinguishes historical evidence from current source and reports whether the source changed.","parameters":{"type":"object","properties":{"id":{"type":"string"},"offset_chars":{"type":"integer","minimum":0},"max_chars":{"type":"integer","minimum":1,"maximum":16000}},"required":["id"]}}}),
     ];
-    if has_project_root {
+    if scope != ToolScope::None {
         tools.extend([
-            json!({"type":"function","function":{"name":"apply_patch","description":"Apply a project patch.","parameters":{"type":"object","properties":{"patch":{"type":"string"}},"required":["patch"]}}}),
+            json!({"type":"function","function":{"name":"apply_patch","description":"Edit files atomically. For a one-line edit, use `*** Begin Patch\n*** Update File: path\n@@\n-old line with original indentation\n+new line with original indentation\n*** End Patch`. Every unchanged context line needs one EXTRA leading space before the exact source indentation; copied source alone is not valid patch context. Every update hunk must contain at least one -old or +new line. Patch format: *** Begin Patch, then per file `*** Update File: path` with hunks of ` unchanged context`, `-old` and `+new` lines (separate hunks with a line `@@`; add enough context to match exactly one place), `*** Add File: path` with every line prefixed `+`, or `*** Delete File: path`, then *** End Patch. The whole patch applies or none of it does.","parameters":{"type":"object","properties":{"patch":{"type":"string"}},"required":["patch"]}}}),
             json!({"type":"function","function":{"name":"create_file","description":"Create a new project file.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}),
             json!({"type":"function","function":{"name":"delete_file","description":"Delete a project file when allowed.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}),
             json!({"type":"function","function":{"name":"list_directory","description":"List a project directory. complete=true means all directory entries are represented; false means internal runtime entries were omitted.","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}),
@@ -572,9 +822,14 @@ fn tool_schemas(has_project_root: bool) -> Vec<Value> {
             json!({"type":"function","function":{"name":"project_knowledge_index","description":"Read the small .ai-framework manifest index and source freshness map. Use it before repeating broad project orientation.","parameters":{"type":"object","properties":{}}}}),
             json!({"type":"function","function":{"name":"project_knowledge_read","description":"Read selected reusable project observations from .ai-framework: paths is required. Prefer relevant fresh knowledge before broad rereads; do not reread unchanged source only to reconstruct context. Read source for exact current code or a concrete unresolved/verification detail.","parameters":{"type":"object","properties":{"paths":{"type":"array","items":{"type":"string"}}},"required":["paths"]}}}),
             json!({"type":"function","function":{"name":"project_knowledge_update","description":"Optionally persist durable, reusable semantic project knowledge in .ai-framework. This is never required for normal work. Only use project/, modules/, sources/, or tasks/ markdown paths.","parameters":{"type":"object","properties":{"updates":{"type":"array","items":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["replace","merge"]}},"required":["path","content"]}},"source_paths":{"type":"array","items":{"type":"string"}}},"required":["updates"]}}}),
-            json!({"type":"function","function":{"name":"run_terminal","description":"Run an existing relevant project command. After code changes, prefer a focused test, typecheck, lint, build, or check when available.","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1}},"required":["command"]}}}),
-            json!({"type":"function","function":{"name":"write_file","description":"Write a project file.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}),
+            json!({"type":"function","function":{"name":"run_terminal","description":"Run an existing relevant project command. For an acceptance check, select deliverable_ids BEFORE running it. The command remains associated with those items on every retry, including failures. Unselected checks remain project warnings; full-test requirements are project-wide; build requirements cover build checks. After code changes, prefer a focused check.","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1},"deliverable_ids":{"type":"array","items":{"type":"string"},"description":"Existing deliverable ids this check verifies. Associations are permanent, including failed checks."}},"required":["command"]}}}),
+            json!({"type":"function","function":{"name":"replace_text","description":"For a small edit, replace exactly one literal snippet in an existing file after a fresh read. old_text and new_text are plain source strings, not patch syntax. Include enough exact text to identify one place. Empty, missing or repeated old_text and changes since the last read are refused; write is atomic. Prefer this for one-line edits; use apply_patch for multiple hunks.","parameters":{"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}},"required":["path","old_text","new_text"]}}}),
+            json!({"type":"function","function":{"name":"write_file","description":"Write the full content of a project file, replacing it. To change part of a file, prefer apply_patch.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}),
         ]);
+    }
+    if scope == ToolScope::Workspace {
+        // The .ai-framework cache belongs to a selected project.
+        tools.retain(|tool| !tool_name(tool).starts_with("project_knowledge_"));
     }
     tools.sort_by(|left, right| tool_name(left).cmp(tool_name(right)));
     tools
@@ -583,13 +838,15 @@ fn tool_schemas(has_project_root: bool) -> Vec<Value> {
 /// cannot strand the model behind an approval-only capability. Task Memory and
 /// explicit knowledge reads remain available so analysis has a complete
 /// working contract.
-fn tool_schemas_for_policy(has_project_root: bool, policy: RunPolicy) -> Vec<Value> {
-    let mut tools = tool_schemas(has_project_root);
+fn tool_schemas_for_policy(scope: ToolScope, policy: RunPolicy) -> Vec<Value> {
+    let mut tools = tool_schemas(scope);
     if policy == RunPolicy::Safe {
         tools.retain(|tool| {
             matches!(
                 tool_name(tool),
                 "task_memory"
+                    | "deliverables"
+                    | "plan"
                     | "observation_index"
                     | "observation_read"
                     | "read_file"
@@ -612,6 +869,7 @@ fn is_project_side_effect_tool(name: &str) -> bool {
             | "project_knowledge_read"
             | "project_knowledge_update"
             | "write_file"
+            | "replace_text"
     )
 }
 
@@ -641,13 +899,76 @@ fn user_requests_read_only(user: &str) -> bool {
     .any(|marker| user.contains(marker))
 }
 
-fn tool_schemas_for_request(has_project_root: bool, policy: RunPolicy, user: &str) -> Vec<Value> {
-    let mut tools = tool_schemas_for_policy(has_project_root, policy);
+fn tool_schemas_for_request(scope: ToolScope, policy: RunPolicy, user: &str) -> Vec<Value> {
+    let mut tools = tool_schemas_for_policy(scope, policy);
     if user_requests_read_only(user) {
-        tools.retain(|tool| !is_project_side_effect_tool(tool_name(tool)));
+        // A read-only request produces nothing to deliver, so the execution
+        // contract tool is not offered either.
+        tools.retain(|tool| {
+            !is_project_side_effect_tool(tool_name(tool)) && tool_name(tool) != "deliverables"
+        });
     }
     tools
 }
+
+const CHECKPOINT_TOOLS: [&str; 3] = ["task_memory", "deliverables", "plan"];
+
+fn pause_run_schema() -> Value {
+    json!({"type":"function","function":{
+        "name":"pause_run",
+        "description":"Call this only if the user's latest message clearly asks you to pause or stop working at this point. It does not delete anything: you get a short checkpoint to save state, then the run ends and the user can continue later. Do not call it for any other message.",
+        "parameters":{"type":"object","properties":{},"additionalProperties":false}
+    }})
+}
+
+/// Schemas offered for one provider request. A paused run may only write its
+/// checkpoint; right after a steering message the model may also classify it
+/// as a pause request.
+fn turn_schemas(schemas: &[Value], state: &AgentState, finalizing: bool) -> Vec<Value> {
+    if finalizing {
+        Vec::new()
+    } else if state.pause.is_some() {
+        schemas
+            .iter()
+            .filter(|schema| CHECKPOINT_TOOLS.contains(&tool_name(schema)))
+            .cloned()
+            .collect()
+    } else if state.pause_offered {
+        let mut offered = schemas.to_vec();
+        offered.push(pause_run_schema());
+        offered
+    } else {
+        schemas.to_vec()
+    }
+}
+
+fn begin_pause(config: &Config, state: &mut AgentState, source: &str) -> bool {
+    if state.pause.is_some() {
+        return false;
+    }
+    state.pause = Some(PauseState {
+        checkpoint_turns_left: PauseState::CHECKPOINT_TURNS,
+    });
+    state.pause_offered = false;
+    emit(
+        &config.run_id,
+        Event::PauseStarted {
+            source: source.into(),
+        },
+    );
+    trace_forensics(
+        &config.run_id,
+        "pause_started",
+        json!({"source":source,"checkpoint_turns":PauseState::CHECKPOINT_TURNS}),
+    );
+    true
+}
+
+const PAUSE_DIRECTIVE: &str = "<run_paused>The user paused this run. Do not start new investigation or work. With the checkpoint tools only: record in task_memory what is established and what is still unknown, with the next step, and set each deliverable to its true status (implemented is not verified), and keep the plan current. Then write a short answer for the user: what is done, what is not, and that the work continues when they ask to continue. Do not claim unfinished work as done.</run_paused>";
+
+const PAUSED_TOOL_MESSAGE: &str = "The run is paused: only the checkpoint tools (task_memory, deliverables, plan) are available. Save the checkpoint and write the short pause summary.";
+
+const PAUSE_FALLBACK: &str = "Работа поставлена на паузу. Состояние и список невыполненного сохранены; чтобы продолжить, напишите «Продолжить».";
 
 fn tool_name(tool: &Value) -> &str {
     tool.pointer("/function/name")
@@ -664,47 +985,165 @@ fn required_text(arguments: &Value, key: &str) -> Result<String, String> {
         .ok_or_else(|| format!("missing required field: {key}"))
 }
 
-fn write_task_memory(
-    memory: &mut crate::agent::task_memory::TaskMemory,
+/// Maps the action names models commonly use to the supported ones.
+fn canonical_memory_action(action: &str) -> Option<&'static str> {
+    match action.trim().to_lowercase().as_str() {
+        "record" | "add" | "create" | "new" | "write" | "save" => Some("record"),
+        "update" | "revise" | "edit" | "modify" | "amend" => Some("update"),
+        "invalidate" | "delete" | "remove" | "discard" | "retract" => Some("invalidate"),
+        "view" | "get" | "list" | "read" | "show" => Some("view"),
+        _ => None,
+    }
+}
+
+fn memory_text_field(value: &Value, key: &str) -> Result<Option<String>, String> {
+    match value.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text.clone())),
+        Some(_) => Err(format!("{key} must be a string.")),
+    }
+}
+
+/// Evidence arrives as a string, an array, or in `observations`; all are
+/// merged into one reference string.
+fn memory_evidence_field(value: &Value) -> Result<Option<String>, String> {
+    let mut parts = Vec::new();
+    let mut given = false;
+    for key in ["evidence", "observations"] {
+        match value.get(key) {
+            None | Some(Value::Null) => {}
+            Some(Value::String(text)) => {
+                given = true;
+                parts.push(text.clone());
+            }
+            Some(Value::Array(items)) => {
+                given = true;
+                for item in items {
+                    parts.push(item.as_str().map(str::to_owned).ok_or_else(|| {
+                        format!(
+                            "{key} must be a list of strings (observation ids or source paths)."
+                        )
+                    })?);
+                }
+            }
+            Some(_) => {
+                return Err(format!(
+                    "{key} must be a string or a list of strings (observation ids or source paths)."
+                ))
+            }
+        }
+    }
+    Ok(given.then(|| parts.join(", ")))
+}
+
+fn parse_task_memory_change(
     value: &Value,
-) -> Result<String, String> {
-    let finding = value
-        .get("finding")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    let evidence = value
-        .get("evidence")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    let implication = value
-        .get("implication")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    let next = value
-        .get("next")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    let status = value
-        .get("status")
-        .and_then(Value::as_str)
+    transcript: &Transcript,
+) -> Result<crate::agent::task_memory::Change, String> {
+    let status = memory_text_field(value, "status")?
         .filter(|status| !status.trim().is_empty())
-        .map(crate::agent::task_memory::Status::parse)
+        .map(|status| crate::agent::task_memory::Status::parse(&status))
         .transpose()?;
-    memory.upsert_with_status(
-        value.get("id").and_then(Value::as_str),
-        finding,
-        evidence,
-        implication,
-        next,
-        value
-            .get("supersedes")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
+    Ok(crate::agent::task_memory::Change {
+        id: memory_text_field(value, "id")?,
+        finding: memory_text_field(value, "finding")?,
+        evidence: memory_evidence_field(value)?.map(|e| normalize_evidence_refs(&e, transcript)),
+        implication: memory_text_field(value, "implication")?,
+        next: memory_text_field(value, "next")?,
+        supersedes: memory_text_field(value, "supersedes")?,
         status,
+    })
+}
+
+/// Rewrites observation references into their exact ids: unpadded ids
+/// (`obs-15`), any letter case, and compact runs such as
+/// `obs-00000015/0016` or `obs-15, 16` become one id per observation. A
+/// reference that names no real observation is left as written so that it is
+/// reported, never silently repaired.
+fn normalize_evidence_refs(evidence: &str, transcript: &Transcript) -> String {
+    let chars = evidence.chars().collect::<Vec<_>>();
+    let mut out = String::new();
+    let mut index = 0;
+    let is_prefix = |at: usize| {
+        chars.len() >= at + 4
+            && chars[at..at + 4]
+                .iter()
+                .collect::<String>()
+                .eq_ignore_ascii_case("obs-")
+            && (at == 0 || !(chars[at - 1].is_alphanumeric() || chars[at - 1] == '_'))
+    };
+    let digits_at = |at: usize| {
+        chars[at..]
+            .iter()
+            .take_while(|c| c.is_ascii_digit())
+            .count()
+    };
+    while index < chars.len() {
+        if !is_prefix(index) || digits_at(index + 4) == 0 {
+            out.push(chars[index]);
+            index += 1;
+            continue;
+        }
+        let first = digits_at(index + 4);
+        let width = first;
+        let mut numbers = vec![chars[index + 4..index + 4 + first]
+            .iter()
+            .collect::<String>()];
+        let mut end = index + 4 + first;
+        // `/0016`, `, 16` or `+0016` directly continues the run only when no new `obs-` prefix follows.
+        loop {
+            let mut at = end;
+            if at < chars.len() && matches!(chars[at], '/' | '+' | ',' | '&') {
+                at += 1;
+                while at < chars.len() && chars[at] == ' ' {
+                    at += 1;
+                }
+                let run = if at < chars.len() { digits_at(at) } else { 0 };
+                let word_boundary = at + run >= chars.len() || !chars[at + run].is_alphanumeric();
+                if run > 0 && word_boundary && !is_prefix(at) {
+                    numbers.push(chars[at..at + run].iter().collect::<String>());
+                    end = at + run;
+                    continue;
+                }
+            }
+            break;
+        }
+        let rendered = numbers
+            .iter()
+            .map(|digits| {
+                let number = digits.parse::<usize>().unwrap_or(usize::MAX);
+                let candidate = format!("obs-{number:0width$}", width = width.max(8));
+                transcript
+                    .observation(&candidate)
+                    .map_or_else(|| format!("obs-{digits}"), |o| o.id.clone())
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&rendered);
+        index = end;
+    }
+    out
+}
+
+/// A short list of real references the model can cite instead.
+fn observation_hint(transcript: &Transcript) -> String {
+    let observations = transcript.observations();
+    if observations.is_empty() {
+        return "No observations exist in this run yet: read or search something first, then cite its obs- id.".into();
+    }
+    let recent = observations
+        .iter()
+        .rev()
+        .filter(|observation| !observation.error)
+        .take(4)
+        .map(|observation| match observation.source.as_deref() {
+            Some(source) if !source.is_empty() => format!("{} ({source})", observation.id),
+            _ => observation.id.clone(),
+        })
+        .collect::<Vec<_>>();
+    format!(
+        "Valid references include: {}. observation_index lists all.",
+        recent.join(", ")
     )
 }
 
@@ -717,6 +1156,14 @@ fn task_memory_conflict(
         .get("supersedes")
         .or_else(|| arguments.get("id"))
         .and_then(Value::as_str)?;
+    // Revising only status, next or implication leaves the cited evidence in place.
+    if arguments.get("supersedes").is_none()
+        && arguments.get("finding").is_none()
+        && arguments.get("evidence").is_none()
+        && arguments.get("observations").is_none()
+    {
+        return None;
+    }
     let prior = state
         .task_memory
         .entries
@@ -726,10 +1173,11 @@ fn task_memory_conflict(
         .observations()
         .iter()
         .find(|o| prior.evidence.contains(&o.id))?;
-    let new_evidence = arguments
-        .get("evidence")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let new_evidence = memory_evidence_field(arguments)
+        .ok()
+        .flatten()
+        .map(|evidence| normalize_evidence_refs(&evidence, transcript))
+        .unwrap_or_default();
     if transcript.observations().iter().any(|o| {
         new_evidence.contains(&o.id)
             || o.source
@@ -738,7 +1186,46 @@ fn task_memory_conflict(
     }) {
         return None;
     }
-    Some(format!("Potential evidence conflict: {} cites exact historical observation {}. Retrieve that observation with observation_read and cite a verified observation before replacing this finding.", prior.id, cited.id))
+    Some(format!("Potential evidence conflict: {} cites exact historical observation {}. Retrieve that observation with observation_read and cite a verified observation before replacing this finding (to retire it without a replacement, use action=invalidate). {}", prior.id, cited.id, observation_hint(transcript)))
+}
+
+/// Why this evidence does not support a confirmed claim, or `None` if it does.
+fn evidence_problem(evidence: &str, transcript: &Transcript) -> Option<String> {
+    let reference_character = |character: char| {
+        character.is_alphanumeric() || matches!(character, '-' | '_' | '.' | '/' | '\\')
+    };
+    let tokens = evidence
+        .split(|character| !reference_character(character))
+        .flat_map(|token| token.split(".."))
+        .map(|token| token.trim_matches('.'));
+    let mut found = transcript.observations().iter().any(|observation| {
+        observation.source.as_deref().is_some_and(|source| {
+            !source.is_empty()
+                && evidence.match_indices(source).any(|(start, matched)| {
+                    let end = start + matched.len();
+                    !evidence[..start]
+                        .chars()
+                        .next_back()
+                        .is_some_and(reference_character)
+                        && !evidence[end..]
+                            .chars()
+                            .next()
+                            .is_some_and(reference_character)
+                })
+        })
+    });
+    for token in tokens.filter(|token| !token.is_empty()) {
+        if token.starts_with("obs-") {
+            if transcript.observation(token).is_none() {
+                return Some(format!(
+                    "evidence cites unknown observation '{token}'. {}",
+                    observation_hint(transcript)
+                ));
+            }
+            found = true;
+        }
+    }
+    (!found).then(|| format!("evidence is empty or names no observation ID or exact source path inspected in this run. {}", observation_hint(transcript)))
 }
 
 fn validate_confirmed_memory(
@@ -749,45 +1236,11 @@ fn validate_confirmed_memory(
     if entry.status != Some(Status::Confirmed) {
         return Ok(());
     }
-    let reference_character = |character: char| {
-        character.is_alphanumeric() || matches!(character, '-' | '_' | '.' | '/' | '\\')
-    };
-    let tokens = entry
-        .evidence
-        .split(|character| !reference_character(character))
-        .flat_map(|token| token.split(".."))
-        .map(|token| token.trim_matches('.'));
-    let mut found = transcript.observations().iter().any(|observation| {
-        observation.source.as_deref().is_some_and(|source| {
-            !source.is_empty()
-                && entry
-                    .evidence
-                    .match_indices(source)
-                    .any(|(start, matched)| {
-                        let end = start + matched.len();
-                        !entry.evidence[..start]
-                            .chars()
-                            .next_back()
-                            .is_some_and(reference_character)
-                            && !entry.evidence[end..]
-                                .chars()
-                                .next()
-                                .is_some_and(reference_character)
-                    })
-        })
-    });
-    for token in tokens.filter(|token| !token.is_empty()) {
-        if token.starts_with("obs-") {
-            if transcript.observation(token).is_none() {
-                return Err(format!("Confirmed Task Memory cites unknown observation '{token}'. Use observation_index to find a valid reference and retry; no memory was changed."));
-            }
-            found = true;
-        }
+    match evidence_problem(&entry.evidence, transcript) {
+        None => Ok(()),
+        Some(problem) if problem.starts_with("evidence cites unknown") => Err(format!("Confirmed Task Memory cites unknown observation{}. Fix the reference (or use status inferred/unknown while it is unverified) and retry; no memory was changed.", &problem["evidence cites unknown observation".len()..])),
+        Some(problem) => Err(format!("Confirmed Task Memory needs support: {problem} Add it with evidence (or observations), or use status inferred/unknown while it is unverified; no memory was changed.")),
     }
-    if !found {
-        return Err("Confirmed Task Memory requires nonempty evidence referencing an observation ID or exact source path inspected in this transcript. Use observation_index and retry with evidence, or explicitly use inferred/unknown when unverified; no memory was changed.".into());
-    }
-    Ok(())
 }
 
 fn restore_task_memory(
@@ -811,69 +1264,461 @@ fn apply_task_memory(
     arguments: &Value,
     transcript: &Transcript,
 ) -> Result<(Value, bool), String> {
-    let action = required_text(arguments, "action")?;
+    let requested = required_text(arguments, "action")?;
+    let action = canonical_memory_action(&requested).ok_or_else(|| {
+        format!(
+            "unsupported task_memory action '{requested}': use record, update, invalidate or view"
+        )
+    })?;
     if action == "view" {
         return Ok((
             json!({"task_memory": state.task_memory, "updated": false}),
             false,
         ));
     }
+    let mut notes = Vec::new();
+    let mut touched = None;
     if action == "invalidate" {
-        state
-            .task_memory
-            .invalidate(required_text(arguments, "id")?.as_str())?;
-    } else if action == "record" || action == "update" {
+        let id = arguments
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "invalidate needs the id of the entry to retire. {}",
+                    state.task_memory.ids_hint()
+                )
+            })?;
+        state.task_memory.invalidate(id)?;
+    } else {
         if state.memory_writes_this_turn >= strategy::MAX_MEMORY_WRITES_PER_TURN {
             return Err(format!("Task Memory accepts at most {} writes per turn. Merge the remaining findings into one entry (update an existing id) instead of one entry per fact.", strategy::MAX_MEMORY_WRITES_PER_TURN));
         }
+        let kind = if action == "record" {
+            crate::agent::task_memory::WriteKind::Record
+        } else {
+            crate::agent::task_memory::WriteKind::Update
+        };
+        let change = parse_task_memory_change(arguments, transcript)?;
         let mut candidate = state.task_memory.clone();
-        let id = write_task_memory(&mut candidate, arguments)?;
+        let applied = candidate.apply(kind, change)?;
         let entry = candidate
             .entries
             .iter()
-            .find(|entry| entry.id == id)
+            .find(|entry| entry.id == applied.id)
             .ok_or_else(|| "Task Memory write did not create an entry".to_owned())?;
         validate_confirmed_memory(entry, transcript)?;
         state.task_memory = candidate;
         state.memory_writes_this_turn += 1;
-    } else {
-        return Err("unsupported task_memory action".into());
+        notes = applied.notes;
+        touched = Some(applied.id);
     }
     state.calls_since_memory = 0;
+    let mut result = json!({"task_memory": state.task_memory, "updated": true});
+    if let Some(id) = touched {
+        result["id"] = json!(id);
+    }
+    if !notes.is_empty() {
+        result["notes"] = json!(notes);
+    }
+    Ok((result, true))
+}
+
+/// Updates the execution plan. The result is the compact plan itself: the plan
+/// is short by construction, and the model needs nothing else back.
+fn apply_plan(state: &mut AgentState, arguments: &Value) -> Result<(Value, bool), String> {
+    let action = required_text(arguments, "action")?;
+    let text_arg = |key: &str| arguments.get(key).and_then(Value::as_str);
+    let mut candidate = state.task_memory.plan.clone();
+    match action.trim().to_lowercase().as_str() {
+        "view" | "get" | "list" | "show" => {
+            return Ok((
+                json!({"plan": state.task_memory.plan, "updated": false}),
+                false,
+            ));
+        }
+        "set" | "create" | "replace" => {
+            let steps = arguments
+                .get("steps")
+                .and_then(Value::as_array)
+                .map(|steps| {
+                    steps
+                        .iter()
+                        .filter_map(|step| {
+                            step.as_str().map(str::to_owned).or_else(|| {
+                                step.get("text").and_then(Value::as_str).map(str::to_owned)
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .ok_or_else(|| "steps is required: an array of short one-line steps".to_owned())?;
+            candidate.set(&steps)?;
+        }
+        "add" => candidate.add(&required_text(arguments, "text")?, text_arg("after"))?,
+        "update" | "complete" | "done" => {
+            let status = match text_arg("status") {
+                Some(value) => Some(StepStatus::parse(value).ok_or_else(|| {
+                    "status must be pending, in_progress, completed or blocked".to_owned()
+                })?),
+                None if action.trim().eq_ignore_ascii_case("update") => None,
+                None => Some(StepStatus::Completed),
+            };
+            candidate.update(
+                &required_text(arguments, "id")?,
+                status,
+                text_arg("text"),
+                text_arg("note"),
+            )?;
+        }
+        _ => return Err("unsupported plan action: use set, update, add or view".into()),
+    }
+    let unchanged = candidate == state.task_memory.plan;
+    state.task_memory.plan = candidate;
     Ok((
-        json!({"task_memory": state.task_memory, "updated": true}),
+        json!({"plan": state.task_memory.plan, "updated": !unchanged}),
+        !unchanged,
+    ))
+}
+
+/// Updates the execution contract. In Deep, completing an item needs evidence
+/// that cites an observation or an inspected source path, like a confirmed
+/// finding; Fast only asks the model to say what it observed.
+fn apply_deliverables(
+    state: &mut AgentState,
+    arguments: &Value,
+    transcript: &Transcript,
+) -> Result<(Value, bool), String> {
+    let action = required_text(arguments, "action")?;
+    let text_of = |key: &str| {
+        arguments
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let id = || required_text(arguments, "id");
+    let mut candidate = state.task_memory.deliverables.clone();
+    match action.as_str() {
+        "view" => {
+            return Ok((
+                json!({"deliverables": state.task_memory.deliverables, "updated": false}),
+                false,
+            ))
+        }
+        "add" => {
+            let check = match arguments.get("check").and_then(Value::as_str) {
+                Some(value) if !value.trim().is_empty() => {
+                    Some(Need::parse(value).ok_or_else(|| {
+                        "check must be readback, static, build, test, runtime or browser".to_owned()
+                    })?)
+                }
+                _ => None,
+            };
+            candidate.add_checked(
+                arguments.get("id").and_then(Value::as_str),
+                &text_of("task"),
+                &text_of("text"),
+                check,
+            )?;
+        }
+        "implemented" | "done" => {
+            let id = id()?;
+            let evidence = normalize_evidence_refs(&text_of("evidence"), transcript);
+            if state.strategy.is_deep() {
+                if let Some(problem) = evidence_problem(&evidence, transcript) {
+                    return Err(format!("In Deep mode a deliverable is marked implemented only with evidence that cites an observation ID (obs-…) or the exact path of a source you inspected in this run: {problem} Check it, then retry with that evidence; nothing was changed."));
+                }
+            }
+            candidate.implement(&id, &evidence)?;
+        }
+        "verify" => {
+            let id = id()?;
+            let item = candidate
+                .items
+                .iter()
+                .find(|item| item.id == id)
+                .ok_or_else(|| format!("unknown deliverable '{id}'"))?;
+            let cited = evidence_ids(arguments);
+            // Persist the relationship BEFORE judging the result. A rejected
+            // verify attempt cannot be undone by subsequently omitting its ids.
+            let attachment = state.task_memory.verification.attach(&id, &cited);
+            sync_verification_failure(state);
+            attachment?;
+            let proof = state.task_memory.verification.proof_for_item(
+                item,
+                &cited,
+                state.strategy.is_deep(),
+                state.browser_available,
+            )?;
+            candidate.verify(&id, proof)?;
+        }
+        "block" => candidate.block(&id()?, &text_of("reason"))?,
+        "drop" => candidate.drop_item(&id()?, &text_of("reason"))?,
+        _ => return Err(
+            "unsupported deliverables action: use add, implemented, verify, block, drop or view"
+                .into(),
+        ),
+    }
+    state.task_memory.deliverables = candidate;
+    sync_verification_failure(state);
+    Ok((
+        json!({"deliverables": state.task_memory.deliverables, "updated": true}),
         true,
     ))
+}
+
+/// Evidence ids (ev-…) named in a `verify` call, whether given as a list or
+/// as free text.
+fn evidence_ids(arguments: &Value) -> Vec<String> {
+    let mut text = String::new();
+    for key in ["evidence", "proof", "evidence_ids"] {
+        match arguments.get(key) {
+            Some(Value::String(value)) => {
+                text.push(' ');
+                text.push_str(value);
+            }
+            Some(Value::Array(values)) => {
+                for value in values.iter().filter_map(Value::as_str) {
+                    text.push(' ');
+                    text.push_str(value);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut ids: Vec<String> = text
+        .split(|character: char| !(character.is_ascii_alphanumeric() || character == '-'))
+        .filter(|word| word.len() > 3 && word[..3].eq_ignore_ascii_case("ev-"))
+        .map(str::to_ascii_lowercase)
+        .collect();
+    ids.dedup();
+    ids
+}
+
+fn checkpoint_work_budget(config: &Config, state: &AgentState, transcript: &mut Transcript) {
+    let changed = transcript.entries().iter().rev().find_map(|entry| {
+        if let crate::agent::transcript::Entry::WorkBudget(budget) = entry { Some(budget.view()) } else { None }
+    }).is_none_or(|previous| previous != state.work_budget.view());
+    transcript.checkpoint_work_budget(state.work_budget.clone());
+    if changed { emit(&config.run_id, Event::WorkBudget { budget: state.work_budget.view() }); }
+}
+
+fn emit_task_memory(config: &Config, state: &AgentState) {
+    if let Ok(memory) = serde_json::to_value(&state.task_memory) {
+        emit(&config.run_id, Event::TaskMemoryUpdate { memory });
+    }
+}
+
+/// Keeps the deliverables honest about the checks the runtime saw fail. Returns
+/// whether anything changed.
+fn sync_verification_failure(state: &mut AgentState) -> bool {
+    state
+        .task_memory
+        .deliverables
+        .sync_failures(&state.task_memory.verification)
+}
+
+/// Applies what a terminal command may have done to the project, so a command
+/// that edits files (sed -i, mv, a redirect) invalidates earlier checks the way
+/// a file tool would. Returns whether the project is known or assumed changed.
+///
+/// A read-only command changes nothing. Any command not recognised as a check
+/// or as read-only is assumed to change the project: the epoch advances, so all
+/// run, test and static evidence goes stale, and the code files it names are
+/// marked changed. Before a check is trusted, tracked files are compared with
+/// what the runtime last saw, so an edit made by the check itself (for example
+/// `--fix`) is noticed too. Files a check changes that the task never touched
+/// are not detected.
+fn record_terminal_effect(
+    state: &mut AgentState,
+    scope: &crate::tools::filesystem::Scope,
+    command: &str,
+    effect: verification::Effect,
+) -> bool {
+    if effect == verification::Effect::ReadOnly {
+        return false;
+    }
+    let mut changed = false;
+    let tracked = state
+        .task_memory
+        .verification
+        .revisions
+        .iter()
+        .map(|(path, revision)| (path.clone(), revision.clone()))
+        .collect::<Vec<_>>();
+    for (path, known) in tracked {
+        match crate::tools::filesystem::file_revision(scope, &path) {
+            Some((_, current)) if current == known => {}
+            Some((_, current)) => {
+                state.task_memory.verification.note_change(Some(&path));
+                state.work_budget.changed_file(&path, &current);
+                state
+                    .task_memory
+                    .verification
+                    .revisions
+                    .insert(path, current);
+                changed = true;
+            }
+            None => {
+                state.task_memory.verification.note_deletion(&path);
+                state.work_budget.changed_file(&path, "[deleted]");
+                changed = true;
+            }
+        }
+    }
+    if effect == verification::Effect::Mutating {
+        let ledger = &mut state.task_memory.verification;
+        ledger.note_change(None);
+        for token in verification::mentioned_code_paths(command) {
+            let path = token.strip_prefix("./").unwrap_or(&token).to_owned();
+            match crate::tools::filesystem::file_revision(scope, &path) {
+                Some((_, revision)) => {
+                    ledger.note_change(Some(&path));
+                    state.work_budget.changed_file(&path, &revision);
+                    ledger.revisions.insert(path, revision);
+                }
+                None => ledger.note_deletion(&path),
+            }
+        }
+        state.record_mutation();
+        changed = true;
+    }
+    if changed {
+        state.task_memory.deliverables.demote_verified();
+        sync_verification_failure(state);
+    }
+    changed
+}
+
+/// Records what a finished terminal command shows. Only a command with an exit
+/// code that the runtime can classify as a check becomes evidence; timeouts and
+/// cancellations are inconclusive.
+fn record_terminal_evidence(
+    state: &mut AgentState,
+    root: &Path,
+    command: &str,
+    value: &Value,
+) -> bool {
+    let completed = value.get("status").and_then(Value::as_str);
+    let Some(exit_code) = value.get("exit_code").and_then(Value::as_i64) else {
+        return false;
+    };
+    if value.get("timed_out").and_then(Value::as_bool) == Some(true)
+        || value.get("cancelled").and_then(Value::as_bool) == Some(true)
+        || !matches!(completed, Some("completed" | "error"))
+    {
+        return false;
+    }
+    let changed = state
+        .task_memory
+        .verification
+        .changed
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let Some(mut kind) = verification::classify_command(command, &changed) else {
+        return false;
+    };
+    if kind == verification::Kind::Run && verification::script_drives_browser(root, command) {
+        kind = verification::Kind::Browser;
+    }
+    let pass = exit_code == 0 && completed == Some("completed");
+    let detail = if pass {
+        "exit 0".to_owned()
+    } else {
+        let text = |key: &str| value.get(key).and_then(Value::as_str).unwrap_or_default();
+        let output = if text("stderr").trim().is_empty() {
+            text("stdout")
+        } else {
+            text("stderr")
+        };
+        let tail = output
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or_default();
+        format!("exit {exit_code}: {tail}")
+    };
+    let turn = state.turn;
+    let id = state.task_memory.verification.record_outcome(
+        kind,
+        command,
+        pass,
+        &detail,
+        turn,
+        &json!({
+            "exit_code": exit_code, "status": completed,
+            "stdout": value.get("stdout"), "stderr": value.get("stderr")
+        })
+        .to_string(),
+    );
+    if let Some(record) = state.task_memory.verification.get(&id) {
+        state.work_budget.checked(record, &state.task_memory.verification, &state.task_memory.deliverables);
+    }
+    if state.verification_reviews > 0 {
+        state.checks_since_review += 1;
+    }
+    sync_verification_failure(state);
+    true
+}
+
+/// A successful write, patch or delete changes what any earlier check saw. The
+/// runtime reads each written file back itself, so "it was written" never
+/// depends on the model's word.
+fn record_project_change(
+    state: &mut AgentState,
+    scope: &crate::tools::filesystem::Scope,
+    name: &str,
+    paths: &[String],
+) {
+    let turn = state.turn;
+    for path in paths {
+        if name == "delete_file" {
+            state.task_memory.verification.note_deletion(path);
+            state.work_budget.changed_file(path, "[deleted]");
+            continue;
+        }
+        state.task_memory.verification.note_change(Some(path));
+        if let Some((file, revision)) = crate::tools::filesystem::file_revision(scope, path) {
+            state
+                .task_memory
+                .verification
+                .revisions
+                .insert(path.clone(), revision.clone());
+            state.work_budget.changed_file(path, &revision);
+            let size = std::fs::metadata(&file).map(|meta| meta.len()).unwrap_or(0);
+            state.task_memory.verification.record(
+                verification::Kind::Readback,
+                path,
+                true,
+                &format!("{size} bytes on disk"),
+                turn,
+            );
+        }
+    }
+    if paths.is_empty() {
+        state.task_memory.verification.note_change(None);
+    }
+    state.task_memory.deliverables.demote_verified();
+    sync_verification_failure(state);
+}
+
+/// Paths a patch adds, so files created through `apply_patch` are tracked too.
+fn patch_added_files(patch: &str) -> Vec<String> {
+    patch
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("*** Add File:"))
+        .map(|path| path.trim().to_owned())
+        .filter(|path| !path.is_empty())
+        .collect()
 }
 
 fn mutation_tool(name: &str) -> bool {
     matches!(
         name,
-        "write_file" | "create_file" | "apply_patch" | "delete_file"
+        "write_file" | "create_file" | "apply_patch" | "delete_file" | "replace_text"
     )
-}
-
-fn validation_command(command: &str) -> bool {
-    let command = command.to_ascii_lowercase();
-    [
-        " test",
-        "test ",
-        "cargo test",
-        "cargo check",
-        "typecheck",
-        "type-check",
-        " lint",
-        "lint ",
-        " build",
-        "build ",
-        " compile",
-        "compile ",
-        "clippy",
-        "vitest",
-        "jest",
-    ]
-    .iter()
-    .any(|needle| command.contains(needle))
 }
 
 fn continuation_tail(content: &str) -> String {
@@ -947,6 +1792,84 @@ fn present_answer(
         );
     }
     crate::agent::presentation::project_answer_with_prefix(content, prefix, &references)
+}
+
+fn budget_stop_reason(reason: &str, russian: bool) -> &'static str {
+    match (reason, russian) {
+        ("absolute_maximum", true) => "достигнут абсолютный предел 256 рабочих ходов",
+        ("absolute_maximum", false) => "absolute maximum of 256 work turns reached",
+        ("verification_grace_exhausted", true) => "единственное продление для проверки использовано; нужна новая успешная проверка",
+        ("verification_grace_exhausted", false) => "the single verification extension was spent; a fresh passing check is required",
+        ("repeated_failed_edits", true) => "повторные ошибки изменения файлов без восстановления",
+        ("repeated_failed_edits", false) => "repeated failed edits without recovery",
+        (_, true) => "нет нового подтверждённого прогресса за последние 16 рабочих ходов",
+        (_, false) => "no new checked progress in the last 16 work turns",
+    }
+}
+
+fn anonymous_verification_gap(state: &AgentState) -> bool {
+    let ledger = &state.task_memory.verification;
+    let mut need = ledger.effective_need(None);
+    // A stopped unregistered implementation still needs a check on Continue,
+    // even if the caller has no saved Task Memory projection.
+    if need == Need::Readback && state.work_budget.has_changed_code() { need = Need::Runtime; }
+    state.task_memory.deliverables.is_empty() && (state.mutations > 0 || state.work_budget.has_changed_code())
+        && state.can_verify && need != Need::Readback
+        && (ledger.best_passing(need).is_none() || ledger.blocking_failure(&state.task_memory.deliverables).is_some())
+}
+
+/// Surface authoritative unresolved state without another provider/tool turn
+/// or invented plan transitions. Model prose cannot suppress this disclosure.
+fn terminal_status_note(
+    state: &AgentState,
+    transcript: &Transcript,
+    turn_budget_exhausted: bool,
+) -> String {
+    use deliverables::DeliverableStatus as Status;
+    let items = &state.task_memory.deliverables.items;
+    let outstanding = items.iter().any(|item| matches!(item.status,
+        Status::Pending | Status::Implemented | Status::Blocked));
+    let anonymous_gap = anonymous_verification_gap(state);
+    let steps = &state.task_memory.plan.steps;
+    let unfinished_plan = steps.iter().any(|step| step.status != StepStatus::Completed);
+    if !outstanding && !unfinished_plan && !anonymous_gap && !turn_budget_exhausted {
+        return String::new();
+    }
+    let russian = transcript.language_preference() == "Russian";
+    let mut parts = Vec::new();
+    if anonymous_gap {
+        parts.push(if russian { "Изменённое поведение не подтверждено проверкой." }
+            else { "Changed behaviour is not verified." }.to_owned());
+    }
+    if outstanding {
+        let total = items.iter().filter(|item| item.status != Status::Dropped).count();
+        let verified = items.iter().filter(|item| item.status == Status::Verified).count();
+        parts.push(if russian { format!("Подтверждено результатов: {verified}/{total}.") }
+            else { format!("Deliverables verified: {verified}/{total}.") });
+        for (status, label) in [
+            (Status::Implemented, if russian { "Реализовано, но не проверено" } else { "Implemented, not verified" }),
+            (Status::Pending, if russian { "Не завершено" } else { "Pending" }),
+            (Status::Blocked, if russian { "Заблокировано" } else { "Blocked" }),
+        ] {
+            let ids = items.iter().filter(|item| item.status == status)
+                .map(|item| item.id.as_str()).collect::<Vec<_>>();
+            if !ids.is_empty() { parts.push(format!("{label}: {}.", ids.join(", "))); }
+        }
+    }
+    if unfinished_plan {
+        let completed = steps.iter().filter(|step| step.status == StepStatus::Completed).count();
+        parts.push(if russian { format!("Последнее сохранённое состояние плана: {completed}/{} шагов выполнено; остальные шаги не завершены.", steps.len()) }
+            else { format!("Last recorded plan: {completed}/{} steps complete; remaining steps are incomplete.", steps.len()) });
+    }
+    if turn_budget_exhausted {
+        parts.push(if russian { "Лимит рабочих ходов исчерпан; запуск остановлен с указанным выше состоянием." }
+            else { "Work-turn budget exhausted; the run ended with the state above." }.to_owned());
+    }
+    if turn_budget_exhausted && state.work_budget.decision == "denied" {
+        parts.push(if russian { format!("Причина: {}.", budget_stop_reason(&state.work_budget.reason, true)) }
+            else { format!("Budget decision: {}.", budget_stop_reason(&state.work_budget.reason, false)) });
+    }
+    format!("\n\n**{}** {}", if russian { "Статус Agent V2:" } else { "Agent V2 status:" }, parts.join(" "))
 }
 
 fn emit_status(run_id: &str, content: &str) {
@@ -1181,8 +2104,83 @@ fn suffix_prefix_length(value: &str, marker: &str) -> usize {
         .unwrap_or(0)
 }
 
+/// Prefix of the stream error raised when the model's output degenerates into
+/// verbatim repetition. Sampling can trap a local model in a paragraph loop that
+/// otherwise runs until `max_tokens` (tens of minutes on a large MoE model).
+const REPETITION_LOOP_ERROR: &str = "repetition_loop";
+const REPETITION_CHECK_STEP_CHARS: usize = 256;
+const REPETITION_WINDOW_CHARS: usize = 16_000;
+const REPETITION_MIN_PERIOD: usize = 32;
+const REPETITION_MAX_PERIOD: usize = 4_000;
+const REPETITION_MIN_RUN_CHARS: usize = 1_500;
+
+/// Detects a tail that repeats one block verbatim at least four times (the
+/// periodic run covers three further periods) over at least
+/// `REPETITION_MIN_RUN_CHARS`. The block must be textual (≥10 distinct chars), so
+/// separators or padding runs are not mistaken for a loop.
+fn degenerate_repetition(text: &str) -> Option<(usize, usize)> {
+    let tail: Vec<char> = {
+        let total = text.chars().count();
+        text.chars()
+            .skip(total.saturating_sub(REPETITION_WINDOW_CHARS))
+            .collect()
+    };
+    let n = tail.len();
+    let max_period = REPETITION_MAX_PERIOD.min(n / 4);
+    for period in REPETITION_MIN_PERIOD..=max_period {
+        let mut run = 0;
+        let mut index = n - 1;
+        while index >= period && tail[index] == tail[index - period] {
+            run += 1;
+            index -= 1;
+        }
+        if run >= (3 * period).max(REPETITION_MIN_RUN_CHARS) {
+            let distinct: std::collections::BTreeSet<char> =
+                tail[n - period..].iter().copied().collect();
+            if distinct.len() >= 10 {
+                return Some((period, run));
+            }
+        }
+    }
+    None
+}
+
+fn check_repetition(text: &str, checked: &mut usize, kind: &str) -> Result<(), String> {
+    let length = text.len();
+    if length < *checked + REPETITION_CHECK_STEP_CHARS {
+        return Ok(());
+    }
+    *checked = length;
+    match degenerate_repetition(text) {
+        Some((period, run)) => Err(format!(
+            "{REPETITION_LOOP_ERROR}: model {kind} repeated a {period}-character block verbatim over the last {run} characters"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Text returned to the model when a call needs approval it cannot get in this run.
+fn approval_refusal(tool: &ValidatedCall) -> &'static str {
+    if tool.name == "run_terminal"
+        && tool
+            .arguments
+            .get("command")
+            .and_then(Value::as_str)
+            .is_some_and(|c| c.contains("git "))
+    {
+        "approval required for shell composition. For read-only history, retry as one scoped command: git -C <selected-project> log --oneline -30. Do not treat this attempt as evidence of repository history."
+    } else if tool.name == "run_terminal" {
+        "approval required: this command uses shell composition (&&, ||, ;, redirection, substitution, a wrapper) or affects the user session, and it was not run. Run each step as its own simple command; the terminal already starts in the working directory, so cd is not needed. Do not treat this refusal as a result."
+    } else {
+        "approval required"
+    }
+}
+
 #[derive(Default)]
 struct StreamedTurn {
+    /// Byte lengths of `content`/`reasoning_raw` at the last repetition check.
+    content_repetition_checked: usize,
+    reasoning_repetition_checked: usize,
     content: String,
     /// What the UI shows: reasoning with provider tool-call markup removed.
     reasoning: String,
@@ -1190,6 +2188,8 @@ struct StreamedTurn {
     /// text, is the canonical record that is replayed on the next request.
     reasoning_raw: String,
     reasoning_markup_filter: ReasoningMarkupFilter,
+    content_markup_filter: ContentMarkupFilter,
+    tool_names: Vec<String>,
     thinking_started: bool,
     reasoning_delta_count: usize,
     calls: BTreeMap<usize, Value>,
@@ -1202,6 +2202,107 @@ struct StreamedTurn {
     prompt_ms: Option<f64>,
     predicted_ms: Option<f64>,
     predicted_per_second: Option<f64>,
+}
+
+#[derive(Default)]
+struct ContentMarkupFilter { pending: String, inside_tool_call: bool, candidate: String, hid_markup: bool }
+
+impl ContentMarkupFilter {
+    fn push(&mut self, input: &str, flush: bool, prefix: &str, tool_names: &[String]) -> String {
+        const OPEN: &str = "<tool_call>";
+        const CLOSE: &str = "</tool_call>";
+        self.pending.push_str(input);
+        let mut visible = String::new();
+        loop {
+            let lower = self.pending.to_ascii_lowercase();
+            if self.inside_tool_call {
+                if let Some(end) = lower.find(CLOSE) {
+                    self.candidate.push_str(&self.pending[..end]);
+                    self.pending.drain(..end + CLOSE.len());
+                    let structured = structured_tool_markup(&self.candidate, tool_names);
+                    if !structured { visible.push_str(OPEN); visible.push_str(&self.candidate); visible.push_str(CLOSE); }
+                    else { self.hid_markup = true; }
+                    self.candidate.clear(); self.inside_tool_call = false;
+                    continue;
+                }
+                let keep = suffix_prefix_length(&lower, CLOSE);
+                let safe = self.pending.len() - keep;
+                self.candidate.push_str(&self.pending[..safe]);
+                self.pending = self.pending[safe..].to_owned();
+                break;
+            }
+            if let Some(start) = lower.find(OPEN) {
+                let literal_prefix = format!("{prefix}{visible}{}", &self.pending[..start]);
+                visible.push_str(&self.pending[..start]);
+                if markdown_code_is_open(&literal_prefix) {
+                    visible.push_str(OPEN);
+                    self.pending.drain(..start + OPEN.len());
+                    continue;
+                }
+                self.pending.drain(..start + OPEN.len());
+                self.inside_tool_call = true;
+                continue;
+            }
+            let keep = suffix_prefix_length(&lower, OPEN);
+            let safe = self.pending.len() - keep;
+            visible.push_str(&self.pending[..safe]);
+            self.pending = self.pending[safe..].to_owned();
+            break;
+        }
+        if flush {
+            if self.inside_tool_call {
+                let structured = structured_tool_markup(&self.candidate, tool_names);
+                if !structured { visible.push_str(OPEN); visible.push_str(&self.candidate); }
+                else { self.hid_markup = true; }
+            } else { visible.push_str(&self.pending); }
+            self.pending.clear(); self.candidate.clear(); self.inside_tool_call = false;
+        }
+        visible
+    }
+}
+
+fn structured_tool_markup(body: &str, tool_names: &[String]) -> bool {
+    if let Ok(value) = serde_json::from_str::<Value>(body.trim()) {
+        return value.get("name").and_then(Value::as_str).is_some_and(|name| tool_names.iter().any(|known| known == name))
+            && value.get("arguments").is_some_and(Value::is_object);
+    }
+    if let Some(position) = body.find("\"name\"") {
+        let tail = body[position + 6..].trim_start();
+        if let Some(encoded) = tail.strip_prefix(':').map(str::trim_start).and_then(|tail| tail.strip_prefix('"')) {
+            if let Some(end) = encoded.find('"') {
+                if tool_names.iter().any(|known| known == &encoded[..end]) { return true; }
+            }
+        }
+    }
+    let trimmed = body.trim_start();
+    let Some(rest) = trimmed.strip_prefix("<function=") else { return false; };
+    let Some(name) = rest.split(['>', ' ', '\n', '\r']).next() else { return false; };
+    tool_names.iter().any(|known| known == name)
+}
+
+fn markdown_code_is_open(source: &str) -> bool {
+    let mut in_fence = false;
+    let mut inline = false;
+    let mut index = 0;
+    while index < source.len() {
+        let rest = &source[index..];
+        if rest.starts_with("```") { in_fence = !in_fence; index += 3; continue; }
+        if !in_fence && rest.starts_with('`') { inline = !inline; index += 1; continue; }
+        index += source[index..].chars().next().map(char::len_utf8).unwrap_or(1);
+    }
+    in_fence || inline
+}
+
+fn append_content(turn: &mut StreamedTurn, content: &str, run_id: &str, emit_content: bool) {
+    let prefix_len = turn.content.len();
+    turn.content.push_str(content);
+    let visible = turn.content_markup_filter.push(content, false, &turn.content[..prefix_len], &turn.tool_names);
+    if emit_content && !visible.is_empty() { emit(run_id, Event::ContentDelta { content: visible }); }
+}
+
+fn flush_content(turn: &mut StreamedTurn, run_id: &str, emit_content: bool) {
+    let visible = turn.content_markup_filter.push("", true, &turn.content, &turn.tool_names);
+    if emit_content && !visible.is_empty() { emit(run_id, Event::ContentDelta { content: visible }); }
 }
 
 fn append_reasoning(turn: &mut StreamedTurn, run_id: &str, reasoning: &str, emit_visible: bool) {
@@ -1439,6 +2540,8 @@ fn stream_call(
         }
     }
     let mut turn = StreamedTurn::default();
+    turn.tool_names = payload.get("tools").and_then(Value::as_array).into_iter().flatten()
+        .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str).map(str::to_owned)).collect();
     let mut buffer = String::new();
     if chunked {
         loop {
@@ -1512,6 +2615,7 @@ fn stream_call(
         consume_sse(&mut buffer, &mut turn, run_id, emit_visible, emit_content)?;
     }
     flush_reasoning(&mut turn, run_id, emit_visible);
+    flush_content(&mut turn, run_id, emit_content);
     trace_forensics(
         run_id,
         "assembled_turn",
@@ -1623,6 +2727,11 @@ fn consume_sse(
                     json!({"chars":reasoning.chars().count()}),
                 );
                 append_reasoning(turn, run_id, reasoning, emit_visible);
+                check_repetition(
+                    &turn.reasoning_raw,
+                    &mut turn.reasoning_repetition_checked,
+                    "reasoning",
+                )?;
             }
             if let Some(content) = delta
                 .and_then(|delta| delta.get("content"))
@@ -1633,15 +2742,12 @@ fn consume_sse(
                     "parsed_content_delta",
                     json!({"chars":content.chars().count()}),
                 );
-                turn.content.push_str(content);
-                if emit_content {
-                    emit(
-                        run_id,
-                        Event::ContentDelta {
-                            content: content.to_owned(),
-                        },
-                    );
-                }
+                append_content(turn, content, run_id, emit_content);
+                check_repetition(
+                    &turn.content,
+                    &mut turn.content_repetition_checked,
+                    "output",
+                )?;
             }
             if let Some(calls) = delta
                 .and_then(|delta| delta.get("tool_calls"))
@@ -1733,32 +2839,57 @@ fn summarize_span(config: &Config, plan: &CompactionPlan) -> SummaryResult {
             output_tokens: 0,
         };
     }
-    let payload = summary_payload(config, &messages, max_tokens);
-    match stream_call(
-        &config.endpoint,
-        &payload,
-        &config.run_id,
-        0,
-        &config.cancelled,
-        false,
-        false,
-    ) {
-        Ok(turn) if !turn.content.trim().is_empty() => {
-            let text = mark_if_cut_at_output_limit(turn.content.trim(), &turn.finish_reason);
-            SummaryResult {
-                output_tokens: turn
-                    .completion_tokens
-                    .map_or_else(|| estimate_tokens(&json!(text)), |tokens| tokens as usize),
-                text,
-                input_tokens,
+    // A model that is mid-task may answer the summary request with tool-call
+    // markup instead of a handoff. That is not a summary: it carries none of
+    // the state compaction exists to preserve, so it is retried once with an
+    // explicit instruction and otherwise replaced by a neutral note (Task
+    // Memory and the deliverables stay authoritative in the prompt tail).
+    let mut attempt_messages = messages.clone();
+    for attempt in 0..2 {
+        let payload = summary_payload(config, &attempt_messages, max_tokens);
+        if let Ok(turn) = stream_call(
+            &config.endpoint,
+            &payload,
+            &config.run_id,
+            0,
+            &config.cancelled,
+            false,
+            false,
+        ) {
+            if is_usable_summary(&turn.content) {
+                let text = mark_if_cut_at_output_limit(turn.content.trim(), &turn.finish_reason);
+                return SummaryResult {
+                    output_tokens: turn
+                        .completion_tokens
+                        .map_or_else(|| estimate_tokens(&json!(text)), |tokens| tokens as usize),
+                    text,
+                    input_tokens,
+                };
             }
         }
-        _ => SummaryResult {
-            text: "Earlier conversation was compacted; the current prompt contains the usable summary and retained recent transcript.".into(),
-            input_tokens,
-            output_tokens: 0,
-        },
+        if attempt == 0 {
+            attempt_messages.push(json!({"role":"user", "content":"Reply with the plain-text checkpoint only, under the required headings. Do not call tools and do not write tool-call markup."}));
+        }
     }
+    SummaryResult {
+        text: "Earlier conversation was compacted; the current prompt contains the usable summary and retained recent transcript.".into(),
+        input_tokens,
+        output_tokens: 0,
+    }
+}
+
+/// A summary must be prose. Empty text, or text that is (or starts with)
+/// tool-call markup, preserves nothing.
+fn is_usable_summary(content: &str) -> bool {
+    let text = content.trim();
+    if text.is_empty() {
+        return false;
+    }
+    let lowered = text.to_ascii_lowercase();
+    !(lowered.starts_with("<tool_call")
+        || lowered.starts_with("<function=")
+        || lowered.starts_with("<|tool_call")
+        || (lowered.contains("<tool_call>") && lowered.contains("<function=")))
 }
 
 /// A checkpoint that stopped at the output limit is incomplete, and its last
@@ -2240,6 +3371,35 @@ fn request_shape(messages: &[Value]) -> Vec<String> {
         .collect()
 }
 
+/// Project 2 is a reference the user may only want to read. Passive knowledge
+/// caching writes into the project's `.ai-framework`, so it is limited to the
+/// primary project; an explicit `project_knowledge_update` stays the model's choice.
+fn targets_secondary_project(tool: &ValidatedCall) -> bool {
+    tool.arguments.get("project").and_then(Value::as_u64) == Some(2)
+}
+
+/// A reference project without a knowledge cache stays that way: the knowledge
+/// tools would otherwise create `.ai-framework` in it just to answer "nothing here".
+fn absent_reference_knowledge(config: &Config, tool: &ValidatedCall) -> Option<Value> {
+    if !targets_secondary_project(tool)
+        || !matches!(
+            tool.name.as_str(),
+            "project_knowledge_index" | "project_knowledge_read"
+        )
+    {
+        return None;
+    }
+    let root = config.root.as_deref()?;
+    if Path::new(root).join(".ai-framework").exists() {
+        return None;
+    }
+    Some(json!({
+        "exists": false,
+        "entries": [],
+        "message": "Project 2 has no knowledge cache and the runtime does not create one in a reference project. Read its files directly."
+    }))
+}
+
 fn scoped_tool_config(config: &Config, tool: &ValidatedCall) -> Result<Config, String> {
     let slot = match tool.arguments.get("project") {
         None => 1,
@@ -2295,6 +3455,14 @@ fn run_tool(
         .map(|result| project_result(config, tool, result))
 }
 
+fn tool_call_fingerprint(tool: &ValidatedCall) -> String {
+    format!("{}:{}", tool.name, serde_json::to_string(&tool.arguments).unwrap_or_default())
+}
+
+fn failed_call_retry_exhausted(state: &AgentState, fingerprint: &str) -> bool {
+    state.failed_tool_calls.get(fingerprint).copied().unwrap_or(0) >= 2
+}
+
 fn run_scoped_tool(
     config: &Config,
     state: &mut AgentState,
@@ -2303,6 +3471,24 @@ fn run_scoped_tool(
 ) -> Result<(Value, Option<String>), String> {
     let scoped = scoped_tool_config(config, tool)?;
     let config = &scoped;
+    if let Some(absent) = absent_reference_knowledge(config, tool) {
+        return Ok((absent, None));
+    }
+    if crate::tools::web::is_web_tool(&tool.name) {
+        if !config.web_tools.iter().any(|schema| tool_name(schema) == tool.name) { return Err("Web tool is unavailable".into()); }
+        let result = config.host_tools.as_ref().ok_or("Web host is unavailable")?.execute(&config.run_id, &tool.name, &tool.arguments, &config.cancelled)?;
+        return if result.get("error").is_some() || result.get("blocked_reason").is_some() { Err(result.to_string()) } else { Ok((result, None)) };
+    }
+    if tool.name == "create_visual_artifact" {
+        if !config.artifact_tools.iter().any(|schema| tool_name(schema) == tool.name) { return Err("Visual artifact tool is unavailable".into()); }
+        let result = config.host_tools.as_ref().ok_or("Artifact host is unavailable")?.execute(&config.run_id, &tool.name, &tool.arguments, &config.cancelled)?;
+        return if result.get("error").is_some() { Err(result.to_string()) } else { Ok((result, None)) };
+    }
+    if tool.name == "read_attachment_data" {
+        if !config.attachment_tools.iter().any(|schema| tool_name(schema) == tool.name) { return Err("Attachment data tool is unavailable".into()); }
+        let result = config.host_tools.as_ref().ok_or("Attachment host is unavailable")?.execute(&config.run_id, &tool.name, &tool.arguments, &config.cancelled)?;
+        return if result.get("error").is_some() { Err(result.to_string()) } else { Ok((result, None)) };
+    }
     match tool.name.as_str() {
         "project_knowledge_index" => {
             let root = config
@@ -2360,6 +3546,37 @@ fn run_scoped_tool(
             emit_knowledge_diagnostics(config, state);
             Ok((value, None))
         }
+        "deliverables" => {
+            let result = apply_deliverables(state, &tool.arguments, transcript);
+            // Failed verify citations also change the durable evidence state.
+            if result.is_err() {
+                emit_task_memory(config, state);
+            }
+            let (value, changed) = result?;
+            if changed {
+                emit(
+                    &config.run_id,
+                    Event::TaskMemoryUpdate {
+                        memory: serde_json::to_value(&state.task_memory)
+                            .map_err(|error| error.to_string())?,
+                    },
+                );
+            }
+            Ok((value, None))
+        }
+        "plan" => {
+            let (value, changed) = apply_plan(state, &tool.arguments)?;
+            if changed {
+                emit(
+                    &config.run_id,
+                    Event::TaskMemoryUpdate {
+                        memory: serde_json::to_value(&state.task_memory)
+                            .map_err(|error| error.to_string())?,
+                    },
+                );
+            }
+            Ok((value, None))
+        }
         "task_memory" => {
             let (value, changed) = apply_task_memory(state, &tool.arguments, transcript)?;
             if changed {
@@ -2375,8 +3592,8 @@ fn run_scoped_tool(
         }
         "run_terminal" => {
             let root = config
-                .root
-                .as_ref()
+                .work_root()
+                .map(str::to_owned)
                 .ok_or_else(|| "no project scope".to_owned())?;
             let command = tool
                 .arguments
@@ -2384,8 +3601,40 @@ fn run_scoped_tool(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_owned();
+            let ids = match tool.arguments.get("deliverable_ids") {
+                None => Vec::new(),
+                Some(Value::Array(values)) => values
+                    .iter()
+                    .map(|value| {
+                        let id = value
+                            .as_str()
+                            .ok_or_else(|| "deliverable_ids must contain strings".to_owned())?;
+                        if !state.task_memory.deliverables.items.iter().any(|item| {
+                            item.id == id
+                                && !matches!(
+                                    item.status,
+                                    deliverables::DeliverableStatus::Dropped
+                                        | deliverables::DeliverableStatus::Blocked
+                                )
+                        }) {
+                            return Err(format!("unknown or inactive deliverable '{id}'"));
+                        }
+                        Ok(id.to_owned())
+                    })
+                    .collect::<Result<Vec<_>, String>>()?,
+                _ => {
+                    return Err(
+                        "deliverable_ids must be an array of recorded deliverable ids".into(),
+                    )
+                }
+            };
+            state.task_memory.verification.bind(&command, &ids)?;
+            if !ids.is_empty() {
+                sync_verification_failure(state);
+                emit_task_memory(config, state);
+            }
             let value = crate::tools::shell::execute(
-                &PathBuf::from(root),
+                &PathBuf::from(&root),
                 &tool.arguments,
                 || config.cancelled.load(Ordering::Relaxed),
                 |pid, pgid, session_id, started_at| {
@@ -2413,24 +3662,120 @@ fn run_scoped_tool(
                     )
                 },
             )?;
+            let grants = config.grants();
+            let scope = crate::tools::filesystem::Scope {
+                root: Path::new(&root),
+                grants: &grants,
+            };
+            let tracked = state
+                .task_memory
+                .verification
+                .changed
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            let effect = verification::terminal_effect(&command, &tracked);
+            let mut changed = record_terminal_effect(state, &scope, &command, effect);
+            // A check that rewrote tracked files did not check the files the
+            // runtime knows about, so its exit code is not recorded.
+            let inconclusive = changed && matches!(effect, verification::Effect::Check(_));
+            if !inconclusive && record_terminal_evidence(state, Path::new(&root), &command, &value)
+            {
+                changed = true;
+            }
+            if changed {
+                emit_task_memory(config, state);
+            }
             if terminal_execution_failed(&value) {
                 return Err(value.to_string());
-            }
-            if value.get("status").and_then(Value::as_str) == Some("completed")
-                && validation_command(&command)
-            {
-                state.record_validation();
             }
             Ok((value, None))
         }
         name => {
             let root = config
-                .root
-                .as_ref()
+                .work_root()
                 .ok_or_else(|| "no project scope".to_owned())?;
-            let result =
-                crate::tools::filesystem::execute(&PathBuf::from(root), name, &tool.arguments)?;
-            if matches!(name, "read_file" | "list_directory")
+            let grants = config.grants();
+            let target = tool
+                .arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let existed_before = target
+                .as_deref()
+                .is_some_and(|path| Path::new(root).join(path).exists());
+            let file_scope = crate::tools::filesystem::Scope {
+                root: Path::new(root),
+                grants: &grants,
+            };
+            if let Some(path) = target.as_deref() {
+                if let Some((_, revision)) = crate::tools::filesystem::file_revision(&file_scope, path) {
+                    state.work_budget.observe_file(path, &revision);
+                }
+            }
+            if name == "write_file" {
+                if let Some((file, revision)) = target
+                    .as_deref()
+                    .and_then(|path| crate::tools::filesystem::file_revision(&file_scope, path))
+                {
+                    if state.file_changed_since_seen(&file, &revision) {
+                        return Err("File changed since your last read. Read the latest version before writing.".to_owned());
+                    }
+                }
+            }
+            let result = if name == "replace_text" {
+                let (file, _) = target.as_deref()
+                    .and_then(|path| crate::tools::filesystem::file_revision(&file_scope, path))
+                    .ok_or_else(|| "replace_text requires an existing file inside the project scope".to_owned())?;
+                let expected = state.file_revisions.get(&file)
+                    .ok_or_else(|| "Read the file before using replace_text; model-supplied revisions are not accepted".to_owned())?;
+                crate::tools::filesystem::replace_text_in(&file_scope, &tool.arguments, expected)?
+            } else {
+                crate::tools::filesystem::execute_in(&file_scope, name, &tool.arguments)?
+            };
+            let touched = match name {
+                "read_file" | "write_file" | "create_file" | "replace_text" => target.iter().cloned().collect(),
+                "apply_patch" => result
+                    .0
+                    .get("files")
+                    .and_then(Value::as_array)
+                    .map(|files| {
+                        files
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                _ => Vec::<String>::new(),
+            };
+            for path in touched {
+                if let Some((file, revision)) =
+                    crate::tools::filesystem::file_revision(&file_scope, &path)
+                {
+                    state.note_file_revision(file, revision);
+                }
+            }
+            match (name, target.as_deref()) {
+                ("create_file" | "write_file", Some(path)) if !existed_before => {
+                    state.record_created_file(path);
+                }
+                ("delete_file", Some(path)) => state.record_deleted_file(path),
+                ("apply_patch", _) => {
+                    let patch = tool
+                        .arguments
+                        .get("patch")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    for path in patch_added_files(patch) {
+                        state.record_created_file(&path);
+                    }
+                }
+                _ => {}
+            }
+            if config.root.is_some()
+                && !targets_secondary_project(tool)
+                && matches!(name, "read_file" | "list_directory")
                 && !user_requests_read_only(&config.user)
             {
                 let _ = crate::tools::knowledge::observe_tool(
@@ -2446,6 +3791,23 @@ fn run_scoped_tool(
             }
             if mutation_tool(name) {
                 state.record_mutation();
+                let changed = match name {
+                    "apply_patch" => result
+                        .0
+                        .get("files")
+                        .and_then(Value::as_array)
+                        .map(|files| {
+                            files
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_owned)
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    _ => target.iter().cloned().collect::<Vec<_>>(),
+                };
+                record_project_change(state, &file_scope, name, &changed);
+                emit_task_memory(config, state);
             }
             Ok(result)
         }
@@ -2611,20 +3973,38 @@ fn run_scoped_read_tool(
 ) -> Result<(Value, Option<String>), String> {
     let scoped = scoped_tool_config(config, tool)?;
     let config = &scoped;
+    if let Some(absent) = absent_reference_knowledge(config, tool) {
+        return Ok((absent, None));
+    }
     let root = config
-        .root
-        .as_ref()
+        .work_root()
         .ok_or_else(|| "no project scope".to_owned())?;
     match tool.name.as_str() {
         "project_knowledge_index" => {
+            let root = config
+                .root
+                .as_ref()
+                .ok_or_else(|| "no project scope".to_owned())?;
             crate::tools::knowledge::index(&PathBuf::from(root)).map(|value| (value, None))
         }
         "project_knowledge_read" => {
+            let root = config
+                .root
+                .as_ref()
+                .ok_or_else(|| "no project scope".to_owned())?;
             crate::tools::knowledge::read(&PathBuf::from(root), &tool.arguments)
                 .map(|value| (value, None))
         }
         "read_file" | "list_directory" => {
-            crate::tools::filesystem::execute(&PathBuf::from(root), &tool.name, &tool.arguments)
+            let grants = config.grants();
+            crate::tools::filesystem::execute_in(
+                &crate::tools::filesystem::Scope {
+                    root: Path::new(root),
+                    grants: &grants,
+                },
+                &tool.name,
+                &tool.arguments,
+            )
         }
         _ => Err(format!("{} is not a safe read-only tool", tool.name)),
     }
@@ -2640,6 +4020,9 @@ fn record_safe_read_effect(
         return;
     };
     let config = &scoped;
+    if absent_reference_knowledge(config, tool).is_some() {
+        return;
+    }
     match tool.name.as_str() {
         "project_knowledge_index" | "project_knowledge_read" => {
             if tool.name == "project_knowledge_read" {
@@ -2665,7 +4048,25 @@ fn record_safe_read_effect(
             emit_knowledge_diagnostics(config, state);
         }
         "read_file" | "list_directory" => {
-            if !user_requests_read_only(&config.user) {
+            if tool.name == "read_file" {
+                if let (Some(root), Some(path)) = (
+                    config.work_root(),
+                    tool.arguments.get("path").and_then(Value::as_str),
+                ) {
+                    let grants = config.grants();
+                    let scope = crate::tools::filesystem::Scope {
+                        root: Path::new(root),
+                        grants: &grants,
+                    };
+                    if let Some((file, revision)) =
+                        crate::tools::filesystem::file_revision(&scope, path)
+                    {
+                        state.work_budget.observe_file(path, &revision);
+                        state.note_file_revision(file, revision);
+                    }
+                }
+            }
+            if !user_requests_read_only(&config.user) && !targets_secondary_project(tool) {
                 if let Some(root) = config.root.as_deref() {
                     let _ = crate::tools::knowledge::observe_tool(
                         &PathBuf::from(root),
@@ -2691,21 +4092,94 @@ fn concise_tool_error(message: &str) -> String {
     json!({"error":bounded}).to_string()
 }
 
-fn add_soft_closeout_if_needed(state: &mut AgentState, transcript: &mut Transcript) -> bool {
-    let needs_validation = state.workspace_mutated_since_validation && !state.verification_nudged;
-    if !needs_validation {
-        return false;
+/// Commands that produce evidence a run may spend after the first
+/// verification review before the gate stops asking.
+fn verification_budget(strategy: Strategy) -> usize {
+    if strategy.is_deep() {
+        12
+    } else {
+        6
     }
-    if needs_validation {
-        state.verification_nudged = true;
-        transcript.remind("You changed project files but no meaningful validation has been observed since the latest mutation. Run the most relevant available check, or state why validation is unavailable. Inspect the diff when practical.".into());
+}
+
+/// What a finished modification run has not shown yet, or `None`. The gate
+/// applies only to runs that changed the project and can execute commands, and
+/// it asks for the cheapest check that settles it, not for exhaustive testing.
+fn verification_gap(state: &AgentState) -> Option<String> {
+    if state.mutations == 0 || !state.can_verify || state.verification_closed {
+        return None;
     }
-    true
+    let ledger = &state.task_memory.verification;
+    let mut lines = Vec::new();
+    if let Some(failure) = ledger.blocking_failure(&state.task_memory.deliverables) {
+        lines.push(format!(
+            "{} failed after your last change: {} ({})",
+            failure.id, failure.subject, failure.detail
+        ));
+    }
+    let deliverables = &state.task_memory.deliverables;
+    let unreachable = ledger.unreachable(deliverables, state.browser_available);
+    let reachable = deliverables
+        .unverified()
+        .into_iter()
+        .filter(|item| !unreachable.iter().any(|other| other.id == item.id))
+        .collect::<Vec<_>>();
+    if !reachable.is_empty() {
+        let mut line = format!(
+            "implemented but not verified: {}",
+            deliverables::Deliverables::summarize(&reachable)
+        );
+        if reachable.iter().any(|item| {
+            ledger.effective_need(item.check) == Need::Browser
+                && ledger.best_passing(Need::Browser).is_none()
+        }) {
+            line.push_str(" (needs a run in a real browser, e.g. a headless browser or a Playwright or Puppeteer script; a jsdom or node script is not one)");
+        }
+        lines.push(line);
+    } else if deliverables.is_empty() {
+        let need = ledger.effective_need(None);
+        if need != Need::Readback
+            && ledger.reachable(need, state.browser_available)
+            && ledger.best_passing(need).is_none()
+        {
+            lines.push(match need {
+                Need::Browser => "you changed a page, and no run in a real browser (a headless browser, Playwright or Puppeteer script) has passed since your last change; a jsdom or node script is not one".to_owned(),
+                _ => "you changed code, and no test or script that runs it has passed since your last change".to_owned(),
+            });
+        }
+    }
+    if state.strategy.is_deep()
+        && (deliverables.is_empty()
+            || deliverables
+                .unverified()
+                .iter()
+                .any(|item| item.check == Some(Need::Test)))
+        && ledger.code_changed
+        && !ledger.has_fresh_pass_of(verification::Kind::Test)
+    {
+        if let Some(command) = &state.project_test_command {
+            lines.push(format!(
+                "the project has a test command ({command}) that has not passed since your last change"
+            ));
+        }
+    }
+    (!lines.is_empty()).then(|| lines.join("; "))
+}
+
+fn verification_review_text(gap: &str, failing: bool) -> String {
+    let fix = if failing {
+        " A check failed: fix the cause and run it again."
+    } else {
+        ""
+    };
+    format!("Before finishing: the runtime has not seen your work verified: {gap}.{fix} Run the most relevant check now: the project's tests, or a short script that runs the changed code (for a page, a real headless browser; jsdom is only a stand-in and does not prove page behaviour). Reading the file back does not show it works. Then call deliverables verify for what the check covers. If it cannot be checked here, finish and say plainly that it is implemented but not verified. Do not call it working without a passing check.")
 }
 
 enum FinalCandidateReview {
+    PendingDeliverables(String),
     Accept,
-    ValidationPending,
+    /// The work changed and was not shown to work; one bounded review.
+    VerificationPending(String),
     /// One bounded reminder naming concrete, mechanically known local files
     /// that sources actually request but that were never opened.
     UnopenedRequests(String),
@@ -2722,11 +4196,40 @@ fn review_tool_free_final(
     transcript: &mut Transcript,
     ledger: &Ledger,
 ) -> FinalCandidateReview {
-    if transcript.is_finalizing() {
+    if transcript.is_finalizing() || state.pause.is_some() {
         return FinalCandidateReview::Accept;
     }
-    if add_soft_closeout_if_needed(state, transcript) {
-        return FinalCandidateReview::ValidationPending;
+    // The model recorded what the user asked for and has not finished it. Deep
+    // may be sent back twice; Fast once. Afterwards the answer is accepted, so
+    // this can never deadlock a run. The answer must then say what is missing.
+    let allowed_reviews = if state.strategy.is_deep() { 2 } else { 1 };
+    if state.task_memory.deliverables.has_pending() && state.deliverable_reviews < allowed_reviews {
+        state.deliverable_reviews += 1;
+        return FinalCandidateReview::PendingDeliverables(deliverables::pending_review(
+            &state.task_memory.deliverables.pending_summary(),
+            &state.created_files,
+            state.strategy.is_deep(),
+        ));
+    }
+    if let Some(gap) = verification_gap(state) {
+        let failure = state
+            .task_memory
+            .verification
+            .blocking_failure(&state.task_memory.deliverables)
+            .map(|record| record.id.clone());
+        // A new failing check earns one review of its own; the same failure is
+        // never sent back twice, and otherwise reviews are fixed per mode.
+        let new_failure = failure.is_some() && failure != state.reviewed_failure;
+        if new_failure || state.verification_reviews < allowed_reviews {
+            state.verification_reviews += 1;
+            if new_failure {
+                state.reviewed_failure = failure.clone();
+            }
+            return FinalCandidateReview::VerificationPending(verification_review_text(
+                &gap,
+                failure.is_some(),
+            ));
+        }
     }
     let requests = ledger.unopened_requests();
     if !state.request_review_given && !requests.is_empty() {
@@ -2783,10 +4286,19 @@ pub fn run(config: Config) {
         }
         transcript
     };
-    if !transcript.has_current_run_user(&config.user) {
-        transcript.push_run_user(json!({"role":"user", "content":config.user}));
+    let previous_budget = transcript.entries().iter().rev().find_map(|entry| {
+        if let crate::agent::transcript::Entry::WorkBudget(budget) = entry { Some(budget.clone()) } else { None }
+    }).unwrap_or_default();
+    let new_request = !transcript.has_current_run_input(&config.user, &config.user_image_refs);
+    if new_request {
+        let mut user = json!({"role":"user", "content":config.user});
+        if !config.user_images.is_empty() { user["images"] = json!(config.user_images); }
+        if !config.user_image_refs.is_empty() { user["image_refs"] = json!(config.user_image_refs); }
+        transcript.push_run_user(user);
     }
+    transcript.set_ui_language(config.ui_language.as_deref());
     let mut state = AgentState::default();
+    state.work_budget = if previous_budget.closed && new_request { Default::default() } else { previous_budget };
     state.strategy = Strategy::from_mode(&config.reasoning_mode);
     state.task_memory = match restore_task_memory(config.task_memory.as_ref(), &transcript) {
         Ok(memory) => memory,
@@ -2801,6 +4313,8 @@ pub fn run(config: Config) {
             return;
         }
     };
+    state.task_memory.verification.start_run();
+    state.task_memory.deliverables.demote_verified();
     if !user_requests_read_only(&config.user) {
         if let Some(root) = config.root.as_deref() {
             let _ = crate::tools::knowledge::bootstrap(&PathBuf::from(root));
@@ -2813,16 +4327,35 @@ pub fn run(config: Config) {
     };
     let stable = stable_prefix(&config);
     transcript.set_secondary_project_root(config.secondary_root.as_deref().map(Path::new));
-    let mut schemas = tool_schemas_for_request(config.root.is_some(), config.policy, &config.user);
+    let mut schemas = tool_schemas_for_request(config.tool_scope(), config.policy, &config.user);
+    schemas.extend(config.artifact_tools.iter().cloned());
+    schemas.extend(config.attachment_tools.iter().cloned());
+    if config.host_tools.is_some() {
+        schemas.extend(config.web_tools.iter().filter(|schema| crate::tools::web::is_web_tool(tool_name(schema))).cloned());
+    }
     if config.secondary_root.is_some() {
         for schema in &mut schemas {
             if !matches!(
                 tool_name(schema),
-                "task_memory" | "observation_read" | "observation_index"
+                "task_memory" | "deliverables" | "plan" | "observation_read" | "observation_index"
             ) {
                 schema["function"]["parameters"]["properties"]["project"] = json!({"type":"integer","enum":[1,2],"description":"Selected project slot. 1 is the primary root; 2 is the secondary root. Defaults to 1."});
             }
         }
+    }
+    state.can_verify = schemas
+        .iter()
+        .any(|schema| tool_name(schema) == "run_terminal");
+    state.browser_available = state.can_verify
+        && config.browser_capability.unwrap_or_else(|| {
+            config
+                .work_root()
+                .is_some_and(|root| verification::browser_available(Path::new(root)))
+        });
+    if state.can_verify && state.strategy.is_deep() {
+        state.project_test_command = config
+            .work_root()
+            .and_then(|root| verification::detect_test_command(Path::new(root)));
     }
     let mut final_content = String::new();
     let mut visible_final_content = String::new();
@@ -2845,8 +4378,9 @@ pub fn run(config: Config) {
         .as_deref()
         .map_or_else(ProjectIndex::empty, ProjectIndex::scan);
     let mut indexed_mutations = state.mutations;
-    let empty_schemas: Vec<Value> = Vec::new();
     let mut consecutive_empty_turns = 0_usize;
+    let mut turn_budget_exhausted = state.work_budget.decision == "denied";
+    let mut synthesis_turns = 0;
 
     emit(
         &config.run_id,
@@ -2854,8 +4388,14 @@ pub fn run(config: Config) {
             run_id: config.run_id.clone(),
         },
     );
+    // Continue's epoch/status transition must reach persistence and the panel
+    // even if the model finishes without another tool call.
+    if !state.task_memory.verification.is_empty() || !state.task_memory.deliverables.is_empty() {
+        emit_task_memory(&config, &state);
+    }
     emit_knowledge_diagnostics(&config, &state);
-    for turn in 0..MAX_INVESTIGATION_TURNS + MAX_SYNTHESIS_TURNS {
+    checkpoint_work_budget(&config, &state, &mut transcript);
+    for turn in 0..super::work_budget::MAXIMUM + MAX_SYNTHESIS_TURNS {
         if let Some(error) = transcript.storage_error() {
             emit(
                 &config.run_id,
@@ -2875,25 +4415,56 @@ pub fn run(config: Config) {
             );
             return;
         }
+        state.pause_offered = false;
+        let mut steering_applied = false;
         if let Ok(mut steering) = config.steering.lock() {
             for content in steering.drain(..) {
                 transcript.push_steering(content.clone());
                 emit(&config.run_id, Event::SteeringApplied { content });
+                steering_applied = true;
+            }
+            if config.pause_requested.swap(false, Ordering::Relaxed) {
+                begin_pause(&config, &mut state, "user_control");
             }
         }
-        if turn >= MAX_INVESTIGATION_TURNS && !transcript.is_finalizing() {
-            transcript.mark_finalizing();
-            trace_forensics(
-                &config.run_id,
-                "lifecycle_transition",
-                json!({"state":"finalizing","reason":"turn_budget_exhausted","turn":turn+1}),
-            );
+        state.pause_offered = steering_applied && state.pause.is_none();
+        if let Some(pause) = state.pause.as_mut() {
+            if pause.checkpoint_turns_left == 0 {
+                if !transcript.is_finalizing() {
+                    transcript.mark_finalizing();
+                }
+            } else {
+                pause.checkpoint_turns_left -= 1;
+            }
         }
-        let request_schemas = if transcript.is_finalizing() {
-            &empty_schemas
-        } else {
-            &schemas
-        };
+        state.turn = state.work_budget.used;
+        if !state.verification_closed
+            && state.verification_reviews > 0
+            && state.checks_since_review >= verification_budget(state.strategy)
+        {
+            state.verification_closed = true;
+        }
+        if !transcript.is_finalizing() && state.pause.is_none() {
+            let old_limit = state.work_budget.limit;
+            if !state.work_budget.allow_next() {
+                turn_budget_exhausted = true;
+                transcript.mark_finalizing();
+                trace_forensics(&config.run_id, "lifecycle_transition", json!({
+                    "state":"finalizing", "reason":"turn_budget_exhausted", "turn":turn+1,
+                    "work_turns":state.work_budget.used, "budget_reason":state.work_budget.reason
+                }));
+            }
+            if state.work_budget.limit != old_limit || turn_budget_exhausted {
+                checkpoint_work_budget(&config, &state, &mut transcript);
+                trace_forensics(&config.run_id, "work_budget_decision", serde_json::to_value(state.work_budget.view()).unwrap());
+            }
+        }
+        if transcript.is_finalizing() || state.pause.is_some() {
+            synthesis_turns += 1;
+            if synthesis_turns > MAX_SYNTHESIS_TURNS { break; }
+        }
+        let offered_schemas = turn_schemas(&schemas, &state, transcript.is_finalizing());
+        let request_schemas = &offered_schemas;
         if state.mutations != indexed_mutations {
             if let Some(root) = project_root.as_deref() {
                 project_index = ProjectIndex::scan(root);
@@ -3060,6 +4631,10 @@ pub fn run(config: Config) {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        if !transcript.is_finalizing() && state.pause.is_none() {
+            state.work_budget.start_turn();
+            checkpoint_work_budget(&config, &state, &mut transcript);
+        }
         emit(&config.run_id, Event::TurnStarted { index: turn + 1 });
         state.memory_writes_this_turn = 0;
         emit(
@@ -3084,8 +4659,10 @@ pub fn run(config: Config) {
                     .collect(),
                 current_user_index: payload_messages.iter().rposition(|message| {
                     message.get("role").and_then(Value::as_str) == Some("user")
-                        && message.get("content").and_then(Value::as_str)
-                            == Some(config.user.as_str())
+                        && message
+                            .get("content")
+                            .and_then(Value::as_str)
+                            .is_some_and(|content| content.contains(config.user.as_str()))
                 }),
                 system_first: payload_messages
                     .first()
@@ -3214,6 +4791,16 @@ pub fn run(config: Config) {
                     continue;
                 }
             }
+            Err(error) if error.starts_with(REPETITION_LOOP_ERROR) => {
+                emit(
+                    &config.run_id,
+                    Event::AgentError {
+                        code: REPETITION_LOOP_ERROR.into(),
+                        message: format!("Модель зациклилась и начала дословно повторять один и тот же фрагмент, поэтому генерация остановлена автоматически. Уже выполненная работа сохранена — отправьте сообщение, чтобы продолжить. ({error})"),
+                    },
+                );
+                return;
+            }
             Err(error) => {
                 emit(
                     &config.run_id,
@@ -3284,6 +4871,14 @@ pub fn run(config: Config) {
         if !calls.is_empty() || !streamed.content.trim().is_empty() {
             consecutive_empty_turns = 0;
         }
+        if state.pause.is_some()
+            && calls.is_empty()
+            && streamed.content.trim().is_empty()
+            && !was_continuation
+            && consecutive_empty_turns >= 1
+        {
+            streamed.content = PAUSE_FALLBACK.into();
+        }
         if calls.is_empty() && streamed.content.trim().is_empty() && !was_continuation {
             // Nothing was said and nothing was called (for example a tool call
             // written inside the reasoning stream, which is never executed).
@@ -3334,7 +4929,7 @@ pub fn run(config: Config) {
                     continue;
                 }
             }
-            if unstructured_tool_call_content(&streamed.content) {
+            if unstructured_tool_call_content(&streamed.content) || streamed.content_markup_filter.hid_markup {
                 transcript.assistant_withheld_draft(
                     streamed.content,
                     "unstructured provider tool-call markup",
@@ -3414,8 +5009,25 @@ pub fn run(config: Config) {
                 continue;
             }
             match review_tool_free_final(&mut state, &mut transcript, &ledger) {
-                FinalCandidateReview::ValidationPending => {
-                    transcript.assistant_withheld_draft(streamed.content, "pending validation");
+                FinalCandidateReview::VerificationPending(nudge) => {
+                    trace_forensics(
+                        &config.run_id,
+                        "completion_review",
+                        json!({"decision":"verification_pending","turn":turn+1,"reviews":state.verification_reviews}),
+                    );
+                    transcript.assistant_withheld_draft(streamed.content, "unverified changes");
+                    transcript.remind(nudge);
+                    continue;
+                }
+                FinalCandidateReview::PendingDeliverables(nudge) => {
+                    trace_forensics(
+                        &config.run_id,
+                        "completion_review",
+                        json!({"decision":"pending_deliverables","turn":turn+1,"pending":state.task_memory.deliverables.pending_summary()}),
+                    );
+                    transcript
+                        .assistant_withheld_draft(streamed.content, "unfinished deliverables");
+                    transcript.remind(nudge);
                     continue;
                 }
                 FinalCandidateReview::UnopenedRequests(nudge) => {
@@ -3464,7 +5076,16 @@ pub fn run(config: Config) {
             if !was_continuation {
                 append_final_text(&mut final_content, &streamed.content);
             }
+            let note = terminal_status_note(&state, &transcript, turn_budget_exhausted);
+            emit_accepted_final_content(&config.run_id, &note);
+            visible_final_content.push_str(&note);
+            final_content.push_str(&note);
             transcript.assistant_message_with_reasoning(streamed.content, streamed.reasoning_raw);
+            let unresolved = state.task_memory.deliverables.items.iter().any(|item| matches!(item.status,
+                deliverables::DeliverableStatus::Pending | deliverables::DeliverableStatus::Implemented | deliverables::DeliverableStatus::Blocked));
+            let anonymous_gap = anonymous_verification_gap(&state);
+            state.work_budget.closed = state.pause.is_none() && !turn_budget_exhausted && !unresolved && !anonymous_gap;
+            checkpoint_work_budget(&config, &state, &mut transcript);
             transcript.mark_run_complete();
             trace_forensics(
                 &config.run_id,
@@ -3493,6 +5114,17 @@ pub fn run(config: Config) {
                 );
                 return;
             }
+            if let Some(pause) = state.pause {
+                emit(
+                    &config.run_id,
+                    Event::RunPaused {
+                        checkpoint_turns: PauseState::CHECKPOINT_TURNS
+                            - pause
+                                .checkpoint_turns_left
+                                .min(PauseState::CHECKPOINT_TURNS),
+                    },
+                );
+            }
             emit(
                 &config.run_id,
                 Event::Final {
@@ -3520,6 +5152,7 @@ pub fn run(config: Config) {
         let mut call_index = 0_usize;
         while call_index < calls.len() {
             if !transcript.is_finalizing()
+                && state.pause.is_none()
                 && can_parallelize_safe_read(
                     &calls[call_index],
                     &[],
@@ -3660,6 +5293,14 @@ pub fn run(config: Config) {
                 },
             );
             if config.cancelled.load(Ordering::Relaxed) {
+                emit(
+                    &config.run_id,
+                    Event::ToolError {
+                        id: tool.id.clone(),
+                        name: tool.name.clone(),
+                        message: "generation cancelled".into(),
+                    },
+                );
                 transcript.tool_result(
                     &tool.id,
                     &tool.name,
@@ -3671,11 +5312,29 @@ pub fn run(config: Config) {
                 .iter()
                 .any(|schema| tool_name(schema) == tool.name)
             {
-                let message = if transcript.is_finalizing() {
+                let message = if state.pause.is_some() && !transcript.is_finalizing() {
+                    PAUSED_TOOL_MESSAGE.to_owned()
+                } else if transcript.is_finalizing() {
                     format!("Tool '{}' is unavailable: the investigation budget for this run is exhausted. Write the final answer now from the findings already in context.", tool.name)
                 } else {
                     format!("tool '{}' is unavailable", tool.name)
                 };
+                emit(
+                    &config.run_id,
+                    Event::ToolError {
+                        id: tool.id.clone(),
+                        name: tool.name.clone(),
+                        message: message.clone(),
+                    },
+                );
+                transcript.tool_result(&tool.id, &tool.name, concise_tool_error(&message));
+                continue;
+            }
+            if state.pause.is_some()
+                && !CHECKPOINT_TOOLS.contains(&tool.name.as_str())
+                && tool.name != "pause_run"
+            {
+                let message = PAUSED_TOOL_MESSAGE.to_owned();
                 emit(
                     &config.run_id,
                     Event::ToolError {
@@ -3737,13 +5396,26 @@ pub fn run(config: Config) {
                             .to_owned(),
                     },
                 );
-                transcript.tool_result(
-                    &tool.id,
-                    &tool.name,
-                    concise_tool_error(if tool.name == "run_terminal" && tool.arguments.get("command").and_then(Value::as_str).is_some_and(|c| c.contains("git ")) {
-                        "approval required for shell composition. For read-only history, retry as one scoped command: git -C <selected-project> log --oneline -30. Do not treat this attempt as evidence of repository history."
-                    } else { "approval required" }),
+                let refusal = approval_refusal(tool);
+                // The started card must end with this call's own result: the
+                // model's retry is a new call with a new ID.
+                emit(
+                    &config.run_id,
+                    Event::ToolError {
+                        id: tool.id.clone(),
+                        name: tool.name.clone(),
+                        message: refusal.into(),
+                    },
                 );
+                transcript.tool_result(&tool.id, &tool.name, concise_tool_error(refusal));
+                continue;
+            }
+            let failure_fingerprint = tool_call_fingerprint(tool);
+            if !transcript.is_finalizing() && crate::tools::web::is_host_tool(&tool.name) && failed_call_retry_exhausted(&state, &failure_fingerprint) {
+                let message = "This identical tool call has failed twice without changed arguments. It was not run again. Use a corrected call only if you can change the failing input; otherwise explain the blocker and finish.";
+                emit(&config.run_id, Event::ToolError { id: tool.id.clone(), name: tool.name.clone(), message: message.into() });
+                transcript.tool_result(&tool.id, &tool.name, concise_tool_error(message));
+                transcript.remind("Those hosted tool arguments were rejected twice. Correct the failing input or explain the limitation; corrected calls and other tools remain available within the normal run budget.".into());
                 continue;
             }
             emit(
@@ -3784,11 +5456,23 @@ pub fn run(config: Config) {
                             .unwrap_or(8_000) as usize,
                     )
                     .map(|value| (value, None)),
+                "pause_run" if state.pause_offered && state.pause.is_none() => {
+                    begin_pause(&config, &mut state, "model_classified");
+                    Ok((
+                        json!({"status":"pausing","next":"Save the checkpoint with task_memory and deliverables, then write the short pause summary."}),
+                        None,
+                    ))
+                }
+                "pause_run" => Err(
+                    "pause_run is available only right after the user sent a new message".into(),
+                ),
                 "task_memory"
-                    if matches!(
-                        tool.arguments.get("action").and_then(Value::as_str),
-                        Some("update" | "record") | None
-                    ) =>
+                    if match tool.arguments.get("action").and_then(Value::as_str) {
+                        None => true,
+                        Some(action) => {
+                            matches!(canonical_memory_action(action), Some("update" | "record"))
+                        }
+                    } =>
                 {
                     if let Some(conflict) =
                         task_memory_conflict(&state, &transcript, &tool.arguments)
@@ -3802,6 +5486,7 @@ pub fn run(config: Config) {
             };
             match outcome {
                 Ok((value, diff)) => {
+                    state.failed_tool_calls.remove(&failure_fingerprint);
                     let content = value.to_string();
                     budget.spend(content.chars().count());
                     tool_result_tokens_since_compaction = tool_result_tokens_since_compaction
@@ -3843,14 +5528,9 @@ pub fn run(config: Config) {
                     record_read_evidence(&config, &transcript, tool);
                 }
                 Err(message) => {
-                    emit(
-                        &config.run_id,
-                        Event::ToolError {
-                            id: tool.id.clone(),
-                            name: tool.name.clone(),
-                            message: concise_tool_error(&message),
-                        },
-                    );
+                    let failed = state.failed_tool_calls.entry(failure_fingerprint).or_default();
+                    *failed = failed.saturating_add(1);
+                    if mutation_tool(&tool.name) { state.work_budget.failed_edit(); }
                     let stored_error = if tool.name == "run_terminal" {
                         serde_json::from_str::<Value>(&message)
                             .map(|execution| {
@@ -3861,6 +5541,16 @@ pub fn run(config: Config) {
                     } else {
                         concise_tool_error(&message)
                     };
+                    // A failed terminal keeps its structured execution so the
+                    // result closes the same card the process started.
+                    emit(
+                        &config.run_id,
+                        Event::ToolError {
+                            id: tool.id.clone(),
+                            name: tool.name.clone(),
+                            message: stored_error.clone(),
+                        },
+                    );
                     if matches!(tool.name.as_str(), "observation_read" | "observation_index") {
                         transcript.inline_tool_result(&tool.id, &tool.name, stored_error);
                     } else {
@@ -3870,6 +5560,7 @@ pub fn run(config: Config) {
                 }
             }
         }
+        checkpoint_work_budget(&config, &state, &mut transcript);
     }
     emit(
         &config.run_id,
@@ -3889,6 +5580,139 @@ fn is_context_overflow(error: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verbatim_paragraph_loop_aborts_the_stream_but_normal_text_does_not() {
+        let block = "**Итог**: я нашёл ключевую проблему — `makeBotMove()` может вернуться без вызова `finishTurn()`.\n\nНо это не объяснит, почему бот не ходит после хода игрока.\n\n";
+        let mut turn = StreamedTurn::default();
+        let mut buffer = String::new();
+        let mut result = Ok(());
+        let mut frames = 0;
+        // Stream the loop one delta at a time, as the provider does.
+        for _ in 0..40 {
+            for piece in block.split_inclusive(' ') {
+                buffer.push_str(&format!(
+                    "data: {}\n\n",
+                    json!({"choices":[{"index":0,"delta":{"content":piece}}]})
+                ));
+                frames += 1;
+                result = consume_sse(&mut buffer, &mut turn, "test-run", false, false);
+                if result.is_err() {
+                    break;
+                }
+            }
+            if result.is_err() {
+                break;
+            }
+        }
+        let error = result.expect_err("a verbatim loop must stop the stream");
+        assert!(error.starts_with(REPETITION_LOOP_ERROR), "{error}");
+        // Detected after a handful of repetitions, not at max_tokens.
+        assert!(
+            turn.content.chars().count() < REPETITION_MIN_RUN_CHARS + 3 * block.chars().count(),
+            "{frames} {} {}",
+            turn.content.chars().count(),
+            block.chars().count()
+        );
+
+        let varied: String = (0..400)
+            .map(|n| {
+                format!(
+                    "Шаг {n}: проверяю файл module_{n}.js и фиксирую результат {}.\n",
+                    n * 7
+                )
+            })
+            .collect();
+        assert_eq!(degenerate_repetition(&varied), None);
+        assert_eq!(degenerate_repetition(&"=".repeat(8_000)), None);
+        let table: String = (0..300).map(|n| format!("| {n} | ok | — |\n")).collect();
+        assert_eq!(degenerate_repetition(&table), None);
+    }
+    #[test]
+    fn pause_restricts_schemas_to_the_checkpoint_and_offers_pause_run_only_after_steering() {
+        let schemas = tool_schemas_for_request(ToolScope::Project, RunPolicy::Auto, "build it");
+        let names = |offered: &[Value]| {
+            offered
+                .iter()
+                .map(|s| tool_name(s).to_owned())
+                .collect::<Vec<_>>()
+        };
+        let mut state = AgentState::default();
+        assert!(!names(&turn_schemas(&schemas, &state, false)).contains(&"pause_run".to_owned()));
+        state.pause_offered = true;
+        assert!(names(&turn_schemas(&schemas, &state, false)).contains(&"pause_run".to_owned()));
+        state.pause_offered = false;
+        state.pause = Some(PauseState {
+            checkpoint_turns_left: 2,
+        });
+        assert_eq!(
+            names(&turn_schemas(&schemas, &state, false)),
+            ["deliverables", "plan", "task_memory"]
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect::<Vec<_>>()
+                .into_iter()
+                .filter(|n| names(&schemas).contains(n))
+                .collect::<Vec<_>>()
+        );
+        assert!(turn_schemas(&schemas, &state, true).is_empty());
+    }
+
+    #[test]
+    fn a_paused_tail_carries_state_but_none_of_the_guidance_that_resumes_work() {
+        let mut state = AgentState::default();
+        state.turn = 5;
+        state.mutations = 3;
+        state.created_files.push("a.txt".into());
+        let transcript = Transcript::default();
+        let request = "Do two things:\n1. add a bot mode\n2. add a theme switch";
+        let running = dynamic_tail(
+            &state,
+            None,
+            request,
+            &transcript,
+            "<investigation>x</investigation>",
+        );
+        assert!(running.contains("<deliverables_hint>") && running.contains("<investigation>"));
+        state.pause = Some(PauseState {
+            checkpoint_turns_left: 2,
+        });
+        let paused = dynamic_tail(
+            &state,
+            None,
+            request,
+            &transcript,
+            "<investigation>x</investigation>",
+        );
+        assert!(paused.contains("<run_paused>"));
+        for resumed in [
+            "deliverables_hint",
+            "run_budget",
+            "files_created_this_run",
+            "<investigation>",
+            "checkpoint_due",
+        ] {
+            assert!(!paused.contains(resumed), "{resumed}");
+        }
+        assert!(!paused.to_lowercase().contains("todo"));
+    }
+
+    #[test]
+    fn a_paused_final_is_accepted_without_any_completion_review() {
+        let mut state = AgentState::default();
+        state.mutations = 3;
+        state.can_verify = true;
+        state.strategy = Strategy::Deep;
+        state.pause = Some(PauseState {
+            checkpoint_turns_left: 1,
+        });
+        let mut transcript = Transcript::default();
+        assert!(matches!(
+            review_tool_free_final(&mut state, &mut transcript, &Ledger::default()),
+            FinalCandidateReview::Accept
+        ));
+        assert_eq!(state.verification_reviews, 0);
+    }
 
     #[test]
     fn parallel_reads_route_repeated_successes_and_missing_paths_through_the_guard() {
@@ -4064,6 +5888,39 @@ mod tests {
     }
 
     #[test]
+    fn an_explicit_main_reasoning_selection_is_independent_of_the_strategy() {
+        let mut config = test_config(32_768);
+        config.reasoning_mode = "deep".into();
+        config.reasoning_options = Some(json!({
+            "fast":{"reasoning_effort":"low"},
+            "deep":{"reasoning_effort":"xhigh"},
+            "main":{"reasoning_effort":"medium","chat_template_kwargs":{"enable_thinking":true}},
+            "final":{"chat_template_kwargs":{"enable_thinking":false}}
+        }));
+        let messages = vec![json!({"role":"user","content":"work"})];
+        let working = request_payload_for_phase(&config, &messages, &[], 1_024, false);
+        assert_eq!(
+            working["reasoning_effort"], "medium",
+            "Deep strategy must not override the chosen effort"
+        );
+        let finalizing = request_payload_for_phase(&config, &messages, &[], 1_024, true);
+        assert!(finalizing.get("reasoning_effort").is_none());
+        assert_eq!(
+            finalizing["chat_template_kwargs"]["enable_thinking"],
+            json!(false)
+        );
+
+        config.reasoning_options =
+            Some(json!({"main":{"chat_template_kwargs":{"enable_thinking":false}}}));
+        let off = request_payload_for_phase(&config, &messages, &[], 1_024, false);
+        assert_eq!(off["chat_template_kwargs"]["enable_thinking"], json!(false));
+        assert!(
+            off.get("reasoning_effort").is_none(),
+            "thinking off sends no effort"
+        );
+    }
+
+    #[test]
     fn reasoning_markup_filter_handles_split_tool_tags_and_keeps_surrounding_text() {
         let mut filter = ReasoningMarkupFilter::default();
         let mut visible = String::new();
@@ -4077,6 +5934,39 @@ mod tests {
         }
         visible.push_str(&filter.push("", true));
         assert_eq!(visible, "Analysis before  then continue.");
+    }
+
+    #[test]
+    fn content_filter_hides_only_real_tool_markup_and_preserves_literal_code_examples() {
+        let tools = vec!["create_visual_artifact".to_owned()];
+        let call = r#"<tool_call>{"name":"create_visual_artifact","arguments":{"artifact":{"type":"metric_group"}}}</tool_call>"#;
+        let mut filter = ContentMarkupFilter::default();
+        let mut visible = String::new();
+        for delta in ["Preparing report. <tool_", "call>{\"name\":\"create_visual_", "artifact\",\"arguments\":{\"artifact\":{\"type\":\"metric_group\"}}}</tool_call> Done."] {
+            visible.push_str(&filter.push(delta, false, "", &tools));
+        }
+        visible.push_str(&filter.push("", true, "", &tools));
+        assert_eq!(visible, "Preparing report.  Done.");
+        assert!(filter.hid_markup);
+        assert!(structured_tool_markup("{\"name\":\"create_visual_artifact\",\"arguments\":", &tools), "malformed known tool JSON should be hidden from the visible transcript");
+
+        let mut literal = ContentMarkupFilter::default();
+        let source = format!("Example syntax:\n```json\n{call}\n```\nThis is a literal example.");
+        let mut literal_visible = literal.push(&source, false, "", &tools);
+        literal_visible.push_str(&literal.push("", true, &source, &tools));
+        assert_eq!(literal_visible, source, "code example was mistaken for an executed tool call");
+        assert!(!literal.hid_markup);
+    }
+
+    #[test]
+    fn an_identical_tool_call_is_allowed_two_failed_attempts_then_closes_the_retry_loop() {
+        let mut state = AgentState::default();
+        assert!(!failed_call_retry_exhausted(&state, "web_image_search:{\"query\":\"flowers\"}"));
+        state.failed_tool_calls.insert("web_image_search:{\"query\":\"flowers\"}".into(), 1);
+        assert!(!failed_call_retry_exhausted(&state, "web_image_search:{\"query\":\"flowers\"}"), "one bounded recovery retry should remain");
+        state.failed_tool_calls.insert("web_image_search:{\"query\":\"flowers\"}".into(), 2);
+        assert!(failed_call_retry_exhausted(&state, "web_image_search:{\"query\":\"flowers\"}"), "repeated identical failures should stop re-execution");
+        assert!(!failed_call_retry_exhausted(&state, "web_image_search:{\"query\":\"sunflowers\"}"), "a corrected request must remain available");
     }
 
     #[test]
@@ -4211,9 +6101,12 @@ mod tests {
             endpoint: "http://localhost/v1/chat/completions".into(),
             model: "test".into(),
             system: "system".into(),
+            ui_language: None,
             user: "audit".into(),
+            user_images: Vec::new(), user_image_refs: Vec::new(), web_tools: Vec::new(), artifact_tools: Vec::new(), attachment_tools: Vec::new(), host_tools: None,
             root: None,
             secondary_root: None,
+            workspace_roots: Vec::new(),
             context_limit: window,
             reasoning_mode: "fast".into(),
             supports_reasoning: true,
@@ -4223,9 +6116,11 @@ mod tests {
             evidence_dir: None,
             task_memory: None,
             provider_max_output: None,
+            browser_capability: None,
             cancelled: Arc::new(AtomicBool::new(false)),
             steering: Arc::new(Mutex::new(Vec::new())),
             steering_closed: Arc::new(AtomicBool::new(false)),
+            pause_requested: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -4366,7 +6261,7 @@ mod tests {
 
     #[test]
     fn experimental_toolset_excludes_todo_and_keeps_production_capabilities() {
-        let schemas = tool_schemas(true);
+        let schemas = tool_schemas(ToolScope::Project);
         let names = schemas.iter().map(tool_name).collect::<Vec<_>>();
         assert!(!names.contains(&"todo"));
         for name in [
@@ -4404,7 +6299,7 @@ mod tests {
 
     #[test]
     fn task_memory_schema_exposes_parameters_at_object_root() {
-        let memory = tool_schemas(true)
+        let memory = tool_schemas(ToolScope::Project)
             .into_iter()
             .find(|tool| tool_name(tool) == "task_memory")
             .unwrap();
@@ -4425,11 +6320,16 @@ mod tests {
         ] {
             assert_eq!(parameters["properties"][field]["type"], "string", "{field}");
         }
+        assert_eq!(parameters["properties"]["observations"]["type"], "array");
+        assert_eq!(
+            parameters["properties"]["observations"]["items"]["type"],
+            "string"
+        );
     }
 
     #[test]
     fn provider_serialization_preserves_declared_tool_parameter_order() {
-        let schemas = tool_schemas(true);
+        let schemas = tool_schemas(ToolScope::Project);
         let payload = json!({"tools": schemas});
         let wire = serde_json::to_string(&payload).unwrap();
         let decoded: Value = serde_json::from_str(&wire).unwrap();
@@ -4456,7 +6356,8 @@ mod tests {
                 "implication",
                 "next",
                 "supersedes",
-                "status"
+                "status",
+                "observations"
             ]
         );
         let read = decoded["tools"]
@@ -4536,7 +6437,7 @@ mod tests {
     #[test]
     fn explicit_read_only_request_removes_project_mutations_from_toolset() {
         for prompt in ["Не изменяй файлы.", "Do not modify files."] {
-            let schemas = tool_schemas_for_request(true, RunPolicy::Auto, prompt);
+            let schemas = tool_schemas_for_request(ToolScope::Project, RunPolicy::Auto, prompt);
             let names = schemas.iter().map(tool_name).collect::<Vec<_>>();
             for name in [
                 "apply_patch",
@@ -4560,7 +6461,11 @@ mod tests {
             }
         }
 
-        let writable = tool_schemas_for_request(true, RunPolicy::Auto, "Update the project files.");
+        let writable = tool_schemas_for_request(
+            ToolScope::Project,
+            RunPolicy::Auto,
+            "Update the project files.",
+        );
         assert!(writable.iter().any(|tool| tool_name(tool) == "write_file"));
     }
 
@@ -4632,6 +6537,32 @@ mod tests {
         assert!(wire[0].get("_result_policy").is_none());
         assert!(wire[0].get("_rehydration").is_none());
         assert_eq!(wire[0]["content"], "result");
+    }
+
+    #[test]
+    fn ui_language_preference_survives_compaction_without_changing_history() {
+        let mut config = test_config(65_536);
+        config.user = "Проверь код".into();
+        config.ui_language = Some("en".into());
+        assert!(stable_prefix(&config).contains("English (default; explicit user language requests take priority)"));
+        let mut transcript = Transcript::default();
+        transcript.push_run_user(json!({"role":"user", "content":config.user}));
+        let before = transcript.entries().len();
+        transcript.set_ui_language(Some("en"));
+        assert_eq!(transcript.language_preference(), "English");
+        assert_eq!(transcript.clone().language_preference(), "English");
+        assert_eq!(transcript.entries().len(), before, "language settings are not conversation messages");
+        let covered = transcript.entries().len();
+        transcript.compact("Untranslated summary".into(), covered);
+        assert_eq!(transcript.language_preference(), "English");
+        transcript.set_ui_language(Some("ru"));
+        assert_eq!(transcript.language_preference(), "Russian");
+        assert!(transcript.pending_tail("").contains("Preferred language for visible prose: Russian."));
+        let checkpoint = continuation_checkpoint(&transcript, "Established work: retained.\nCurrent focus: continue.".into());
+        assert!(checkpoint.contains("Preferred visible prose language: Russian."));
+        assert!(!checkpoint.contains("Preferred visible prose language: English."));
+        config.ui_language = Some("ru".into());
+        assert!(stable_prefix(&config).contains("Russian (default; explicit user language requests take priority)"));
     }
 
     #[test]
@@ -4980,6 +6911,116 @@ mod tests {
         .is_err());
     }
 
+    fn transcript_with_reads(count: usize) -> (Transcript, std::path::PathBuf) {
+        let base = std::env::temp_dir().join(format!(
+            "memory-refs-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(base.join("project")).unwrap();
+        let root = base.join("project");
+        let mut transcript =
+            Transcript::durable(&base.join("store"), "refs-test", &[], root.to_str()).unwrap();
+        transcript.push_run_user(json!({"role":"user","content":"inspect"}));
+        for n in 0..count {
+            let file = format!("f{n}.ts");
+            std::fs::write(root.join(&file), format!("export const v = {n};")).unwrap();
+            transcript.assistant_tool_turn(
+                String::new(),
+                &[ValidatedCall {
+                    id: format!("read{n}"),
+                    name: "read_file".into(),
+                    arguments: json!({"path":file}),
+                }],
+            );
+            transcript.tool_result(
+                &format!("read{n}"),
+                "read_file",
+                json!({"path":file,"content":format!("export const v = {n};")}).to_string(),
+            );
+        }
+        (transcript, base)
+    }
+
+    #[test]
+    fn evidence_references_are_normalized_but_never_invented() {
+        let (transcript, base) = transcript_with_reads(3);
+        let normalize = |text: &str| normalize_evidence_refs(text, &transcript);
+        assert_eq!(normalize("obs-00000001"), "obs-00000001");
+        assert_eq!(normalize("obs-1"), "obs-00000001");
+        assert_eq!(normalize("OBS-2"), "obs-00000002");
+        assert_eq!(normalize("obs-00000001/0002"), "obs-00000001, obs-00000002");
+        assert_eq!(
+            normalize("obs-00000001, 0003 and f0.ts"),
+            "obs-00000001, obs-00000003 and f0.ts"
+        );
+        assert_eq!(
+            normalize("obs-00000001, obs-00000002"),
+            "obs-00000001, obs-00000002"
+        );
+        assert_eq!(
+            normalize("obs-99"),
+            "obs-99",
+            "a fabricated id stays as written so it is reported"
+        );
+        assert_eq!(normalize("obs-1/99"), "obs-00000001, obs-99");
+        assert_eq!(normalize("see src/obs-notes.md"), "see src/obs-notes.md");
+        let problem = evidence_problem(&normalize("obs-99"), &transcript).unwrap();
+        assert!(
+            problem.contains("obs-99") && problem.contains("obs-00000003"),
+            "{problem}"
+        );
+        assert!(evidence_problem(&normalize("obs-1/2"), &transcript).is_none());
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn task_memory_accepts_common_action_names_and_evidence_shapes() {
+        let (transcript, base) = transcript_with_reads(2);
+        let mut state = AgentState::default();
+        apply_task_memory(
+            &mut state,
+            &json!({"action":"create","finding":"a","status":"refuted"}),
+            &transcript,
+        )
+        .unwrap();
+        assert_eq!(
+            state.task_memory.entries[0].status,
+            Some(crate::agent::task_memory::Status::Contradicted)
+        );
+        state.memory_writes_this_turn = 0;
+        apply_task_memory(
+            &mut state,
+            &json!({"action":"edit","id":"tm-001","status":"confirmed","observations":["obs-1","obs-2"]}),
+            &transcript,
+        )
+        .unwrap();
+        assert_eq!(
+            state.task_memory.entries[0].evidence,
+            "obs-00000001, obs-00000002"
+        );
+        assert_eq!(state.task_memory.entries[0].finding, "a");
+        state.memory_writes_this_turn = 0;
+        for bad in [
+            json!({"action":"update","id":"tm-001","evidence":[1]}),
+            json!({"action":"update","id":"tm-001","evidence":{"a":1}}),
+        ] {
+            assert!(apply_task_memory(&mut state, &bad, &transcript).is_err());
+        }
+        apply_task_memory(
+            &mut state,
+            &json!({"action":"delete","id":"tm-001"}),
+            &transcript,
+        )
+        .unwrap();
+        assert!(state.task_memory.entries[0].invalidated);
+        assert!(
+            canonical_memory_action("get") == Some("view")
+                && canonical_memory_action("zzz").is_none()
+        );
+        std::fs::remove_dir_all(base).ok();
+    }
+
     #[test]
     fn confirmed_memory_checks_effective_status_before_mutation() {
         let base = std::env::temp_dir().join(format!(
@@ -5158,6 +7199,230 @@ mod tests {
         std::fs::remove_dir_all(base).unwrap();
     }
 
+    fn state_with_pending() -> AgentState {
+        let mut state = AgentState::default();
+        state
+            .task_memory
+            .deliverables
+            .add(None, "bot", "bot opponent is selectable in the UI")
+            .unwrap();
+        state
+            .task_memory
+            .deliverables
+            .add(None, "theme", "theme switch changes the theme")
+            .unwrap();
+        state
+            .task_memory
+            .deliverables
+            .implement("d-001", "")
+            .unwrap();
+        state
+    }
+
+    #[test]
+    fn terminal_disclosure_distinguishes_unverified_blocked_and_saved_plan_without_mutation() {
+        let mut state = state_with_pending();
+        state.task_memory.plan.set(&["inspect".into(), "verify".into()]).unwrap();
+        state.task_memory.deliverables.block("d-002", "browser unavailable").unwrap();
+        let before = serde_json::to_value(&state.task_memory).unwrap();
+        let mut transcript = Transcript::default();
+        transcript.push_run_user(json!({"role":"user","content":"Выполни задачу"}));
+        let note = terminal_status_note(&state, &transcript, true);
+        assert!(note.contains("Подтверждено результатов: 0/2"));
+        assert!(note.contains("Реализовано, но не проверено: d-001"));
+        assert!(note.contains("Заблокировано: d-002"));
+        assert!(note.contains("0/2 шагов выполнено"));
+        assert!(note.contains("Лимит рабочих ходов исчерпан"));
+        assert_eq!(serde_json::to_value(&state.task_memory).unwrap(), before);
+        assert!(!terminal_status_note(&state, &transcript, false).contains("Лимит рабочих ходов"));
+        assert!(terminal_status_note(&AgentState::default(), &transcript, false).is_empty());
+        for item in &mut state.task_memory.deliverables.items {
+            item.status = deliverables::DeliverableStatus::Verified;
+        }
+        for step in &mut state.task_memory.plan.steps { step.status = StepStatus::Completed; }
+        assert!(terminal_status_note(&state, &transcript, false).is_empty());
+        assert!(terminal_status_note(&state, &transcript, true).contains("Лимит рабочих ходов исчерпан"));
+        let mut without_items = AgentState::default();
+        without_items.mutations = 1;
+        without_items.can_verify = true;
+        without_items.verification_closed = true;
+        without_items.task_memory.verification.note_change(Some("app.js"));
+        assert!(terminal_status_note(&without_items, &transcript, false).contains("не подтверждено проверкой"),
+            "an exhausted review allowance must not silently certify an unregistered change");
+    }
+
+    #[test]
+    fn unfinished_deliverables_are_in_every_tail_and_survive_what_compaction_discards() {
+        let state = state_with_pending();
+        let tail = dynamic_tail(&state, None, "", &Transcript::default(), "");
+        assert!(tail.contains("[implemented] d-001 bot opponent is selectable in the UI"));
+        assert!(tail.contains("[pending] d-002 theme switch changes the theme"));
+        // The tail is rebuilt from durable state each turn, so a compaction summary can never be the only place
+        // the requirements live.
+        let mut compacted = Transcript::default();
+        compacted.push_run_user(json!({"role":"user","content":"x"}));
+        compacted.compact("[checkpoint without any deliverables]".into(), 1);
+        assert!(dynamic_tail(&state, None, "", &compacted, "").contains("[pending] d-002"));
+    }
+
+    #[test]
+    fn enumerated_items_are_counted_from_list_markers_not_from_words() {
+        assert_eq!(
+            enumerated_items("Do two things.\n1. Add the bot mode\n2. Add the theme switch"),
+            2
+        );
+        assert_eq!(enumerated_items("У тебя 2 задачи.\n1. Добавить режим бота\n2) Добавить переключатель темы\n3 не пункт"), 2);
+        assert_eq!(
+            enumerated_items(
+                "- first thing to build\n* second thing to build\n• third thing to build"
+            ),
+            3
+        );
+        assert_eq!(
+            enumerated_items("Add a mode and also a theme switch in one go, 2 things in total."),
+            0
+        );
+        assert_eq!(
+            enumerated_items("1. ok"),
+            0,
+            "a marker with no real content is not an item"
+        );
+        assert_eq!(
+            enumerated_items("version 1.2 is out\nsee 3.5 for details"),
+            0
+        );
+    }
+
+    #[test]
+    fn the_contract_hint_is_structural_bounded_and_goes_away_once_a_list_exists() {
+        let request =
+            "Two tasks:\n1. Add the bot mode to the game\n2. Add the theme switch to the game";
+        let mut state = AgentState::default();
+        assert!(contract_hint(&state, request)
+            .unwrap()
+            .contains("lists 2 separate items"));
+        assert!(
+            contract_hint(&state, "Fix the typo in the readme").is_none(),
+            "a single-step request gets no hint"
+        );
+        state.mutations = 1;
+        assert!(contract_hint(&state, "Fix the typo in the readme")
+            .unwrap()
+            .contains("Ignore this for a single-step request"));
+        state.turn = 30;
+        assert!(
+            contract_hint(&state, request).is_none(),
+            "the hint must stop nagging"
+        );
+        state.turn = 3;
+        state
+            .task_memory
+            .deliverables
+            .add(None, "", "the bot mode is selectable")
+            .unwrap();
+        assert!(
+            contract_hint(&state, request).is_none(),
+            "once a list exists the hint is redundant"
+        );
+        let mut fresh = AgentState::default();
+        assert!(
+            dynamic_tail(&fresh, None, request, &Transcript::default(), "")
+                .contains("<deliverables_hint>")
+        );
+        assert!(!dynamic_tail(
+            &fresh,
+            None,
+            "Audit the product. Do not modify files.\n1. Product\n2. Backend",
+            &Transcript::default(),
+            ""
+        )
+        .contains("<deliverables_hint>"));
+        fresh.turn = 1;
+    }
+
+    #[test]
+    fn the_budget_notice_appears_only_while_deliverables_are_pending_and_the_budget_is_half_used() {
+        assert!(run_budget_notice(10, 128, "d-002 x").is_none());
+        let middle = run_budget_notice(70, 128, "d-002 x").unwrap();
+        assert!(middle.contains("Turn 71 of 128") && middle.contains("d-002 x"));
+        assert!(!middle.contains("Only about"));
+        let late = run_budget_notice(120, 128, "d-002 x").unwrap();
+        assert!(late.contains("Only about 7 turns remain") && late.contains("blocked"));
+        let mut state = state_with_pending();
+        state.turn = 100;
+        let tail = dynamic_tail(&state, None, "", &Transcript::default(), "");
+        assert!(tail.contains("<run_budget>"));
+        state
+            .task_memory
+            .deliverables
+            .implement("d-002", "")
+            .unwrap();
+        assert!(
+            !dynamic_tail(&state, None, "", &Transcript::default(), "").contains("<run_budget>")
+        );
+    }
+
+    #[test]
+    fn a_forced_final_names_the_unfinished_deliverables_and_forbids_calling_them_done() {
+        let state = state_with_pending();
+        let mut transcript = Transcript::default();
+        transcript.mark_finalizing();
+        let tail = dynamic_tail(&state, None, "", &transcript, "");
+        assert!(
+            tail.contains("<unfinished_deliverables>d-002 theme switch changes the theme (theme)")
+        );
+        assert!(tail.contains("report each of them plainly as not completed"));
+        assert!(!tail.contains("<run_budget>"));
+    }
+
+    #[test]
+    fn tool_call_markup_is_not_a_usable_compaction_summary() {
+        assert!(!is_usable_summary(""));
+        assert!(!is_usable_summary("   \n"));
+        assert!(!is_usable_summary(
+            "<tool_call>\n<function=read_file>\n<parameter=path>\nx\n</parameter>\n</function>\n</tool_call>"
+        ));
+        assert!(!is_usable_summary(
+            "<function=read_file><parameter=path>x</parameter></function>"
+        ));
+        assert!(is_usable_summary(
+            "Established work:\n- read the rules\nCurrent focus: wiring"
+        ));
+        assert!(is_usable_summary("A summary that mentions <tool_call> markup only in passing is prose, but must start as prose."));
+    }
+
+    #[test]
+    fn guidance_describes_the_execution_contract_without_forcing_it_on_simple_requests() {
+        assert!(AGENT_GUIDANCE.contains("deliverables tool"));
+        assert!(AGENT_GUIDANCE.contains("Do not use it for a single-step or analysis-only request"));
+        assert!(AGENT_GUIDANCE.contains("never your own ideas"));
+        assert!(AGENT_GUIDANCE.contains("delete them before you finish"));
+        assert!(Strategy::Deep
+            .guidance()
+            .contains("what you observed, not what you intended"));
+        assert!(!Strategy::Fast.guidance().contains("deliverable"));
+    }
+
+    #[test]
+    fn the_deliverables_tool_schema_is_flat_and_survives_serialization_in_declaration_order() {
+        let tool = tool_schemas(ToolScope::Project)
+            .into_iter()
+            .find(|tool| tool_name(tool) == "deliverables")
+            .expect("deliverables tool");
+        let parameters = &tool["function"]["parameters"];
+        assert!(parameters.get("oneOf").is_none() && parameters.get("anyOf").is_none());
+        let serialized = serde_json::to_string(parameters).unwrap();
+        let order = ["action", "id", "task", "text", "evidence", "reason"]
+            .iter()
+            .map(|key| serialized.find(&format!("\"{key}\"")).unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            order.windows(2).all(|pair| pair[0] < pair[1]),
+            "{serialized}"
+        );
+        assert_eq!(parameters["required"], json!(["action"]));
+    }
+
     #[test]
     fn dynamic_tail_contains_memory_and_knowledge_without_plan_state() {
         let state = AgentState::default();
@@ -5256,5 +7521,22 @@ mod tests {
         assert!(!state.task_memory.entries[0].invalidated);
         assert!(!state.task_memory.entries[1].invalidated);
         std::fs::remove_dir_all(base).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod multimodal_regressions {
+    use super::*;
+    #[test]
+    fn image_projection_preserves_transcript_and_does_not_count_base64_as_text() {
+        let input = json!({"role":"user","content":"describe","images":[format!("data:image/jpeg;base64,{}", "A".repeat(100_000))]});
+        let before = input.clone();
+        let wire = wire_messages(&[input.clone()]);
+        assert_eq!(wire[0]["content"][1]["image_url"]["url"], input["images"][0]);
+        assert!(wire[0].get("images").is_none());
+        assert_eq!(input, before);
+        assert!(estimate_tokens(&input) < 5000);
+        assert!(estimate_tokens(&wire[0]) < 5000);
+        assert!(estimate_tokens(&wire[0]) >= 4096);
     }
 }

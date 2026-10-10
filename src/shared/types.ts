@@ -41,6 +41,7 @@ export interface AttachmentInput {
   /** Bytes are copied to application-managed storage in Electron main, never executed. */
   data: Uint8Array;
 }
+export interface RemoteImageData { mimeType: 'image/png' | 'image/jpeg' | 'image/webp'; dataUrl: string }
 
 export interface ActionApproval {
   approvalId: string;
@@ -83,6 +84,9 @@ export interface GenerationStats {
   inputTokens?: number;
 }
 
+export interface WorkBudget {
+  used: number; limit: number; maximum: number; extensions: number; decision: string; reason: string; basis?: string;
+}
 export interface AgentTelemetry {
   turn: number;
   contextUsed?: number;
@@ -107,6 +111,10 @@ export interface AgentTelemetry {
 }
 
 export interface ModelInfo {
+  /** Validated normal startup configuration, independent of measured/manual Max options. */
+  normalContext?: { initialContextWindow: number; kvCacheType: LlamaKvCacheType };
+  /** A configured, supported mechanism, not a claim that an offline runtime is active. */
+  speculative?: { mechanism: 'mtp' | 'eagle3'; draftSource: 'embedded' | 'external' };
   id: string;
   name: string;
   size?: number;
@@ -117,6 +125,8 @@ export interface ModelInfo {
   supportedContextPresets: number[];
   supportsTools: boolean;
   supportsReasoning: boolean;
+  /** What the user can control about the model's reasoning; absent when it has no configurable reasoning. */
+  reasoning?: import('./reasoning-controls').ReasoningCapability;
   shortName: string;
 }
 
@@ -134,7 +144,12 @@ export interface Conversation {
   contextWindow: number;
   llamaKvCacheType?: LlamaKvCacheType;
   llamaKvOffload?: boolean;
+  /** Agent strategy (Fast/Deep) and chat guidance. It does not decide whether the model thinks or how hard. */
   reasoningMode: ReasoningMode;
+  /** Explicit thinking toggle. null = never chosen: the model's default applies (legacy conversations). */
+  thinkingEnabled: boolean | null;
+  /** Explicit reasoning depth. null = never chosen: derived from the strategy for legacy conversations. */
+  reasoningEffort: import('./reasoning-controls').ReasoningEffort | null;
   contextTokens: number | null;
   contextModelId: string | null;
   webMode: WebMode;
@@ -172,6 +187,8 @@ export interface ChatMessage {
   taskPlan?: AgentPlan;
   /** Optional for conversations written before per-message generation statistics existed. */
   generationStats?: GenerationStats;
+  /** Validated, versioned data-only visual elements generated for this answer. */
+  richArtifacts?: import('./rich-artifacts').RichArtifact[];
   /** V2 Agent terminal state kept in the flat activity timeline. It is never
    * sent back to a model or persisted as a normal assistant completion. */
   agentError?: string;
@@ -191,11 +208,43 @@ export interface HardwareStats {
   available: boolean;
 }
 
+export type ExecutableValidation = { status: 'not-configured' | 'valid' | 'missing' | 'not-executable' | 'unsupported' | 'failed'; path?: string };
+export type RuntimeDraftAvailability = { folderExists: boolean; models: Array<{ id: string; installed: boolean; projectorMissing: boolean }> };
+export type ExecutableResolution = { status: ExecutableValidation['status'] | 'multiple' | 'not-found' | 'incomplete' | 'cancelled'; path?: string; candidates: string[]; kind?: 'file' | 'directory'; incomplete?: boolean; selectedMissing?: boolean; reasons?: string[] };
+
+export interface RuntimeConfiguration {
+  searchProvider?: import('./search-settings').SearchPreference;
+  allowBingFallback?: boolean;
+  language?: 'ru' | 'en';
+  /** Explicit global menu selection overrides legacy per-model placement. */
+  imageProcessingDevice?: 'cpu' | 'gpu';
+  schemaVersion: 2;
+  llamaServerPath: string | null;
+  /** User-entered file/folder; llamaServerPath always stores the resolved executable. */
+  llamaServerInput?: string;
+  modelsPath: string;
+  gpuLayers: number;
+  setupDismissed: boolean;
+  models: RuntimeModelConfiguration[];
+}
+export interface RuntimeModelConfiguration {
+  id: string;
+  displayName: string;
+  modelPath: string;
+  mmprojPath: string;
+  projectorDevice?: 'auto' | 'gpu' | 'cpu';
+  gpuLayers: number | null;
+  supportsTools: boolean;
+  speculative: 'mtp' | 'none';
+  /** Null inherits the global GPU layer count; a number overrides it for this model. */
+  builtin: boolean;
+}
 export interface AppSettings {
+  setup?: { config: RuntimeConfiguration; server: string | null; ready: boolean; autoOpen: boolean; models: Array<{ id: string; name: string; modelPath: string; mmprojPath?: string; installed: boolean; status: 'ready' | 'missing-model' | 'missing-server' | 'invalid-projector'; issue?: string; builtin: boolean }>; issues: string[]; configPath: string; dataDirectory: string };
   llamaServerPath: string | null;
   llamaRuntimeModelId?: string;
   /** Live state of the launcher-managed llama-server; the authority on what is running. */
-  llamaRuntime?: { status: 'starting' | 'ready' | 'switching' | 'offline' | 'stopped'; modelId: string | null; contextWindow: number | null; kvCacheType?: LlamaKvCacheType; kvOffload?: boolean; error?: string; rolledBack?: boolean };
+  llamaRuntime?: { status: 'idle' | 'starting' | 'ready' | 'switching' | 'offline' | 'stopped'; modelId: string | null; contextWindow: number | null; kvCacheType?: LlamaKvCacheType; kvOffload?: boolean; speculativeMode?: 'mtp' | 'eagle3' | 'none'; projectorDevice?: 'cpu' | 'gpu'; pendingProjectorDevice?: 'cpu' | 'gpu'; deviceError?: string; error?: string; rolledBack?: boolean };
   modelsPath: string;
 }
 
@@ -254,10 +303,14 @@ export interface TerminalExecution {
   stderr?: string;
 }
 
+/** `pause` is chosen by an explicit UI control; a free-text clarification never pauses the run by itself. */
+export type SteeringIntent = 'pause';
+
 export type ThinkingTimelineEvent =
   | { id: string; kind: 'reasoning'; content: string; position: number; startedAt?: string; completedAt?: string }
   | { id: string; kind: 'activity'; activityId: string; position: number }
-  | { id: string; kind: 'steering'; messageId: string; position: number; status: 'accepted' | 'applied' };
+  | { id: string; kind: 'steering'; messageId: string; position: number; status: 'accepted' | 'applied' }
+  | { id: string; kind: 'paused'; position: number };
 
 export type AgentPlanStepStatus = 'pending' | 'in_progress' | 'completed' | 'abandoned';
 /** Kept optional for reading messages saved by the pre-milestone renderer. */
@@ -276,15 +329,22 @@ export interface AgentMilestone {
 export interface ModelTodoItem { id: string; content: string; status: AgentPlanStepStatus; memoryId?: string | null; }
 export interface ModelTodoPhase { name: string; items: ModelTodoItem[]; }
 export interface ModelTodo { phases: ModelTodoPhase[]; revision?: number; }
+/** `done` is the legacy spelling of `implemented`; only `verified` means a runtime-recorded check passed. */
+export type DeliverableStatus = 'pending' | 'implemented' | 'verified' | 'done' | 'blocked' | 'dropped';
+export interface DeliverableItem { id: string; text: string; status: DeliverableStatus; task?: string; evidence?: string; reason?: string; check?: 'readback' | 'static' | 'build' | 'test' | 'runtime' | 'browser'; proof?: string[]; failing?: string; verification_scope?: 'project' | 'acceptance'; }
+export interface PlanStepItem { id: string; text: string; status: 'pending' | 'in_progress' | 'completed' | 'blocked'; note?: string; }
+export interface VerificationRecord { id: string; kind: string; class: 'readback' | 'static' | 'functional'; subject: string; pass: boolean; epoch: number; turn: number; detail?: string; check_key?: string; deliverable_ids?: string[]; baseline?: boolean; outcome_hash?: string; baseline_failure?: string; }
 export interface TaskMemoryEntry { id: string; finding: string; evidence?: string; implication?: string; next?: string; todoId?: string | null; invalidated?: boolean; }
 /** Persistent agent planning state: stable milestones plus only the active
  * milestone's adaptive Work Plan in the primary UI. */
 export interface AgentPlan {
+  /** Runtime-owned projection; authority remains in the canonical journal. */
+  workBudget?: WorkBudget;
   milestones?: AgentMilestone[];
   activeMilestoneId?: string | null;
   revision?: number;
   modelTodo?: ModelTodo;
-  taskMemory?: { entries: TaskMemoryEntry[]; revision?: number };
+  taskMemory?: { entries: TaskMemoryEntry[]; revision?: number; deliverables?: { items: DeliverableItem[]; revision?: number }; plan?: { steps: PlanStepItem[]; revision?: number }; verification?: { epoch?: number; records: VerificationRecord[]; changed?: Record<string, number>; code_changed?: boolean; bindings?: Record<string, string[]> } };
   /** Legacy persisted snapshots are normalized at the Electron boundary. */
   steps?: AgentPlanStep[];
 }
@@ -294,11 +354,21 @@ export interface AnalysisRun {
   conversationId: string;
   assistantMessageId: string | null;
   reasoningMode: ReasoningMode;
-  status: 'running' | 'completed' | 'error' | 'cancelled';
+  status: 'running' | 'completed' | 'error' | 'cancelled' | 'interrupted';
   actionCount: number;
   actions: ToolActivity[];
   createdAt: string;
   completedAt: string | null;
+  /** Durable timeline checkpoint (reasoning blocks, steering, pauses, activity
+   * positions). Saved at stable event boundaries so a Stop, failure or restart
+   * reconstructs the same history the live view showed. */
+  timeline?: ThinkingTimelineEvent[];
+  /** Visible output received before a run ended without a final answer. */
+  partialOutput?: string;
+  /** Accepted artifacts checkpointed before completion, scoped to this run. */
+  richArtifacts?: import('./rich-artifacts').RichArtifact[];
+  /** Failure text for a run that ended in `error`. */
+  error?: string;
 }
 
 export interface AnalysisProgress {
@@ -307,10 +377,14 @@ export interface AnalysisProgress {
 }
 
 export type StreamEvent =
+  | { type: 'model-state'; state: 'waiting' | 'streaming' }
+  | { type: 'work-budget'; budget: WorkBudget }
   | { type: 'token'; content: string }
   | { type: 'thinking'; content: string; timelinePosition?: number }
+  | { type: 'rich-artifact'; artifact: import('./rich-artifacts').RichArtifact }
   | { type: 'task-memory'; memory: NonNullable<AgentPlan['taskMemory']> }
   | { type: 'steering'; userMessage: ChatMessage; status: 'accepted' | 'applied'; timelinePosition?: number }
+  | { type: 'paused'; timelinePosition?: number }
   | { type: 'tool'; activity: ToolActivity; runId?: string }
   | { type: 'attachment'; activity: ToolActivity }
   | { type: 'approval-request'; actionId: string; approval: ActionApproval }
@@ -340,19 +414,23 @@ export interface LocalAiApi {
     list(messageId: string): Promise<Attachment[]>;
     dataUrl(id: string): Promise<string | null>;
   };
+  webImages: { load(url: string): Promise<RemoteImageData>; openSource(url: string): Promise<void> };
   analysis: { list(conversationId: string): Promise<AnalysisRun[]> };
   models: { list(): Promise<ModelInfo[]> };
-  settings: { get(): Promise<AppSettings> };
+  runtime: { state(): Promise<NonNullable<AppSettings['llamaRuntime']>> };
+  settings: { setLanguage(language: 'en' | 'ru'): Promise<void>; validateDraft(config: Pick<RuntimeConfiguration, 'modelsPath' | 'models'>): Promise<RuntimeDraftAvailability>; resolveExecutable(path: string, selected?: string): Promise<ExecutableResolution>; cancelResolution(): Promise<void>; onLanguageChanged(listener: (language: 'ru' | 'en') => void): () => void; get(): Promise<AppSettings>; save(config: RuntimeConfiguration): Promise<AppSettings>; dismissSetup(): Promise<AppSettings> };
   hardware: { get(): Promise<HardwareStats> };
   contextEstimate(modelId: string): Promise<RuntimeContextEstimate>;
   contextDiscover(modelId: string): Promise<ContextDiscoveryResult>;
-  contextDiscoveryStatus(): Promise<import('./context-estimator').ContextDiscoveryProgress>;
-  dialog: { chooseDirectory(initialDirectory?: string | null): Promise<string | null> };
+  contextDiscoveryStatus(modelId?: string | null): Promise<import('./context-estimator').ContextDiscoveryProgress>;
+  dialog: { chooseDirectory(initialDirectory?: string | null): Promise<string | null>; chooseFile(): Promise<string | null> };
   chat: {
     send(request: ChatRequest): Promise<void>;
-    steer(conversationId: string, generationId: string, content: string): Promise<ChatMessage>;
+    steer(conversationId: string, generationId: string, content: string, intent?: SteeringIntent): Promise<ChatMessage>;
     stop(conversationId: string, generationId?: string): Promise<void>;
     approve(request: { conversationId: string; generationId: string; approvalId: string; decision: ApprovalDecision }): Promise<boolean>;
+    onDiagramValidation(listener: (request: { id: string; source: string }) => void): () => void;
+    diagramValidationResult(id: string, error?: string): void;
     onStream(listener: (event: StreamEvent & { conversationId: string; generationId: string; modelId?: string }) => void): () => void;
   };
 }

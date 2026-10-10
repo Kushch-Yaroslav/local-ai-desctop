@@ -11,6 +11,7 @@ pub struct Transcript {
     evidence_base: Option<PathBuf>,
     project_root: Option<PathBuf>,
     storage_error: Option<String>,
+    ui_language: Option<String>,
 }
 
 impl Default for Transcript {
@@ -21,6 +22,7 @@ impl Default for Transcript {
             evidence_base: None,
             project_root: None,
             storage_error: None,
+            ui_language: None,
         }
     }
 }
@@ -34,12 +36,14 @@ impl Clone for Transcript {
             evidence_base: None,
             project_root: self.project_root.clone(),
             storage_error: None,
+            ui_language: self.ui_language.clone(),
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Entry {
+    WorkBudget(super::work_budget::WorkBudget),
     Message(Value),
     RunUser(Value),
     Compaction {
@@ -121,6 +125,9 @@ impl CompactionPlan {
 }
 
 impl Transcript {
+    pub fn checkpoint_work_budget(&mut self, budget: super::work_budget::WorkBudget) {
+        self.record(Entry::WorkBudget(budget));
+    }
     pub fn set_project_root(&mut self, root: Option<&Path>) {
         self.project_root = root.and_then(|path| path.canonicalize().ok());
     }
@@ -143,6 +150,7 @@ impl Transcript {
             evidence_base: Some(base.to_path_buf()),
             project_root: root.and_then(|path| Path::new(path).canonicalize().ok()),
             storage_error: None,
+            ui_language: None,
         };
         if transcript.entries.is_empty() {
             for message in history {
@@ -191,6 +199,9 @@ impl Transcript {
         self.storage_error.as_deref()
     }
     pub fn has_current_run_user(&self, content: &str) -> bool {
+        self.has_current_run_input(content, &[])
+    }
+    pub fn has_current_run_input(&self, content: &str, image_refs: &[String]) -> bool {
         let completed = self
             .entries
             .iter()
@@ -201,7 +212,8 @@ impl Transcript {
             .rev()
             .find_map(|(i, entry)| match entry {
                 Entry::RunUser(message) if completed.is_none_or(|done| i > done) => {
-                    Some(message.get("content").and_then(Value::as_str) == Some(content))
+                    let refs: Vec<String> = message.get("image_refs").and_then(Value::as_array).map(|refs| refs.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default();
+                    Some(message.get("content").and_then(Value::as_str) == Some(content) && refs == image_refs)
                 }
                 _ => None,
             })
@@ -297,7 +309,11 @@ impl Transcript {
                     _ => None,
                 })
                 .collect::<Vec<_>>();
-            store.finish(base, history, user, &steering, final_text)
+            let image_refs: Vec<String> = self.entries.iter().rev().find_map(|entry| match entry {
+                Entry::RunUser(value) => Some(value.get("image_refs").and_then(Value::as_array).map(|refs| refs.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default()),
+                _ => None,
+            }).unwrap_or_default();
+            store.finish(base, history, user, &image_refs, &steering, final_text)
         } else {
             Ok(())
         }
@@ -315,7 +331,16 @@ impl Transcript {
         self.record(Entry::LanguagePreference(language));
     }
 
+    pub fn set_ui_language(&mut self, language: Option<&str>) {
+        self.ui_language = match language {
+            Some("ru") => Some("Russian".into()),
+            Some("en") => Some("English".into()),
+            _ => None,
+        };
+    }
+
     pub fn language_preference(&self) -> String {
+        if let Some(language) = &self.ui_language { return language.clone(); }
         let last_user = self
             .entries
             .iter()
@@ -462,19 +487,21 @@ impl Transcript {
         .join("\n\n")
     }
 
-    /// Only the latest accepted dynamic tail is current. Older snapshots stay
-    /// canonical but do not accumulate as stale user-shaped prompt messages.
+    /// Tool substeps do not invalidate accepted state. Compaction/finalization
+    /// boundaries do: the first request after them needs a fresh full snapshot.
     pub fn has_active_prompt_tail(&self, content: &str) -> bool {
         let boundary = self
             .compaction_boundary()
             .unwrap_or(0)
-            .max(self.finalization_index().unwrap_or(0));
+            .max(self.finalization_index().unwrap_or(0))
+            .max(self.entries.iter().rposition(|entry| matches!(entry, Entry::RunUser(_))).unwrap_or(0));
         self.entries
             .iter()
             .skip(boundary)
             .rev()
             .find_map(|entry| match entry {
                 Entry::PromptTail(existing) => Some(existing == content),
+                // Assistant/tool substeps do not change accepted runtime state.
                 _ => None,
             })
             .unwrap_or(false)
@@ -520,17 +547,16 @@ impl Transcript {
     /// This is deliberately separate from the append-only record: a later
     /// compaction must summarize the latest summary and its tail, never count
     /// covered raw history again.
+    // Adapted from Jan (Menlo Research), transcript.rs::conversation and
+    // ::compaction_plan at revision 9925f8b6d9fab968284b4dd11566b9435229b690.
+    // Copyright 2025 Menlo Research; Apache-2.0 applies to these adapted portions.
+    // Modified for Local AI Desktop: run-user/steering entries, accepted-message
+    // projection and runtime-state deltas. See THIRD_PARTY_NOTICES.md and licenses/.
     fn conversation(&self) -> (Vec<Value>, Vec<usize>) {
         let boundary = self.compaction_boundary().unwrap_or(0);
-        let active_tail = self
-            .entries
-            .iter()
-            .enumerate()
-            .skip(boundary.max(self.finalization_index().unwrap_or(0)))
-            .rfind(|(_, entry)| matches!(entry, Entry::PromptTail(_)))
-            .map(|(index, _)| index);
         let mut messages = Vec::new();
         let mut sources = Vec::new();
+        let mut previous_state: Option<&str> = None;
         if let Some((summary, _)) = self.latest_summary() {
             messages.push(
                 json!({"role":"assistant", "content":format!("[earlier summary]\n{summary}")}),
@@ -546,6 +572,7 @@ impl Transcript {
                     sources.push(index);
                 }
                 Entry::RunUser(message) => {
+                    previous_state = None;
                     messages.push(message.clone());
                     sources.push(index);
                 }
@@ -555,14 +582,18 @@ impl Transcript {
                     );
                     sources.push(index);
                 }
-                Entry::PromptTail(content) if active_tail == Some(index) => {
-                    messages.push(prompt_tail_message(content));
-                    sources.push(index);
+                Entry::PromptTail(content) if index >= self.finalization_index().unwrap_or(0) => {
+                    if let Some(message) = crate::context::runtime_state::message(previous_state, content) {
+                        messages.push(message);
+                        sources.push(index);
+                    }
+                    previous_state = Some(content);
                 }
                 Entry::Compaction { .. }
                 | Entry::Reminder(_)
                 | Entry::ClearReminders
                 | Entry::Finalizing
+                | Entry::WorkBudget(_)
                 | Entry::CloseoutRequested
                 | Entry::RunComplete
                 | Entry::LanguagePreference(_)
@@ -581,6 +612,9 @@ impl Transcript {
     /// tool-result batch so the dropped span is as large as possible; when a
     /// batch reaches the end, move back to its owning assistant call instead.
     /// Either choice keeps every projected assistant/tool relationship valid.
+    // Adapted from Jan compaction.rs::tail_start and transcript.rs::compaction_plan
+    // at the revision above (Copyright 2025 Menlo Research, Apache-2.0).
+    // Modified for Local AI Desktop's plan type and current-run user exclusion.
     pub fn compaction_plan(&self, keep_recent: usize) -> Option<CompactionPlan> {
         let (messages, sources) = self.conversation();
         if messages.len() <= keep_recent {
@@ -641,7 +675,8 @@ pub fn preferred_visible_language(user: &str) -> String {
 }
 
 pub fn prompt_tail_message(content: &str) -> Value {
-    json!({"role":"user", "content":format!("[RUNTIME GUIDANCE — NOT USER CONTENT]\n{content}")})
+    crate::context::runtime_state::message(None, content)
+        .unwrap_or_else(|| json!({"role":"runtime", "content":""}))
 }
 
 fn attach_reasoning(message: &mut Value, reasoning: String) {
@@ -941,6 +976,36 @@ mod tests {
         std::fs::remove_dir_all(base).unwrap();
     }
 
+    #[test]
+    fn accepted_state_deltas_resume_identically_and_compaction_refreshes_full_state() {
+        let base = std::env::temp_dir().join(format!(
+            "state-restart-{}-{:?}", std::process::id(), std::thread::current().id()
+        ));
+        let mut transcript = Transcript::durable(&base, "first", &[], None).unwrap();
+        transcript.push_run_user(json!({"role":"user","content":"implement"}));
+        let old = "<plan>\ns1 active\n</plan>\n<deliverables>\nd1 pending\n</deliverables>";
+        let current = old.replace("s1 active", "s1 done");
+        transcript.record_prompt_tail(old);
+        transcript.assistant_message("working".into());
+        transcript.record_prompt_tail(&current);
+        let before = crate::context::projection::project(&transcript, "stable", "");
+        drop(transcript);
+        let mut resumed = Transcript::durable(&base, "second", &[], None).unwrap();
+        assert_eq!(crate::context::projection::project(&resumed, "stable", ""), before);
+        assert!(resumed.has_active_prompt_tail(&current));
+        let count = resumed.entries().len();
+        resumed.record_prompt_tail(&current);
+        assert_eq!(resumed.entries().len(), count);
+        resumed.compact("implementation checkpoint".into(), count);
+        assert!(!resumed.has_active_prompt_tail(&current));
+        let refreshed = crate::context::projection::project(&resumed, "stable", &current);
+        let state = refreshed.last().unwrap()["content"].as_str().unwrap();
+        assert!(state.contains("s1 done") && state.contains("d1 pending"));
+        assert!(state.contains("Current runtime state"));
+        drop(resumed);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
     /// Journals written while the runtime graded claims and gated finalization
     /// must keep loading: an unparseable line would otherwise be treated as a
     /// torn tail and the rest of the run truncated from disk.
@@ -1072,6 +1137,19 @@ mod tests {
         assert!(second.covers > first_boundary);
         assert!(second.render(10_000).contains("verified first handoff"));
         assert!(!second.render(10_000).contains("old finding 0"));
+    }
+
+    #[test]
+    fn an_identical_tail_does_not_repeat_after_an_assistant_substep() {
+        let mut t = Transcript::default();
+        t.push_run_user(json!({"role":"user","content":"task"}));
+        t.record_prompt_tail("same tail");
+        assert!(t.has_active_prompt_tail("same tail"));
+        t.assistant_withheld_draft("draft".into(), "unverified changes");
+        assert!(
+            t.has_active_prompt_tail("same tail"),
+            "an assistant substep does not change runtime-owned state"
+        );
     }
 
     #[test]

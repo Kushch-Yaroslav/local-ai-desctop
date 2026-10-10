@@ -604,6 +604,34 @@ mod tests {
     }
 
     #[test]
+    fn discarded_interrupted_lineage_leaves_no_state_for_the_regenerated_attempt() {
+        let (base, root, mut t) = fixture();
+        let user = json!({"role":"user","content":"audit"});
+        t.push_run_user(user.clone());
+        read_step(&mut t, "source", "stale attempt output");
+        drop(t);
+        // The same request after an interrupted attempt resumes its journal;
+        // Regenerate must therefore remove the lineage, not just the message.
+        let resumed =
+            Transcript::durable(&base.join("evidence"), "retry", &[], root.to_str()).unwrap();
+        assert_eq!(resumed.observations().len(), 1);
+        drop(resumed);
+        fs::remove_dir_all(base.join("evidence")).unwrap();
+        let mut fresh =
+            Transcript::durable(&base.join("evidence"), "retry", &[], root.to_str()).unwrap();
+        assert!(fresh.observations().is_empty());
+        assert!(!fresh.has_current_run_user("audit"));
+        fresh.push_run_user(user);
+        read_step(&mut fresh, "source", "fresh attempt output");
+        assert_eq!(fresh.observations().len(), 1);
+        assert_eq!(
+            fresh.read_observation("obs-00000001", 0, 100).unwrap()["content"],
+            "fresh attempt output"
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn russian_visible_language_survives_compaction_restart_and_finalization() {
         let (base, root, mut t) = fixture();
         t.push_run_user(

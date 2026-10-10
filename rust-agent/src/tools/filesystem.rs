@@ -66,24 +66,52 @@ fn returned_line_range(
     Some((start_line, end_line, starts_mid_line))
 }
 
-fn scoped(root: &Path, path: &str) -> Result<PathBuf, String> {
-    let candidate = root.join(path);
-    let normalized = match fs::canonicalize(&candidate) {
-        Ok(path) => path,
-        Err(_) => {
-            let parent = candidate
-                .parent()
-                .ok_or_else(|| "invalid path".to_owned())?;
-            fs::canonicalize(parent)
-                .map_err(|error| error.to_string())?
-                .join(
-                    candidate
-                        .file_name()
-                        .ok_or_else(|| "invalid path".to_owned())?,
-                )
+/// Where file tools may act: the primary root plus directories the user named
+/// explicitly. Relative paths resolve against the primary root.
+#[derive(Clone, Copy)]
+pub struct Scope<'a> {
+    pub root: &'a Path,
+    pub grants: &'a [PathBuf],
+}
+
+/// Canonicalize the deepest existing ancestor and re-append the components that
+/// do not exist yet, so a file can be created below directories that are about
+/// to be created. A missing tail can never contain `..` or a symlink.
+fn resolve_with_missing_tail(candidate: &Path) -> Result<PathBuf, String> {
+    let mut missing = Vec::new();
+    let mut current = candidate.to_path_buf();
+    loop {
+        match fs::canonicalize(&current) {
+            Ok(mut base) => {
+                base.extend(missing.iter().rev());
+                return Ok(base);
+            }
+            Err(error) => {
+                let Some(name) = current.file_name().map(|name| name.to_owned()) else {
+                    return Err(format!("invalid path: {error}"));
+                };
+                missing.push(name);
+                if !current.pop() {
+                    return Err("invalid path".to_owned());
+                }
+            }
         }
-    };
-    if !normalized.starts_with(root) {
+    }
+}
+
+fn scoped(scope: &Scope, path: &str) -> Result<PathBuf, String> {
+    let root = fs::canonicalize(scope.root).unwrap_or_else(|_| scope.root.to_path_buf());
+    let normalized = resolve_with_missing_tail(&root.join(path))?;
+    let allowed = std::iter::once(root.clone()).chain(
+        scope
+            .grants
+            .iter()
+            .map(|grant| fs::canonicalize(grant).unwrap_or_else(|_| grant.clone())),
+    );
+    if !allowed
+        .into_iter()
+        .any(|allowed| normalized.starts_with(allowed))
+    {
         return Err("path escapes project scope".to_owned());
     }
     Ok(normalized)
@@ -116,14 +144,87 @@ fn is_knowledge_cache(root: &Path, target: &Path) -> bool {
         .and_then(|relative| relative.components().next())
         .is_some_and(|component| component.as_os_str() == ".ai-framework")
 }
+/// SHA-256 of a file's current bytes, with its resolved path, or `None` when it
+/// is not a readable file inside the scope. Used to notice that a file changed
+/// between a read and a later write.
+pub fn file_revision(scope: &Scope, path: &str) -> Option<(PathBuf, String)> {
+    use sha2::{Digest, Sha256};
+    let target = scoped(scope, path).ok()?;
+    let bytes = fs::read(&target).ok()?;
+    Some((target, format!("{:x}", Sha256::digest(bytes))))
+}
+
+/// A literal, single-occurrence edit. The expected revision comes from runtime
+/// read tracking, never from model arguments. Staging and rename preserve the
+/// original on every validation/write failure and preserve its permissions.
+pub fn replace_text_in(
+    scope: &Scope,
+    args: &Value,
+    expected_revision: &str,
+) -> Result<(Value, Option<String>), String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let text = |key: &str| args.get(key).and_then(Value::as_str)
+        .ok_or_else(|| format!("{key} must be a string"));
+    let path = text("path")?;
+    let old = text("old_text")?;
+    let new = text("new_text")?;
+    if old.is_empty() || old == new {
+        return Err("old_text must be nonempty and new_text must differ".into());
+    }
+    let target = scoped(scope, path)?;
+    let original = fs::read(&target).map_err(|error| error.to_string())?;
+    if format!("{:x}", Sha256::digest(&original)) != expected_revision {
+        return Err("File changed since your last read. Read the latest version before replacing text.".into());
+    }
+    let content = std::str::from_utf8(&original).map_err(|error| error.to_string())?;
+    let start = content.find(old).ok_or_else(|| "old_text does not exactly match current content; no file was written".to_owned())?;
+    let next_character = start + old.chars().next().expect("nonempty").len_utf8();
+    if content[next_character..].contains(old) {
+        return Err("old_text matches more than one place; include a larger exact snippet; no file was written".into());
+    }
+    let updated = format!("{}{}{}", &content[..start], new, &content[start + old.len()..]);
+    let permissions = fs::metadata(&target).map_err(|error| error.to_string())?.permissions();
+    let temporary = target.parent().ok_or("file has no parent")?.join(format!(
+        ".local-ai-replace-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut staged = fs::OpenOptions::new().write(true).create_new(true)
+        .open(&temporary).map_err(|error| error.to_string())?;
+    let result = (|| {
+        staged.set_permissions(permissions).map_err(|error| error.to_string())?;
+        staged.write_all(updated.as_bytes()).map_err(|error| error.to_string())?;
+        staged.sync_all().map_err(|error| error.to_string())?;
+        drop(staged);
+        if scoped(scope, path)? != target || fs::read(&target).map_err(|error| error.to_string())? != original {
+            return Err("File changed while staging the edit; no file was written. Read the latest version.".into());
+        }
+        fs::rename(&temporary, &target).map_err(|error| error.to_string())
+    })();
+    let _ = fs::remove_file(&temporary);
+    result?;
+    Ok((json!({"path":path,"bytes":updated.len(),"replacements":1}),
+        Some(format!("--- {path}\n+++ {path}\n-{old}\n+{new}"))))
+}
+
 pub fn execute(root: &Path, name: &str, args: &Value) -> Result<(Value, Option<String>), String> {
+    execute_in(&Scope { root, grants: &[] }, name, args)
+}
+
+pub fn execute_in(
+    scope: &Scope,
+    name: &str,
+    args: &Value,
+) -> Result<(Value, Option<String>), String> {
+    let root = scope.root;
     let object = args
         .as_object()
         .ok_or_else(|| "arguments must be an object".to_owned())?;
     let path = object.get("path").and_then(Value::as_str).unwrap_or(".");
     match name {
         "list_directory" => {
-            let target = scoped(root, path)?;
+            let target = scoped(scope, path)?;
             if is_runtime_temporary(root, &target) || is_knowledge_cache(root, &target) {
                 return Err(
                     "internal runtime/cache files are excluded from project discovery".to_owned(),
@@ -145,7 +246,7 @@ pub fn execute(root: &Path, name: &str, args: &Value) -> Result<(Value, Option<S
             Ok((json!({"entries":items,"complete":complete}), None))
         }
         "read_file" => {
-            let target = scoped(root, path)?;
+            let target = scoped(scope, path)?;
             if is_runtime_temporary(root, &target) || is_knowledge_cache(root, &target) {
                 return Err(
                     "internal runtime/cache files are excluded from project discovery".to_owned(),
@@ -221,7 +322,7 @@ pub fn execute(root: &Path, name: &str, args: &Value) -> Result<(Value, Option<S
                 .get("content")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "content is required".to_owned())?;
-            let target = scoped(root, path)?;
+            let target = scoped(scope, path)?;
             let before = fs::read_to_string(&target).unwrap_or_default();
             if name == "create_file" && target.exists() {
                 return Err("file already exists; use write_file".to_owned());
@@ -235,13 +336,13 @@ pub fn execute(root: &Path, name: &str, args: &Value) -> Result<(Value, Option<S
                 Some(format!("--- {path}\n+++ {path}\n-{}\n+{}", before, content)),
             ))
         }
-        "apply_patch" => apply_patch(root, object),
+        "apply_patch" => apply_patch(scope, object),
         "delete_file" => {
             let content = object
                 .get("path")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "path is required".to_owned())?;
-            let target = scoped(root, content)?;
+            let target = scoped(scope, content)?;
             if !target.is_file() {
                 return Err("only regular files can be deleted".to_owned());
             }
@@ -252,107 +353,293 @@ pub fn execute(root: &Path, name: &str, args: &Value) -> Result<(Value, Option<S
     }
 }
 
-/// Apply a `*** Begin Patch` style patch (Add/Update/Delete sections). The
-/// body of an Update section is either a classic unified diff (context `/ -/ +`
-/// lines) or a literal old/new block when context is absent; both forms
-/// round-trip against the same file content. A section failure leaves the file
-/// untouched because the rewrite happens in memory until the last byte is
-/// validated.
+const PATCH_FORMAT: &str = "Format: *** Begin Patch, then per file `*** Update File: path` (hunks of ` context`, `-old`, `+new` lines, hunks separated by `@@`), `*** Add File: path` (every line prefixed `+`) or `*** Delete File: path`, then *** End Patch.";
+
+/// One file change inside a patch, computed fully in memory before anything
+/// is written.
+enum PatchOp {
+    Add {
+        rel: String,
+        lines: Vec<String>,
+    },
+    Delete {
+        rel: String,
+    },
+    Update {
+        rel: String,
+        hunks: Vec<Vec<String>>,
+    },
+}
+
+/// Parse a patch tolerantly: surrounding blank lines and a markdown fence are
+/// ignored, CRLF is normalized, and a missing `*** End Patch` is accepted.
+fn parse_patch(patch: &str) -> Result<Vec<PatchOp>, String> {
+    let normalized = patch.replace("\r\n", "\n");
+    let mut lines = normalized.split('\n').collect::<Vec<_>>();
+    while lines.first().is_some_and(|line| line.trim().is_empty()) {
+        lines.remove(0);
+    }
+    if lines
+        .first()
+        .is_some_and(|line| line.trim().starts_with("```"))
+    {
+        lines.remove(0);
+    }
+    while lines.last().is_some_and(|line| {
+        let line = line.trim();
+        line.is_empty() || line.starts_with("```")
+    }) {
+        lines.pop();
+    }
+    let lines = lines.into_iter().map(str::to_owned).collect::<Vec<_>>();
+    if lines.first().map(|line| line.trim()) != Some("*** Begin Patch") {
+        return Err(format!(
+            "patch must start with *** Begin Patch. {PATCH_FORMAT}"
+        ));
+    }
+    let mut cursor = 1;
+    let mut operations = Vec::new();
+    while cursor < lines.len() {
+        let header = lines[cursor].trim().to_owned();
+        cursor += 1;
+        if header == "*** End Patch" {
+            break;
+        }
+        if header.is_empty() {
+            continue;
+        }
+        if let Some(rel) = header.strip_prefix("*** Add File:") {
+            let body = collect_body(&lines, &mut cursor);
+            let mut content = body
+                .iter()
+                .map(|line| line.strip_prefix('+').unwrap_or(line).to_owned())
+                .collect::<Vec<_>>();
+            while content.last().is_some_and(String::is_empty) {
+                content.pop();
+            }
+            operations.push(PatchOp::Add {
+                rel: rel.trim().to_owned(),
+                lines: content,
+            });
+        } else if let Some(rel) = header.strip_prefix("*** Delete File:") {
+            operations.push(PatchOp::Delete {
+                rel: rel.trim().to_owned(),
+            });
+        } else if let Some(rel) = header.strip_prefix("*** Update File:") {
+            let body = collect_body(&lines, &mut cursor);
+            operations.push(PatchOp::Update {
+                rel: rel.trim().to_owned(),
+                hunks: hunk_blocks(&body),
+            });
+        } else {
+            return Err(format!("unknown patch section: {header}. {PATCH_FORMAT}"));
+        }
+    }
+    if operations.is_empty() {
+        return Err(format!("patch contains no file sections. {PATCH_FORMAT}"));
+    }
+    Ok(operations)
+}
+
+fn find_block(
+    haystack: &[String],
+    needle: &[&str],
+    same: impl Fn(&str, &str) -> bool,
+) -> Vec<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return Vec::new();
+    }
+    (0..=haystack.len() - needle.len())
+        .filter(|start| {
+            needle
+                .iter()
+                .enumerate()
+                .all(|(offset, line)| same(&haystack[start + offset], line))
+        })
+        .collect()
+}
+
+/// Apply the hunks of one Update section to `content`. Matching is by whole
+/// lines: exact first, then ignoring trailing whitespace. A hunk that matches
+/// several places is refused rather than applied to an arbitrary one.
+fn apply_hunks(rel: &str, content: &str, hunks: &[Vec<String>]) -> Result<String, String> {
+    let crlf = content.contains("\r\n");
+    let mut lines = content
+        .replace("\r\n", "\n")
+        .split('\n')
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    for (index, hunk) in hunks.iter().enumerate() {
+        if !hunk.iter().any(|line| line.starts_with('+') || line.starts_with('-')) {
+            return Err(format!(
+                "hunk {} for {rel} contains no change lines. Prefix the removed line with `-` and its replacement with `+`; prefix each unchanged context line with one EXTRA space before its original indentation. Context-only hunks cannot edit a file.",
+                index + 1
+            ));
+        }
+        let (old, new) = interpret_hunk(hunk);
+        if old.iter().all(|line| line.trim().is_empty()) {
+            return Err(format!(
+                "hunk {} for {rel} has no existing line to anchor on: include at least one unchanged ` context` line or a `-` line from the file",
+                index + 1
+            ));
+        }
+        let old_refs = old.iter().map(String::as_str).collect::<Vec<_>>();
+        let mut matches = find_block(&lines, &old_refs, |left, right| left == right);
+        if matches.is_empty() {
+            matches = find_block(&lines, &old_refs, |left, right| {
+                left.trim_end() == right.trim_end()
+            });
+        }
+        match matches.as_slice() {
+            [] => {
+                let first = old
+                    .iter()
+                    .find(|line| !line.trim().is_empty())
+                    .map_or("", String::as_str);
+                let hint = if lines.iter().any(|line| line.trim() == first.trim()) {
+                    "its first line exists, but the surrounding lines differ"
+                } else {
+                    "its first line is not in the file"
+                };
+                let candidate = lines.iter().position(|line| line.trim() == first.trim());
+                let detail = candidate.and_then(|start| {
+                    let anchor_offset = old.iter().position(|line| !line.trim().is_empty())?;
+                    let start = start.checked_sub(anchor_offset)?;
+                    old.iter().enumerate().find_map(|(offset, expected)| {
+                        let actual = lines.get(start + offset)?;
+                        (actual.trim_end() != expected.trim_end()).then(|| format!(
+                            " First mismatch at file line {}: expected {:?}, current {:?}.",
+                            start + offset + 1,
+                            expected.chars().take(160).collect::<String>(),
+                            actual.chars().take(160).collect::<String>()
+                        ))
+                    })
+                }).unwrap_or_default();
+                return Err(format!(
+                    "patch does not match current content: {rel} (hunk {}: {hint}).{detail} Context lines need one EXTRA leading space as the patch marker, followed by the exact original indentation. Prefer a small `-old` / `+new` replacement for a one-line edit. If the source actually changed, read the latest range; no file was written.",
+                    index + 1
+                ));
+            }
+            [position] => {
+                lines.splice(*position..*position + old.len(), new);
+            }
+            several => {
+                return Err(format!(
+                    "hunk {} for {rel} matches {} places: add unchanged ` context` lines around it so it matches exactly one",
+                    index + 1,
+                    several.len()
+                ));
+            }
+        }
+    }
+    let joined = lines.join("\n");
+    Ok(if crlf {
+        joined.replace('\n', "\r\n")
+    } else {
+        joined
+    })
+}
+
+/// Apply a `*** Begin Patch` style patch (Add/Update/Delete sections). Every
+/// section is computed in memory first, so a failure anywhere leaves the
+/// project untouched; the files are written only once the whole patch is
+/// known to apply, and restored if a write itself fails.
 fn apply_patch(
-    root: &Path,
+    scope: &Scope,
     object: &serde_json::Map<String, Value>,
 ) -> Result<(Value, Option<String>), String> {
     let patch = object
         .get("patch")
         .and_then(Value::as_str)
         .ok_or_else(|| "patch is required".to_owned())?;
-    let lines: Vec<String> = patch
-        .replace("\r\n", "\n")
-        .split('\n')
-        .map(str::to_owned)
-        .collect();
-    if lines
-        .first()
-        .map(|l| l.trim())
-        .is_some_and(|h| h != "*** Begin Patch")
-    {
-        return Err("patch must start with *** Begin Patch".to_owned());
-    }
-    let mut cursor = 1;
+    let operations = parse_patch(patch)?;
+    // Latest in-memory state per path: Some(content) or None when deleted.
+    let mut staged: Vec<(String, PathBuf, Option<String>)> = Vec::new();
+    let mut original: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::new();
     let mut changed: Vec<String> = Vec::new();
-    while cursor < lines.len() {
-        let header = lines[cursor].trim();
-        cursor += 1;
-        if header == "*** End Patch" {
-            break;
-        }
-        if let Some(rel) = header.strip_prefix("*** Add File: ") {
-            let rel = rel.trim();
-            let target = scoped(root, rel)?;
-            if target.exists() {
-                return Err(format!("file already exists: {rel}"));
+    for operation in operations {
+        let rel = match &operation {
+            PatchOp::Add { rel, .. } | PatchOp::Delete { rel } | PatchOp::Update { rel, .. } => {
+                rel.clone()
             }
-            let body = collect_body(&lines, &mut cursor);
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-            }
-            let mut content = body
-                .iter()
-                .filter(|line| line.starts_with('+'))
-                .map(|line| line[1..].to_owned())
-                .collect::<Vec<_>>()
-                .join("\n");
-            if !content.is_empty() && !content.ends_with('\n') {
-                content.push('\n');
-            }
-            fs::write(&target, &content).map_err(|e| e.to_string())?;
-            changed.push(rel.to_owned());
-            continue;
-        }
-        if let Some(rel) = header.strip_prefix("*** Delete File: ") {
-            let rel = rel.trim();
-            let target = scoped(root, rel)?;
-            if !target.is_file() {
-                return Err(format!("only regular files can be deleted: {rel}"));
-            }
-            fs::remove_file(&target).map_err(|e| e.to_string())?;
-            changed.push(rel.to_owned());
-            continue;
-        }
-        if let Some(rel) = header.strip_prefix("*** Update File: ") {
-            let rel = rel.trim();
-            let target = scoped(root, rel)?;
-            let before =
-                fs::read_to_string(&target).map_err(|e| format!("cannot read {rel}: {e}"))?;
-            let body = collect_body(&lines, &mut cursor);
-            let mut content = before.clone();
-            for hunk in hunk_blocks(&body) {
-                let (old, new) = interpret_hunk(&hunk);
-                if old.trim().is_empty() {
+        };
+        let target = scoped(scope, &rel)?;
+        let position = staged.iter().position(|(_, known, _)| *known == target);
+        let current = match position {
+            Some(index) => staged[index].2.clone(),
+            None => target
+                .is_file()
+                .then(|| fs::read_to_string(&target))
+                .transpose()
+                .map_err(|e| format!("cannot read {rel}: {e}"))?,
+        };
+        let next = match operation {
+            PatchOp::Add { lines, .. } => {
+                if current.is_some() || target.exists() && position.is_none() {
                     return Err(format!(
-                        "patch for {rel} must remove or replace existing content"
+                        "file already exists: {rel}. Use *** Update File to change it."
                     ));
                 }
-                // Apply each hunk against the latest in-memory content so a
-                // multi-hunk section edits the same file consistently.
-                let position = content
-                    .find(&old)
-                    .ok_or_else(|| format!("patch does not match current content: {rel}"))?;
-                content = format!(
-                    "{}{}{}",
-                    &content[..position],
-                    new,
-                    &content[position + old.len()..]
-                );
+                let mut content = lines.join("\n");
+                if !content.is_empty() {
+                    content.push('\n');
+                }
+                Some(content)
             }
-            fs::write(&target, &content).map_err(|e| e.to_string())?;
-            changed.push(rel.to_owned());
-            continue;
+            PatchOp::Delete { .. } => {
+                if current.is_none() {
+                    return Err(format!("only regular files can be deleted: {rel}"));
+                }
+                None
+            }
+            PatchOp::Update { hunks, .. } => {
+                let before = current.ok_or_else(|| {
+                    format!("cannot update {rel}: the file does not exist (use *** Add File)")
+                })?;
+                if hunks.is_empty() {
+                    return Err(format!("patch for {rel} has no changes. {PATCH_FORMAT}"));
+                }
+                Some(apply_hunks(&rel, &before, &hunks)?)
+            }
+        };
+        if position.is_none() {
+            original.push((
+                target.clone(),
+                target
+                    .is_file()
+                    .then(|| fs::read(&target).unwrap_or_default()),
+            ));
         }
-        return Err(format!("unknown patch section: {header}"));
+        match position {
+            Some(index) => staged[index].2 = next,
+            None => staged.push((rel.clone(), target, next)),
+        }
+        if !changed.contains(&rel) {
+            changed.push(rel);
+        }
     }
-    if changed.is_empty() {
-        return Err("patch contains no file sections".to_owned());
+    let mut failure = None;
+    for (_, target, content) in &staged {
+        let outcome = match content {
+            Some(content) => target
+                .parent()
+                .map_or(Ok(()), fs::create_dir_all)
+                .and_then(|()| fs::write(target, content)),
+            None => fs::remove_file(target),
+        };
+        if let Err(error) = outcome {
+            failure = Some(format!("cannot write {}: {error}", target.display()));
+            break;
+        }
+    }
+    if let Some(message) = failure {
+        for (target, bytes) in original {
+            let _ = match bytes {
+                Some(bytes) => fs::write(&target, bytes),
+                None => fs::remove_file(&target).or(Ok(())),
+            };
+        }
+        return Err(format!("{message}; no file was changed"));
     }
     Ok((
         json!({"applied":true,"files":changed}),
@@ -375,44 +662,56 @@ fn collect_body(lines: &[String], cursor: &mut usize) -> Vec<String> {
     body
 }
 
+/// Hunks are separated by `@@` lines; a header such as `@@ fn main() @@` or
+/// `@@ -1,3 +1,3 @@` is accepted and ignored. Blank lines at the edges of a
+/// hunk are formatting, not content.
 fn hunk_blocks(body: &[String]) -> Vec<Vec<String>> {
     let mut blocks: Vec<Vec<String>> = Vec::new();
     let mut current: Vec<String> = Vec::new();
     for line in body {
-        if line.trim() == "@@" {
-            if !current.is_empty() {
-                blocks.push(std::mem::take(&mut current));
-            }
+        if line.trim_start().starts_with("@@") {
+            blocks.push(std::mem::take(&mut current));
         } else {
             current.push(line.to_owned());
         }
     }
-    if !current.is_empty() {
-        blocks.push(current);
-    }
+    blocks.push(current);
     blocks
+        .into_iter()
+        .map(|mut block| {
+            while block.last().is_some_and(String::is_empty) {
+                block.pop();
+            }
+            while block.first().is_some_and(String::is_empty) {
+                block.remove(0);
+            }
+            block
+        })
+        .filter(|block| !block.is_empty())
+        .collect()
 }
 
-/// Interpret one hunk body. Classic unified form keeps ` ` context lines and
-/// uses `-`/`+` for the old/new halves; a compact literal form pairs trailing
-/// `-` lines with trailing `+` lines and has no context. Both must produce a
-/// non-empty old half; the outer caller rejects otherwise.
-fn interpret_hunk(hunk: &[String]) -> (String, String) {
-    let mut old: Vec<&str> = Vec::new();
-    let mut new: Vec<&str> = Vec::new();
+/// Interpret one hunk body. `-` and `+` lines form the old and new halves; a
+/// ` ` line (or a bare empty line, or any other unprefixed line) is context in
+/// both halves, so the anchor matches a wider window than the changed lines
+/// alone. Context is verified against the file like everything else.
+fn interpret_hunk(hunk: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut old = Vec::new();
+    let mut new = Vec::new();
     for line in hunk {
-        if line.starts_with("-") {
-            old.push(&line[1..]);
-        } else if line.starts_with("+") {
-            new.push(&line[1..]);
-        } else if let Some(rest) = line.strip_prefix(' ') {
-            // Context lines belong to both halves and let the anchor match a
-            // wider window than a bare old-content search.
-            old.push(rest);
-            new.push(rest);
+        if let Some(rest) = line.strip_prefix('-') {
+            old.push(rest.to_owned());
+        } else if let Some(rest) = line.strip_prefix('+') {
+            new.push(rest.to_owned());
+        } else if line.starts_with('\\') {
+            continue;
+        } else {
+            let rest = line.strip_prefix(' ').unwrap_or(line);
+            old.push(rest.to_owned());
+            new.push(rest.to_owned());
         }
     }
-    (old.join("\n"), new.join("\n"))
+    (old, new)
 }
 
 #[cfg(test)]
@@ -588,7 +887,10 @@ mod tests {
         ]
         .join("\n");
         let result = apply_patch(
-            &root,
+            &Scope {
+                root: &root,
+                grants: &[],
+            },
             &serde_json::json!({"patch": patch})
                 .as_object()
                 .cloned()
@@ -608,7 +910,10 @@ mod tests {
         assert!(!root.join("src/old.txt").exists());
 
         let bad = apply_patch(
-            &root,
+            &Scope {
+                root: &root,
+                grants: &[],
+            },
             &serde_json::json!({"patch":"*** Begin Patch\n*** Update File: src/a.txt\n-DOES-NOT-EXIST\n+X\n*** End Patch"})
                 .as_object()
                 .cloned()
@@ -623,6 +928,193 @@ mod tests {
         );
 
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    fn patch_fixture(files: &[(&str, &str)]) -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "fs-patch-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        for (name, content) in files {
+            fs::write(root.join(name), content).unwrap();
+        }
+        root
+    }
+
+    fn patch(root: &Path, text: &str) -> Result<(Value, Option<String>), String> {
+        apply_patch(
+            &Scope { root, grants: &[] },
+            json!({ "patch": text }).as_object().unwrap(),
+        )
+    }
+
+    #[test]
+    fn incident_context_marker_error_reports_indentation_without_fuzzy_editing() {
+        let root = patch_fixture(&[("a.js", "    function count() {\n      return 1;\n    }\n")]);
+        let error = patch(&root, "*** Begin Patch\n*** Update File: a.js\n@@\n    function count() {\n      return 1;\n    }\n+    const added = true;\n*** End Patch").unwrap_err();
+        assert!(error.contains("hunk 1"), "{error}");
+        assert!(error.contains("file line 1"), "{error}");
+        assert!(error.contains("expected \"   function"), "{error}");
+        assert!(error.contains("current \"    function"), "{error}");
+        assert!(error.contains("EXTRA leading space"), "{error}");
+        assert_eq!(fs::read_to_string(root.join("a.js")).unwrap(), "    function count() {\n      return 1;\n    }\n");
+        patch(&root, "*** Begin Patch\n*** Update File: a.js\n@@\n     function count() {\n-      return 1;\n+      return 2;\n     }\n*** End Patch").unwrap();
+        let stale = patch(&root, "*** Begin Patch\n*** Update File: a.js\n@@\n-      return 1;\n+      return 3;\n*** End Patch").unwrap_err();
+        assert!(stale.contains("does not match"));
+        assert!(fs::read_to_string(root.join("a.js")).unwrap().contains("return 2"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn context_only_hunks_are_rejected_before_matching_or_writing() {
+        let root = patch_fixture(&[("a.js", "    old();\n")]);
+        let error = patch(&root, "*** Begin Patch\n*** Update File: a.js\n@@\n     old();\n*** End Patch").unwrap_err();
+        assert!(error.contains("contains no change lines"), "{error}");
+        assert!(error.contains("replacement with `+`"), "{error}");
+        assert_eq!(fs::read_to_string(root.join("a.js")).unwrap(), "    old();\n");
+        assert!(patch(&root, "not a patch").is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn literal_replacement_is_unique_fresh_atomic_and_preserves_line_endings() {
+        let root = patch_fixture(&[("a.txt", "alpha\r\nbeta\r\n"), ("overlap.txt", "aaa")]);
+        let scope = Scope { root: &root, grants: &[] };
+        let (_, revision) = file_revision(&scope, "a.txt").unwrap();
+        let result = replace_text_in(&scope, &json!({"path":"a.txt","old_text":"beta","new_text":"BETA"}), &revision).unwrap();
+        assert_eq!(result.0["replacements"], 1);
+        assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"alpha\r\nBETA\r\n");
+        let stale = replace_text_in(&scope, &json!({"path":"a.txt","old_text":"BETA","new_text":"new"}), &revision).unwrap_err();
+        assert!(stale.contains("changed since your last read"));
+        let (_, current) = file_revision(&scope, "a.txt").unwrap();
+        for args in [
+            json!({"path":"a.txt","old_text":"","new_text":"new"}),
+            json!({"path":"a.txt","old_text":"BETA","new_text":"BETA"}),
+            json!({"path":"a.txt","old_text":"missing","new_text":"new"}),
+            json!({"path":"../escape.txt","old_text":"x","new_text":"y"}),
+        ] {
+            assert!(replace_text_in(&scope, &args, &current).is_err());
+        }
+        let (_, overlap) = file_revision(&scope, "overlap.txt").unwrap();
+        assert!(replace_text_in(&scope, &json!({"path":"overlap.txt","old_text":"aa","new_text":"b"}), &overlap).unwrap_err().contains("more than one place"));
+        assert_eq!(fs::read_to_string(root.join("overlap.txt")).unwrap(), "aaa");
+        assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"alpha\r\nBETA\r\n");
+        assert!(!fs::read_dir(&root).unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().starts_with(".local-ai-replace")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn patch_tolerates_fences_blank_edges_hunk_headers_and_blank_context() {
+        let root = patch_fixture(&[("a.js", "one\ntwo\n\nthree\nfour\nfive\n")]);
+        let text = "\n```diff\n*** Begin Patch\n*** Update File: a.js\n@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n\n three\n@@ function four() @@\n-four\n+FOUR\n*** End Patch\n```\n";
+        patch(&root, text).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("a.js")).unwrap(),
+            "one\nTWO\n\nthree\nFOUR\nfive\n"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn patch_preserves_crlf_files_and_accepts_a_missing_end_marker() {
+        let root = patch_fixture(&[("a.txt", "alpha\r\nbeta\r\ngamma\r\n")]);
+        patch(
+            &root,
+            "*** Begin Patch\n*** Update File: a.txt\n-beta\n+BETA",
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("a.txt")).unwrap(),
+            "alpha\r\nBETA\r\ngamma\r\n"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_ambiguous_hunk_is_refused_and_context_disambiguates_it() {
+        let root = patch_fixture(&[("a.txt", "x\nsame\ny\nsame\nz\n")]);
+        let error = patch(
+            &root,
+            "*** Begin Patch\n*** Update File: a.txt\n-same\n+SAME\n*** End Patch",
+        )
+        .unwrap_err();
+        assert!(error.contains("matches 2 places"), "{error}");
+        assert_eq!(
+            fs::read_to_string(root.join("a.txt")).unwrap(),
+            "x\nsame\ny\nsame\nz\n"
+        );
+        patch(
+            &root,
+            "*** Begin Patch\n*** Update File: a.txt\n y\n-same\n+SAME\n*** End Patch",
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("a.txt")).unwrap(),
+            "x\nsame\ny\nSAME\nz\n"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_multi_file_patch_is_all_or_nothing() {
+        let root = patch_fixture(&[("a.txt", "a\n"), ("b.txt", "b\n")]);
+        let error = patch(
+            &root,
+            "*** Begin Patch\n*** Update File: a.txt\n-a\n+A\n*** Add File: c.txt\n+c\n*** Update File: b.txt\n-missing\n+B\n*** End Patch",
+        )
+        .unwrap_err();
+        assert!(error.contains("does not match"), "{error}");
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "a\n");
+        assert!(
+            !root.join("c.txt").exists(),
+            "an earlier Add must not survive a later failure"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn later_sections_see_earlier_sections_of_the_same_patch() {
+        let root = patch_fixture(&[("a.txt", "a\nb\n")]);
+        patch(
+            &root,
+            "*** Begin Patch\n*** Update File: a.txt\n-a\n+A\n*** Update File: a.txt\n-b\n+B\n*** End Patch",
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "A\nB\n");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn patch_errors_say_how_to_fix_the_call() {
+        let root = patch_fixture(&[("a.txt", "a\n")]);
+        let error = patch(&root, "diff --git a/a.txt b/a.txt").unwrap_err();
+        assert!(
+            error.contains("*** Begin Patch") && error.contains("Format:"),
+            "{error}"
+        );
+        let error = patch(
+            &root,
+            "*** Begin Patch\n*** Add File: a.txt\n+x\n*** End Patch",
+        )
+        .unwrap_err();
+        assert!(error.contains("Update File"), "{error}");
+        let error = patch(
+            &root,
+            "*** Begin Patch\n*** Update File: a.txt\n+only added\n*** End Patch",
+        )
+        .unwrap_err();
+        assert!(error.contains("context"), "{error}");
+        let error = patch(
+            &root,
+            "*** Begin Patch\n*** Update File: a.txt\n-nope\n+x\n*** End Patch",
+        )
+        .unwrap_err();
+        assert!(error.contains("not in the file"), "{error}");
+        fs::remove_dir_all(root).unwrap();
     }
 
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -667,5 +1159,74 @@ mod tests {
         .is_err());
 
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn files_can_be_created_below_directories_that_do_not_exist_yet() {
+        let root = std::env::temp_dir().join(format!("fs-nested-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        execute(
+            &root,
+            "create_file",
+            &json!({"path":"src/components/ui/Board.tsx","content":"x"}),
+        )
+        .unwrap();
+        assert!(root.join("src/components/ui/Board.tsx").is_file());
+        for escape in [
+            "new/../../escape.txt",
+            "../escape.txt",
+            "a/b/../../../escape.txt",
+        ] {
+            assert!(
+                execute(&root, "write_file", &json!({"path":escape,"content":"x"})).is_err(),
+                "{escape}"
+            );
+        }
+        assert!(!root.parent().unwrap().join("escape.txt").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn granted_directories_extend_scope_and_symlinks_cannot_escape_them() {
+        let base = std::env::temp_dir().join(format!("fs-grants-{}", std::process::id()));
+        let (root, granted, other) = (base.join("root"), base.join("granted"), base.join("other"));
+        for dir in [&root, &granted, &other] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let (root, granted, other) = (
+            root.canonicalize().unwrap(),
+            granted.canonicalize().unwrap(),
+            other.canonicalize().unwrap(),
+        );
+        std::os::unix::fs::symlink(&other, granted.join("link")).unwrap();
+        let grants = [granted.clone()];
+        let scope = Scope {
+            root: &root,
+            grants: &grants,
+        };
+        let inside = granted.join("new/ok.txt");
+        execute_in(
+            &scope,
+            "create_file",
+            &json!({"path":inside,"content":"ok"}),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&inside).unwrap(), "ok");
+        for denied in [other.join("x.txt"), granted.join("link/x.txt")] {
+            let error = execute_in(&scope, "write_file", &json!({"path":denied,"content":"no"}))
+                .unwrap_err();
+            assert!(error.contains("escapes"), "{error}");
+        }
+        assert!(!other.join("x.txt").exists());
+        assert!(execute_in(
+            &Scope {
+                root: &root,
+                grants: &[]
+            },
+            "write_file",
+            &json!({"path":inside,"content":"no"})
+        )
+        .is_err());
+        std::fs::remove_dir_all(base).unwrap();
     }
 }

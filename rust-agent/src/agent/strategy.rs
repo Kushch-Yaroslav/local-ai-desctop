@@ -51,6 +51,8 @@ impl Strategy {
 const FAST_GUIDANCE: &str = r#"
 # Investigation strategy: Fast
 - Aim for the smallest set of observations that supports a correct, honest answer. Orient once, pick the few sources most likely to decide each question, and read those.
+- For implementation: understand, make the targeted edit, verify the acceptance criterion, then continue. Runtime state is your working state, not a new human request; continue from it without re-orienting or restating the plan.
+- Give a brief visible progress update for a meaningful milestone, finding or blocker. Do not repeat the same intended action before successive tools. A tool call may have an empty prose preamble; useful progress does not require a separate turn.
 - Request independent reads/listings together in one turn instead of one per turn.
 - Do not widen the search to be thorough. Follow a reference only if your answer would be materially wrong or empty without it; otherwise say it was not inspected.
 - Stop investigating as soon as the questions are answerable from what you hold, then answer. Prefer a precise, compact answer over an exhaustive one.
@@ -65,6 +67,7 @@ Deep means a more rigorous investigation, not a longer one. Spend observations w
 - Verify a claim at its source rather than from a name, a comment, a summary, or an earlier inference. Actively look for evidence that would contradict your current understanding, for example a second code path, an override, a config switch, or a mismatch between layers.
 - Keep Task Memory current as a compact working record of a few entries (revise an entry by id instead of adding near-duplicates; never one entry per fact), using its status field: confirmed (observed and cited), inferred (reasoned, not observed), unknown (still open, with the step that would resolve it), contradicted (evidence disagrees). Update a status when new evidence changes it.
 - Choose the next step by information gain: prefer the single observation that resolves the most important open item. Do not re-read what you already hold, and do not chase low-impact items.
+- Check completion against what you observed, not what you intended to build: before you finish, compare each requested deliverable with evidence that it works.
 - Converge. When the central questions are answered from observed evidence and the remaining unknowns are low-impact, stop and answer. In the answer, state which conclusions are confirmed, which are inferred, and what stayed unverified.
 "#;
 

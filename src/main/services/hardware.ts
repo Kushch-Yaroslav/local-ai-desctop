@@ -8,11 +8,11 @@ const execFileAsync = promisify(execFile);
 
 export async function getOwnedServerVramBudget(pid: number) {
   const hardware = await getHardwareStats();
-  if (!hardware.available || hardware.vramTotalBytes === null || hardware.vramUsedBytes === null || hardware.vramAvailableBytes === null) throw new Error('GPU telemetry unavailable.');
+  if (!hardware.available || hardware.vramTotalBytes === null || hardware.vramUsedBytes === null || hardware.vramAvailableBytes === null) throw new Error('Телеметрия GPU недоступна.');
   const { stdout } = await execFileAsync('nvidia-smi', ['--query-compute-apps=pid,used_gpu_memory', '--format=csv,noheader,nounits'], { timeout: 2000 });
   const rows = stdout.trim().split(/\r?\n/).map((row) => row.split(',').map((field) => field.trim()));
   const owned = rows.filter(([processId]) => Number(processId) === pid);
-  if (owned.length !== 1 || !/^\d+$/.test(owned[0][1] ?? '')) throw new Error('Owned llama-server GPU process accounting unavailable.');
+  if (owned.length !== 1 || !/^\d+$/.test(owned[0][1] ?? '')) throw new Error('Не удалось определить память GPU, занятую процессом llama-server этого приложения.');
   return createVramBudget(hardware.vramTotalBytes, hardware.vramUsedBytes, hardware.vramAvailableBytes, Number(owned[0][1]) * 1024 ** 2);
 }
 export function parseNvidiaMemorySnapshot(text: string) {
@@ -27,6 +27,26 @@ export function parseNvidiaMemorySnapshot(text: string) {
   if (total <= 0 || used + free > total || utilization > 100) return null;
   return { vramUsedBytes: used * 1024 ** 2, vramTotalBytes: total * 1024 ** 2,
     vramAvailableBytes: free * 1024 ** 2, gpuUtilization: utilization };
+}
+
+export function parseNvidiaGpuIdentity(text: string): { name: string; vramTotalBytes: number } | null {
+  const rows = text.trim().split(/\r?\n/);
+  if (rows.length !== 1) return null;
+  const separator = rows[0].lastIndexOf(',');
+  const name = rows[0].slice(0, separator).trim();
+  const total = Number(rows[0].slice(separator + 1));
+  return separator > 0 && name && Number.isFinite(total) && total > 0 ? { name, vramTotalBytes: total * 1024 ** 2 } : null;
+}
+
+let gpuIdentity: { name: string; vramTotalBytes: number } | null = null;
+/** Model name and total VRAM only: stable across restarts, unlike used/free memory. Cached once found. */
+export async function getGpuIdentity(): Promise<{ name: string; vramTotalBytes: number }> {
+  if (gpuIdentity) return gpuIdentity;
+  const { stdout } = await execFileAsync('nvidia-smi', ['--query-gpu=name,memory.total', '--format=csv,noheader,nounits'], { timeout: 2_000 });
+  const parsed = parseNvidiaGpuIdentity(stdout);
+  if (!parsed) throw new Error('Не удалось определить модель GPU.');
+  gpuIdentity = parsed;
+  return parsed;
 }
 
 export async function getHardwareStats(): Promise<HardwareStats> {

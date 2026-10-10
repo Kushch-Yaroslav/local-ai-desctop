@@ -4,6 +4,7 @@ import type { ContextDiscoveryOption } from './context-estimator';
 import { llamaContextPresets } from '../main/models/llama-runtime-policy';
 
 const qwen = 'qwen3.8:27b-q4_K_M';
+const qwen36 = 'qwen3.6:35b-a3b-ud-q4_k_m';
 const glm = 'glm-4.7-flash:q4_k';
 const option = (modelId: string, contextWindow: number, kvCacheType: 'f16' | 'q8_0'): ContextDiscoveryOption => ({
   modelId, contextWindow, kvCacheType, kvOffload: true, discoveredAt: new Date().toISOString(),
@@ -12,6 +13,7 @@ const option = (modelId: string, contextWindow: number, kvCacheType: 'f16' | 'q8
 
 export function runContextOptionsRegression() {
   assert.deepEqual(llamaContextPresets(qwen), [16384, 32768, 65536, 131072, 262144]);
+  assert.deepEqual(llamaContextPresets(qwen36), [16384, 32768, 65536, 131072, 262144]);
   assert.deepEqual(llamaContextPresets(glm), [16384, 32768, 65536, 131072]);
   assert.deepEqual(llamaContextPresets(qwen, 65536), [16384, 32768, 65536], 'only trained/backend capability may reduce normal presets');
   for (const model of [qwen, glm]) {
@@ -32,9 +34,17 @@ export function runContextOptionsRegression() {
   assert.deepEqual(resolveLlamaKvSelection(current, {}, true), { llamaKvCacheType: 'f16', llamaKvOffload: true }, 'model change must discard the previous cache override');
   assert.deepEqual(resolveLlamaKvSelection(current, {}, false), current, 'non-runtime edits must preserve the selected configuration');
   assert.deepEqual(normalContextPatch(65536), { contextWindow: 65536, llamaKvCacheType: 'f16', llamaKvOffload: true });
+  const normalQ8 = { llamaKvCacheType: 'q8_0' as const, llamaKvOffload: true };
+  assert.deepEqual(resolveLlamaKvSelection({ llamaKvCacheType: 'f16', llamaKvOffload: false }, {}, true, normalQ8), normalQ8, 'a newly selected CPU-offloaded runtime uses its own validated normal cache mode');
+  assert.deepEqual(resolveLlamaKvSelection(current, { contextWindow: 65536 }, false, normalQ8), normalQ8);
+  const q8Choices = buildContextChoices('future-moe', [16384, 32768, 65536], 262144, [option('future-moe', 53248, 'f16'), option('future-moe', 98304, 'q8_0')], 'q8_0');
+  assert(q8Choices.some((choice) => choice.contextWindow === 65536 && choice.kvCacheType === 'q8_0' && choice.label === '64K (Q8)'), 'normal 64K/Q8 must be selectable without fabricating a Max result');
+  assert(q8Choices.some((choice) => choice.contextWindow === 53248 && choice.kvCacheType === 'f16'), 'measured FP16 remains independent of normal Q8');
   assert.equal(normalContextForModel(106496, llamaContextPresets(glm)), 65536, 'model change must replace an unverified custom context with a normal target-model preset');
   assert.equal(normalContextForModel(262144, llamaContextPresets(glm)), 131072, 'model change must respect the new model capability');
   assert.equal(normalContextForModel(16384, llamaContextPresets(qwen)), 16384);
+  const qwen36Choices = buildContextChoices(qwen36, llamaContextPresets(qwen36), 262144, [], 'q8_0');
+  assert(qwen36Choices.some((choice) => choice.contextWindow === 65536 && choice.kvCacheType === 'q8_0' && choice.label === '64K (Q8)'));
 }
 
 if (require.main === module) runContextOptionsRegression();

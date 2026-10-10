@@ -42,10 +42,10 @@ export const defaultContextDeviceReserveBytes = vramEstimatorMarginBytes;
 
 export function resolveContextReserve(value: string | undefined, variable: string, defaultBytes: number): { bytes: number | null; error?: string } {
   if (value === undefined) return { bytes: defaultBytes };
-  if (!/^\d+$/.test(value)) return { bytes: null, error: `${variable} must be an integer byte count at least ${defaultBytes}` };
+  if (!/^\d+$/.test(value)) return { bytes: null, error: `${variable} должно быть целым числом байт не меньше ${defaultBytes}` };
   const bytes = Number(value);
   if (!Number.isSafeInteger(bytes) || bytes < defaultBytes) {
-    return { bytes: null, error: `${variable} must be a safe integer byte count at least ${defaultBytes}` };
+    return { bytes: null, error: `${variable} должно быть допустимым целым числом байт не меньше ${defaultBytes}` };
   }
   return { bytes };
 }
@@ -92,8 +92,12 @@ function setTier(allocation: Partial<Record<AllocationLocation, number>>, locati
 /** Parses final non-dry-run allocation evidence; repeat reserve summaries are maxima, not additive allocations. */
 export function parseLlamaAllocationLog(text: string, runtimeArguments?: readonly string[]): LlamaAllocationLog {
   const lines = text.split(/\r?\n/);
-  const offloadIndex = lastMatchingIndex(lines, /load_tensors:.*offloaded\s+\d+\/\d+\s+layers/i);
-  const nonZeroWeightsIndex = lastMatchingIndex(lines, /model buffer size\s*=\s*(?!0+(?:\.0+)?\s*(?:MiB|GiB|MB|GB))/i);
+  // A separate drafter has its own final offload/weight lines. Select the final
+  // target load before draft initialization, not the last model in the log.
+  const draftStart = lastMatchingIndex(lines, /common_speculative_init_result: (?:creating (?:MTP|EAGLE|draft)\b|loading draft model\b)/i);
+  const targetLines = draftStart >= 0 ? lines.slice(0, draftStart) : lines;
+  const offloadIndex = lastMatchingIndex(targetLines, /load_tensors:.*offloaded\s+\d+\/\d+\s+layers/i);
+  const nonZeroWeightsIndex = lastMatchingIndex(targetLines, /model buffer size\s*=\s*(?!0+(?:\.0+)?\s*(?:MiB|GiB|MB|GB))/i);
   const start = offloadIndex >= 0 ? offloadIndex : Math.max(0, nonZeroWeightsIndex);
   const runtimeInitIndex = lines.findIndex((line, index) => index >= start && /srv.*load_model: initializing,/i.test(line));
   const end = runtimeInitIndex >= start ? runtimeInitIndex + 1 : lines.length;
@@ -127,19 +131,26 @@ export function parseLlamaAllocationLog(text: string, runtimeArguments?: readonl
   let inVisionSection = false;
   let currentPhase: AllocationPhase = 'target';
   const measurements: AllocationMeasurement[] = [];
+  // Backends may partition one context into several caches (e.g. full and SWA).
+  // Keep maxima within a named partition, then sum independent partitions.
+  let kvPartition = 'default';
+  const kvPartitions: Record<AllocationPhase, Map<string, Partial<Record<AllocationLocation, number>>>> = { target: new Map(), speculative: new Map() };
+  const kvSummaries: Record<AllocationPhase, Map<string, number>> = { target: new Map(), speculative: new Map() };
+  const sharedDraftLayers = new Map<string, Set<number>>();
+  const draftLayerCounts = new Map<string, number>();
   let latestContextFromServer: number | null = null;
   for (let index = 0; index < start; index += 1) {
     const line = lines[index];
     const loadedPath = line.match(/srv\s+load_model: loading model ['"](.+?)['"]/i)?.[1]
       ?? line.match(/llama_model_loader: loaded meta data .* from (.+?) \(version GGUF/i)?.[1];
-    if (loadedPath) modelPath = loadedPath;
+    if (loadedPath && currentPhase === 'target') modelPath = loadedPath;
   }
 
   for (let index = start; index < end; index += 1) {
     const line = lines[index];
     const loadedPath = line.match(/srv\s+load_model: loading model ['"](.+?)['"]/i)?.[1]
       ?? line.match(/llama_model_loader: loaded meta data .* from (.+?) \(version GGUF/i)?.[1];
-    if (loadedPath) modelPath = loadedPath;
+    if (loadedPath && currentPhase === 'target') modelPath = loadedPath;
     if (/clip_model_loader: has vision encoder/i.test(line)) { visionPresent = true; inVisionSection = true; }
     if (/srv.*load_model: initializing,/i.test(line)) {
       const context = line.match(/\bn_ctx_slot\s*=\s*(\d+)\b/i)?.[1];
@@ -147,9 +158,10 @@ export function parseLlamaAllocationLog(text: string, runtimeArguments?: readonl
       const slots = line.match(/\bn_slots\s*=\s*(\d+)\b/i)?.[1];
       if (slots) sequenceSlots = Number(slots);
     }
-    if (/common_speculative_init_result: creating (MTP|EAGLE|draft)\b/i.test(line)) {
+    if (/common_speculative_init_result: (?:creating (?:MTP|EAGLE|draft)\b|loading draft model\b)/i.test(line)) {
       currentPhase = 'speculative';
-      speculativeMode = /EAGLE/i.test(line) ? 'eagle3' : /MTP/i.test(line) ? 'mtp' : 'draft';
+      kvPartition = 'default';
+      speculativeMode = /loading draft model/i.test(line) ? 'unknown' : /EAGLE/i.test(line) ? 'eagle3' : /MTP/i.test(line) ? 'mtp' : 'draft';
       if (/against the target model/i.test(line)) speculativeUsesTargetModel = true;
     }
     if (/speculative.*(?:disabled|none)|draft.*(?:disabled|none)/i.test(line)) speculativeMode = 'none';
@@ -163,17 +175,31 @@ export function parseLlamaAllocationLog(text: string, runtimeArguments?: readonl
     const context = line.match(/\bn_ctx(?:_slot|_seq)?\s*=\s*(\d+)\b/i)?.[1];
     if (context && currentPhase === 'target') contextTokens = Number(context);
 
+    const partition = line.match(/llama_kv_cache_iswa:\s*creating\s+(.+?)\s+KV cache/i)?.[1];
+    if (partition) kvPartition = partition.trim();
+    if (currentPhase === 'speculative') {
+      const shared = line.match(/llama_kv_cache:\s*layer\s+(\d+): sharing with layer\s+\d+/i)?.[1];
+      if (shared) {
+        const layers = sharedDraftLayers.get(kvPartition) ?? new Set<number>();
+        layers.add(Number(shared)); sharedDraftLayers.set(kvPartition, layers);
+      }
+    }
     const types = kvTypesFromLine(line);
     if (types) {
       if (/llama_kv_cache/i.test(line)) {
-        if (currentPhase === 'speculative') { speculativeKvTypeK = types.key; speculativeKvTypeV = types.value; speculativeKvTypesSeen = true; }
-        else { kvTypeK = types.key; kvTypeV = types.value; targetKvTypesSeen = true; }
+        if (currentPhase === 'speculative') { speculativeKvTypeK = speculativeKvTypeK && speculativeKvTypeK !== types.key ? 'mixed' : types.key; speculativeKvTypeV = speculativeKvTypeV && speculativeKvTypeV !== types.value ? 'mixed' : types.value; speculativeKvTypesSeen = true; }
+        else { kvTypeK = kvTypeK && kvTypeK !== types.key ? 'mixed' : types.key; kvTypeV = kvTypeV && kvTypeV !== types.value ? 'mixed' : types.value; targetKvTypesSeen = true; }
       }
     }
 
     const totalSize = sizeFromLine(line);
     if (/llama_kv_cache: size\s*=/i.test(line) && totalSize !== null) {
-      if (currentPhase === 'speculative') { speculativeKvSummaryBytes = totalSize; sawSpeculativeKvSummary = true; }
+      kvSummaries[currentPhase].set(kvPartition, Math.max(kvSummaries[currentPhase].get(kvPartition) ?? 0, totalSize));
+      if (currentPhase === 'speculative') {
+        speculativeKvSummaryBytes = totalSize; sawSpeculativeKvSummary = true;
+        const count = line.match(/\b(\d+)\s+layers?\b/i)?.[1];
+        if (count) draftLayerCounts.set(kvPartition, Number(count));
+      }
       else { targetKvSummaryBytes = totalSize; sawTargetKvSummary = true; }
     }
     if (/llama_memory_recurrent: size\s*=/i.test(line) && totalSize !== null && currentPhase === 'target') {
@@ -193,19 +219,47 @@ export function parseLlamaAllocationLog(text: string, runtimeArguments?: readonl
     if (!kind || totalSize === null || totalSize <= 0) continue;
     const location = locationOf(line);
     if (!location) continue;
-    measurements.push({ value: totalSize, phase: currentPhase, kind, location });
+    if (kind === 'kv' || kind === 'speculativeKv') {
+      const partition = kvPartitions[currentPhase].get(kvPartition) ?? {};
+      setTier(partition, location, totalSize);
+      kvPartitions[currentPhase].set(kvPartition, partition);
+    } else measurements.push({ value: totalSize, phase: currentPhase, kind, location });
   }
   contextTokens = latestContextFromServer ?? contextTokens;
   const loadedIndex = lines.findIndex((line, index) => index >= start && /\bsrv\s+llama_server: model loaded/.test(line));
   const fullyLoaded = loadedIndex >= start;
   const startupText = lines.slice(start, fullyLoaded ? loadedIndex + 1 : end).join('\n');
+  const implementation = startupText.match(/adding speculative implementation '(draft-mtp|draft-eagle3|draft)'/i)?.[1];
+  if (implementation) speculativeMode = implementation === 'draft-mtp' ? 'mtp' : implementation === 'draft-eagle3' ? 'eagle3' : 'draft';
   if (/\bspec\s+common_specu:\s+no implementations specified for speculative decoding/.test(startupText)) speculativeMode = 'none';
   if (visionPresent === null && fullyLoaded && runtimeArguments && !runtimeArguments.some((arg) => arg === '--mmproj' || arg === '-mm' || arg === '--mmproj-url' || arg.startsWith('--mmproj=') || arg.startsWith('--mmproj-url='))) visionPresent = false;
+
+  // Shared-cache summaries describe views of target tensors, not additional
+  // memory. Only a completed startup with evidence for every layer establishes
+  // zero owned bytes; missing/partial sharing logs must remain unknown.
+  if (fullyLoaded && sawTargetKvSummary) {
+    for (const [partition, count] of draftLayerCounts) {
+      if (count > 0 && sharedDraftLayers.get(partition)?.size === count && !kvPartitions.speculative.has(partition)) {
+        kvPartitions.speculative.set(partition, { host: 0, device: 0 });
+        kvSummaries.speculative.set(partition, 0);
+      }
+    }
+  }
 
   for (const measurement of measurements) {
     const target = phaseTotals[measurement.phase][measurement.kind];
     setTier(target, measurement.location, measurement.value);
   }
+  for (const phase of ['target', 'speculative'] as const) {
+    const kind = phase === 'target' ? 'kv' : 'speculativeKv';
+    for (const partition of kvPartitions[phase].values()) {
+      for (const location of ['host', 'device'] as const) {
+        if (partition[location] !== undefined) phaseTotals[phase][kind][location] = (phaseTotals[phase][kind][location] ?? 0) + partition[location]!;
+      }
+    }
+  }
+  targetKvSummaryBytes = kvSummaries.target.size ? [...kvSummaries.target.values()].reduce((sum, value) => sum + value, 0) : null;
+  speculativeKvSummaryBytes = kvSummaries.speculative.size ? [...kvSummaries.speculative.values()].reduce((sum, value) => sum + value, 0) : null;
   allocations.weights = { ...phaseTotals.target.weights };
   allocations.compute = { ...phaseTotals.target.compute };
   allocations.output = { ...phaseTotals.target.output };
@@ -258,23 +312,23 @@ export function parseLlamaAllocationLog(text: string, runtimeArguments?: readonl
   }
 
   const unknownReasons: string[] = [];
-  if (!contextTokens) unknownReasons.push('startup log has no active per-sequence context allocation');
-  if (!sequenceSlots) unknownReasons.push('startup log has no target sequence-slot count');
-  if (speculativeMode === 'unknown') unknownReasons.push('startup log does not confirm speculative mode');
-  if (speculativeMode !== 'none' && !speculativeSlots) unknownReasons.push('startup log has no draft sequence-slot count');
-  if (!targetKvTypesSeen || !kvTypeK || !kvTypeV) unknownReasons.push('startup log does not report target K/V cache precisions');
-  if (speculativeMode !== 'none' && (!speculativeKvTypesSeen || !speculativeKvTypeK || !speculativeKvTypeV)) unknownReasons.push('startup log does not report draft K/V cache precisions');
-  if (visionPresent === null) unknownReasons.push('startup log does not confirm whether a vision projector is loaded');
-  if (visionPresent && !visionWeightsBytes) unknownReasons.push('startup log has no vision projector weight size');
-  if (visionPresent && !visionComputeBytes) unknownReasons.push('startup log has no vision projector compute reservation');
+  if (!contextTokens) unknownReasons.push('в журнале запуска нет размера контекста на последовательность');
+  if (!sequenceSlots) unknownReasons.push('в журнале запуска нет числа слотов основной модели');
+  if (speculativeMode === 'unknown') unknownReasons.push('журнал запуска не подтверждает режим спекулятивного декодирования');
+  if (speculativeMode !== 'none' && !speculativeSlots) unknownReasons.push('в журнале запуска нет числа слотов draft-модели');
+  if (!targetKvTypesSeen || !kvTypeK || !kvTypeV) unknownReasons.push('журнал запуска не сообщает точность K/V-кэша основной модели');
+  if (speculativeMode !== 'none' && (!speculativeKvTypesSeen || !speculativeKvTypeK || !speculativeKvTypeV)) unknownReasons.push('журнал запуска не сообщает точность K/V-кэша draft-модели');
+  if (visionPresent === null) unknownReasons.push('журнал запуска не подтверждает, загружен ли визуальный проектор');
+  if (visionPresent && !visionWeightsBytes) unknownReasons.push('в журнале запуска нет размера весов визуального проектора');
+  if (visionPresent && !visionComputeBytes) unknownReasons.push('в журнале запуска нет резерва вычислений визуального проектора');
   for (const kind of allocationKinds) {
     if (kind === 'speculativeWeights' && (speculativeMode === 'none' || speculativeUsesTargetModel)) continue;
     if (speculativeMode === 'none' && ['speculativeCompute', 'speculativeKv'].includes(kind)) continue;
-    if (!Object.keys(allocations[kind]).length) unknownReasons.push(`startup log has no final ${kind} allocation`);
+    if (!Object.keys(allocations[kind]).length) unknownReasons.push(`в журнале запуска нет итогового выделения памяти: ${kind}`);
   }
-  if (!sawTargetKvSummary) unknownReasons.push('startup log has no target KV allocation summary');
-  if (speculativeMode !== 'none' && !sawSpeculativeKvSummary) unknownReasons.push('startup log has no draft KV allocation summary');
-  if (!sawTargetRsSummary) unknownReasons.push('startup log has no recurrent-state allocation summary');
+  if (!sawTargetKvSummary) unknownReasons.push('в журнале запуска нет сводки по KV-кэшу основной модели');
+  if (speculativeMode !== 'none' && !sawSpeculativeKvSummary) unknownReasons.push('в журнале запуска нет сводки по KV-кэшу draft-модели');
+  if (!sawTargetRsSummary) unknownReasons.push('в журнале запуска нет сводки по рекуррентному состоянию');
   return {
     modelPath,
     contextTokens,
@@ -339,11 +393,11 @@ function createEstimatorInput(request: ContextEstimateRequest, log: LlamaAllocat
 }
 
 export async function readLlamaAllocationLog(path: string | null | undefined): Promise<{ text: string | null; reason?: string }> {
-  if (!path) return { text: null, reason: 'LOCAL_AI_LLAMA_SERVER_LOG is not configured' };
+  if (!path) return { text: null, reason: 'не задана переменная LOCAL_AI_LLAMA_SERVER_LOG' };
   try {
     return { text: await readFile(path, 'utf8') };
   } catch (error) {
-    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return { text: null, reason: 'configured llama-server allocation log was not found' };
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return { text: null, reason: 'журнал выделения памяти llama-server не найден' };
     throw error;
   }
 }
@@ -394,38 +448,38 @@ export async function collectRuntimeContextEstimate(
     return { ...base, unknownReasons: [...request.reserveErrors] };
   }
   if (!observed) {
-    return { ...base, unknownReasons: ['active runtime context is not reported for this model; startup log alone does not prove it is currently loaded'] };
+    return { ...base, unknownReasons: ['для этой модели не сообщён активный контекст; один журнал запуска не доказывает, что она загружена сейчас'] };
   }
   const logResult = await readLog(request.startupLogPath);
   if (!logResult.text) {
-    return { ...base, unknownReasons: [logResult.reason ?? 'llama-server allocation log unavailable'] };
+    return { ...base, unknownReasons: [logResult.reason ?? 'журнал выделения памяти llama-server недоступен'] };
   }
   const allocationEvidence = parseLlamaAllocationLog(logResult.text, request.runtimeArguments);
   if (allocationEvidence.contextTokens !== observed.activeContextTokens) {
     return {
       ...base,
-      unknownReasons: [`allocation log context (${allocationEvidence.contextTokens ?? 'unknown'}) does not match active runtime context (${observed.activeContextTokens})`],
+      unknownReasons: [`контекст в журнале выделения памяти (${allocationEvidence.contextTokens ?? 'неизвестен'}) не совпадает с активным контекстом (${observed.activeContextTokens})`],
       allocationEvidence,
     };
   }
   if (!observed.kvCacheType || observed.kvOffload === undefined) {
-    return { ...base, unknownReasons: ['active launcher did not report the effective KV-cache type and offload setting'], allocationEvidence };
+    return { ...base, unknownReasons: ['launcher не сообщил фактический тип KV-кэша и его размещение (GPU/RAM)'], allocationEvidence };
   }
   const loggedKvTypes = [allocationEvidence.kvTypeK, allocationEvidence.kvTypeV];
   const draftTypes = [allocationEvidence.speculativeKvTypeK, allocationEvidence.speculativeKvTypeV];
   if (loggedKvTypes.some((type) => type !== null && type !== observed.kvCacheType)
     || (allocationEvidence.speculativeMode !== 'none' && draftTypes.some((type) => type !== null && type !== observed.kvCacheType))) {
-    return { ...base, unknownReasons: ['startup log cache precisions do not match the active launcher selection'], allocationEvidence };
+    return { ...base, unknownReasons: ['точность кэша в журнале запуска не совпадает с выбором в launcher'], allocationEvidence };
   }
   const hostKvBytes = totalFor(allocationEvidence.allocations.kv, 'host') + totalFor(allocationEvidence.allocations.speculativeKv, 'host');
   const deviceKvBytes = totalFor(allocationEvidence.allocations.kv, 'device') + totalFor(allocationEvidence.allocations.speculativeKv, 'device');
   if (hostKvBytes + deviceKvBytes > 0 && ((observed.kvOffload && deviceKvBytes <= hostKvBytes) || (!observed.kvOffload && hostKvBytes <= deviceKvBytes))) {
-    return { ...base, unknownReasons: ['KV allocation placement does not match the active launcher offload setting'], allocationEvidence };
+    return { ...base, unknownReasons: ['размещение KV-кэша не совпадает с выбором GPU/RAM в launcher'], allocationEvidence };
   }
   if (!observed.modelPath || !allocationEvidence.modelPath || resolve(observed.modelPath) !== resolve(allocationEvidence.modelPath)) {
     return {
       ...base,
-      unknownReasons: ['allocation log model path does not confirm the currently selected runtime model'],
+      unknownReasons: ['путь к модели в журнале не подтверждает выбранную сейчас модель'],
       allocationEvidence,
     };
   }
@@ -434,15 +488,15 @@ export async function collectRuntimeContextEstimate(
     const vramTotalBytes = request.hardware.vramTotalBytes;
     const vramUsedBytes = request.hardware.vramUsedBytes;
     const reserveReasons = [
-      ...(request.hostReserveBytes == null ? ['explicit system RAM reserve is not configured'] : []),
-      ...(request.deviceReserveBytes == null ? ['explicit accelerator-memory reserve is not configured'] : []),
-      ...(!request.hardware.available || request.hardware.ramTotalBytes <= 0 || request.hardware.ramUsedBytes < 0 || request.hardware.ramUsedBytes > request.hardware.ramTotalBytes ? ['system memory snapshot is unavailable or invalid'] : []),
+      ...(request.hostReserveBytes == null ? ['не задан явный резерв системной памяти (RAM)'] : []),
+      ...(request.deviceReserveBytes == null ? ['не задан явный резерв памяти ускорителя (VRAM)'] : []),
+      ...(!request.hardware.available || request.hardware.ramTotalBytes <= 0 || request.hardware.ramUsedBytes < 0 || request.hardware.ramUsedBytes > request.hardware.ramTotalBytes ? ['снимок системной памяти недоступен или некорректен'] : []),
       ...(vramTotalBytes === null || vramUsedBytes === null || vramTotalBytes <= 0 || vramUsedBytes < 0 || vramUsedBytes > vramTotalBytes
         || request.hardware.vramAvailableBytes === null || !Number.isFinite(request.hardware.vramAvailableBytes)
         || request.hardware.vramAvailableBytes < 0 || request.hardware.vramAvailableBytes > vramTotalBytes - vramUsedBytes
-        ? ['accelerator memory availability is unavailable or invalid (requires reported free memory for one device)'] : []),
-      ...(!completeAllocationTier(allocationEvidence, 'host') ? ['startup log does not provide complete host allocation categories'] : []),
-      ...(!completeAllocationTier(allocationEvidence, 'device') ? ['startup log does not provide complete accelerator allocation categories'] : []),
+        ? ['данные о доступной памяти ускорителя недоступны или некорректны (нужна свободная память ровно одного устройства)'] : []),
+      ...(!completeAllocationTier(allocationEvidence, 'host') ? ['журнал запуска не содержит всех категорий выделения памяти в RAM'] : []),
+      ...(!completeAllocationTier(allocationEvidence, 'device') ? ['журнал запуска не содержит всех категорий выделения памяти в VRAM'] : []),
     ];
     return {
       ...base,

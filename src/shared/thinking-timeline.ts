@@ -3,7 +3,60 @@ import type { ChatMessage, ThinkingTimelineEvent, ToolActivity } from './types';
 export type ThinkingTimelineItem =
   | { id: string; kind: 'reasoning'; content: string; live: boolean; position?: number; startedAt?: string; completedAt?: string }
   | { id: string; kind: 'activity'; activity: ToolActivity; position?: number }
-  | { id: string; kind: 'steering'; message: ChatMessage; status: 'accepted' | 'applied'; position: number };
+  | { id: string; kind: 'steering'; message: ChatMessage; status: 'accepted' | 'applied'; position: number }
+  | { id: string; kind: 'paused'; position: number };
+
+/**
+ * A steering message that is only accepted has not been seen by the model yet: the turn that is streaming right now was
+ * requested without it. It must therefore not take a chronological place among that turn's reasoning. Until the runtime
+ * applies it at a turn boundary it sorts after everything else, and application moves it to the position where the model
+ * actually received it.
+ */
+export const PENDING_STEERING_POSITION = Number.MAX_SAFE_INTEGER;
+
+export function applySteeringEvent(entries: ThinkingTimelineEvent[], messageId: string, status: 'accepted' | 'applied', position?: number): ThinkingTimelineEvent[] {
+  const existing = entries.find((entry) => entry.kind === 'steering' && entry.messageId === messageId);
+  if (existing?.kind === 'steering') {
+    if (existing.status === 'applied' || status === 'accepted') return entries;
+    return entries.map((entry) => entry === existing ? { ...existing, status: 'applied', position: position ?? existing.position } : entry);
+  }
+  if (status === 'applied' && position === undefined) return entries;
+  return [...entries, { id: `steering-${messageId}`, kind: 'steering', messageId, position: status === 'applied' ? position! : PENDING_STEERING_POSITION, status }];
+}
+
+export function appendPausedMarker(entries: ThinkingTimelineEvent[], position: number | undefined): ThinkingTimelineEvent[] {
+  if (position === undefined || entries.some((entry) => entry.kind === 'paused')) return entries;
+  return [...entries, { id: `paused-${position}`, kind: 'paused', position }];
+}
+
+/**
+ * Applies a batch of streamed reasoning fragments to a timeline.
+ *
+ * Fragments are batched until the next animation frame, while tool events are applied at once, so a tool call
+ * normally lands in the timeline *before* the last reasoning fragments of the turn that preceded it. A fragment
+ * therefore has to be merged into the entry that already holds its position, wherever that entry now sits; appending a
+ * new entry whenever the last one is not reasoning split one thought into several entries with the same id (duplicate
+ * React keys, so nodes could not be reused and the DOM kept growing) and broke sentences into separate blocks.
+ *
+ * Entries that did not change keep their identity, which the render-side caches rely on.
+ */
+export function appendReasoningFragments(entries: ThinkingTimelineEvent[], fragments: ReadonlyArray<{ content: string; timelinePosition?: number }>): ThinkingTimelineEvent[] {
+  let next = entries;
+  for (const fragment of fragments) {
+    if (fragment.timelinePosition === undefined) continue;
+    if (next === entries) next = [...entries];
+    let index = -1;
+    // A position's entry is always among the most recent ones; never scan the whole history.
+    for (let candidate = next.length - 1; candidate >= Math.max(0, next.length - 8); candidate -= 1) {
+      const entry = next[candidate]!;
+      if (entry.kind === 'reasoning' && entry.position === fragment.timelinePosition) { index = candidate; break; }
+    }
+    const existing = index >= 0 ? next[index] : undefined;
+    if (existing?.kind === 'reasoning') next[index] = { ...existing, content: existing.content + fragment.content };
+    else next.push({ id: `reasoning-${fragment.timelinePosition}`, kind: 'reasoning', content: fragment.content, position: fragment.timelinePosition });
+  }
+  return next;
+}
 
 export function steeringMessageIds(messages: ChatMessage[]): Set<string> {
   const userMessageIds = new Set(messages.filter((message) => message.role === 'user').map((message) => message.id));
@@ -12,8 +65,24 @@ export function steeringMessageIds(messages: ChatMessage[]): Set<string> {
     : []));
 }
 
-function reasoningItems(event: Extract<ThinkingTimelineEvent, { kind: 'reasoning' }>, live: boolean): ThinkingTimelineItem[] {
+type ReasoningEvent = Extract<ThinkingTimelineEvent, { kind: 'reasoning' }>;
+function splitReasoning(event: ReasoningEvent, live: boolean): ThinkingTimelineItem[] {
   return event.content.split(/\n\s*\n/).map((content) => content.trim()).filter(Boolean).map((content, index, sections) => ({ id: `${event.id}-${index}`, kind: 'reasoning' as const, content, live: live && index === sections.length - 1, position: event.position, ...(index === 0 ? { startedAt: event.startedAt, completedAt: event.completedAt } : {}) }));
+}
+
+/**
+ * Timeline events are replaced immutably while they stream and are never mutated afterwards, so a finished
+ * event's paragraphs are split once and the same item objects are reused on every later render. Only the live
+ * event is re-split per update; otherwise each frame would re-split the whole history of the run.
+ */
+const completedReasoning = new WeakMap<ReasoningEvent, ThinkingTimelineItem[]>();
+function reasoningItems(event: ReasoningEvent, live: boolean): ThinkingTimelineItem[] {
+  if (live) return splitReasoning(event, true);
+  const cached = completedReasoning.get(event);
+  if (cached) return cached;
+  const items = splitReasoning(event, false);
+  completedReasoning.set(event, items);
+  return items;
 }
 
 /**
@@ -26,7 +95,11 @@ export function thinkingTimeline(reasoning: string | undefined, activities: Tool
     const activityById = new Map(activities.map((activity) => [activity.id, activity]));
     const messageById = new Map(messages.filter((message) => message.role === 'user').map((message) => [message.id, message]));
     const ordered = [...events].sort((left, right) => left.position - right.position);
-    const last = ordered.at(-1);
+    let last: ThinkingTimelineEvent | undefined;
+    for (let index = ordered.length - 1; index >= 0 && !last; index -= 1) {
+      const candidate = ordered[index]!;
+      if (!(candidate.kind === 'steering' && candidate.status === 'accepted')) last = candidate;
+    }
     const renderedActivities = new Set<string>();
     const renderedSteeringMessages = new Set<string>();
     return ordered.flatMap((event) => {
@@ -37,6 +110,7 @@ export function thinkingTimeline(reasoning: string | undefined, activities: Tool
         renderedSteeringMessages.add(event.messageId);
         return [{ id: event.id, kind: 'steering' as const, message, status: event.status, position: event.position }];
       }
+      if (event.kind === 'paused') return [{ id: event.id, kind: 'paused' as const, position: event.position }];
       if (!activityById.has(event.activityId) || renderedActivities.has(event.activityId)) return [];
       renderedActivities.add(event.activityId);
       return [{ id: event.id, kind: 'activity' as const, activity: activityById.get(event.activityId)!, position: event.position }];

@@ -1,7 +1,9 @@
+pub mod deliverables;
 pub mod events;
 pub mod evidence;
 pub mod ledger;
 pub mod loop_runtime;
+pub mod plan;
 pub mod policy;
 pub mod presentation;
 pub mod reads;
@@ -9,3 +11,5 @@ pub mod state;
 pub mod strategy;
 pub mod task_memory;
 pub mod transcript;
+pub mod verification;
+pub mod work_budget;

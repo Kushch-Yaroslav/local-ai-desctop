@@ -73,6 +73,8 @@ export interface ContextDiscoveryOption {
   memoryBaseline: { hostAvailableBytes: number; deviceAvailableBytes: number };
   measuredHeadroom: { hostBytes: number; deviceBytes: number };
   boundaryTokens?: number;
+  /** Loaded from the persistent store rather than measured in this session. */
+  restored?: boolean;
 }
 
 export interface ContextProbeRecord {
@@ -122,11 +124,12 @@ export function findFreshContextDiscoveryOption(
   return options
     .filter((option) => {
       const age = now - Date.parse(option.discoveredAt);
+      // A saved calibration has no meaningful session age; live memory checks decide.
       return option.modelId === requested.modelId
         && option.contextWindow >= requested.contextWindow
         && option.kvCacheType === requested.kvCacheType
         && option.kvOffload === requested.kvOffload
-        && Number.isFinite(age) && age >= 0 && age <= maxAgeMs;
+        && (option.restored ? Number.isFinite(age) : Number.isFinite(age) && age >= 0 && age <= maxAgeMs);
     })
     .sort((left, right) => left.contextWindow - right.contextWindow)[0] ?? null;
 }
@@ -177,22 +180,22 @@ const requiredByteFields = [
 type RequiredEstimatorNumber = typeof requiredByteFields[number];
 
 const displayNames: Partial<Record<keyof ContextEstimatorInput, string>> = {
-  hostAvailableBytes: 'available system RAM',
-  deviceAvailableBytes: 'available accelerator memory',
-  hostReserveBytes: 'system RAM reserve',
-  deviceReserveBytes: 'accelerator memory reserve',
-  hostWeightBytes: 'model weight residency in system RAM',
-  deviceWeightBytes: 'model weight residency in accelerator memory',
-  hostKvBytesPerToken: 'KV-cache bytes per token in system RAM',
-  deviceKvBytesPerToken: 'KV-cache bytes per token in accelerator memory',
-  speculativeHostKvBytesPerToken: 'draft KV-cache bytes per token in system RAM',
-  speculativeDeviceKvBytesPerToken: 'draft KV-cache bytes per token in accelerator memory',
-  sequenceSlots: 'runtime sequence-slot count',
-  speculativeHostWeightBytes: 'draft/MTP weight residency in system RAM',
-  speculativeDeviceWeightBytes: 'draft/MTP weight residency in accelerator memory',
-  speculativeHostBufferBytesPerSlot: 'draft/MTP buffer size in system RAM',
-  speculativeDeviceBufferBytesPerSlot: 'draft/MTP buffer size in accelerator memory',
-  speculativeSlots: 'draft/MTP slot count',
+  hostAvailableBytes: 'доступная системная память (RAM)',
+  deviceAvailableBytes: 'доступная память ускорителя (VRAM)',
+  hostReserveBytes: 'резерв системной памяти (RAM)',
+  deviceReserveBytes: 'резерв памяти ускорителя (VRAM)',
+  hostWeightBytes: 'веса модели в RAM',
+  deviceWeightBytes: 'веса модели в VRAM',
+  hostKvBytesPerToken: 'байт KV-кэша на токен в RAM',
+  deviceKvBytesPerToken: 'байт KV-кэша на токен в VRAM',
+  speculativeHostKvBytesPerToken: 'байт KV-кэша draft-модели на токен в RAM',
+  speculativeDeviceKvBytesPerToken: 'байт KV-кэша draft-модели на токен в VRAM',
+  sequenceSlots: 'число слотов последовательностей llama.cpp',
+  speculativeHostWeightBytes: 'веса draft/MTP в RAM',
+  speculativeDeviceWeightBytes: 'веса draft/MTP в VRAM',
+  speculativeHostBufferBytesPerSlot: 'размер буфера draft/MTP в RAM',
+  speculativeDeviceBufferBytesPerSlot: 'размер буфера draft/MTP в VRAM',
+  speculativeSlots: 'число слотов draft/MTP',
 };
 
 function isNonNegativeFinite(value: unknown): value is number {
@@ -212,14 +215,14 @@ export function estimateHardwareSafeContext(input: ContextEstimatorInput): Conte
     .filter((field) => !isNonNegativeFinite(input[field]))
     .map((field) => displayNames[field] ?? String(field));
 
-  if (!configuredMaxTokens) unknownReasons.unshift('valid configured model/runtime maximum');
-  if (input.speculativeMode === 'unknown') unknownReasons.push('whether speculative decoding is enabled');
+  if (!configuredMaxTokens) unknownReasons.unshift('допустимый максимум контекста модели и llama.cpp');
+  if (input.speculativeMode === 'unknown') unknownReasons.push('включено ли спекулятивное декодирование');
   if (!Number.isSafeInteger(input.sequenceSlots) || (input.sequenceSlots ?? 0) < 1) {
-    const reason = displayNames.sequenceSlots ?? 'runtime sequence-slot count';
+    const reason = displayNames.sequenceSlots ?? 'число слотов последовательностей llama.cpp';
     if (!unknownReasons.includes(reason)) unknownReasons.push(reason);
   }
   if (!Number.isSafeInteger(input.speculativeSlots) || (input.speculativeSlots ?? 0) < 0) {
-    const reason = displayNames.speculativeSlots ?? 'draft/MTP slot count';
+    const reason = displayNames.speculativeSlots ?? 'число слотов draft/MTP';
     if (!unknownReasons.includes(reason)) unknownReasons.push(reason);
   }
 

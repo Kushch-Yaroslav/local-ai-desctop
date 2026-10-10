@@ -17,6 +17,7 @@ pub struct TailCandidateAttempt {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
+    WorkBudget { budget: super::work_budget::BudgetView },
     AgentStarted {
         run_id: String,
     },
@@ -28,6 +29,15 @@ pub enum Event {
     },
     SteeringRejected {
         message: String,
+    },
+    /// The run entered the graceful pause lifecycle.
+    PauseStarted {
+        source: String,
+    },
+    /// The run ended in a paused state: durable state was saved, unfinished
+    /// work stays unfinished and an explicit Continue resumes it.
+    RunPaused {
+        checkpoint_turns: usize,
     },
     TurnStarted {
         index: usize,
@@ -82,6 +92,7 @@ pub enum Event {
     AgentStatus {
         content: String,
     },
+    HostToolCall { id: String, name: String, arguments: Value },
     ToolCallStarted {
         id: String,
         name: String,

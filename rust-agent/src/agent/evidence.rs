@@ -159,7 +159,13 @@ pub struct EvidenceStore {
 }
 
 pub fn history_hash(history: &[Value]) -> String {
-    let mut canonical = Value::Array(history.to_vec());
+    // Native payloads are rehydrated only when needed. Stable attachment IDs
+    // distinguish changed inputs without hashing transport blobs or breaking
+    // Continue when a follow-up no longer needs a prior image.
+    let mut canonical = Value::Array(history.iter().cloned().map(|mut message| {
+        if let Some(object) = message.as_object_mut() { object.remove("images"); }
+        message
+    }).collect());
     // Persisted lineage hashes predate order-preserving tool schema serialization.
     canonical.sort_all_objects();
     format!(
@@ -438,6 +444,7 @@ impl EvidenceStore {
                 Entry::Finalizing => "finalizing",
                 Entry::CloseoutRequested => "closeout_requested",
                 Entry::RunComplete => "run_complete",
+                Entry::WorkBudget(_) => "work_budget",
                 Entry::LanguagePreference(_) => "language_preference",
                 Entry::Evidence(_) => "established_evidence",
                 Entry::EvidenceRejection { .. } => "evidence_rejection",
@@ -465,11 +472,14 @@ impl EvidenceStore {
         base: &Path,
         history: &[Value],
         user: &str,
+        image_refs: &[String],
         steering: &[String],
         final_text: &str,
     ) -> Result<(), String> {
         let mut next = history.to_vec();
-        next.push(json!({"role":"user","content":user}));
+        let mut current = json!({"role":"user","content":user});
+        if !image_refs.is_empty() { current["image_refs"] = json!(image_refs); }
+        next.push(current);
         for content in steering {
             next.push(json!({"role":"user","content":content}));
         }
@@ -541,8 +551,8 @@ fn can_resume_interrupted(base: &Path, active: &Active, history: &[Value]) -> bo
     }
     let Some(user) = first_user else { return false };
     history.len() > prefix.len()
-        && history.starts_with(&prefix)
-        && history.get(prefix.len()) == Some(&user)
+        && history_hash(&history[..prefix.len()]) == history_hash(&prefix)
+        && history.get(prefix.len()).is_some_and(|current| history_hash(&[current.clone()]) == history_hash(&[user]))
 }
 
 fn read_stored_observation(
@@ -655,5 +665,18 @@ mod tests {
             "total_lines": 664
         });
         assert_eq!(returned_range(&parsed), None);
+    }
+}
+
+#[cfg(test)]
+mod image_identity_regression {
+    use super::*;
+    #[test]
+    fn history_tracks_attachment_identity_not_transient_binary_rehydration() {
+        let stable = json!({"role":"user","content":"look","image_refs":["image-1"]});
+        let mut rehydrated = stable.clone(); rehydrated["images"] = json!(["data:image/jpeg;base64,/9j/"]);
+        assert_eq!(history_hash(&[stable.clone()]), history_hash(&[rehydrated]));
+        let mut changed = stable.clone(); changed["image_refs"] = json!(["image-2"]);
+        assert_ne!(history_hash(&[stable]), history_hash(&[changed]));
     }
 }

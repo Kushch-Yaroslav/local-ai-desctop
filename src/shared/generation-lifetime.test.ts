@@ -5,7 +5,7 @@ import type { ChatMessage, Conversation } from './types';
 import type {} from '../renderer/env';
 
 async function run(): Promise<void> {
-  const chat = (id: string): Conversation => ({ id, title: id, modelId: 'model', mode: 'agent', workingDirectory: null, primaryProjectId: null, secondaryWorkingDirectory: null, secondaryProjectId: null, contextWindow: 16384, reasoningMode: 'fast', contextTokens: null, contextModelId: null, webMode: 'off', createdAt: '', updatedAt: '' });
+  const chat = (id: string): Conversation => ({ id, title: id, modelId: 'model', mode: 'agent', workingDirectory: null, primaryProjectId: null, secondaryWorkingDirectory: null, secondaryProjectId: null, contextWindow: 16384, thinkingEnabled: null, reasoningEffort: null, reasoningMode: 'fast', contextTokens: null, contextModelId: null, webMode: 'off', createdAt: '', updatedAt: '' });
   const persisted = new Map<string, ChatMessage[]>();
   let finish!: () => void;
   let stopped = 0;
@@ -14,14 +14,14 @@ async function run(): Promise<void> {
   const frames: Array<() => void> = [];
   Object.defineProperty(globalThis, 'window', { configurable: true, value: {
     requestAnimationFrame: (callback: () => void) => { frames.push(callback); return 1; }, cancelAnimationFrame: () => {},
-    localAi: {
+    localAi: { agentPlans: { get: async () => null },
       messages: { list: async (id: string) => persisted.get(id) ?? [], regenerate: async () => new Promise<ChatMessage[]>((resolve) => { resolveBranch = resolve; }) },
       analysis: { list: async () => [] },
       conversations: { create: async () => chat('C'), delete: async () => {} },
       chat: { stop: async () => { stopped++; }, send: async () => { sends++; await new Promise<void>((resolve) => { finish = resolve; }); } },
     },
   } });
-  useAppStore.setState({ conversations: [chat('A'), chat('B'), chat('D')], activeId: 'A', messages: [] });
+  useAppStore.setState({ conversations: [chat('A'), chat('B'), chat('D')], activeId: 'A', messages: [], settings: { llamaServerPath: null, modelsPath: '', llamaRuntime: { status: 'ready', modelId: 'model', contextWindow: 16_384 } } });
   const running = useAppStore.getState().sendMessage('inspect');
   const generationId = useAppStore.getState().generationId!;
   await useAppStore.getState().deleteConversation('D');
@@ -31,7 +31,8 @@ async function run(): Promise<void> {
   event('thinking', 'First thought');
   await useAppStore.getState().selectConversation('B');
   const followup: ChatMessage = { id: 'followup', conversationId: 'A', role: 'user', content: 'additional instruction', createdAt: '' };
-  useAppStore.getState().handleStream({ type: 'steering', conversationId: 'A', generationId, userMessage: followup, status: 'accepted', timelinePosition: 2 });
+  useAppStore.getState().handleStream({ type: 'steering', conversationId: 'A', generationId, userMessage: followup, status: 'accepted' });
+  assert.equal(useAppStore.getState().messages.length, 0, 'a background accepted steering must not leak into the visible chat');
   useAppStore.getState().handleStream({ type: 'steering', conversationId: 'A', generationId, userMessage: followup, status: 'applied', timelinePosition: 2 });
   event('token', 'Background answer');
   while (frames.length) frames.shift()!();

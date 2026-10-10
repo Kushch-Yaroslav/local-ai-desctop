@@ -86,7 +86,7 @@ export async function discoverContextBoundary(deps: DiscoveryDependencies): Prom
   const probes: ContextProbeRecord[] = [];
   const hardLimit = Math.floor(deps.hardLimit / bucket) * bucket;
   const baseContext = Math.min(16_384, hardLimit);
-  if (hardLimit < bucket) throw new Error('Model/backend context limit is below the minimum discovery bucket.');
+  if (hardLimit < bucket) throw new Error('Предел контекста модели и llama.cpp ниже минимального шага поиска.');
   const runProbe = async (context: number, mode: 'f16' | 'q8_0', phase: ContextProbeRecord['phase']) => {
     deps.progress(`${mode === 'f16' ? 'FP16' : 'Q8'} · ${context / 1024}K · ${phase}`, probes.length + 1);
     const probe = await deps.probe(context, mode, phase);
@@ -97,7 +97,7 @@ export async function discoverContextBoundary(deps: DiscoveryDependencies): Prom
     for (const mode of ['f16', 'q8_0'] as const) {
       const base = await runProbe(baseContext, mode, 'base');
       if (!completeSample(base, baseContext, mode, deps.kvOffload)) {
-        unsupported.push({ kvCacheType: mode, reason: base.record.reason ?? 'Missing matching allocation, health, or completed inference evidence.' });
+        unsupported.push({ kvCacheType: mode, reason: base.record.reason ?? 'Нет подтверждений: выделения памяти, проверки состояния или завершённого пробного запроса.' });
         continue;
       }
       const samples = [base.estimate];
@@ -112,7 +112,7 @@ export async function discoverContextBoundary(deps: DiscoveryDependencies): Prom
         if (candidate <= low) break;
         if (!predictionFits(samples, candidate, emergencyHostReserve, 0)) {
           probes.push({ kvCacheType: mode, contextWindow: candidate, phase: 'search', startup: false, health: false, inference: false, fits: false,
-            reason: 'Skipped before startup: projected allocation crosses the absolute background budget or actual-free-memory probe guard.',
+            reason: 'Пропущено до запуска: расчётная память выходит за общий бюджет VRAM или за защитный порог фактически свободной памяти.',
             headroom: predictContextHeadroom(samples, candidate), memoryBaseline: null, elapsedMs: 0 });
           high = candidate;
           boundaryReason = 'budget-guard';
@@ -130,7 +130,7 @@ export async function discoverContextBoundary(deps: DiscoveryDependencies): Prom
             high = candidate;
             boundaryReason = 'probe-failure';
             failedContextTokens = candidate;
-            probe.record.reason ??= 'Measured allocation crosses the absolute LLM budget or actual free-memory guard.';
+            probe.record.reason ??= 'Измеренная память выходит за бюджет VRAM для LLM или за защитный порог свободной памяти.';
           }
         }
         if (low === hardLimit) { boundaryReason = 'model-limit'; break; }
@@ -140,7 +140,7 @@ export async function discoverContextBoundary(deps: DiscoveryDependencies): Prom
       // KV multipliers or arbitrary percentage reductions of context.
       let finalContext = Math.min(low, predictedCeiling(samples, low, deps.hostReserveBytes, deps.deviceReserveBytes, true));
       if (finalContext < baseContext) {
-        unsupported.push({ kvCacheType: mode, reason: 'No context left the final RAM/VRAM reserves.' });
+        unsupported.push({ kvCacheType: mode, reason: 'Ни один размер контекста не оставляет требуемый запас RAM/VRAM.' });
         continue;
       }
       let final = finalContext === low ? latestGood : await runProbe(finalContext, mode, 'final');
@@ -149,18 +149,18 @@ export async function discoverContextBoundary(deps: DiscoveryDependencies): Prom
         && (probe.estimate.vramBudget ? probe.estimate.vramBudget.llmBytes <= probe.estimate.vramBudget.availableLlmBytes
           : probe.estimate.memoryHeadroom!.deviceBytes >= deps.deviceReserveBytes);
       if (!finalFits(final, finalContext) && finalContext > baseContext) {
-        final.record.reason ??= 'Exact final probe did not preserve the absolute LLM budget and measured free-memory margin.';
+        final.record.reason ??= 'Финальная проверка не сохранила бюджет VRAM для LLM и измеренный запас свободной памяти.';
         finalContext = completeSample(final, finalContext, mode, deps.kvOffload)
           ? Math.min(finalContext - bucket, predictedCeiling([...samples, final.estimate], finalContext - bucket, deps.hostReserveBytes, deps.deviceReserveBytes, true))
           : Math.floor((baseContext + finalContext) / (2 * bucket)) * bucket;
         if (finalContext < baseContext) {
-          unsupported.push({ kvCacheType: mode, reason: 'Changed available memory leaves no final reserve-preserving candidate.' });
+          unsupported.push({ kvCacheType: mode, reason: 'После изменения доступной памяти не осталось варианта, сохраняющего запас.' });
           continue;
         }
         final = await runProbe(finalContext, mode, 'final');
       }
       if (!finalFits(final, finalContext) || !final.estimate?.memoryBaseline || !final.estimate.memoryHeadroom) {
-        unsupported.push({ kvCacheType: mode, reason: final.record.reason ?? 'Exact final-context inference did not leave the required reserves.' });
+        unsupported.push({ kvCacheType: mode, reason: final.record.reason ?? 'Пробный запрос на финальном размере контекста не сохранил требуемый запас памяти.' });
         continue;
       }
       final.record.fits = true;
@@ -173,10 +173,10 @@ export async function discoverContextBoundary(deps: DiscoveryDependencies): Prom
     const q8 = options.find((option) => option.kvCacheType === 'q8_0');
     if (q8 && (!f16 || q8.contextWindow < f16.contextWindow + granularity)) {
       options.splice(options.indexOf(q8), 1);
-      unsupported.push({ kvCacheType: 'q8_0', reason: 'Q8 did not establish a verified improvement of at least 8K over FP16.' });
+      unsupported.push({ kvCacheType: 'q8_0', reason: 'Q8 не дал подтверждённого выигрыша хотя бы в 8K по сравнению с FP16.' });
     }
   } finally {
-    deps.progress('Восстановление исходного runtime…', probes.length);
+    deps.progress('Восстановление исходной конфигурации llama.cpp…', probes.length);
     await deps.restore();
   }
   return { modelId: deps.modelId, probeContextTokens: baseContext, hardLimit, options, unsupported, restored: true, probes };

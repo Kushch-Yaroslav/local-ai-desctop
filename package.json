@@ -1,32 +1,42 @@
 {
   "name": "local-ai-desktop",
   "version": "0.1.0",
+  "license": "MIT AND Apache-2.0",
   "private": true,
   "description": "Локальный AI-клиент для Linux",
   "main": "dist/main/index.js",
   "scripts": {
-    "dev": "concurrently -k \"npm:dev:renderer\" \"npm:dev:main\" \"npm:dev:electron\"",
+    "dev": "npm run build:rust-agent && concurrently -k \"npm:dev:renderer\" \"npm:dev:main\" \"npm:dev:electron\"",
     "dev:renderer": "vite --host 127.0.0.1",
     "dev:main": "tsc -p tsconfig.electron.json --watch",
-    "dev:electron": "wait-on tcp:5173 dist/main/index.js && cross-env LOCAL_AI_DEV_SERVER_URL=http://127.0.0.1:5173 electron dist/main/index.js",
+    "dev:electron": "wait-on tcp:5173 dist/main/index.js && cross-env LOCAL_AI_DEV_SERVER_URL=http://127.0.0.1:5173 bash scripts/electron-start.sh",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
-    "build:rust-agent": "cargo build --manifest-path rust-agent/Cargo.toml",
+    "build:rust-agent": "cargo build --locked --manifest-path rust-agent/Cargo.toml",
     "build": "npm run build:rust-agent && npm run typecheck && vite build && tsc -p tsconfig.electron.json",
+    "test:agent-status": "npm run build && node dist/shared/agent-status.test.js && node scripts/agent-status-renderer.test.mjs",
     "test:attachments": "npm run build && node dist/main/services/attachment-pipeline.test.js",
-    "test:agent-runtime": "npm run build && node dist/main/services/rust-agent-runtime.test.js",
-    "test:context-usage": "npm run build && node dist/shared/context-format.test.js",
-    "test:database-migration": "npm run build && node dist/main/services/database.test.js",
+    "test:agent-runtime": "npm run build && node dist/main/services/rust-agent-runtime.test.js && node dist/main/services/agent-workspace.test.js && node dist/main/tools/process-group.test.js && node dist/main/ipc/failed-run.test.js && node dist/main/ipc/stop-history.test.js && node dist/main/ipc/terminal-lifecycle.test.js && node dist/shared/failed-generation.test.js",
+    "test:context-usage": "npm run build && node dist/shared/context-format.test.js && node dist/shared/localization.test.js && node dist/shared/localization-coverage.test.js",
+    "test:database-migration": "npm run build && node dist/main/services/database.test.js && node dist/main/services/run-recovery.test.js",
     "test:web-chat": "npm run build && node dist/main/services/web-chat.test.js",
-    "test:thinking-timeline": "npm run build && node dist/shared/thinking-timeline.test.js && node dist/shared/generation-lifetime.test.js",
+    "test:thinking-timeline": "npm run build && node dist/shared/thinking-timeline.test.js && node dist/shared/generation-lifetime.test.js && node dist/shared/stop-history.test.js && node dist/shared/failed-generation.test.js && node dist/shared/streaming-load.test.js",
     "test:mermaid-theme": "npm run build && node dist/shared/mermaid-theme.test.js",
     "test:diagnostics": "npm run build && node dist/main/services/generation-diagnostics.test.js",
-    "test:rust-agent-runtime": "npm run build && node dist/main/services/rust-agent-runtime.test.js",
-    "test:regeneration": "npm run build && node dist/shared/generation-guard.test.js",
+    "test:rust-agent-runtime": "npm run build && node dist/main/services/rust-agent-runtime.test.js && node dist/main/ipc/failed-run.test.js",
+    "test:regeneration": "npm run build && node dist/shared/generation-guard.test.js && node dist/shared/conversation-settings.test.js && node dist/shared/reasoning-controls.test.js",
     "test:llama-cpp-backend": "npm run build && node dist/main/backends/llama-cpp-backend.test.js",
-    "test:llama-runtime": "npm run build && bash scripts/electron-sandbox.test.sh && bash scripts/llama-launcher-failure.test.sh && node dist/main/services/llama-runtime-controller.test.js",
-    "test:max-context": "npm run build && node dist/shared/context-options.test.js && node dist/shared/context-estimator.test.js && node dist/shared/vram-budget.test.js && node dist/main/services/context-discovery.test.js && node dist/main/services/context-estimate.test.js && node dist/main/services/hardware.test.js && node dist/main/services/gguf-context.test.js && node dist/main/services/llama-runtime-controller.test.js && node dist/main/backends/llama-cpp-backend.test.js && node dist/main/services/database.test.js && bash scripts/electron-sandbox.test.sh && bash scripts/llama-launcher-failure.test.sh",
-    "start": "electron ."
+    "test:llama-runtime": "npm run build && bash scripts/llama-launch-config.test.sh && bash scripts/electron-sandbox.test.sh && bash scripts/llama-launcher-failure.test.sh && bash scripts/llama-launcher-idle.test.sh && node dist/shared/model-selection.test.js && node dist/shared/startup-session.test.js && node dist/main/ipc/startup-selection.test.js && node dist/main/services/llama-runtime-controller.test.js",
+    "test:max-context": "npm run build && node dist/shared/context-options.test.js && node dist/shared/context-estimator.test.js && node dist/shared/vram-budget.test.js && node dist/main/services/context-discovery.test.js && node dist/main/services/context-discovery-persistence.test.js && node dist/main/services/context-estimate.test.js && node dist/main/services/hardware.test.js && node dist/main/services/gguf-context.test.js && node dist/main/services/llama-runtime-controller.test.js && node dist/main/backends/llama-cpp-backend.test.js && node dist/main/services/database.test.js && bash scripts/llama-launch-config.test.sh && bash scripts/electron-sandbox.test.sh && bash scripts/llama-launcher-failure.test.sh",
+    "start": "bash run-local-ai-desktop.sh",
+    "test:model-capabilities": "npm run build && node dist/main/models/model-capabilities.test.js && node dist/main/models/llama-launch-config.test.js",
+    "package:linux": "npm run build && cargo build --locked --release --target x86_64-unknown-linux-musl --manifest-path rust-agent/Cargo.toml && chmod 755 rust-agent/target/x86_64-unknown-linux-musl/release/local-ai-agent-runtime && electron-builder --linux deb --x64 --publish never",
+    "test:linux-setup": "npm run build && node dist/main/services/runtime-settings.test.js && node scripts/renderer-runtime-status.test.mjs && bash scripts/linux-launcher-setup.test.sh",
+    "test:runtime-setup": "npm run build && node dist/main/services/llama-executable.test.js && node dist/main/services/runtime-settings.test.js && node dist/main/services/llama-runtime-controller.test.js",
+    "test:linux-package": "node scripts/linux-package-smoke.mjs",
+    "test:vision-web-localization": "npm run build && bash scripts/vision-web-localization.test.sh",
+    "test:rich-responses:renderer": "node scripts/rich-responses-renderer.test.mjs",
+    "test:rich-responses": "npm run build && node dist/shared/rich-artifacts.test.js && node dist/shared/rich-response-acceptance.test.js && node dist/main/web/public-network.test.js && node dist/main/web/web-tools.test.js && node dist/main/web/search-providers.test.js && node dist/shared/generation-progress.test.js && node dist/shared/chart-presentation.test.js && node dist/main/services/diagram-validation.test.js && node dist/main/services/remote-image-service.test.js && node dist/main/services/web-chat.test.js && node dist/main/services/rich-chat-http.test.js && node dist/main/services/rich-agent-http.test.js && node dist/main/services/rich-gallery-agent.test.js && node dist/main/services/attachment-pipeline.test.js && node dist/main/services/database.test.js"
   },
   "dependencies": {
     "@electron/remote": "^2.1.3",
@@ -40,6 +50,7 @@
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "react-markdown": "^10.0.0",
+    "recharts": "^3.10.1",
     "rehype-highlight": "^7.0.2",
     "remark-gfm": "^4.0.1",
     "zustand": "^5.0.2"
@@ -53,6 +64,7 @@
     "concurrently": "^9.1.2",
     "cross-env": "^7.0.3",
     "electron": "^39.0.0",
+    "electron-builder": "26.17.0",
     "eslint": "^9.17.0",
     "eslint-plugin-react-hooks": "^5.1.0",
     "globals": "^15.14.0",
@@ -60,5 +72,100 @@
     "typescript-eslint": "^8.19.1",
     "vite": "^6.0.5",
     "wait-on": "^8.0.1"
+  },
+  "author": "Local AI Desktop contributors",
+  "engines": {
+    "node": ">=24 <25",
+    "npm": ">=10 <12"
+  },
+  "build": {
+    "productName": "local-ai-desktop",
+    "appId": "io.github.local-ai-desktop",
+    "asar": false,
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**",
+      "!dist/**/*.test.js",
+      "!dist/**/*.map",
+      "!node_modules/**/*.map",
+      "!node_modules/**/*.test.*",
+      "!node_modules/**/*.spec.*",
+      "!node_modules/**/test/**",
+      "!node_modules/**/tests/**",
+      "!node_modules/**/__tests__/**",
+      "run-local-ai-desktop-llama-cpp-mtp.sh",
+      "scripts/electron-sandbox.sh",
+      "LICENSE",
+      "README.md",
+      "README.ru.md",
+      "docs/en/**",
+      "docs/ru/**",
+      "docs/img/**",
+      "THIRD_PARTY_NOTICES.md",
+      "licenses/**",
+      "package.json",
+      "assets/ATTRIBUTION.md"
+    ],
+    "extraFiles": [
+      {
+        "from": "node_modules/electron/dist/chrome-sandbox.disabled",
+        "to": "chrome-sandbox"
+      }
+    ],
+    "extraResources": [
+      {
+        "from": "rust-agent/target/x86_64-unknown-linux-musl/release/local-ai-agent-runtime",
+        "to": "agent/local-ai-agent-runtime"
+      }
+    ],
+    "linux": {
+      "target": [
+        "deb"
+      ],
+      "executableName": "local-ai-desktop",
+      "category": "Development",
+      "icon": "assets/fluent-bot-sparkle-cyan.png",
+      "maintainer": "Local AI Desktop contributors",
+      "syncDesktopName": true,
+      "desktop": {
+        "entry": {
+          "Name": "Local AI Desktop",
+          "Name[ru]": "Local AI Desktop",
+          "Comment": "Локальный AI-клиент для llama.cpp"
+        }
+      }
+    },
+    "npmRebuild": false,
+    "deb": {
+      "depends": [
+        "libgtk-3-0",
+        "libnotify4",
+        "libnss3",
+        "libxss1",
+        "libxtst6",
+        "xdg-utils",
+        "libatspi2.0-0",
+        "libuuid1",
+        "libsecret-1-0",
+        "libasound2t64 | libasound2",
+        "libgbm1",
+        "libdrm2",
+        "libcups2t64 | libcups2",
+        "bash",
+        "coreutils",
+        "grep",
+        "sed",
+        "curl"
+      ]
+    }
+  },
+  "homepage": "https://github.com/Kushch-Yaroslav/local-ai-desktop",
+  "desktopName": "local-ai-desktop.desktop",
+  "allowScripts": {
+    "electron@39.8.10": true,
+    "esbuild@0.25.12": true,
+    "electron-winstaller": false
   }
 }

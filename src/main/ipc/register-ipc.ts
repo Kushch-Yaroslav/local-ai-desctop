@@ -1,49 +1,64 @@
-import { BrowserWindow, dialog, ipcMain } from 'electron';
+import { resolveLlamaExecutable } from '../services/llama-executable';
+import { DiagramValidationBridge } from '../services/diagram-validation';
+import { VisionDeviceController, type VisionDevice } from '../services/vision-device-controller';
+import { t } from '../../shared/locale';
+import { BrowserWindow, dialog, ipcMain, shell } from 'electron';
 import { randomUUID } from 'node:crypto';
-import type { AnalysisRun, ApprovalDecision, ApprovalStatus, ChatRequest, Conversation, ProjectReference, ProjectSuggestion, RiskCategory, ThinkingTimelineEvent } from '../../shared/types';
+import type { AnalysisRun, ApprovalDecision, ApprovalStatus, ChatRequest, Conversation, ProjectReference, ProjectSuggestion, RiskCategory, SteeringIntent, ThinkingTimelineEvent } from '../../shared/types';
 import { findFreshContextDiscoveryOption, type ContextDiscoveryOption, type ContextDiscoveryResult, type ContextDiscoveryProgress, type RuntimeContextEstimate } from '../../shared/context-estimator';
+import { activeConversationModel, initialModelContext } from '../../shared/model-selection';
 import { defaultLlamaKv, normalContextForModel, resolveLlamaKvSelection } from '../../shared/context-options';
 import { Database } from '../services/database';
-import { getHardwareStats, getOwnedServerVramBudget } from '../services/hardware';
+import { getGpuIdentity, getHardwareStats, getOwnedServerVramBudget } from '../services/hardware';
+import { buildContextDiscoveryIdentity, contextDiscoveryKey, mergeSavedDiscoveryOptions } from '../services/context-discovery-persistence';
 import { vramBudgetStillFits, vramProbeGuardBytes } from '../../shared/vram-budget';
 import { LlamaCppBackend } from '../backends/llama-cpp-backend';
-import { LAUNCHER_ABSENT, LlamaRuntimeController, type LlamaRuntimeState } from '../services/llama-runtime-controller';
+import { LlamaRuntimeController, type LlamaRuntimeState } from '../services/llama-runtime-controller';
 import { RustAgentRuntime, taskPlan, type AgentProject } from '../services/rust-agent-runtime';
 import { paths } from '../services/paths';
+import { runtimeDraftAvailability, effectiveRuntimeConfiguration, dismissRuntimeSetup, saveImageProcessingDevice, normalizeConfiguration, runtimeSetup, saveRuntimeConfiguration } from '../services/runtime-settings';
+import { archiveAgentEvidence, discardAgentEvidence } from '../services/agent-evidence';
 import { log } from '../services/logger';
 import { getModelProfile } from '../models/model-registry';
-import { llamaContextPresets, llamaRuntimeProfile } from '../models/llama-runtime-policy';
+import { agentReasoningOptions, llamaContextPresets, llamaRuntimeProfile, reasoningCapability } from '../models/llama-runtime-policy';
+import { reasoningPatchError, resolveReasoningSelection, type ReasoningInput } from '../../shared/reasoning-controls';
 import { WebBrowserService } from '../web/web-tools';
 import { WebChatService } from '../services/web-chat';
-import { chatMessagesWithSystemPrefix, chatSystemContext } from '../services/capabilities';
+import { RemoteImageService } from '../services/remote-image-service';
+import { richArtifactFingerprint } from '../../shared/rich-artifacts';
 import { ReadonlyProjectTools, type ApprovalResult } from '../tools/project-tools';
-import { AttachmentService } from '../services/attachment-service';
+import { imageMimeType, AttachmentService } from '../services/attachment-service';
 import { AttachmentPipeline } from '../services/attachment-pipeline';
-import { readFile, stat } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { saveGenerationDiagnosticsBestEffort } from '../services/generation-diagnostics';
 import { projectDirectoryName } from '../../shared/project-references';
 import { executionMode } from '../../shared/generation-mode';
+import { enabledAgentTools, explicitWorkspaceRoots } from '../services/agent-workspace';
+import { homedir } from 'node:os';
+import { pinLegacyReasoning, touchesRuntime } from '../../shared/conversation-settings';
 import { existingProjectDirectory } from '../services/project-picker';
 import { collectRuntimeContextEstimate, defaultContextDeviceReserveBytes, defaultContextHostReserveBytes, resolveContextReserve } from '../services/context-estimate';
 import { join } from 'node:path';
 import { llamaCapabilityLimit } from '../services/gguf-context';
+import { ggufArtifactFingerprint } from '../services/gguf-artifacts';
 import { discoverContextBoundary, predictContextHeadroom, type DiscoveryProbe } from '../services/context-discovery';
 
 const database = new Database();
-const llamaRuntimeModelId = process.env.LOCAL_AI_LLAMA_MODEL_ID ?? 'qwen3.8:27b-q4_K_M';
-const defaultLlamaContext = 32_768;
-const maximumLlamaContext = llamaRuntimeProfile(llamaRuntimeModelId)?.maxContext ?? defaultLlamaContext;
-const configuredLlamaContext = Number(process.env.LOCAL_AI_LLAMA_CONTEXT ?? defaultLlamaContext);
-const llamaContextLimit = Number.isSafeInteger(configuredLlamaContext) && configuredLlamaContext >= 4_096 && configuredLlamaContext <= maximumLlamaContext && configuredLlamaContext % 4_096 === 0 ? configuredLlamaContext : defaultLlamaContext;
-const initialLlamaKvType = process.env.LOCAL_AI_LLAMA_KV_TYPE === 'q8_0' ? 'q8_0' : 'f16';
-const initialLlamaKvOffload = process.env.LOCAL_AI_LLAMA_KV_OFFLOAD !== '0';
+const initialLlamaKvType = defaultLlamaKv.llamaKvCacheType;
+const initialLlamaKvOffload = defaultLlamaKv.llamaKvOffload;
 const llamaCppUrl = process.env.LOCAL_AI_LLAMA_CPP_URL ?? 'http://127.0.0.1:8081';
-const llamaCpp = new LlamaCppBackend(llamaCppUrl, llamaContextLimit, process.env.LOCAL_AI_LLAMA_CPP_VISION === '1', llamaRuntimeModelId);
+const llamaCpp = new LlamaCppBackend(llamaCppUrl, 32_768, false, null);
 const backend = llamaCpp;
-const web = new WebBrowserService();
-const rustAgent = new RustAgentRuntime(process.env.LOCAL_AI_AGENT_ENDPOINT ?? `${llamaCppUrl.replace(/\/$/, '')}/v1/chat/completions`);
-const webChat = new WebChatService(backend, web);
+// A live/stale launcher document is not an explicit selection in this Electron process.
+let modelSelectedThisProcess = false;
+const remoteImages = new RemoteImageService();
+const web = new WebBrowserService(undefined, remoteImages);
 const attachments = new AttachmentService(database);
+const rustAgent = new RustAgentRuntime(process.env.LOCAL_AI_AGENT_ENDPOINT ?? `${llamaCppUrl.replace(/\/$/, '')}/v1/chat/completions`, undefined, web, (args) => {
+  if (typeof args.attachment_id !== 'string') throw new Error(t('Выберите вложенную таблицу или CSV по ID.'));
+  return attachments.readStructuredRows(args.attachment_id, typeof args.sheet_name === 'string' ? args.sheet_name : undefined, typeof args.start_row === 'number' ? args.start_row : 0, typeof args.max_rows === 'number' ? args.max_rows : 50);
+});
+const webChat = new WebChatService(backend, web);
 const attachmentPipeline = new AttachmentPipeline(database, attachments);
 type ActiveGeneration = {
   id: string;
@@ -51,8 +66,9 @@ type ActiveGeneration = {
   settled: Promise<void>;
   finish: () => void;
   mode?: 'chat' | 'agent';
-  followups?: Array<{ message: import('../../shared/types').ChatMessage; timelinePosition: number; applied: boolean }>;
+  followups?: Array<{ message: import('../../shared/types').ChatMessage; applied: boolean }>;
   thinkingTimeline: ThinkingTimelineEvent[];
+  richArtifacts: import('../../shared/rich-artifacts').RichArtifact[];
   activityTimelinePositions: Map<string, number>;
   timelinePosition: number;
   lastTimelineKind: ThinkingTimelineEvent['kind'] | null;
@@ -67,24 +83,59 @@ const llamaRuntime = new LlamaRuntimeController({
 });
 const discoveredContextOptions = new Map<string, { option: ContextDiscoveryOption; modelIdentity: string }>();
 let contextDiscoveryBusy = false;
+let savedDiscoveryAttempted: string | null = null;
 let runtimeSelectionBusy = false;
+let runtimeShuttingDown = false;
+let deviceChanged = () => {};
+export function onImageProcessingDeviceChanged(listener: () => void): void { deviceChanged = listener; }
+const visionDevice = new VisionDeviceController({
+  busy: () => runtimeShuttingDown || activeGenerations.size > 0 || contextDiscoveryBusy || runtimeSelectionBusy,
+  state: () => llamaRuntime.state(),
+  save: saveImageProcessingDevice,
+  supportsProjector: state => {
+    const profile = state.modelId ? llamaRuntimeProfile(state.modelId) : undefined;
+    return Boolean(profile?.mmprojPath && (state.speculativeMode !== 'mtp' || profile.visionWithMtp !== false));
+  },
+  restart: async (state, device) => {
+    runtimeSelectionBusy = true;
+    try {
+      const result = await llamaRuntime.switchTo(state.modelId!, state.contextWindow!, state.kvCacheType, state.kvOffload, device);
+      await syncLlamaBackend();
+      return result;
+    } finally { runtimeSelectionBusy = false; }
+  },
+  changed: () => deviceChanged(),
+});
+export async function selectImageProcessingDevice(device: VisionDevice): Promise<void> {
+  await visionDevice.select(device);
+}
+export async function imageProcessingDeviceSelection(): Promise<VisionDevice> {
+  const state = await llamaRuntime.state();
+  const config = effectiveRuntimeConfiguration();
+  if (state.status === 'ready' && state.projectorDevice) return state.projectorDevice;
+  if (visionDevice.pending) return visionDevice.pending;
+  return config.imageProcessingDevice ?? (config.models.find(model => model.id === state.modelId)?.projectorDevice === 'gpu' ? 'gpu' : 'cpu');
+}
+
 let contextDiscoveryProgress: ContextDiscoveryProgress = { busy: false, modelId: null, stage: '', probeCount: 0 };
 const discoveryKey = (modelId: string, contextWindow: number, kvCacheType: 'f16' | 'q8_0', kvOffload: boolean) => `${modelId}:${contextWindow}:${kvCacheType}:${kvOffload ? 'gpu' : 'ram'}`;
 function currentDiscoveryHeadroomFits(option: ContextDiscoveryOption, current: RuntimeContextEstimate): boolean {
   const host = resolveContextReserve(process.env.LOCAL_AI_CONTEXT_HOST_RESERVE_BYTES, 'LOCAL_AI_CONTEXT_HOST_RESERVE_BYTES', defaultContextHostReserveBytes);
-  if (host.bytes === null) throw new Error(host.error ?? 'Invalid discovery reserve.');
+  if (host.bytes === null) throw new Error(host.error ?? 'Некорректный резерв памяти для поиска.');
   return !!current.memoryBaseline && !!current.vramBudget && !!option.vramBudget
     && option.measuredHeadroom.hostBytes + current.memoryBaseline.hostAvailableBytes - option.memoryBaseline.hostAvailableBytes >= host.bytes
     && vramBudgetStillFits(option.vramBudget, current.vramBudget);
 }
+/** Fresh results must stay near their measured baseline; a saved calibration only needs the live fit check below, since more free RAM is never unsafe. */
+const hostBaselineStable = (option: ContextDiscoveryOption, current: RuntimeContextEstimate) =>
+  option.restored || Math.abs(current.memoryBaseline!.hostAvailableBytes - option.memoryBaseline.hostAvailableBytes) <= 2 * 1024 ** 3;
 async function modelFileIdentity(path: string): Promise<string> {
-  const file = await stat(path);
-  return `${file.dev}:${file.ino}:${file.size}:${file.mtimeMs}`;
+  return ggufArtifactFingerprint(path, true);
 }
 async function runtimeConfigurationIdentity(modelId: string): Promise<string> {
   const profile = llamaRuntimeProfile(modelId);
   const state = await llamaRuntime.state();
-  if (!profile?.modelPath || state.status !== 'ready' || state.modelId !== modelId || !state.serverPid) throw new Error('Discovery configuration is no longer running.');
+  if (!profile?.modelPath || state.status !== 'ready' || state.modelId !== modelId || !state.serverPid) throw new Error('Проверенная конфигурация llama.cpp больше не запущена.');
   const args = (await readFile(`/proc/${state.serverPid}/cmdline`, 'utf8')).split('\0').filter(Boolean);
   const stableArgs: string[] = [];
   for (let i = 0; i < args.length; i += 1) {
@@ -93,24 +144,71 @@ async function runtimeConfigurationIdentity(modelId: string): Promise<string> {
   }
   return JSON.stringify({ args: stableArgs, model: await modelFileIdentity(profile.modelPath),
     projector: profile.mmprojPath ? await modelFileIdentity(profile.mmprojPath) : null,
-    binary: await modelFileIdentity(args[0]), hardLimit: await llamaCapabilityLimit(modelId), speculative: profile.speculative });
+    ...(state.speculativeMode !== 'none' && profile.draft ? { draft: await modelFileIdentity(profile.draft.path) } : {}),
+    binary: await modelFileIdentity(args[0]), hardLimit: await llamaCapabilityLimit(modelId), speculative: state.speculativeMode ?? profile.speculative });
 }
-/** The launcher's state file is the authority. A manually managed server has no launcher, so the startup environment stands in. */
+/** Size and mtime survive restarts and remounts; device/inode numbers may not. */
+async function persistentFileFingerprint(path: string): Promise<string> {
+  return ggufArtifactFingerprint(path);
+}
+/** The stable configuration a saved Max Context calibration belongs to; requires the model's launcher-managed server to be running. */
+async function persistentDiscoveryIdentity(modelId: string): Promise<{ key: string; serialized: string; hardLimit: number }> {
+  const profile = llamaRuntimeProfile(modelId);
+  const state = await llamaRuntime.state();
+  if (!profile?.modelPath || state.status !== 'ready' || state.modelId !== modelId || !state.serverPid) throw new Error('Сохранённый максимальный контекст можно показать только при запущенной модели.');
+  const args = (await readFile(`/proc/${state.serverPid}/cmdline`, 'utf8')).split('\0').filter(Boolean);
+  const hostReserve = resolveContextReserve(process.env.LOCAL_AI_CONTEXT_HOST_RESERVE_BYTES, 'LOCAL_AI_CONTEXT_HOST_RESERVE_BYTES', defaultContextHostReserveBytes);
+  if (hostReserve.bytes === null) throw new Error(hostReserve.error ?? 'Некорректный резерв памяти для поиска.');
+  const hardLimit = await llamaCapabilityLimit(modelId);
+  const identity = buildContextDiscoveryIdentity({
+    modelId, modelFingerprint: await persistentFileFingerprint(profile.modelPath),
+    projectorFingerprint: profile.mmprojPath ? await persistentFileFingerprint(profile.mmprojPath) : null,
+    ...(state.speculativeMode !== 'none' && profile.draft ? { draftFingerprint: await persistentFileFingerprint(profile.draft.path) } : {}),
+    runtimeFingerprint: `${args[0]}:${await persistentFileFingerprint(args[0])}`,
+    arguments: args, speculative: state.speculativeMode ?? profile.speculative, hardLimit, gpu: await getGpuIdentity(), hostReserveBytes: hostReserve.bytes,
+  });
+  return { ...contextDiscoveryKey(identity), hardLimit };
+}
+/** Saved options never trigger probing; each is still checked against live memory when selected. */
+async function loadSavedDiscovery(modelId: string): Promise<{ options: ContextDiscoveryOption[]; hardLimit: number; key: string } | null> {
+  try {
+    const identity = await persistentDiscoveryIdentity(modelId);
+    return { options: database.loadContextDiscoveryOptions(identity.key, modelId, identity.hardLimit), hardLimit: identity.hardLimit, key: identity.key };
+  } catch (error) {
+    log('context.discovery.saved.unavailable', { modelId, message: error instanceof Error ? error.message : String(error) });
+    return null;
+  }
+}
+async function adoptSavedDiscovery(modelId: string, error?: string): Promise<void> {
+  discoveredContextOptions.clear();
+  const saved = await loadSavedDiscovery(modelId);
+  if (!saved) return;
+  savedDiscoveryAttempted = modelId;
+  if (!saved.options.length) return;
+  const configurationId = await runtimeConfigurationIdentity(modelId);
+  for (const option of saved.options) discoveredContextOptions.set(discoveryKey(modelId, option.contextWindow, option.kvCacheType, option.kvOffload), { option, modelIdentity: configurationId });
+  contextDiscoveryProgress = { busy: false, modelId, stage: 'Сохранённый результат', probeCount: 0, error,
+    result: { modelId, probeContextTokens: Math.min(16_384, saved.hardLimit), options: saved.options, unsupported: [], restored: true, hardLimit: saved.hardLimit, configurationId } };
+  log('context.discovery.saved.restored', { modelId, options: saved.options.map((option) => ({ contextWindow: option.contextWindow, kvCacheType: option.kvCacheType, kvOffload: option.kvOffload })) });
+}
+/** Only the live launcher's state can attest to an explicitly selected runtime. */
 async function currentLlamaRuntime(): Promise<LlamaRuntimeState> {
   const state = await llamaRuntime.state();
-  if (state.status === 'offline' && state.error === LAUNCHER_ABSENT) return { status: 'ready', modelId: llamaRuntimeModelId, contextWindow: llamaContextLimit, kvCacheType: initialLlamaKvType, kvOffload: initialLlamaKvOffload };
+  if (!modelSelectedThisProcess && state.status === 'ready') return { status: 'idle', modelId: null, contextWindow: null };
   if (state.status === 'ready') {
     // The state file records the last transition; a server that died since then must not be reported as running.
     const health = await llamaCpp.getStatus();
     if (!health.available) return { status: 'offline', modelId: null, contextWindow: null, error: `llama-server не отвечает: ${health.message ?? 'health check failed'}` };
   }
-  return state;
+  return { ...state, ...(visionDevice.pending ? { pendingProjectorDevice: visionDevice.pending } : {}), ...(visionDevice.error ? { deviceError: visionDevice.error } : {}) };
 }
 async function syncLlamaBackend(): Promise<LlamaRuntimeState> {
   const state = await currentLlamaRuntime();
   if (state.status === 'ready' && state.modelId && state.contextWindow) {
-    try { llamaCpp.updateRuntimeSelection(state.modelId, state.contextWindow, state.kvCacheType ?? initialLlamaKvType, state.kvOffload ?? initialLlamaKvOffload); } catch { /* an unsupported combination is reported by the launcher state itself */ }
-  }
+    const profile = llamaRuntimeProfile(state.modelId);
+    const visionEnabled = profile?.vision && (state.speculativeMode !== 'mtp' || profile.visionWithMtp !== false);
+    try { llamaCpp.updateRuntimeSelection(state.modelId, state.contextWindow, state.kvCacheType ?? initialLlamaKvType, state.kvOffload ?? initialLlamaKvOffload, visionEnabled); } catch { /* an unsupported combination is reported by the launcher state itself */ }
+  } else { llamaCpp.clearRuntimeSelection(); }
   return state;
 }
 async function estimateModelContext(modelId: string): Promise<RuntimeContextEstimate> {
@@ -125,7 +223,7 @@ async function estimateModelContext(modelId: string): Promise<RuntimeContextEsti
   if (configuredMaxTokens) {
     if (llamaProfile) {
       const current = await llamaRuntime.state();
-      if (current.status === 'ready' && current.launcherPid !== undefined && current.modelId === modelId && current.kvCacheType && current.kvOffload !== undefined) {
+      if (modelSelectedThisProcess && current.status === 'ready' && current.launcherPid !== undefined && current.modelId === modelId && current.kvCacheType && current.kvOffload !== undefined) {
         await syncLlamaBackend();
         runtime = await llamaCpp.getRuntimeContextEvidence(modelId);
         if (current.serverPid) {
@@ -158,10 +256,10 @@ async function estimateModelContext(modelId: string): Promise<RuntimeContextEsti
 }
 async function discoverModelContexts(modelId: string): Promise<ContextDiscoveryResult> {
   const profile = llamaRuntimeProfile(modelId);
-  if (contextDiscoveryBusy) throw new Error('Max Context discovery is already running.');
+  if (contextDiscoveryBusy) throw new Error('Поиск максимального контекста уже выполняется.');
   if (runtimeSelectionBusy) throw new Error('Дождитесь завершения переключения runtime.');
   discoveredContextOptions.clear();
-  if (!profile) throw new Error('Max Context discovery requires an installed llama.cpp model.');
+  if (!profile) throw new Error('Для поиска максимального контекста нужна установленная модель llama.cpp.');
   contextDiscoveryBusy = true;
   contextDiscoveryProgress = { busy: true, modelId, stage: 'Подготовка; llama.cpp будет перезапущен несколько раз…', probeCount: 0 };
   let original: LlamaRuntimeState | null = null;
@@ -197,17 +295,17 @@ async function discoverModelContexts(modelId: string): Promise<ContextDiscoveryR
         try {
           const switched = await llamaRuntime.switchTo(modelId, contextWindow, kvCacheType, offload);
           if (!switched.ok) {
-            if (switched.state.status !== 'ready') throw new Error(`Discovery rollback failed: ${switched.error}`);
+            if (switched.state.status !== 'ready') throw new Error(`Не удалось вернуть исходную конфигурацию llama.cpp после проверки: ${switched.error}`);
             record.reason = switched.error;
             return { record, estimate };
           }
           record.startup = true;
           const state = await syncLlamaBackend();
-          if (state.status !== 'ready' || !state.serverPid) throw new Error('Probe server is not alive/healthy.');
+          if (state.status !== 'ready' || !state.serverPid) throw new Error('Пробный сервер llama.cpp не запущен или не отвечает.');
           process.kill(state.serverPid, 0);
           record.args = (await readFile(`/proc/${state.serverPid}/cmdline`, 'utf8')).split('\0').filter(Boolean);
           record.health = (await llamaCpp.getStatus()).available;
-          if (!record.health) throw new Error('Probe health check failed.');
+          if (!record.health) throw new Error('Пробный сервер llama.cpp не прошёл проверку состояния.');
           await verifyContextProbeInference(modelId);
           record.inference = true;
           process.kill(state.serverPid, 0);
@@ -229,23 +327,40 @@ async function discoverModelContexts(modelId: string): Promise<ContextDiscoveryR
       },
       restore: async () => {
         const restore = await llamaRuntime.switchTo(prior.modelId!, prior.contextWindow!, prior.kvCacheType!, prior.kvOffload!);
-        if (!restore.ok) throw new Error(`Max Context discovery could not restore the prior runtime: ${restore.error}`);
+        if (!restore.ok) throw new Error(`Поиск максимального контекста не смог восстановить прежнюю конфигурацию llama.cpp: ${restore.error}`);
         await syncLlamaBackend();
       },
     });
     // Identity excludes context/cache mode, so choosing an option does not
     // invalidate the sibling mode. Model/draft/projector/backend args do.
     result.configurationId = await runtimeConfigurationIdentity(modelId);
-    if (result.configurationId !== configurationId) throw new Error('Runtime/model/draft configuration changed during discovery.');
+    if (result.configurationId !== configurationId) throw new Error('Конфигурация llama.cpp (модель, режим или draft) изменилась во время поиска.');
+    // Only a completed discovery reaches here; its options replace the saved value for their KV mode.
+    // A KV mode this run did not establish keeps its last successful saved value.
+    let saved: ContextDiscoveryOption[] = [];
+    try {
+      const identity = await persistentDiscoveryIdentity(modelId);
+      database.saveContextDiscoveryOptions(identity.key, identity.serialized, result.options);
+      saved = database.loadContextDiscoveryOptions(identity.key, modelId, identity.hardLimit);
+      log('context.discovery.saved', { modelId, options: result.options.map((option) => ({ contextWindow: option.contextWindow, kvCacheType: option.kvCacheType })) });
+    } catch (error) {
+      log('context.discovery.save.failed', { modelId, message: error instanceof Error ? error.message : String(error) });
+    }
+    result.options = mergeSavedDiscoveryOptions(result.options, saved);
     for (const option of result.options) discoveredContextOptions.set(discoveryKey(modelId, option.contextWindow, option.kvCacheType, option.kvOffload), { option, modelIdentity: result.configurationId });
+    savedDiscoveryAttempted = modelId;
     contextDiscoveryProgress = { busy: false, modelId, stage: 'Готово', probeCount: result.probes?.length ?? 0, result };
     return result;
   } catch (error) {
     discoveredContextOptions.clear();
-    contextDiscoveryProgress = { busy: false, modelId, stage: 'Discovery не завершён', probeCount: contextDiscoveryProgress.probeCount, error: error instanceof Error ? error.message : String(error) };
+    const message = error instanceof Error ? error.message : String(error);
+    contextDiscoveryProgress = { busy: false, modelId, stage: 'Поиск не завершён', probeCount: contextDiscoveryProgress.probeCount, error: message };
+    // A failed or interrupted run leaves the previously saved result untouched and selectable.
+    await adoptSavedDiscovery(modelId, message).catch(() => undefined);
     throw error;
   } finally {
     contextDiscoveryBusy = false;
+    void visionDevice.flush();
   }
 }
 async function verifyContextProbeInference(modelId: string): Promise<void> {
@@ -256,34 +371,42 @@ async function verifyContextProbeInference(modelId: string): Promise<void> {
     body: JSON.stringify({ model: modelId, messages: [{ role: 'user', content: 'What is 1 + 1? Reply with exactly 2 and no explanation.' }], max_tokens: 128, temperature: 0, chat_template_kwargs: { enable_thinking: false }, stream: false }),
     signal: AbortSignal.timeout(60_000),
   });
-  if (!response.ok) throw new Error(`Discovery inference failed with HTTP ${response.status}.`);
+  if (!response.ok) throw new Error(`Пробный запрос к модели завершился ошибкой HTTP ${response.status}.`);
   const value = await response.json() as { choices?: Array<{ message?: { content?: unknown; reasoning_content?: unknown } }> };
   if (!Array.isArray(value.choices) || !value.choices.length
     || !(typeof value.choices[0]?.message?.content === 'string' && value.choices[0].message.content.trim())) {
-    throw new Error('Discovery runtime returned no completed inference choice.');
+    throw new Error('Пробный запрос к модели не вернул завершённый ответ.');
   }
 }
 async function validateDiscoveredOption(modelId: string, contextWindow: number, kvCacheType: 'f16' | 'q8_0', kvOffload: boolean): Promise<void> {
+  if (!discoveredContextOptions.size && !contextDiscoveryBusy) await adoptSavedDiscovery(modelId).catch(() => undefined);
   const cachedOptions = [...discoveredContextOptions.values()];
   const option = findFreshContextDiscoveryOption(cachedOptions.map((item) => item.option), { modelId, contextWindow, kvCacheType, kvOffload });
-  if (!option) throw new Error('Max Context discovery is missing, stale, or does not validate this KV configuration and context; run Discover again.');
+  if (!option) throw new Error('Результат поиска максимального контекста отсутствует, устарел или не подтверждает эту конфигурацию KV и размер контекста; запустите «Найти максимальный контекст» заново.');
   const cached = cachedOptions.find((item) => item.option === option);
-  if (!cached || await runtimeConfigurationIdentity(modelId) !== cached.modelIdentity) throw new Error('Runtime/model/draft configuration changed since discovery; run Discover again.');
+  if (!cached || await runtimeConfigurationIdentity(modelId) !== cached.modelIdentity) throw new Error('Конфигурация llama.cpp изменилась с момента поиска; запустите «Найти максимальный контекст» заново.');
   const current = await estimateModelContext(modelId);
-  if (current.status !== 'estimated' || !current.memoryBaseline || current.observedContextTokens === null) throw new Error('Current runtime memory evidence is unavailable; run Discover again.');
-  if (Math.abs(current.memoryBaseline.hostAvailableBytes - option.memoryBaseline.hostAvailableBytes) > 2 * 1024 ** 3
-    || !currentDiscoveryHeadroomFits(option, current)) {
-    throw new Error('Available memory changed materially since discovery; run Discover again before selecting this context.');
+  if (current.status !== 'estimated' || !current.memoryBaseline || current.observedContextTokens === null) throw new Error('Нет данных о текущей памяти llama.cpp; запустите «Найти максимальный контекст» заново.');
+  if (!hostBaselineStable(option, current) || !currentDiscoveryHeadroomFits(option, current)) {
+    throw new Error('Доступная память заметно изменилась с момента поиска; перед выбором этого контекста запустите «Найти максимальный контекст» заново.');
   }
 }
-async function discoveryStatus(): Promise<ContextDiscoveryProgress> {
-  if (contextDiscoveryBusy || runtimeSelectionBusy || activeGenerations.size || !contextDiscoveryProgress.result) return contextDiscoveryProgress;
+async function discoveryStatus(_event?: unknown, requestedModelId?: string): Promise<ContextDiscoveryProgress> {
+  if (!modelSelectedThisProcess) return { busy: false, modelId: null, stage: '', probeCount: 0 };
+  if (contextDiscoveryBusy || runtimeSelectionBusy || activeGenerations.size) return contextDiscoveryProgress;
+  if (typeof requestedModelId === 'string' && requestedModelId && savedDiscoveryAttempted !== requestedModelId && !contextDiscoveryProgress.error) {
+    if (contextDiscoveryProgress.modelId !== requestedModelId) contextDiscoveryProgress = { busy: false, modelId: requestedModelId, stage: '', probeCount: 0 };
+    if (!contextDiscoveryProgress.result) await adoptSavedDiscovery(requestedModelId).catch(() => undefined);
+  }
+  if (!contextDiscoveryProgress.result) return contextDiscoveryProgress;
   const result = contextDiscoveryProgress.result;
   try {
     if (!result.configurationId || await runtimeConfigurationIdentity(result.modelId) !== result.configurationId) throw new Error('Модель/runtime/draft изменились; повторите discovery.');
     const estimate = await estimateModelContext(result.modelId);
-    if (result.options.length && (!estimate.memoryBaseline || result.options.some((option) => !findFreshContextDiscoveryOption([option], option)
-      || Math.abs(estimate.memoryBaseline!.hostAvailableBytes - option.memoryBaseline.hostAvailableBytes) > 2 * 1024 ** 3
+    // Saved options stay listed under memory pressure; selecting one re-runs these same checks.
+    const measured = result.options.filter((option) => !option.restored);
+    if (measured.length && (!estimate.memoryBaseline || measured.some((option) => !findFreshContextDiscoveryOption([option], option)
+      || !hostBaselineStable(option, estimate)
       || !currentDiscoveryHeadroomFits(option, estimate)))) {
       throw new Error('Ресурсы существенно изменились или результат устарел; повторите discovery.');
     }
@@ -293,6 +416,12 @@ async function discoveryStatus(): Promise<ContextDiscoveryProgress> {
   } catch (error) {
     if (contextDiscoveryProgress.result !== result || contextDiscoveryBusy || runtimeSelectionBusy) return contextDiscoveryProgress;
     discoveredContextOptions.clear();
+    if (result.options.every((option) => option.restored)) {
+      // A saved calibration is never discarded by a transient runtime state; it is re-adopted once the runtime matches again.
+      savedDiscoveryAttempted = null;
+      contextDiscoveryProgress = { busy: false, modelId: result.modelId, stage: '', probeCount: 0 };
+      return contextDiscoveryProgress;
+    }
     contextDiscoveryProgress = { busy: false, modelId: result.modelId, stage: 'Результат недействителен', probeCount: 0, error: error instanceof Error ? error.message : String(error) };
   }
   return contextDiscoveryProgress;
@@ -307,6 +436,7 @@ const waitFor = (promise: Promise<void>, timeoutMs: number): Promise<void> => ne
 
 /** Called by Electron's main lifecycle before process exit, never by a renderer. */
 export async function shutdownRuntime(): Promise<void> {
+  runtimeShuttingDown = true;
   const active = [...activeGenerations.values()];
   log('runtime.shutdown.started', { backend: 'llama-cpp', activeGenerations: active.length });
   for (const generation of active) generation.abort.abort();
@@ -333,13 +463,29 @@ async function cancelGeneration(conversationId: string, generationId?: string, r
 }
 
 export function registerIpc(): void {
+  const diagramValidation = new DiagramValidationBridge();
+  ipcMain.handle('chat:diagram-validation-result', (event, id: unknown, error: unknown) => diagramValidation.reply(event.sender.id, id, error));
+  const interruptedRuns = database.recoverInterruptedRuns();
+  if (interruptedRuns) log('generation.interrupted-recovered', { runs: interruptedRuns });
   ipcMain.handle('conversations:list', () => database.listConversations());
   ipcMain.handle('conversations:create', async (_event, requestedModelId?: string) => {
-    const modelId = requestedModelId ?? (await currentLlamaRuntime()).modelId ?? llamaRuntimeModelId;
-    if (!getModelProfile(modelId)) throw new Error('Выбранная модель отсутствует в реестре приложения');
+    const modelId = requestedModelId ?? (await currentLlamaRuntime()).modelId ?? null;
+    if (modelId && !getModelProfile(modelId)) throw new Error('Выбранная модель отсутствует в реестре приложения');
     return database.createConversation(modelId);
   });
-  ipcMain.handle('conversations:update', async (_event, id: string, patch: Partial<Pick<Conversation, 'title' | 'modelId' | 'mode' | 'workingDirectory' | 'secondaryWorkingDirectory' | 'contextWindow' | 'llamaKvCacheType' | 'llamaKvOffload' | 'reasoningMode' | 'webMode'>>) => {
+  ipcMain.handle('conversations:update', async (_event, id: string, patch: Partial<Pick<Conversation, 'title' | 'modelId' | 'mode' | 'workingDirectory' | 'secondaryWorkingDirectory' | 'contextWindow' | 'llamaKvCacheType' | 'llamaKvOffload' | 'reasoningMode' | 'thinkingEnabled' | 'reasoningEffort' | 'webMode'>>) => {
+    // Reasoning/mode/web/project/title changes never touch llama.cpp, so they must not queue behind
+    // (or be refused by) a runtime switch: a refusal made the UI roll the user's choice back.
+    if (!touchesRuntime(patch)) {
+      if (activeGenerations.size && Object.keys(patch).some((key) => key !== 'title')) throw new Error('Дождитесь завершения активной генерации перед изменением настроек.');
+      const existing = database.getConversation(id);
+      if (!existing) throw new Error('Чат не найден');
+      const reasoningError = reasoningPatchError(patch, reasoningCapability(llamaRuntimeProfile(existing.modelId ?? '')));
+      if (reasoningError) throw new Error(reasoningError);
+      const stored = database.updateConversation(id, pinLegacyReasoning(existing, reasoningCapability(llamaRuntimeProfile(existing.modelId ?? '')), patch));
+      if ((patch.workingDirectory !== undefined && patch.workingDirectory !== existing.workingDirectory) || (patch.secondaryWorkingDirectory !== undefined && patch.secondaryWorkingDirectory !== existing.secondaryWorkingDirectory)) sessionApprovals.delete(id);
+      return database.getConversation(id) ?? stored;
+    }
     if (contextDiscoveryBusy) throw new Error('Дождитесь завершения Max Context discovery перед изменением настроек runtime.');
     if (runtimeSelectionBusy) throw new Error('Дождитесь завершения переключения runtime.');
     runtimeSelectionBusy = true;
@@ -347,6 +493,8 @@ export function registerIpc(): void {
     if (activeGenerations.size && Object.keys(patch).some((key) => key !== 'title')) throw new Error('Дождитесь завершения активной генерации перед изменением настроек.');
     const current = database.getConversation(id);
     if (!current) throw new Error('Чат не найден');
+    const runtime = await syncLlamaBackend();
+    if (!patch.modelId && !activeConversationModel(current, runtime)) throw new Error('Выберите модель перед изменением настроек runtime.');
     const nextModelId = patch.modelId ?? current.modelId;
     const profile = nextModelId ? getModelProfile(nextModelId) : undefined;
     if (nextModelId && !profile) throw new Error('Выбранная модель отсутствует в реестре приложения');
@@ -354,33 +502,37 @@ export function registerIpc(): void {
     const allowed = profile ? llamaContextPresets(nextModelId ?? '', capability) : [];
     const requestedContext = patch.contextWindow ?? current.contextWindow;
     const modelChanged = nextModelId !== current.modelId;
-    const contextWindow = modelChanged && patch.contextWindow === undefined && allowed.length ? normalContextForModel(requestedContext, allowed) : requestedContext;
+    const firstSelection = patch.modelId !== undefined && !activeConversationModel(current, runtime);
+    const normalConfiguration = llamaRuntimeProfile(nextModelId ?? '')?.normalContext;
+    const initial = initialModelContext(allowed, normalConfiguration);
+    const contextWindow = (firstSelection || (modelChanged && normalConfiguration)) && patch.contextWindow === undefined ? initial.contextWindow : modelChanged && patch.contextWindow === undefined && allowed.length ? normalContextForModel(requestedContext, allowed) : requestedContext;
     if (allowed.length && !allowed.includes(contextWindow)) {
       if (contextWindow % 4_096 !== 0 || contextWindow > capability || contextWindow <= 0) {
-        throw new Error(`Requested context ${contextWindow} is outside the model/backend capability or runtime bucket size.`);
+        throw new Error(`Запрошенный контекст ${contextWindow} выходит за пределы возможностей модели и llama.cpp или не кратен допустимому шагу.`);
       }
     }
     if (nextModelId && profile) {
       const isRuntimeRequest = patch.modelId !== undefined || patch.contextWindow !== undefined || patch.llamaKvCacheType !== undefined || patch.llamaKvOffload !== undefined;
-      const { llamaKvCacheType: kvCacheType, llamaKvOffload: kvOffload } = resolveLlamaKvSelection(current, patch, modelChanged);
-      const requiresDiscovery = !allowed.includes(contextWindow) || kvCacheType !== defaultLlamaKv.llamaKvCacheType || kvOffload !== defaultLlamaKv.llamaKvOffload;
+      const { llamaKvCacheType: kvCacheType, llamaKvOffload: kvOffload } = resolveLlamaKvSelection(current, patch, modelChanged || firstSelection, initial);
+      const requiresDiscovery = !allowed.includes(contextWindow) || kvCacheType !== initial.llamaKvCacheType || kvOffload !== initial.llamaKvOffload;
       if (isRuntimeRequest && requiresDiscovery) await validateDiscoveredOption(nextModelId, contextWindow, kvCacheType, kvOffload);
       patch = { ...patch, llamaKvCacheType: kvCacheType, llamaKvOffload: kvOffload };
-      const runtime = await syncLlamaBackend();
       const runtimeDiffers = runtime.status !== 'ready' || runtime.modelId !== nextModelId || runtime.contextWindow !== contextWindow || runtime.kvCacheType !== kvCacheType || runtime.kvOffload !== kvOffload;
       // Re-selecting the stored model is a retry when the server is not running it.
       if (runtimeDiffers && (patch.modelId !== undefined || patch.contextWindow !== undefined || patch.llamaKvCacheType !== undefined || patch.llamaKvOffload !== undefined)) {
         if (activeGenerations.size > 0) throw new Error('Нельзя переключать llama.cpp во время генерации: остановите её или дождитесь завершения.');
         log('llama.runtime.switch.requested', { conversationId: id, from: runtime, to: { modelId: nextModelId, contextWindow, kvCacheType, kvOffload } });
         const result = await llamaRuntime.switchTo(nextModelId, contextWindow, kvCacheType, kvOffload);
+        if (result.ok) modelSelectedThisProcess = true;
         await syncLlamaBackend();
         log('llama.runtime.switch.finished', { conversationId: id, ok: result.ok, state: result.state, error: result.ok ? undefined : result.error });
         // Nothing is persisted for a failed switch: the stored conversation must keep
         // naming the model that is really running (or none, when the server is down).
         if (!result.ok) throw new Error(`Не удалось переключить llama.cpp на ${profile.displayName} (${Math.round(contextWindow / 1024)}K, ${kvCacheType}, KV ${kvOffload ? 'GPU' : 'RAM'}): ${result.error}${result.state.rolledBack ? ` Продолжает работать ${result.state.modelId}.` : result.state.status === 'offline' ? ' llama.cpp сейчас не запущен.' : ''}`);
       }
-      if (modelChanged) {
+      if (modelChanged || firstSelection) {
         discoveredContextOptions.clear();
+        savedDiscoveryAttempted = null;
         contextDiscoveryProgress = { busy: false, modelId: nextModelId, stage: '', probeCount: 0 };
       }
     }
@@ -390,11 +542,14 @@ export function registerIpc(): void {
     return database.getConversation(id) ?? updated;
     } finally {
       runtimeSelectionBusy = false;
+      deviceChanged();
+      void visionDevice.flush();
     }
   });
   ipcMain.handle('conversations:delete', async (_event, id: string) => {
     if (activeGenerations.has(id)) throw new Error('Нельзя удалить чат с активной генерацией.');
     sessionApprovals.delete(id); await attachments.removeManagedFiles(database.deleteConversation(id));
+    await discardAgentEvidence(paths.userData, id, true);
   });
   ipcMain.handle('messages:list', (_event, conversationId: string) => database.listMessages(conversationId));
   ipcMain.handle('agent-plan:get', (_event, conversationId: string) => database.getAgentPlan(conversationId));
@@ -403,6 +558,7 @@ export function registerIpc(): void {
     const message = database.getMessage(messageId) ?? (fallback ? database.findUserMessage(fallback.conversationId, fallback.content) : null); if (!message) throw new Error('Сообщение не найдено');
     const before = database.listAttachmentsForConversation(message.conversationId);
     await cancelGeneration(message.conversationId); const edited = database.editUserMessageAndTruncate(message.id, content);
+    await discardAgentEvidence(paths.userData, message.conversationId);
     const kept = new Set(database.listAttachmentsForConversation(message.conversationId).map((attachment) => attachment.id));
     await attachments.removeManagedFiles(before.filter((attachment) => !kept.has(attachment.id)));
     return edited;
@@ -413,6 +569,7 @@ export function registerIpc(): void {
     const before = database.listAttachmentsForConversation(message.conversationId);
     await cancelGeneration(message.conversationId);
     const retained = database.regenerateUserMessageAndTruncate(message.id);
+    await archiveAgentEvidence(paths.userData, message.conversationId);
     const kept = new Set(database.listAttachmentsForConversation(message.conversationId).map((attachment) => attachment.id));
     await attachments.removeManagedFiles(before.filter((attachment) => !kept.has(attachment.id)));
     return retained;
@@ -431,17 +588,72 @@ export function registerIpc(): void {
   ipcMain.handle('attachments:list', (_event, messageId: string) => database.listAttachments(messageId));
   ipcMain.handle('attachments:dataUrl', async (_event, id: string) => {
     const attachment = database.getAttachment(id); if (!attachment || attachment.kind !== 'image') return null;
-    const data = await readFile(attachment.storageRef); return `data:${attachment.mimeType};base64,${data.toString('base64')}`;
+    const data = await readFile(attachment.storageRef); return `data:${imageMimeType(attachment.filename)};base64,${data.toString('base64')}`;
+  });
+  ipcMain.handle('web-images:load', async (_event, url: string) => {
+    if (typeof url !== 'string' || url.length > 2_000) throw new Error(t('Некорректный URL изображения.'));
+    return remoteImages.load(url);
+  });
+  ipcMain.handle('web-images:open-source', async (_event, url: string) => {
+    if (typeof url !== 'string' || url.length > 2_000) throw new Error(t('Некорректный URL источника.'));
+    const safe = await remoteImages.validateSource(url);
+    await shell.openExternal(safe);
   });
   ipcMain.handle('analysis:list', (_event, conversationId: string) => database.listAnalysisRuns(conversationId));
   ipcMain.handle('models:list', async () => {
-    try { return await backend.getModels(); }
+    try { await syncLlamaBackend(); return await backend.getModels(); }
     catch (error) { log('backend.models.failed', { backend: 'llama-cpp', message: error instanceof Error ? error.message : String(error) }); return []; }
   });
-  ipcMain.handle('settings:get', async () => {
+  // The toolbar polls only live process health. Model paths and GGUF metadata
+  // are checked on initialization and when model settings are opened/saved.
+  ipcMain.handle('runtime:state', currentLlamaRuntime);
+  const getSettings = async () => {
     const llama = await syncLlamaBackend();
-    return { llamaServerPath: process.env.LOCAL_AI_LLAMA_SERVER_PATH ?? null, llamaRuntimeModelId: llama.modelId ?? undefined, llamaRuntime: llama, modelsPath: paths.models };
+    const setup = runtimeSetup();
+    return { llamaServerPath: setup.server, llamaRuntimeModelId: llama.modelId ?? undefined, llamaRuntime: llama, modelsPath: setup.config.modelsPath, setup };
+  };
+  ipcMain.handle('settings:get', getSettings);
+  ipcMain.handle('settings:validateDraft', (_event, config: unknown) => runtimeDraftAvailability(config));
+  const resolutionJobs = new Map<number, AbortController>();
+  ipcMain.handle('settings:cancelResolution', (event) => { resolutionJobs.get(event.sender.id)?.abort(); });
+  ipcMain.handle('settings:resolveExecutable', async (event, input: unknown, selected: unknown) => {
+    if (typeof input !== 'string' || input.length > 4096 || selected !== undefined && (typeof selected !== 'string' || selected.length > 4096)) throw new Error(t('Некорректный путь к исполняемому файлу'));
+    const id = event.sender.id;
+    resolutionJobs.get(id)?.abort();
+    const controller = new AbortController(); resolutionJobs.set(id, controller);
+    const cancel = () => controller.abort(); event.sender.once('destroyed', cancel);
+    try { return await resolveLlamaExecutable(input, selected as string | undefined, { signal: controller.signal }); }
+    finally { event.sender.removeListener('destroyed', cancel); if (resolutionJobs.get(id) === controller) resolutionJobs.delete(id); }
   });
+  ipcMain.handle('settings:save', async (_event, config: unknown) => {
+    if (activeGenerations.size || contextDiscoveryBusy || runtimeSelectionBusy) throw new Error('Дождитесь завершения генерации, выбора модели или поиска контекста.');
+    runtimeSelectionBusy = true;
+    try {
+    const next = normalizeConfiguration(config);
+    // Native menu owns this preference; an older open setup form must not revert it.
+    next.imageProcessingDevice = effectiveRuntimeConfiguration().imageProcessingDevice;
+    const input = next.llamaServerInput ?? next.llamaServerPath ?? '';
+    if (input.trim()) {
+      const resolution = await resolveLlamaExecutable(input, next.llamaServerPath ?? undefined);
+      if (resolution.status !== 'valid' || !resolution.path) throw new Error(t('Выберите корректный исполняемый файл llama-server.'));
+      next.llamaServerPath = resolution.path;
+    } else next.llamaServerPath = null;
+    const active = await llamaRuntime.state();
+    if (active.status === 'ready' && active.modelId) {
+      const prior = runtimeSetup().config;
+      const before = prior.models.find((model) => model.id === active.modelId);
+      const after = next.models.find((model) => model.id === active.modelId);
+      const sameActive = before && after && before.modelPath === after.modelPath && before.mmprojPath === after.mmprojPath
+        && before.gpuLayers === after.gpuLayers && before.speculative === after.speculative && (before.projectorDevice ?? 'auto') === (after.projectorDevice ?? 'auto');
+      if (!sameActive || prior.llamaServerPath !== next.llamaServerPath || prior.gpuLayers !== next.gpuLayers) {
+        throw new Error('Сначала выберите другую модель или перезапустите приложение, чтобы изменить настройки активной модели/runtime.');
+      }
+    }
+    saveRuntimeConfiguration(next);
+    return await getSettings();
+    } finally { runtimeSelectionBusy = false; void visionDevice.flush(); }
+  });
+  ipcMain.handle('settings:dismissSetup', async () => { dismissRuntimeSetup(); return getSettings(); });
   ipcMain.handle('hardware:get', getHardwareStats);
   ipcMain.handle('context:estimate', async (_event, modelId: string): Promise<RuntimeContextEstimate> => {
     if (typeof modelId !== 'string' || !modelId) throw new Error('Не указана модель для оценки контекста');
@@ -449,6 +661,7 @@ export function registerIpc(): void {
   });
   ipcMain.handle('context:discover', async (_event, modelId: string): Promise<ContextDiscoveryResult> => {
     if (typeof modelId !== 'string' || !modelId) throw new Error('Не указана модель для discovery контекста');
+    if (!modelSelectedThisProcess) throw new Error('Выберите модель перед поиском максимального контекста.');
     return discoverModelContexts(modelId);
   });
   ipcMain.handle('context:discovery-status', discoveryStatus);
@@ -459,22 +672,22 @@ export function registerIpc(): void {
     return result.canceled ? null : result.filePaths[0] ?? null;
   });
   ipcMain.handle('chat:stop', async (_event, conversationId: string, generationId?: string) => { await cancelGeneration(conversationId, generationId, 'user_stop'); });
-  ipcMain.handle('chat:steer', async (event, conversationId: string, generationId: string, content: string) => {
+  ipcMain.handle('dialog:chooseFile', async () => {
+    const result = await dialog.showOpenDialog(BrowserWindow.getFocusedWindow()!, { properties: ['openFile'] });
+    return result.canceled ? null : result.filePaths[0] ?? null;
+  });
+  ipcMain.handle('chat:steer', async (event, conversationId: string, generationId: string, content: string, intent?: SteeringIntent) => {
     const generation = activeGenerations.get(conversationId);
     if (!generation || generation.id !== generationId || generation.abort.signal.aborted || generation.mode !== 'agent') throw new Error('Уточнения доступны только во время активного Agent run.');
     if (typeof content !== 'string' || !content.trim() || content.length > 16_000) throw new Error('Уточнение должно содержать от 1 до 16000 символов.');
-    await rustAgent.steer(generation.id, content.trim());
+    if (intent !== undefined && intent !== 'pause') throw new Error('Неизвестный тип уточнения.');
+    await rustAgent.steer(generation.id, content.trim(), intent);
     const message = database.addMessage(conversationId, 'user', content.trim());
-    if (generation.lastTimelineKind === 'reasoning') {
-      const prior = generation.thinkingTimeline.at(-1);
-      if (prior?.kind === 'reasoning') prior.completedAt = new Date().toISOString();
-    }
-    const timelinePosition = ++generation.timelinePosition;
-    generation.thinkingTimeline.push({ id: randomUUID(), kind: 'steering', messageId: message.id, position: timelinePosition, status: 'accepted' });
-    generation.lastTimelineKind = 'steering';
-    (generation.followups ??= []).push({ message, timelinePosition, applied: false });
-    log('generation.steering.accepted', { conversationId, generationId, messageId: message.id });
-    event.sender.send('chat:stream', { type: 'steering', conversationId, generationId, userMessage: message, status: 'accepted', timelinePosition });
+    // The model has not seen this message yet and its current turn is still streaming, so nothing is added to the
+    // chronological timeline now: the entry is placed when the runtime applies it at a turn boundary.
+    (generation.followups ??= []).push({ message, applied: false });
+    log('generation.steering.accepted', { conversationId, generationId, messageId: message.id, intent: intent ?? null });
+    event.sender.send('chat:stream', { type: 'steering', conversationId, generationId, userMessage: message, status: 'accepted' });
     return message;
   });
   ipcMain.handle('chat:approve', (_event, request: { conversationId: string; generationId: string; approvalId: string; decision: ApprovalDecision }) => {
@@ -491,20 +704,38 @@ export function registerIpc(): void {
     return true;
   });
   ipcMain.handle('chat:send', async (event, request: ChatRequest) => {
+    const requestStarted = performance.now();
+    log('rich.request.lifecycle', { generationId: request.generationId, stage: 'submitted', monotonicMs: requestStarted });
     if (contextDiscoveryBusy) throw new Error('Дождитесь завершения Max Context discovery перед генерацией.');
     if (runtimeSelectionBusy) throw new Error('Дождитесь завершения переключения runtime перед генерацией.');
     // Claim the process-wide inference slot synchronously, before any await.
     if (activeGenerations.size) throw new Error('Уже выполняется генерация в другом чате. Дождитесь завершения или остановите её.');
     const abort = new AbortController(); let finish!: () => void;
-    const generation: ActiveGeneration = { id: request.generationId, abort, settled: new Promise<void>((resolve) => { finish = resolve; }), finish, thinkingTimeline: [], activityTimelinePositions: new Map(), timelinePosition: 0, lastTimelineKind: null };
+    const generation: ActiveGeneration = { id: request.generationId, abort, settled: new Promise<void>((resolve) => { finish = resolve; }), finish, thinkingTimeline: [], richArtifacts: [], activityTimelinePositions: new Map(), timelinePosition: 0, lastTimelineKind: null };
     activeGenerations.set(request.conversationId, generation);
     const current = () => activeGenerations.get(request.conversationId) === generation && !abort.signal.aborted;
     let run: AnalysisRun | null = null;
+    let output = ''; let thinking = ''; let messageDiagnostics: import('../../shared/types').GenerationDiagnostics | undefined; let completed = false; let failed = false; let cancelled = false; let finishReason: 'stop' | 'length' = 'stop';
+    const { thinkingTimeline, activityTimelinePositions } = generation;
+    let failure: string | undefined;
+    // The timeline is checkpointed at stable boundaries (steering, pause, tool
+    // start/finish), never per token, so a Stop, failure or crash keeps every
+    // event the live view already committed.
+    const checkpoint = () => { if (run) database.saveAnalysisRunTimeline(run.id, thinkingTimeline, generation.richArtifacts); };
+    const closeReasoning = () => { if (generation.lastTimelineKind === 'reasoning') { const prior = thinkingTimeline.at(-1); if (prior?.kind === 'reasoning' && !prior.completedAt) prior.completedAt = new Date().toISOString(); } };
+    const finishRun = (status: AnalysisRun['status'], assistantMessageId: string | null = null) => {
+      if (!run) return null;
+      closeReasoning();
+      return database.finishAnalysisRun(run.id, status, assistantMessageId, { timeline: thinkingTimeline, richArtifacts: generation.richArtifacts, ...(status === 'completed' ? {} : { partialOutput: output, ...(failure ? { error: failure } : {}) }) });
+    };
+    const sendRun = (finished: AnalysisRun | null) => { if (finished) event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run: finished }); };
     try {
     const user = request.persistUserMessage ? request.messages.at(-1) : null;
     if (request.persistUserMessage && (!user || user.role !== 'user')) throw new Error('Неверное сообщение');
     const conversation = database.getConversation(request.conversationId);
     if (!conversation) throw new Error('Чат не найден');
+    const runtime = await syncLlamaBackend();
+    if (activeConversationModel(conversation, runtime) !== request.model) throw new Error('Выберите модель перед отправкой сообщения.');
     const mode = executionMode(conversation.mode, request.mode);
     generation.mode = mode;
     if (conversation.modelId && conversation.modelId !== request.model) throw new Error('Выбранная модель была изменена. Повторите отправку сообщения.');
@@ -535,12 +766,13 @@ export function registerIpc(): void {
     if (!current()) return;
     await backend.ensureModelAvailable(request.model);
     if (!current()) return;
-    let output = ''; let thinking = ''; let messageDiagnostics: import('../../shared/types').GenerationDiagnostics | undefined; let completed = false; let failed = false; let finishReason: 'stop' | 'length' = 'stop';
-    const { thinkingTimeline, activityTimelinePositions } = generation;
     const agentProjects: AgentProject[] = mode === 'agent' ? [...selectedProjects] : [];
     const agentRoot = agentProjects[0]?.root ?? null;
-    const enabledTools = mode === 'agent' ? ['apply_patch', 'create_file', 'delete_file', 'list_directory', 'project_knowledge_index', 'project_knowledge_read', 'project_knowledge_update', 'read_file', 'run_terminal', 'task_memory', 'write_file'] : conversation.webMode === 'auto' ? ['web'] : [];
-    log('generation.snapshot', { generationId: generation.id, chatId: request.conversationId, mode, storedMode: conversation.mode, requestedMode: request.mode, workingDirectory: conversation.workingDirectory, resolvedWorkingDirectory: agentRoot, projects: agentProjects.map((project) => ({ id: project.id, slot: project.slot })), webMode: conversation.webMode, modelId: request.model, contextSize: conversation.contextWindow, reasoningMode: conversation.reasoningMode, enabledTools });
+    // Directories the user named in their own messages extend the file/terminal scope; without a project they are the scope.
+    const workspaceRoots = mode === 'agent' ? await explicitWorkspaceRoots(request.messages.filter((message) => message.role === 'user').map((message) => message.content), homedir()) : [];
+    if (!current()) return;
+    const enabledTools = enabledAgentTools(mode, { hasProject: Boolean(agentRoot), workspaceRootCount: workspaceRoots.length }, conversation.webMode);
+    log('generation.snapshot', { generationId: generation.id, chatId: request.conversationId, mode, storedMode: conversation.mode, requestedMode: request.mode, workingDirectory: conversation.workingDirectory, resolvedWorkingDirectory: agentRoot, workspaceRoots, projects: agentProjects.map((project) => ({ id: project.id, slot: project.slot })), webMode: conversation.webMode, modelId: request.model, contextSize: conversation.contextWindow, reasoningMode: conversation.reasoningMode, enabledTools });
     run = mode === 'agent' ? database.createAnalysisRun(request.conversationId, conversation.reasoningMode) : null;
     if (run && current()) event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run });
       const context = await backend.resolveContextWindow(request.model, conversation.contextWindow, abort.signal);
@@ -552,11 +784,17 @@ export function registerIpc(): void {
       if (nativeVision) history = await attachmentPipeline.prepareNativeImages(history, abort.signal);
       const persistedTaskMemory = mode === 'agent' ? taskPlan(database.getAgentPlan(request.conversationId) ?? {}).taskMemory : undefined;
       const agentSupportsReasoning = mode === 'agent' && llamaCpp.supportsReasoning(request.model);
+      const reasoningCapabilityForModel = reasoningCapability(llamaRuntimeProfile(request.model));
+      const reasoningSelection = resolveReasoningSelection(reasoningCapabilityForModel, conversation.reasoningMode, conversation);
+      const reasoningInput: ReasoningInput = reasoningCapabilityForModel ? { mode: conversation.reasoningMode, selection: reasoningSelection } : conversation.reasoningMode;
+      const validateDiagram = (source: string, signal: AbortSignal) => diagramValidation.validate(event.sender, source, signal);
       const stream = mode === 'agent'
-        ? rustAgent.stream(request.model, history, agentProjects, abort.signal, context.active, conversation.reasoningMode, conversation.webMode, generation.id, persistedTaskMemory, request.conversationId, agentSupportsReasoning, llamaRuntimeProfile(request.model)?.reasoningOptions)
-        : conversation.webMode === 'auto'
-          ? webChat.stream(request.model, history, abort.signal, context.active, conversation.reasoningMode)
-          : backend.streamChat(request.model, chatMessagesWithSystemPrefix(history, [chatSystemContext({ webAvailable: false }, conversation.reasoningMode === 'deep' ? 'deep' : 'fast')], request.conversationId, `capability-${request.conversationId}`), abort.signal, context.active, conversation.reasoningMode);
+        ? rustAgent.stream(request.model, history, agentProjects, abort.signal, context.active, conversation.reasoningMode, conversation.webMode, generation.id, persistedTaskMemory, request.conversationId, agentSupportsReasoning, agentReasoningOptions(request.model, reasoningSelection), workspaceRoots, validateDiagram)
+        : webChat.stream(request.model, history, abort.signal, context.active, reasoningInput, conversation.webMode === 'auto', (args) => {
+          const allowed = new Set(history.flatMap((message) => message.attachments ?? []).map((attachment) => attachment.id));
+          if (typeof args.attachment_id !== 'string' || !allowed.has(args.attachment_id)) throw new Error(t('Выберите структурированное вложение из этого диалога.'));
+          return attachments.readStructuredRows(args.attachment_id, typeof args.sheet_name === 'string' ? args.sheet_name : undefined, typeof args.start_row === 'number' ? args.start_row : 0, typeof args.max_rows === 'number' ? args.max_rows : 50);
+        }, validateDiagram, generation.id);
       for await (let chunk of stream) {
         if (!current()) break;
         if (chunk.type === 'steering') {
@@ -564,11 +802,23 @@ export function registerIpc(): void {
           const followup = generation.followups?.find((entry) => !entry.applied && entry.message.content === content);
           if (followup) {
             followup.applied = true;
-            const timelineEvent = thinkingTimeline.find((entry) => entry.kind === 'steering' && entry.messageId === followup.message.id);
-            if (timelineEvent?.kind === 'steering') timelineEvent.status = 'applied';
-            event.sender.send('chat:stream', { ...chunk, userMessage: followup.message, timelinePosition: followup.timelinePosition, conversationId: request.conversationId, generationId: generation.id });
-            log('generation.steering.applied', { conversationId: request.conversationId, generationId: generation.id, messageId: followup.message.id });
+            closeReasoning();
+            const timelinePosition = ++generation.timelinePosition;
+            thinkingTimeline.push({ id: `steering-${followup.message.id}`, kind: 'steering', messageId: followup.message.id, position: timelinePosition, status: 'applied' });
+            generation.lastTimelineKind = 'steering';
+            checkpoint();
+            event.sender.send('chat:stream', { ...chunk, userMessage: followup.message, timelinePosition, conversationId: request.conversationId, generationId: generation.id });
+            log('generation.steering.applied', { conversationId: request.conversationId, generationId: generation.id, messageId: followup.message.id, timelinePosition });
           }
+          continue;
+        }
+        if (chunk.type === 'paused') {
+          closeReasoning();
+          const timelinePosition = ++generation.timelinePosition;
+          thinkingTimeline.push({ id: `paused-${timelinePosition}`, kind: 'paused', position: timelinePosition });
+          generation.lastTimelineKind = 'paused';
+          checkpoint();
+          event.sender.send('chat:stream', { type: 'paused', timelinePosition, conversationId: request.conversationId, generationId: generation.id });
           continue;
         }
         if (chunk.type === 'token') output += chunk.content;
@@ -581,7 +831,14 @@ export function registerIpc(): void {
           }
         }
         if (chunk.type === 'task-memory') {
-          database.saveAgentPlan(request.conversationId, { milestones: [], taskMemory: structuredClone(chunk.memory) });
+          const workBudget = database.getAgentPlan(request.conversationId)?.workBudget;
+          database.saveAgentPlan(request.conversationId, { milestones: [], ...(workBudget ? { workBudget } : {}), taskMemory: structuredClone(chunk.memory) });
+          event.sender.send('chat:stream', { ...chunk, conversationId: request.conversationId, generationId: generation.id });
+          continue;
+        }
+        if (chunk.type === 'work-budget') {
+          database.saveAgentPlan(request.conversationId, { milestones: [], ...database.getAgentPlan(request.conversationId), workBudget: structuredClone(chunk.budget) });
+          event.sender.send('chat:stream', { ...chunk, conversationId: request.conversationId, generationId: generation.id });
           continue;
         }
         if (chunk.type === 'context-usage') {
@@ -597,25 +854,50 @@ export function registerIpc(): void {
           event.sender.send('chat:stream', { type: 'diagnostics', conversationId: request.conversationId, generationId: generation.id, diagnostics });
           continue;
         }
+        if (chunk.type === 'rich-artifact') {
+          if (generation.richArtifacts.length >= 16 || generation.richArtifacts.some((item) => richArtifactFingerprint(item) === richArtifactFingerprint(chunk.artifact))) continue;
+          generation.richArtifacts.push(chunk.artifact);
+          // Chat only needs a durable run when it accepts an artifact; ordinary Chat stays unchanged.
+          run ??= database.createAnalysisRun(request.conversationId, conversation.reasoningMode);
+          checkpoint();
+          log('rich.request.lifecycle', { generationId: generation.id, stage: 'artifact_sent', artifactId: chunk.artifact.id, elapsedMs: Math.round(performance.now() - requestStarted) });
+          event.sender.send('chat:stream', { ...chunk, conversationId: request.conversationId, generationId: generation.id });
+          continue;
+        }
         if (chunk.type === 'done') { completed = true; finishReason = chunk.finishReason === 'length' ? 'length' : 'stop'; continue; }
-        if (chunk.type === 'error') failed = true;
+        // Terminal events are delivered only after the run's history is final,
+        // so the renderer always reconciles against the persisted state.
+        if (chunk.type === 'error') { failed = true; failure ??= chunk.details ? `${chunk.message}: ${chunk.details}` : chunk.message; continue; }
+        if (chunk.type === 'cancelled') { cancelled = true; continue; }
+        if (!run && chunk.type === 'tool' && chunk.activity.metadata?.artifactType === 'image_gallery') run = database.createAnalysisRun(request.conversationId, conversation.reasoningMode);
         if (run && chunk.type === 'tool') {
-          if (generation.lastTimelineKind === 'reasoning') { const prior = thinkingTimeline.at(-1); if (prior?.kind === 'reasoning') prior.completedAt = new Date().toISOString(); }
+          closeReasoning();
           const existingPosition = activityTimelinePositions.get(chunk.activity.id);
           const position = existingPosition ?? ++generation.timelinePosition;
           if (existingPosition === undefined) { activityTimelinePositions.set(chunk.activity.id, position); thinkingTimeline.push({ id: randomUUID(), kind: 'activity', activityId: chunk.activity.id, position }); }
           generation.lastTimelineKind = 'activity';
           const activity = { ...chunk.activity, timelinePosition: position };
           const updated = database.addAnalysisAction(run.id, activity);
+          if (existingPosition === undefined || activity.state !== 'running') checkpoint();
           const visibleActivity = { ...activity };
           delete visibleActivity.rawOutput;
           event.sender.send('chat:stream', { ...chunk, activity: visibleActivity, runId: run.id, conversationId: request.conversationId, generationId: generation.id });
-          event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run: updated });
+          // The renderer shows a live action from `toolActivities`; the run snapshot only matters when an action appears or
+          // finishes (and the final snapshot follows). Re-sending the whole run for every terminal output line made the
+          // payload grow with the run and replaced renderer state on each line.
+          if (existingPosition === undefined || activity.state !== 'running') event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run: updated });
         } else event.sender.send('chat:stream', { ...chunk, conversationId: request.conversationId, generationId: generation.id });
       }
-      if (!current()) { if (run) database.finishAnalysisRun(run.id, 'cancelled', null); return; }
-      if (failed || !completed) { if (run) event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run: database.finishAnalysisRun(run.id, 'error', null) }); return; }
-      if (generation.lastTimelineKind === 'reasoning') { const prior = thinkingTimeline.at(-1); if (prior?.kind === 'reasoning') prior.completedAt = new Date().toISOString(); }
+      // Stop: the run is finalized before `chat:stop` resolves; `finally` reports the cancellation.
+      if (!current()) { sendRun(finishRun('cancelled')); return; }
+      if (cancelled) { sendRun(finishRun('cancelled')); event.sender.send('chat:stream', { type: 'cancelled', conversationId: request.conversationId, generationId: generation.id }); return; }
+      if (failed || !completed) {
+        failure ??= 'Генерация завершилась без итогового результата.';
+        sendRun(finishRun('error'));
+        event.sender.send('chat:stream', { type: 'error', conversationId: request.conversationId, generationId: generation.id, message: failure });
+        return;
+      }
+      closeReasoning();
       const inputTokens = messageDiagnostics?.promptEvalCount ?? messageDiagnostics?.inputTokens;
       const generationStats = messageDiagnostics?.evalCount === undefined ? undefined : {
         outputTokens: messageDiagnostics.evalCount,
@@ -624,12 +906,16 @@ export function registerIpc(): void {
         ...(messageDiagnostics.timeToFirstTokenMs !== undefined ? { timeToFirstTokenMs: messageDiagnostics.timeToFirstTokenMs } : {}),
         ...(inputTokens !== undefined ? { inputTokens } : {}),
       };
-      const assistant = output ? database.addMessage(request.conversationId, 'assistant', output, undefined, [], { ...(thinking.trim() ? { thinking } : {}), ...(thinkingTimeline.length ? { thinkingTimeline } : {}), ...(generationStats ? { generationStats } : {}) }) : null;
-      if (run) event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run: database.finishAnalysisRun(run.id, 'completed', assistant?.id ?? null) });
+      const assistant = output || generation.richArtifacts.length ? database.addMessage(request.conversationId, 'assistant', output, undefined, [], { ...(thinking.trim() ? { thinking } : {}), ...(thinkingTimeline.length ? { thinkingTimeline } : {}), ...(generationStats ? { generationStats } : {}), ...(generation.richArtifacts.length ? { richArtifacts: generation.richArtifacts } : {}) }) : null;
+      sendRun(finishRun('completed', assistant?.id ?? null));
       event.sender.send('chat:stream', { type: 'done', conversationId: request.conversationId, generationId: generation.id, assistant, finishReason });
     } catch (error) {
       log('generation.failed', { generationId: generation.id, conversationId: request.conversationId, model: request.model, message: error instanceof Error ? error.message : String(error) });
-      if (run) { const finished = database.finishAnalysisRun(run.id, abort.signal.aborted ? 'cancelled' : 'error', null); if (current()) event.sender.send('chat:stream', { type: 'analysis-run', conversationId: request.conversationId, generationId: generation.id, run: finished }); }
+      if (run) {
+        failure ??= `Не удалось выполнить запрос: ${error instanceof Error ? error.message : String(error)}`;
+        const finished = finishRun(abort.signal.aborted ? 'cancelled' : 'error');
+        if (activeGenerations.get(request.conversationId) === generation) sendRun(finished);
+      }
       if (current()) event.sender.send('chat:stream', { type: 'error', conversationId: request.conversationId, generationId: generation.id, message: 'Не удалось выполнить запрос', details: error instanceof Error ? error.message : String(error) });
     } finally {
       if (activeGenerations.get(request.conversationId) === generation) {
@@ -637,6 +923,7 @@ export function registerIpc(): void {
         if (abort.signal.aborted) event.sender.send('chat:stream', { type: 'cancelled', conversationId: request.conversationId, generationId: generation.id });
       }
       generation.finish();
+      void visionDevice.flush();
     }
   });
 }

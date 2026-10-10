@@ -1,8 +1,15 @@
 import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { createServer, type Server } from 'node:http';
 import { once } from 'node:events';
-import { LlamaCppBackend, LlamaCppContextExhaustedError, LlamaCppRequestError, validateLlamaMessageSequence } from './llama-cpp-backend';
+import { nativeImageUrl, LlamaCppBackend, LlamaCppContextExhaustedError, LlamaCppRequestError, validateLlamaMessageSequence } from './llama-cpp-backend';
 import type { ToolMessage } from './types';
+import { llamaReasoningForInput, llamaRuntimeProfiles } from '../models/llama-runtime-policy';
+import { builtinModelCatalog } from '../models/model-catalog';
+import type { RuntimeConfiguration } from '../../shared/types';
 import type { ChatMessage } from '../../shared/types';
 
 const model = 'qwen3.8:27b-q4_K_M';
@@ -61,6 +68,80 @@ const toolSchema = [{ type: 'function', function: { name: 'read_file', descripti
 const call = (backend: LlamaCppBackend, messages: ToolMessage[], tools: unknown[] | undefined = toolSchema) => backend.chatWithTools(model, messages, tools, new AbortController().signal, 65_536, 'deep');
 
 export async function runLlamaCppBackendRegression(): Promise<void> {
+  // Availability/context tests use tiny synthetic metadata, never a
+  // developer's multi-GB weights or directory structure.
+  const fixture = mkdtempSync(join(tmpdir(), 'llama backend models '));
+  const originalPaths = llamaRuntimeProfiles.map((profile) => Object.getOwnPropertyDescriptor(profile, 'modelPath')!);
+  const runtimeSettings = createRequire(__filename)('../services/runtime-settings') as typeof import('../services/runtime-settings');
+  const originalConfiguration = Object.getOwnPropertyDescriptor(runtimeSettings, 'effectiveRuntimeConfiguration');
+  const profiles: RuntimeConfiguration['models'] = [];
+  const u32 = (n: number) => { const b = Buffer.alloc(4); b.writeUInt32LE(n); return b; };
+  const u64 = (n: number) => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(n)); return b; };
+  const text = (s: string) => Buffer.concat([u64(Buffer.byteLength(s)), Buffer.from(s)]);
+  for (const [index, profile] of llamaRuntimeProfiles.entries()) {
+    const path = join(fixture, `model${index}.gguf`);
+    const contents = Buffer.concat([Buffer.from('GGUF'), u32(3), u64(0), u64(2), text('general.architecture'), u32(8), text('fixture'), text('fixture.context_length'), u32(4), u32(262_144)]);
+    writeFileSync(path, contents);
+    const projector = join(fixture, `projector${index}.gguf`); writeFileSync(projector, contents);
+    Object.defineProperty(profile, 'modelPath', { get: () => path, configurable: true });
+    const builtin = builtinModelCatalog.find((entry) => entry.id === profile.id)!;
+    profiles.push({ id: profile.id, displayName: builtin.displayName, modelPath: path, mmprojPath: projector,
+      gpuLayers: null, supportsTools: builtin.supportsTools, speculative: 'mtp', builtin: true });
+  }
+  const fixtureConfiguration: RuntimeConfiguration = { schemaVersion: 2, llamaServerPath: null, modelsPath: fixture,
+    gpuLayers: 999, setupDismissed: true, models: profiles };
+  Object.defineProperty(runtimeSettings, 'effectiveRuntimeConfiguration', { configurable: true, value: () => fixtureConfiguration });
+  try {
+  {
+    const originalFetch = globalThis.fetch;
+    let requests = 0;
+    globalThis.fetch = async () => { requests++; throw new Error('idle backend must not contact a runtime'); };
+    try {
+      const backend = new LlamaCppBackend('http://127.0.0.1:8081', 32_768, false, null);
+      const models = await backend.getModels();
+      assert.equal(models.length, llamaRuntimeProfiles.length, 'idle selection must retain the whole model catalog');
+      assert.equal(requests, 0, 'listing installed models must not query a previously selected server');
+      assert.equal(await backend.supportsVision(model), false);
+      assert.equal(await backend.getRuntimeContextEvidence(), null);
+      await assert.rejects(backend.ensureModelAvailable(model));
+      assert.equal(requests, 0, 'generation cannot implicitly select a model');
+      backend.updateRuntimeSelection(model, 32_768);
+      assert.equal(await backend.supportsVision(model), true);
+      backend.updateRuntimeSelection('qwen3.6:35b-a3b-ud-q4_k_m', 65_536, 'q8_0', true);
+      assert.equal(await backend.supportsVision('qwen3.6:35b-a3b-ud-q4_k_m'), false, 'MTP-active Qwen3.6 runtime does not load its unsupported projector');
+      backend.updateRuntimeSelection('qwen3.6:35b-a3b-ud-q4_k_m', 65_536, 'q8_0', true, true);
+      assert.equal(await backend.supportsVision('qwen3.6:35b-a3b-ud-q4_k_m'), true, 'MTP-off runtime may expose its verified projector');
+      backend.clearRuntimeSelection();
+      assert.equal(await backend.supportsVision(model), false);
+    } finally { globalThis.fetch = originalFetch; }
+  }
+  // A bare strategy keeps its historical meaning (thinking on; Fast = lowest effort, Deep = highest the model supports);
+  // only the final tool-free turn may turn thinking off.
+  for (const profile of llamaRuntimeProfiles) {
+    const reasoning = profile.reasoning;
+    if (!reasoning) continue;
+    const fast = llamaReasoningForInput(profile.id, 'fast');
+    const deep = llamaReasoningForInput(profile.id, 'deep');
+    for (const fragment of [fast, deep]) {
+      assert.notEqual((fragment.chat_template_kwargs as { enable_thinking?: boolean } | undefined)?.enable_thinking, false, `${profile.id} strategies must not disable thinking`);
+      assert.notEqual(fragment.reasoning_effort, 'none', `${profile.id} must not use no-reasoning effort`);
+    }
+    if (Object.keys(reasoning.efforts).length) {
+      assert.equal(fast.reasoning_effort, 'low', `${profile.id} Fast must use low reasoning effort`);
+      assert.notEqual(deep.reasoning_effort, fast.reasoning_effort, `${profile.id} Deep must differ from Fast`);
+    } else {
+      assert.equal(fast.reasoning_effort, undefined, `${profile.id} must not fabricate effort`);
+      assert.equal(deep.reasoning_effort, undefined, `${profile.id} must not fabricate effort`);
+    }
+    assert.deepEqual(llamaReasoningForInput(profile.id, 'auto'), {}, `${profile.id} Auto must leave native reasoning at the model default`);
+  }
+  // Explicit thinking/effort are independent of the strategy and reach llama.cpp unchanged.
+  assert.deepEqual(llamaReasoningForInput('qwen3.8:27b-q4_K_M', { mode: 'deep', selection: { thinking: true, effort: 'medium' } }), { reasoning_effort: 'medium', chat_template_kwargs: { enable_thinking: true } });
+  assert.deepEqual(llamaReasoningForInput('qwen3.8:27b-q4_K_M', { mode: 'fast', selection: { thinking: true, effort: 'max' } }), { reasoning_effort: 'xhigh', chat_template_kwargs: { enable_thinking: true } });
+  assert.deepEqual(llamaReasoningForInput('qwen3.8:27b-q4_K_M', { mode: 'deep', selection: { thinking: false, effort: 'max' } }), { chat_template_kwargs: { enable_thinking: false } }, 'thinking off must send no effort');
+  assert.deepEqual(llamaReasoningForInput('gpt-oss:20b', { mode: 'deep', selection: { thinking: null, effort: 'medium' } }), { reasoning_effort: 'medium' }, 'a model without a thinking switch gets only its effort');
+  assert.deepEqual(llamaReasoningForInput('gpt-oss:20b', { mode: 'fast', selection: { thinking: false, effort: 'high' } }), { reasoning_effort: 'high' }, 'an unsupported thinking switch must never reach a model that lacks it');
+  assert.deepEqual(llamaReasoningForInput('glm-4.7-flash:q4_k', { mode: 'fast', selection: { thinking: true, effort: 'medium' } }), { reasoning_effort: 'low', chat_template_kwargs: { enable_thinking: true } }, 'an unsupported level must fall back to the nearest supported one');
   {
     const scenario: Scenario = { serverContext: 16_384, trainContext: 262_144, modelSize: 16_799_719_424, requestBodies: [], countBodies: [] }; const { server, url } = await startServer(scenario);
     try {
@@ -71,7 +152,7 @@ export async function runLlamaCppBackendRegression(): Promise<void> {
         backend: 'llama-cpp',
         modelId: model,
         activeContextTokens: 16_384,
-        modelPath: '/media/yaroslav/DATA/llama-models/qwen3.8-27b-q4_K_M.gguf',
+        modelPath: llamaRuntimeProfiles[0].modelPath,
         modelTrainContextTokens: 262_144,
         modelFileSizeBytes: 16_799_719_424,
         kvCacheType: 'f16',
@@ -79,14 +160,21 @@ export async function runLlamaCppBackendRegression(): Promise<void> {
       }, 'live llama-server n_ctx was not exposed as runtime evidence');
       assert.equal(await backend.getRuntimeContextEvidence('other-model'), null, 'llama.cpp reported evidence for a model that is not loaded');
       const models = await backend.getModels();
+      assert(!models.some((entry) => ['gemma4:31b-it-q4_k_m', 'devstral-small-2:24b-q4_k_m'].includes(entry.id)), 'removed local choices must not appear');
+      assert.deepEqual(models.find((entry) => entry.id === model)?.speculative, { mechanism: 'mtp', draftSource: 'embedded' });
+      assert.equal(models.find((entry) => entry.id === 'devstral-small-2:24b-q4_k_m')?.speculative, undefined, 'no unsupported control for Devstral');
       assert.deepEqual(models.find((item) => item.id === model)?.supportedContextPresets, [16384, 32768, 65536, 131072, 262144], 'loaded 16K must not redefine model capability');
-      assert.deepEqual(models.find((item) => item.id === 'glm-4.7-flash:q4_k')?.supportedContextPresets, [16384, 32768, 65536, 131072], 'GLM normal options were truncated by an active runtime or another model');
-      const gptOss = models.find((item) => item.id === 'gpt-oss:20b');
-      assert(gptOss, 'GPT-OSS was not included in the llama.cpp model registry');
-      assert.equal(gptOss.backend, 'llama-cpp');
-      assert.equal(gptOss.supportsTools, true);
-      assert.equal(gptOss.supportsReasoning, true);
-      assert.deepEqual(gptOss.supportedContextPresets, [16384, 32768, 65536, 131072]);
+      assert.deepEqual(models.map((item) => item.id), llamaRuntimeProfiles.map((profile) => profile.id));
+      assert(!models.some((item) => ['glm-4.7-flash:q4_k', 'gpt-oss:20b'].includes(item.id)), 'removed local entries must not appear');
+      for (const item of models) assert.deepEqual(item.supportedContextPresets, [16384, 32768, 65536, 131072, 262144], 'active context must not truncate another model capability');
+      const qwen36 = models.find((item) => item.id === 'qwen3.6:35b-a3b-ud-q4_k_m');
+      assert(qwen36?.installed);
+      assert.equal(qwen36.supportsTools, true);
+      assert.equal(qwen36.supportsReasoning, true);
+      assert.equal(qwen36.normalContext?.initialContextWindow, 65_536);
+      assert.equal(qwen36.normalContext?.kvCacheType, 'q8_0');
+      assert.deepEqual(qwen36.speculative, { mechanism: 'mtp', draftSource: 'embedded' });
+      assert.deepEqual(qwen36.reasoning, { thinkingToggle: true, efforts: [] });
     } finally { await stop(server); }
   }
   {
@@ -111,7 +199,7 @@ export async function runLlamaCppBackendRegression(): Promise<void> {
       assert.equal(response.response.thinking, 'Choose tool. ', 'streamed reasoning was not assembled');
       assert.deepEqual(response.response.tool_calls?.map((call) => [call.id, call.function.name, call.function.arguments]), [['call-write', 'write_file', '{"path":"a.txt","content":"x"}'], ['call-read', 'read_file', '{"path":"b.txt"}']], 'fragmented native tool calls were not assembled in index order');
       assert.equal(scenario.requestBodies[0].stream, true, 'Agent tool inference did not request streaming');
-      assert.deepEqual(scenario.requestBodies[0].chat_template_kwargs, { enable_thinking: false }, 'Qwen fast execution turn did not disable template thinking');
+      assert.deepEqual(scenario.requestBodies[0].chat_template_kwargs, { enable_thinking: true }, 'Qwen fast execution turn must keep template thinking enabled');
       assert.equal(events.filter((event) => event.type === 'tool_call_delta').length, 3, 'tool deltas were not exposed for telemetry');
     } finally { await stop(server); }
   }
@@ -120,9 +208,13 @@ export async function runLlamaCppBackendRegression(): Promise<void> {
     try {
       const history: ChatMessage[] = [{ id: 'user', conversationId: 'chat', role: 'user', content: 'Stream this response.', createdAt: new Date().toISOString() }];
       const events = [] as import('../../shared/types').StreamEvent[];
+      const imageUrls = ['data:image/png;base64,iVBORw==', 'data:image/jpeg;base64,/9j/', 'data:image/webp;base64,UklGRg=='];
+      history[history.length - 1].images = imageUrls;
       for await (const event of new LlamaCppBackend(url).streamChat(model, history, new AbortController().signal, 65_536, 'deep')) events.push(event);
       assert.equal(events.find((event) => event.type === 'diagnostics')?.diagnostics?.evalCount, 7, 'usage emitted after finish_reason was not retained for message statistics');
       assert.equal(events.find((event) => event.type === 'diagnostics')?.diagnostics?.tokensPerSecond, 14, 'late timing data was not retained for message statistics');
+      const wireMessages = scenario.requestBodies[0].messages as Array<{ role: string; content: Array<{ image_url?: { url: string } }> }>;
+      assert.deepEqual(wireMessages.find((message) => message.role === 'user')!.content.filter((part) => part.image_url).map((part) => part.image_url!.url), imageUrls);
       assert.deepEqual(events.filter((event) => event.type === 'thinking').map((event) => event.content), ['Reasoning. '], 'real reasoning stream was not forwarded');
     } finally { await stop(server); }
   }
@@ -213,8 +305,8 @@ export async function runLlamaCppBackendRegression(): Promise<void> {
       await backend.chatWithTools(glm, baseMessages('GLM deep'), toolSchema, new AbortController().signal, 65_536, 'deep');
       assert.equal(scenario.requestBodies[0].reasoning_effort, undefined, 'GLM Auto should leave native reasoning at the model default');
       assert.equal(scenario.requestBodies[0].chat_template_kwargs, undefined, 'GLM Auto should not override template thinking');
-      assert.deepEqual(scenario.requestBodies[1].chat_template_kwargs, { enable_thinking: false }, 'GLM fast request did not disable native thinking');
-      assert.equal(scenario.requestBodies[1].reasoning_effort, 'none', 'GLM fast request did not use llama.cpp\'s native no-reasoning setting');
+      assert.deepEqual(scenario.requestBodies[1].chat_template_kwargs, { enable_thinking: true }, 'GLM fast request must keep native thinking enabled');
+      assert.equal(scenario.requestBodies[1].reasoning_effort, 'low', 'GLM fast request must use low reasoning effort');
       assert.deepEqual(scenario.requestBodies[2].chat_template_kwargs, { enable_thinking: true }, 'GLM deep request did not enable native thinking');
       assert.equal(scenario.requestBodies[2].reasoning_effort, 'xhigh', 'GLM deep request did not use llama.cpp\'s native high-reasoning setting');
     } finally { await stop(server); }
@@ -229,6 +321,21 @@ export async function runLlamaCppBackendRegression(): Promise<void> {
       assert(!serialized.includes('activity-trace-only') && !serialized.includes('raw-cache-only'), 'activity telemetry or raw cache leaked into the inference request');
     } finally { await stop(server); }
   }
+  } finally {
+    llamaRuntimeProfiles.forEach((profile, index) => Object.defineProperty(profile, 'modelPath', originalPaths[index]));
+    if (originalConfiguration) Object.defineProperty(runtimeSettings, 'effectiveRuntimeConfiguration', originalConfiguration);
+    rmSync(fixture, { recursive: true, force: true });
+  }
 }
 
 if (require.main === module) void runLlamaCppBackendRegression().catch((error: unknown) => { console.error(error); process.exitCode = 1; });
+
+for (const [mime, bytes] of [
+  ['image/png', Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])],
+  ['image/jpeg', Buffer.from([255, 216, 255, 224, 12])],
+  ['image/webp', Buffer.from('RIFF0000WEBPbytes')],
+] as const) {
+  const raw = bytes.toString('base64');
+  assert.equal(nativeImageUrl(raw), `data:${mime};base64,${raw}`);
+  assert.equal(nativeImageUrl(`data:${mime};base64,${raw}`), `data:${mime};base64,${raw}`);
+}

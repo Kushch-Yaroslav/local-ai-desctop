@@ -1,0 +1,28 @@
+0.00.154.580 I srv    load_model: loading model '/media/yaroslav/DATA/llama-models/Qwen3.6-35B-A3B-Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf'
+0.00.377.439 I llama_model_loader: loaded meta data with 55 key-value pairs and 753 tensors from /media/yaroslav/DATA/llama-models/Qwen3.6-35B-A3B-Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf (version GGUF V3 (latest))
+0.01.893.953 I load_tensors: offloaded 42/42 layers to GPU
+0.01.893.961 I load_tensors:        CUDA0 model buffer size = 19231.70 MiB
+0.01.893.968 I load_tensors:    CUDA_Host model buffer size =  2371.31 MiB
+0.03.728.537 I llama_context: n_seq_max             = 1
+0.03.728.537 I llama_context: n_ctx_seq             = 65536
+0.03.728.542 I llama_context: n_ctx_seq (65536) < n_ctx_train (262144) -- the full capacity of the model will not be utilized
+0.03.732.333 I llama_context:  CUDA_Host  output buffer size =     0.95 MiB
+0.03.732.829 I llama_kv_cache:      CUDA0 KV buffer size =   680.00 MiB
+0.03.733.753 I llama_kv_cache: size =  680.00 MiB ( 65536 cells,  10 layers,  1/1 seqs), K (q8_0):  340.00 MiB, V (q8_0):  340.00 MiB
+0.03.734.158 I llama_memory_recurrent:      CUDA0 RS buffer size =   188.44 MiB
+0.03.734.166 I llama_memory_recurrent: size =  188.44 MiB (     1 cells,  40 layers,  1 seqs  2 rs_seq), R (f32):    8.44 MiB, S (f32):   180.00 MiB, P (f32):    0.00 MiB
+0.03.764.887 I sched_reserve:      CUDA0 compute buffer size =    210.00 MiB
+0.03.764.889 I sched_reserve:  CUDA_Host compute buffer size =    18.27 MiB
+0.03.766.410 I common_speculative_init_result: creating MTP draft context against the target model '/media/yaroslav/DATA/llama-models/Qwen3.6-35B-A3B-Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf'
+0.03.766.422 I llama_context: n_seq_max             = 1
+0.03.766.422 I llama_context: n_ctx_seq             = 65536
+0.03.766.426 I llama_context: n_ctx_seq (65536) < n_ctx_train (262144) -- the full capacity of the model will not be utilized
+0.03.768.217 I llama_context:  CUDA_Host  output buffer size =     0.95 MiB
+0.03.769.679 I llama_kv_cache:      CUDA0 KV buffer size =    68.00 MiB
+0.03.769.858 I llama_kv_cache: size =   68.00 MiB ( 65536 cells,  1 layers,  1/1 seqs), K (q8_0):   34.00 MiB, V (q8_0):   34.00 MiB
+0.03.794.020 I sched_reserve:      CUDA0 compute buffer size =   156.27 MiB
+0.03.794.022 I sched_reserve:  CUDA_Host compute buffer size =    18.27 MiB
+0.03.794.491 I spec common_specu: adding speculative implementation 'draft-mtp'
+0.03.825.125 I sched_reserve:      CUDA0 compute buffer size =   156.27 MiB
+0.03.825.128 I sched_reserve:  CUDA_Host compute buffer size =    18.27 MiB
+0.03.935.851 I srv  llama_server: model loaded

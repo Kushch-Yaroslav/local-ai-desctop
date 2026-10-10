@@ -1,17 +1,21 @@
+import { getLanguage } from '../../shared/locale';
+import { modelLanguageDirective } from '../../shared/model-language';
 import { createInterface } from 'node:readline';
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { resolve } from 'node:path';
-import { join } from 'node:path';
-import { createHash } from 'node:crypto';
-import { paths } from './paths';
-import type { AgentPlan, AgentPlanStepStatus, ChatMessage, ModelTodo, ReasoningMode, StreamEvent, TerminalExecution, ToolActivity, WebMode } from '../../shared/types';
+import { agentRuntimePath, paths } from './paths';
+import { agentEvidenceDir } from './agent-evidence';
+import type { AgentPlan, AgentPlanStepStatus, ChatMessage, ModelTodo, ReasoningMode, StreamEvent, SteeringIntent, TerminalExecution, ToolActivity, WebMode, WorkBudget } from '../../shared/types';
+import { ArtifactToolError, artifactFailure, artifactAcknowledgment, validateRichArtifact, visualArtifactTool, withAttachmentProvenance, richArtifactFingerprint, type RichArtifact, type ArtifactSource } from '../../shared/rich-artifacts';
+import { attachmentDataTool } from './attachment-service';
+import { WebBrowserService, webToolDefinitions, activityForWebTool, type WebBrowserSession } from '../web/web-tools';
 import { maxOutputTokens } from '../models/model-registry';
 
 /** Project identity is a transport value, not an orchestration subsystem. */
 export type AgentProject = { id: string; slot: 1 | 2; root: string; label: string };
 
 type RuntimeEvent = {
+  budget?: WorkBudget;
   type: string; content?: string; id?: string; name?: string; message?: string; detail?: string; status?: string;
   diff?: string | null; is_error?: boolean; plan?: unknown; memory?: unknown; used?: number; limit?: number;
   before?: number; after?: number; stream?: string; state?: string; index?: number;
@@ -25,11 +29,11 @@ type RuntimeEvent = {
   knowledge_reads?: number; knowledge_writes?: number; cache_hits?: number; stale_source_entries?: number; bytes_injected?: number;
 };
 type RuntimeRequest = {
-  type: 'run'; run_id: string; endpoint: string; model: string; system: string; user: string;
+  type: 'run'; run_id: string; endpoint: string; model: string; system: string; ui_language?: 'ru' | 'en'; user: string; user_images?: string[]; user_image_refs?: string[]; web_tools?: unknown[];
   project_root?: string; secondary_project_root?: string; context_limit: number; reasoning_mode: ReasoningMode;
   supports_reasoning: boolean; reasoning_options?: Record<string, Record<string, unknown>>;
-  web_mode: WebMode; policy: 'auto' | 'safe'; history: unknown[]; task_memory?: AgentPlan['taskMemory']; provider_max_output?: number;
-  evidence_dir?: string;
+  web_mode: WebMode; policy: 'auto' | 'safe'; history: unknown[]; artifact_tools: unknown[]; attachment_tools: unknown[]; task_memory?: AgentPlan['taskMemory']; provider_max_output?: number;
+  evidence_dir?: string; workspace_roots?: string[];
 };
 
 export function statusActivity(runId: string, ordinal: number, content: string): ToolActivity {
@@ -50,10 +54,14 @@ export function runtimeTextEvent(event: Pick<RuntimeEvent, 'type' | 'content'>, 
 }
 
 /** The latest actual user node owns an Agent run. */
-export function splitAgentRunHistory(history: ChatMessage[]): { user: string; prior: ChatMessage[] } {
+export function splitAgentRunHistory(history: ChatMessage[]): { user: string; images: string[]; imageRefs: string[]; prior: ChatMessage[] } {
   const currentIndex = history.map((message) => message.role).lastIndexOf('user');
-  if (currentIndex < 0 || !history[currentIndex].content.trim()) throw new Error('Agent request has no current user message.');
-  return { user: history[currentIndex].content, prior: history.slice(0, currentIndex) };
+  if (currentIndex < 0 || !history[currentIndex].content.trim()) throw new Error('В запросе агента нет текущего сообщения пользователя.');
+  return { user: history[currentIndex].content, images: history[currentIndex].images ?? [], imageRefs: imageReferences(history[currentIndex]), prior: history.slice(0, currentIndex) };
+}
+
+function imageReferences(message: ChatMessage): string[] {
+  return (message.attachments ?? []).filter(attachment => attachment.kind === 'image').map(attachment => attachment.id);
 }
 
 const status = (value: unknown): AgentPlanStepStatus => value === 'completed' || value === 'abandoned' || value === 'in_progress' ? value : 'pending';
@@ -102,6 +110,7 @@ export function taskPlan(value: unknown): AgentPlan {
       ...(typeof raw.active_milestone_id === 'string' ? { activeMilestoneId: raw.active_milestone_id } : typeof raw.activeMilestoneId === 'string' ? { activeMilestoneId: raw.activeMilestoneId } : {}),
       ...(typeof raw.revision === 'number' ? { revision: raw.revision } : {}),
       ...(todo ? { modelTodo: todo } : {}),
+      ...(raw.workBudget ? { workBudget: raw.workBudget as WorkBudget } : {}),
       ...(raw.task_memory && typeof raw.task_memory === 'object' ? { taskMemory: raw.task_memory as AgentPlan['taskMemory'] } : raw.taskMemory && typeof raw.taskMemory === 'object' ? { taskMemory: raw.taskMemory as AgentPlan['taskMemory'] } : {}),
     };
   }
@@ -120,27 +129,36 @@ export function taskPlan(value: unknown): AgentPlan {
 /** Electron bridge for the Rust runtime. It passes each content delta through
  * immediately; `final` is metadata, not a delayed text transport. */
 export class RustAgentRuntime {
-  private readonly steering = new Map<string, (content: string) => Promise<void>>();
-  constructor(private readonly endpoint: string, private readonly binary = process.env.LOCAL_AI_AGENT_RUNTIME ?? resolve(process.cwd(), 'rust-agent', 'target', 'debug', 'local-ai-agent-runtime')) {}
+  private readonly steering = new Map<string, (content: string, intent?: SteeringIntent) => Promise<void>>();
+  constructor(private readonly endpoint: string, private readonly binary = agentRuntimePath(), private readonly web = new WebBrowserService(), private readonly readAttachmentData?: (argumentsObject: Record<string, unknown>) => Promise<unknown>) {}
 
-  steer(runId: string, content: string): Promise<void> {
+  steer(runId: string, content: string, intent?: SteeringIntent): Promise<void> {
     const send = this.steering.get(runId);
     if (!send) return Promise.reject(new Error('Agent ещё не готов к уточнению или уже завершён.'));
-    return send(content);
+    return send(content, intent);
   }
 
-  async *stream(model: string, history: ChatMessage[], projects: AgentProject[], signal: AbortSignal, contextLimit: number, reasoningMode: ReasoningMode, webMode: WebMode, runId: string, persistedTaskMemory?: AgentPlan['taskMemory'], conversationId?: string, supportsReasoning = true, reasoningOptions?: Record<string, Record<string, unknown>>): AsyncIterable<StreamEvent> {
+  async *stream(model: string, history: ChatMessage[], projects: AgentProject[], signal: AbortSignal, contextLimit: number, reasoningMode: ReasoningMode, webMode: WebMode, runId: string, persistedTaskMemory?: AgentPlan['taskMemory'], conversationId?: string, supportsReasoning = true, reasoningOptions?: Record<string, Record<string, unknown>>, workspaceRoots: readonly string[] = [], validateDiagram?: (source: string, signal: AbortSignal) => Promise<void>): AsyncIterable<StreamEvent> {
+    if (signal.aborted) { yield { type: 'cancelled' }; return; }
     if (!existsSync(this.binary)) throw new Error(`Rust Agent Runtime V2 не собран: ${this.binary}. Выполните cargo build в rust-agent.`);
     const child = spawn(this.binary, [], { stdio: 'pipe' });
+    const lines = createInterface({ input: child.stdout });
+    let processError: Error | null = null;
+    const failedProcess = (error: Error) => { processError = error; lines.close(); };
+    child.once('error', failedProcess);
+    child.stdin.on('error', failedProcess);
     const pending: Array<{ content: string; resolve: () => void; reject: (error: Error) => void }> = [];
-    this.steering.set(runId, (content) => {
+    this.steering.set(runId, (content, intent) => {
       if (!child.stdin.writable || signal.aborted) return Promise.reject(new Error('Agent уже завершён.'));
       if (pending.length >= 4) return Promise.reject(new Error('Слишком много ожидающих уточнений.'));
       return new Promise<void>((resolve, reject) => {
         pending.push({ content, resolve, reject });
-        child.stdin.write(`${JSON.stringify({ type: 'steer', run_id: runId, content })}\n`);
+        child.stdin.write(`${JSON.stringify({ type: 'steer', run_id: runId, content, ...(intent ? { intent } : {}) })}\n`);
       });
     });
+    let session: Promise<WebBrowserSession> | undefined;
+    const closeWeb = () => { void session?.then((browser) => browser.close(), () => undefined); };
+    signal.addEventListener('abort', closeWeb, { once: true });
     let stopped = false;
     const stop = () => {
       if (stopped || !child.stdin.writable) return;
@@ -150,22 +168,27 @@ export class RustAgentRuntime {
     };
     signal.addEventListener('abort', stop, { once: true });
     const current = splitAgentRunHistory(history);
+    const attachmentTool = attachmentDataTool(history.flatMap((message) => message.attachments ?? []));
+    const usedAttachmentSources = new Map<string, ArtifactSource>();
+    const acceptedArtifacts = new Map<string, RichArtifact>();
+    const galleryFailures = new Map<string, Record<string, unknown>>();
     const request: RuntimeRequest = {
       type: 'run', run_id: runId, endpoint: this.endpoint, model,
-      system: `You are Local AI Desktop Agent. Work autonomously inside the selected project scope. Use tools only with complete valid JSON arguments.\n${projects.map((project) => `Project ${project.slot}: ${project.label}; identity=${project.id}; root=${project.root}`).join('\n')}`,
-      user: current.user, project_root: projects[0]?.root, secondary_project_root: projects[1]?.root,
+      ui_language: getLanguage(),
+      system: `${modelLanguageDirective()}\nYou are Local AI Desktop Agent. Work autonomously inside the scope described below. Use tools only with complete valid JSON arguments.\n${projects.map((project) => `Project ${project.slot}: ${project.label}; identity=${project.id}; root=${project.root}`).join('\n')}`,
+      user: current.user, user_images: current.images, user_image_refs: current.imageRefs, web_tools: webMode === 'auto' ? webToolDefinitions : [], artifact_tools: [visualArtifactTool], attachment_tools: attachmentTool ? [attachmentTool] : [], project_root: projects[0]?.root, secondary_project_root: projects[1]?.root, ...(workspaceRoots.length ? { workspace_roots: [...workspaceRoots] } : {}),
       context_limit: contextLimit, reasoning_mode: reasoningMode, supports_reasoning: supportsReasoning, reasoning_options: reasoningOptions, web_mode: webMode, policy: 'auto',
-      history: current.prior.filter((message) => !message.agentError && !message.agentCancelled).map((message) => ({ role: message.role, content: message.content })),
-      ...(conversationId ? { evidence_dir: join(paths.userData, 'agent-evidence', createHash('sha256').update(conversationId).digest('hex')) } : {}),
+      history: current.prior.filter((message) => !message.agentError && !message.agentCancelled).map((message) => ({ role: message.role, content: message.content, ...(imageReferences(message).length ? { image_refs: imageReferences(message) } : {}), ...(message.images?.length ? { images: message.images } : {}) })),
+      ...(conversationId ? { evidence_dir: agentEvidenceDir(paths.userData, conversationId) } : {}),
       ...(persistedTaskMemory ? { task_memory: persistedTaskMemory } : {}),
       provider_max_output: maxOutputTokens,
     };
     child.stdin.write(`${JSON.stringify(request)}\n`);
-    const lines = createInterface({ input: child.stdout });
     let compactions = 0;
     let statusCount = 0;
     let terminalFinal = false;
     let terminalFailure = false;
+    let terminalStopped = false;
     let terminalFinishReason: 'stop' | 'length' = 'stop';
     let stderr = '';
     child.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
@@ -173,6 +196,50 @@ export class RustAgentRuntime {
       for await (const line of lines) {
         let event: RuntimeEvent;
         try { event = JSON.parse(line) as RuntimeEvent; } catch { continue; }
+        if (event.type === 'host_tool_call') {
+          let result: unknown;
+          try {
+            if (signal.aborted) throw new Error('Web request cancelled');
+            if (event.name === 'create_visual_artifact') {
+              const galleryKey = (event.arguments?.artifact as { type?: string })?.type === 'image_gallery' ? richArtifactFingerprint(event.arguments?.artifact as RichArtifact) : undefined;
+              if (galleryKey && galleryFailures.has(galleryKey)) throw new ArtifactToolError({ ...galleryFailures.get(galleryKey), code: 'ARTIFACT_DUPLICATE', retrySameArguments: false, error: 'This gallery request already failed. Correct the reported fields or image ID instead of repeating unchanged arguments.' });
+              const browser = session ? await session : undefined;
+              const attachmentLabels = new Set(history.flatMap((message) => message.attachments ?? []).map((attachment) => attachment.filename));
+              const validated = validateRichArtifact(event.arguments?.artifact, browser?.getImageResults(), undefined, browser?.getKnownSources() ?? new Set(), attachmentLabels);
+              if ('artifact' in validated && validated.artifact) {
+                const artifact = withAttachmentProvenance(validated.artifact, [...usedAttachmentSources.values()]);
+                const fingerprint = richArtifactFingerprint(artifact); const previous = acceptedArtifacts.get(fingerprint);
+                if (!previous) {
+                  if (artifact.type === 'image_gallery') await browser?.verifyGalleryImages?.(artifact, signal);
+                  if (artifact.type === 'diagram' && validateDiagram) await validateDiagram(artifact.mermaid, signal);
+                  if (signal.aborted) throw new Error('Diagram validation cancelled');
+                  acceptedArtifacts.set(fingerprint, artifact); yield { type: 'rich-artifact', artifact };
+                }
+                result = artifactAcknowledgment(previous ?? artifact, Boolean(previous));
+              }
+              else result = artifactFailure(validated);
+            } else if (event.name === 'read_attachment_data') {
+              if (!attachmentTool || !this.readAttachmentData) throw new Error('Attachment data is unavailable in this conversation.');
+              const allowed = new Set(history.flatMap((message) => message.attachments ?? []).map((attachment) => attachment.id));
+              if (typeof event.arguments?.attachment_id !== 'string' || !allowed.has(event.arguments.attachment_id)) throw new Error('Select a structured attachment from this conversation.');
+              result = await this.readAttachmentData(event.arguments);
+              const attachment = history.flatMap((message) => message.attachments ?? []).find((item) => item.id === event.arguments?.attachment_id);
+              if (attachment) {
+                const sheet = result && typeof result === 'object' && typeof (result as { sheet?: unknown }).sheet === 'string' ? ` · ${(result as { sheet: string }).sheet}` : '';
+                usedAttachmentSources.set(attachment.id, { label: attachment.filename, ...(sheet ? { detail: sheet } : {}) });
+              }
+            } else {
+              if (webMode !== 'auto' || !webToolDefinitions.some((tool) => tool.function.name === event.name)) throw new Error('Web tool is unavailable');
+              session ??= this.web.openSession();
+              const browser = await session;
+              if (signal.aborted) { await browser.close(); throw new Error('Web request cancelled'); }
+              result = JSON.parse(await browser.execute({ name: event.name!, arguments: event.arguments ?? {} }));
+            }
+          } catch (error) { result = error instanceof ArtifactToolError ? error.result : { error: error instanceof Error ? error.message : String(error) }; }
+          if (event.name === 'create_visual_artifact' && (event.arguments?.artifact as { type?: string })?.type === 'image_gallery' && result && typeof result === 'object' && 'error' in result) galleryFailures.set(richArtifactFingerprint(event.arguments?.artifact as RichArtifact), result as Record<string, unknown>);
+          if (!signal.aborted && child.stdin.writable) child.stdin.write(`${JSON.stringify({ type: 'host_tool_result', run_id: runId, id: event.id, result })}\n`);
+          continue;
+        }
         if (event.type === 'steering_accepted' || event.type === 'steering_rejected') {
           const next = pending.shift();
           if (event.type === 'steering_accepted') next?.resolve();
@@ -181,22 +248,30 @@ export class RustAgentRuntime {
         else if (event.type === 'steering_applied') {
           yield { type: 'steering', userMessage: { id: '', conversationId: conversationId ?? '', role: 'user', content: event.content ?? '', createdAt: new Date().toISOString() }, status: 'applied' };
         }
+        else if (event.type === 'run_paused') yield { type: 'paused' };
         else if (event.type === 'thinking_delta') yield { type: 'thinking', content: event.content ?? '' };
-        else if (event.type === 'turn_started') yield { type: 'agent-telemetry', telemetry: { turn: event.index ?? 0 } };
+        else if (event.type === 'turn_started') { yield { type: 'model-state', state: 'waiting' }; yield { type: 'agent-telemetry', telemetry: { turn: event.index ?? 0 } }; }
+        else if (event.type === 'work_budget' && event.budget) yield { type: 'work-budget', budget: event.budget };
         else if (event.type === 'content_delta' || event.type === 'final_delta' || event.type === 'agent_status') {
           if (event.type === 'agent_status') statusCount += 1;
           yield runtimeTextEvent(event, runId, statusCount)!;
         }
         else if (event.type === 'tool_call_started') {
           const command = event.name === 'run_terminal' && typeof event.arguments?.command === 'string' ? event.arguments.command : undefined;
-          yield { type: 'tool', activity: { id: event.id ?? crypto.randomUUID(), label: activityLabel(event.name), detail: command ?? event.name, kind: activityKind(event.name), state: 'running', ...(command ? { terminal: { command, status: 'running' } } : {}) } };
+          yield { type: 'tool', activity: { id: event.id ?? crypto.randomUUID(), label: activityLabel(event.name), ...(event.name === 'create_visual_artifact' ? { metadata: { artifactType: String((event.arguments?.artifact as { type?: string })?.type ?? '') } } : {}), detail: command ?? event.name, kind: activityKind(event.name), state: 'running', ...(command ? { terminal: { command, status: 'running' } } : {}) } };
         } else if (event.type === 'tool_process_started') {
           yield { type: 'tool', activity: { id: event.id ?? crypto.randomUUID(), label: activityLabel('run_terminal'), detail: event.command ?? 'Terminal', kind: 'terminal', state: 'running', terminal: { command: event.command, cwd: event.cwd, pid: event.pid, pgid: event.pgid, sessionId: event.session_id, startedAt: timestamp(event.started_at), status: 'running' } } };
         } else if (event.type === 'tool_output_delta') {
           yield { type: 'tool', activity: { id: event.id ?? crypto.randomUUID(), label: activityLabel('run_terminal'), kind: 'terminal', state: 'running', terminal: event.stream === 'stderr' ? { stderr: `${event.content ?? ''}\n` } : { stdout: `${event.content ?? ''}\n` } } };
         } else if (event.type === 'tool_result' || event.type === 'tool_error') {
-          const terminal = event.name === 'run_terminal' ? terminalResult(event.content ?? event.message) : undefined;
-          yield { type: 'tool', activity: { id: event.id ?? crypto.randomUUID(), label: activityLabel(event.name), detail: terminal?.command ?? event.name, kind: activityKind(event.name), state: event.is_error || event.type === 'tool_error' ? 'error' : 'completed', output: event.content ?? event.message, rawOutput: event.content ?? event.message, ...(terminal ? { terminal } : {}), ...(event.diff ? { metadata: { diff: event.diff } } : {}) } };
+          const failed = event.is_error || event.type === 'tool_error';
+          // A result carries its call ID, so it finalizes the card the call
+          // opened. Fields it does not know must stay absent rather than
+          // undefined, or the merge would erase the started command.
+          const parsed = event.name === 'run_terminal' ? terminalResult(event.content ?? event.message) ?? (failed ? { exitCode: null } : undefined) : undefined;
+          const terminal = parsed && { ...parsed, status: parsed.status ?? (failed ? 'error' as const : 'completed' as const), finishedAt: parsed.finishedAt ?? new Date().toISOString() };
+          const detail = terminal?.command ?? (event.name === 'run_terminal' ? undefined : event.name);
+          yield { type: 'tool', activity: { id: event.id ?? crypto.randomUUID(), label: activityLabel(event.name), ...(detail ? { detail } : {}), kind: activityKind(event.name), state: failed ? 'error' : 'completed', output: event.content ?? event.message, rawOutput: event.content ?? event.message, ...(terminal ? { terminal } : {}), ...(event.diff ? { metadata: { diff: event.diff } } : {}) } };
         } else if (event.type === 'task_memory_update' && event.memory && typeof event.memory === 'object') {
           yield { type: 'task-memory', memory: event.memory as NonNullable<AgentPlan['taskMemory']> };
         } else if (event.type === 'context_optimized') {
@@ -221,11 +296,17 @@ export class RustAgentRuntime {
             ...(cacheWriteTokens === undefined ? {} : { cacheWriteTokens }),
           } };
         } else if (event.type === 'agent_stopped') {
-          child.stdin.end();
+          terminalStopped = true;
+          if (child.stdin.writable) child.stdin.end();
           yield { type: 'cancelled' };
+          break;
         } else if (event.type === 'agent_error') {
           terminalFailure = true;
+          // The worker has ended; its protocol supervisor still awaits stdin.
+          // End this run's stream now so IPC can release inference ownership.
+          if (child.stdin.writable) child.stdin.end();
           yield { type: 'error', message: 'Rust Agent Runtime V2 error', details: event.message };
+          break;
         }
         if (event.type === 'final') {
           // A bounded continuation cap is still a terminal user-visible result:
@@ -237,30 +318,36 @@ export class RustAgentRuntime {
         }
       }
       if (!signal.aborted && terminalFinal) yield { type: 'done', finishReason: terminalFinishReason };
-      else if (!signal.aborted && !terminalFailure) yield { type: 'error', message: 'Rust Agent Runtime V2 ended without a terminal final response', details: 'The runtime closed before emitting a final event.' };
+      else if (!signal.aborted && !terminalFailure && !terminalStopped) yield { type: 'error', message: 'Rust Agent Runtime V2 ended without a terminal final response', details: processError ? String(processError) : stderr.trim() || 'The runtime closed before emitting a final event.' };
     } finally {
+      signal.removeEventListener('abort', closeWeb);
+      closeWeb();
       this.steering.delete(runId);
       for (const next of pending) next.reject(new Error('Agent завершён до принятия уточнения.'));
       signal.removeEventListener('abort', stop);
       if (child.stdin.writable) child.stdin.end();
       if (!child.killed && child.exitCode === null) child.kill('SIGTERM');
     }
-    if (stderr.trim()) throw new Error(`Rust Agent Runtime V2 stderr: ${stderr.trim()}`);
   }
 }
 
 function activityLabel(name?: string): string {
-  return ({ list_directory: 'Просмотр структуры проекта', read_file: 'Чтение файла', write_file: 'Изменение файла', create_file: 'Создание файла', apply_patch: 'Изменение проекта', delete_file: 'Удаление файла', run_terminal: 'Запуск terminal', task_memory: 'Task Memory', project_knowledge_index: 'Индекс знаний проекта', project_knowledge_read: 'Чтение знаний проекта', project_knowledge_update: 'Обновление знаний проекта' } as Record<string, string>)[name ?? ''] ?? 'Действие агента';
+  if (name?.startsWith('web_')) return activityForWebTool({ name, arguments: {} }).label;
+  if (name === 'create_visual_artifact') return 'Подготовка визуального ответа';
+  return ({ list_directory: 'Просмотр структуры проекта', read_file: 'Чтение файла', write_file: 'Изменение файла', replace_text: 'Изменение файла', create_file: 'Создание файла', apply_patch: 'Изменение проекта', delete_file: 'Удаление файла', run_terminal: 'Запуск terminal', task_memory: 'Task Memory', deliverables: 'Требуемый результат', plan: 'План выполнения', project_knowledge_index: 'Индекс знаний проекта', project_knowledge_read: 'Чтение знаний проекта', project_knowledge_update: 'Обновление знаний проекта' } as Record<string, string>)[name ?? ''] ?? 'Действие агента';
 }
 function activityKind(name?: string): NonNullable<import('../../shared/types').ToolActivity['kind']> {
-  return name === 'run_terminal' ? 'terminal' : name === 'task_memory' || name === 'project_knowledge_read' || name === 'project_knowledge_index' ? 'file_read' : name === 'read_file' ? 'file_read' : name === 'list_directory' ? 'directory' : 'mutation';
+  return name?.startsWith('web_') ? 'web' : name === 'run_terminal' ? 'terminal' : name === 'deliverables' || name === 'plan' ? 'planning' : name === 'task_memory' || name === 'project_knowledge_read' || name === 'project_knowledge_index' ? 'file_read' : name === 'read_file' ? 'file_read' : name === 'list_directory' ? 'directory' : 'mutation';
 }
 function timestamp(value: number | undefined): string | undefined { return typeof value === 'number' && Number.isFinite(value) ? new Date(value).toISOString() : undefined; }
 function terminalResult(raw: string | undefined): TerminalExecution | undefined {
   if (!raw) return undefined;
   try {
-    const result = JSON.parse(raw) as Record<string, unknown>;
-    return { command: text(result.command), cwd: text(result.cwd), pid: number(result.pid), pgid: number(result.pgid), sessionId: number(result.session_id), startedAt: timestamp(number(result.started_at)), finishedAt: timestamp(number(result.finished_at)), exitCode: number(result.exit_code) ?? null, timedOut: bool(result.timed_out), cancelled: bool(result.cancelled), status: terminalStatus(result.status), stdout: text(result.stdout), stderr: text(result.stderr) };
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const result = parsed.execution && typeof parsed.execution === 'object' ? parsed.execution as Record<string, unknown> : parsed;
+    if (!('command' in result) && !('exit_code' in result) && !('status' in result)) return { status: 'error', exitCode: null };
+    const terminal: TerminalExecution = { command: text(result.command), cwd: text(result.cwd), pid: number(result.pid), pgid: number(result.pgid), sessionId: number(result.session_id), startedAt: timestamp(number(result.started_at)), finishedAt: timestamp(number(result.finished_at)), exitCode: number(result.exit_code) ?? null, timedOut: bool(result.timed_out), cancelled: bool(result.cancelled), status: terminalStatus(result.status), stdout: text(result.stdout), stderr: text(result.stderr) };
+    return Object.fromEntries(Object.entries(terminal).filter(([, value]) => value !== undefined)) as TerminalExecution;
   } catch { return undefined; }
 }
 const text = (value: unknown) => typeof value === 'string' ? value : undefined;

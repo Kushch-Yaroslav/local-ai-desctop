@@ -48,7 +48,7 @@ export async function runDatabaseMigrationRegression(): Promise<void> {
   const freshPath = join(directory, 'fresh.db');
   try {
     await legacyDatabase(legacyPath);
-    const database = new Database(legacyPath);
+    let database = new Database(legacyPath);
     const migrated = schema(legacyPath);
     assert(!migrated.columns.includes('depth'), 'legacy depth NOT NULL column survived analysis_runs migration');
     assert(migrated.columns.includes('reasoning_mode'), 'analysis_runs migration did not create reasoning_mode');
@@ -62,7 +62,22 @@ export async function runDatabaseMigrationRegression(): Promise<void> {
     assert.equal(legacyMessage?.thinking, undefined, 'old messages unexpectedly gained synthetic Thinking content');
     assert.equal(legacyMessage?.generationStats, undefined, 'old messages unexpectedly gained generation statistics');
 
+    const oldShape = database.createConversation('qwen3.8:27b-q4_K_M');
+    database.close();
+    const stripped = new DatabaseSync(legacyPath);
+    stripped.exec('ALTER TABLE conversations DROP COLUMN thinking_enabled; ALTER TABLE conversations DROP COLUMN reasoning_effort;');
+    stripped.close();
+    const upgraded = new Database(legacyPath);
+    assert.equal(upgraded.getConversation(oldShape.id)?.thinkingEnabled, null, 'a conversation from before the reasoning controls must stay on legacy (NULL) thinking');
+    assert.equal(upgraded.getConversation(oldShape.id)?.reasoningEffort, null, 'a conversation from before the reasoning controls must stay on legacy (NULL) effort');
+    upgraded.close();
+    database = new Database(legacyPath);
     const chat = database.createConversation('qwen3.8:27b-q4_K_M');
+    assert.equal(chat.thinkingEnabled, null);
+    assert.equal(chat.reasoningEffort, null);
+    const explicit = database.updateConversation(chat.id, { thinkingEnabled: false, reasoningEffort: 'medium' });
+    assert.equal(explicit?.thinkingEnabled, false, 'an explicit Thinking OFF choice was not stored');
+    assert.equal(explicit?.reasoningEffort, 'medium');
     for (const reasoningMode of ['fast', 'deep'] as const) {
       const run = database.createAnalysisRun(chat.id, reasoningMode);
       database.addAnalysisAction(run.id, { id: `${reasoningMode}-first-tool`, label: 'Первый tool call', kind: 'directory', state: 'completed' });
@@ -71,6 +86,9 @@ export async function runDatabaseMigrationRegression(): Promise<void> {
     database.close();
 
     const reopened = new Database(legacyPath);
+    assert.equal(reopened.getConversation(chat.id)?.thinkingEnabled, false, 'Thinking OFF did not survive a restart');
+    assert.equal(reopened.getConversation(chat.id)?.reasoningEffort, 'medium', 'reasoning effort did not survive a restart');
+    assert.equal(reopened.updateConversation(chat.id, { thinkingEnabled: null, reasoningEffort: null })?.thinkingEnabled, null, 'resetting to legacy must clear the stored choice');
     const afterReopen = schema(legacyPath);
     assert.equal(afterReopen.runs.length, 5, 'migration was not idempotent or new Agent runs were lost after restart');
     assert(!afterReopen.columns.includes('depth'), 'reopening reran an incomplete legacy migration');
@@ -92,6 +110,10 @@ export async function runDatabaseMigrationRegression(): Promise<void> {
       thinking: 'I checked the backend timing fields first.',
       thinkingTimeline: [{ id: 'reasoning-1', kind: 'reasoning', content: 'I checked the backend timing fields first.', position: 1 }, { id: 'steering-1', kind: 'steering', messageId: 'steering-message', position: 2, status: 'applied' }, { id: 'plan-event', kind: 'activity', activityId: 'plan-update', position: 3 }],
       generationStats: { outputTokens: 4049, tokensPerSecond: 49, generationDurationMs: 82_600, timeToFirstTokenMs: 620, inputTokens: 1_200 },
+      richArtifacts: [
+        { version: 1, id: 'persisted-chart', type: 'chart', chart: 'line', title: 'Measured values', xKey: 'day', series: [{ key: 'value', name: 'Value' }], data: [{ day: 'Mon', value: 4 }, { day: 'Tue', value: 7 }] },
+        { version: 1, id: 'persisted-gallery', type: 'image_gallery', summary: 'Licenses not verified.', images: [{ discoveryId: 'discovery-1', url: 'https://images.example.test/flower.jpg', sourceUrl: 'https://flowers.example.test/peony', sourceDomain: 'flowers.example.test', title: 'Peony', alt: 'Pink peony' }] },
+      ],
     });
     const persistedRun = fresh.createAnalysisRun(freshChat.id, 'fast');
     // `analysis_actions.id` is globally unique storage identity. Agent event
@@ -145,6 +167,10 @@ export async function runDatabaseMigrationRegression(): Promise<void> {
     assert.deepEqual(restoredResponse?.thinkingTimeline, [{ id: 'reasoning-1', kind: 'reasoning', content: 'I checked the backend timing fields first.', position: 1 }, { id: 'steering-1', kind: 'steering', messageId: 'steering-message', position: 2, status: 'applied' }, { id: 'plan-event', kind: 'activity', activityId: 'plan-update', position: 3 }], 'message Thinking and steering event order was not preserved after restart');
     assert.equal(reopenedFresh.getMessage('steering-message')?.content, 'Поправка, напиши ещё плюсы и минусы.', 'canonical steering message did not survive database reopen');
     assert.deepEqual(restoredResponse?.generationStats, { outputTokens: 4049, tokensPerSecond: 49, generationDurationMs: 82_600, timeToFirstTokenMs: 620, inputTokens: 1_200 }, 'message generation statistics were not preserved after restart');
+    assert.deepEqual(restoredResponse?.richArtifacts?.[0], { version: 1, id: 'persisted-chart', type: 'chart', chart: 'line', title: 'Measured values', xKey: 'day', series: [{ key: 'value', name: 'Value' }], data: [{ day: 'Mon', value: 4 }, { day: 'Tue', value: 7 }] }, 'validated visual data did not survive application restart');
+    assert.equal(restoredResponse?.richArtifacts?.[1]?.type === 'image_gallery' ? restoredResponse.richArtifacts[1].summary : undefined, 'Licenses not verified.');
+    assert.equal(restoredResponse?.richArtifacts?.[1]?.type, 'image_gallery', 'image gallery did not survive application restart');
+    if (restoredResponse?.richArtifacts?.[1]?.type === 'image_gallery') assert.equal(restoredResponse.richArtifacts[1].images[0]?.sourceUrl, 'https://flowers.example.test/peony', 'image attribution was lost on restore');
     assert.deepEqual(loaded.actions.find((action) => action.id === 'plan-update')?.plan, finalPlan, 'last structured Agent Plan was not preserved after restart');
     assert.deepEqual(reopenedFresh.getAgentPlan(freshChat.id), finalPlan, 'canonical Goal/Work Plan was not preserved after restart');
     const resumedPlan = reopenedFresh.getAgentPlan(freshChat.id)!;

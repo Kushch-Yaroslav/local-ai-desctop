@@ -1,4 +1,5 @@
-import type { ChatMessage, FinishReason, GenerationDiagnostics, ModelInfo, ReasoningMode, StreamEvent } from '../../shared/types';
+import type { ReasoningInput } from '../../shared/reasoning-controls';
+import type { ChatMessage, FinishReason, GenerationDiagnostics, ModelInfo, StreamEvent } from '../../shared/types';
 
 /** OpenAI-compatible call identity is retained so every tool result can be
  * matched to the exact assistant call, including sibling calls with one name. */
@@ -35,16 +36,16 @@ export type ToolMessage = {
 
 /** Contract implemented by the launcher-managed llama.cpp server. */
 export interface ToolCallingBackend {
-  chatWithTools(model: string, messages: ToolMessage[], tools: unknown[] | undefined, signal: AbortSignal, contextWindow: number, reasoningMode: ReasoningMode, requestContext?: ToolInferenceRequestContext): Promise<ToolMessage>;
+  chatWithTools(model: string, messages: ToolMessage[], tools: unknown[] | undefined, signal: AbortSignal, contextWindow: number, reasoningMode: ReasoningInput, requestContext?: ToolInferenceRequestContext): Promise<ToolMessage>;
   /** Same tokenizer/chat-template accounting used by the runtime request. */
-  countInputTokens?(model: string, messages: ToolMessage[], tools: unknown[] | undefined, contextWindow: number, reasoningMode: ReasoningMode, signal: AbortSignal): Promise<number>;
+  countInputTokens?(model: string, messages: ToolMessage[], tools: unknown[] | undefined, contextWindow: number, reasoningMode: ReasoningInput, signal: AbortSignal): Promise<number>;
   /** Native streaming Agent transport when a provider can expose tool deltas. */
-  streamWithTools?(model: string, messages: ToolMessage[], tools: unknown[] | undefined, signal: AbortSignal, contextWindow: number, reasoningMode: ReasoningMode, requestContext?: ToolInferenceRequestContext): AsyncIterable<ToolInferenceStreamEvent>;
+  streamWithTools?(model: string, messages: ToolMessage[], tools: unknown[] | undefined, signal: AbortSignal, contextWindow: number, reasoningMode: ReasoningInput, requestContext?: ToolInferenceRequestContext): AsyncIterable<ToolInferenceStreamEvent>;
 }
 
 export interface LlmBackend {
   getModels(): Promise<ModelInfo[]>;
-  streamChat(model: string, messages: ChatMessage[], signal: AbortSignal, contextWindow?: number, reasoningMode?: ReasoningMode): AsyncIterable<StreamEvent>;
+  streamChat(model: string, messages: ChatMessage[], signal: AbortSignal, contextWindow?: number, reasoningMode?: ReasoningInput): AsyncIterable<StreamEvent>;
   getStatus(): Promise<{ available: boolean; message?: string }>;
 }
 

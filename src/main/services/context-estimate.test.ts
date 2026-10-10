@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { collectRuntimeContextEstimate, defaultContextDeviceReserveBytes, defaultContextHostReserveBytes, parseLlamaAllocationLog, resolveContextReserve } from './context-estimate';
 import type { HardwareStats } from '../../shared/types';
 import type { RuntimeContextEvidence } from '../backends/types';
@@ -62,10 +64,57 @@ export async function runContextEstimateRegression(): Promise<void> {
   assert.deepEqual(resolveContextReserve(undefined, 'HOST_RESERVE', defaultContextHostReserveBytes), { bytes: 8 * 1024 ** 3 });
   assert.deepEqual(resolveContextReserve(undefined, 'DEVICE_RESERVE', defaultContextDeviceReserveBytes), { bytes: 384 * 1024 ** 2 });
   assert.deepEqual(resolveContextReserve(String(12 * 1024 ** 3), 'HOST_RESERVE', defaultContextHostReserveBytes), { bytes: 12 * 1024 ** 3 });
-  assert.match(resolveContextReserve(String(7 * 1024 ** 3), 'HOST_RESERVE', defaultContextHostReserveBytes).error ?? '', /at least/);
-  assert.match(resolveContextReserve('invalid', 'DEVICE_RESERVE', defaultContextDeviceReserveBytes).error ?? '', /integer byte count/);
-  assert.match(resolveContextReserve(String(Number.MAX_SAFE_INTEGER + 1), 'DEVICE_RESERVE', defaultContextDeviceReserveBytes).error ?? '', /safe integer/);
+  assert.match(resolveContextReserve(String(7 * 1024 ** 3), 'HOST_RESERVE', defaultContextHostReserveBytes).error ?? '', /не меньше/);
+  assert.match(resolveContextReserve('invalid', 'DEVICE_RESERVE', defaultContextDeviceReserveBytes).error ?? '', /целым числом байт/);
+  assert.match(resolveContextReserve(String(Number.MAX_SAFE_INTEGER + 1), 'DEVICE_RESERVE', defaultContextDeviceReserveBytes).error ?? '', /допустимым целым числом/);
 
+  // Actual Qwen3.6 hybrid-MoE MTP capture: CPU-offloaded weights are allocated
+  // without mmap, so MemAvailable already includes host residency.
+  const moeLog = readFileSync(resolve(process.cwd(), 'test-fixtures/llama-allocation/qwen3.6-65536-q8_0-mtp.txt'), 'utf8');
+  const moe = parseLlamaAllocationLog(moeLog, ['llama-server', '--n-cpu-moe', '4', '--load-mode', 'none']);
+  assert.deepEqual(moe.unknownReasons, []);
+  assert.equal(moe.contextTokens, 65_536);
+  assert.equal(moe.allocations.kv.device, 65_536 * 10 * 4 * 128 * 2 * 34 / 32, '10 attention layers × 4 KV heads × 128 dimensions × K/V × Q8 block size');
+  assert.equal(moe.allocations.weights.host, Math.ceil(2_371.31 * 1024 ** 2));
+  assert.equal(moe.allocations.weights.device, Math.ceil(19_231.70 * 1024 ** 2));
+  assert.equal(moe.allocations.compute.device, 210 * 1024 ** 2);
+  assert.equal(moe.allocations.compute.host, Math.ceil(18.27 * 1024 ** 2));
+  assert.equal(moe.allocations.ssm.device, Math.ceil(188.44 * 1024 ** 2));
+  assert.equal(moe.allocations.speculativeKv.device, 68 * 1024 ** 2);
+  assert.equal(moe.allocations.speculativeCompute.device, Math.ceil(156.27 * 1024 ** 2));
+  assert.equal(moe.allocations.speculativeCompute.host, Math.ceil(18.27 * 1024 ** 2));
+  assert.equal(moe.allocations.output.host, 2 * Math.ceil(0.95 * 1024 ** 2));
+  assert.equal(moe.speculativeMode, 'mtp'); assert.equal(moe.visionPresent, false);
+  const moeRequest = { backend: 'llama-cpp' as const, modelId: 'qwen3.6:35b-a3b-ud-q4_k_m', configuredMaxTokens: 262_144, contextPresets: [16_384, 32_768, 65_536],
+    hardware: { ...hardware, ramTotalBytes: 64 * 1024 ** 3, ramUsedBytes: 35 * 1024 ** 3 },
+    runtime: { ...runtime, modelId: 'qwen3.6:35b-a3b-ud-q4_k_m', modelPath: moe.modelPath!, activeContextTokens: 65_536, kvCacheType: 'q8_0' as const },
+    runtimeArguments: ['llama-server', '--n-cpu-moe', '4', '--load-mode', 'none'], hostReserveBytes: defaultContextHostReserveBytes, deviceReserveBytes: defaultContextDeviceReserveBytes };
+  const moeEstimate = await collectRuntimeContextEstimate(moeRequest, async () => ({ text: moeLog }));
+  assert.equal(moeEstimate.status, 'estimated');
+  assert.equal(moeEstimate.memoryHeadroom?.hostBytes, 29 * 1024 ** 3, 'allocated CPU weights are already reflected in live available RAM');
+  const lowRamEstimate = await collectRuntimeContextEstimate({ ...moeRequest, hardware: { ...moeRequest.hardware, ramUsedBytes: 58 * 1024 ** 3 } }, async () => ({ text: moeLog }));
+  assert.equal(lowRamEstimate.hardwareSafeTokens, 0, 'the existing host reserve prevents any context from fitting with insufficient available RAM');
+
+  // Actual production Devstral startup captures, including the zero-sized
+  // initial fit pass, final GPU allocation, CPU projector and warmup.
+  for (const [context, mode, bytesPerToken, computeMiB] of [[53248, 'f16', 163840, 272.01], [98304, 'q8_0', 87040, 516.09]] as const) {
+    const log = readFileSync(resolve(process.cwd(), 'test-fixtures/llama-allocation', `devstral-${context}-${mode}.txt`), 'utf8');
+    const dev = parseLlamaAllocationLog(log);
+    assert.deepEqual(dev.unknownReasons, [], 'all real Devstral allocation classes must be understood');
+    assert.equal(dev.contextTokens, context);
+    assert.equal(dev.kvTypeK, mode); assert.equal(dev.kvTypeV, mode);
+    assert.equal(dev.visionPresent, true);
+    assert.equal(dev.speculativeMode, 'none');
+    assert.equal(dev.allocations.kv.device, context * bytesPerToken, '40 layers × 8 KV heads × 128 dimensions × K/V precision');
+    assert.equal(dev.allocations.kv.host, 0);
+    assert.equal(dev.allocations.weights.device, Math.ceil(13302.36 * 1024 ** 2));
+    assert.equal(dev.allocations.weights.host, Math.ceil(360 * 1024 ** 2) + Math.ceil(837.36 * 1024 ** 2), 'projector is host allocated, not additional GPU weights');
+    assert.equal(dev.allocations.compute.device, Math.ceil(computeMiB * 1024 ** 2));
+    assert.equal(dev.allocations.ssm.device, 0);
+    assert.equal(dev.allocations.speculativeKv.device, 0);
+    const repeated = log.replace(/(I srv\s+load_model: initializing)/, `I sched_reserve: CUDA0 compute buffer size = ${computeMiB} MiB\n$1`);
+    assert.deepEqual(parseLlamaAllocationLog(repeated).allocations, dev.allocations, 'repeated reserve logging is not another allocation');
+  }
   const parsed = parseLlamaAllocationLog(allocationLog);
   assert.equal(parsed.contextTokens, 32_768);
   assert.equal(parsed.modelPath, runtime.modelPath);
@@ -76,6 +125,29 @@ export async function runContextEstimateRegression(): Promise<void> {
   assert.equal(parsed.kvTypeV, 'f16');
   assert.equal(parsed.speculativeKvTypeK, 'f16');
   assert.equal(parsed.speculativeKvTypeV, 'f16');
+  const externalLog = allocationLog.replace("I common_speculative_init_result: creating MTP draft context against the target model 'target.gguf'", `I common_speculative_init_result: loading draft model '/models/assistant.gguf'
+I llama_model_loader: loaded meta data with 20 key-value pairs from /models/assistant.gguf (version GGUF V3)
+I load_tensors: offloaded 5/5 layers to GPU
+I load_tensors: CPU_Mapped model buffer size = 3.00 MiB
+I load_tensors: CUDA0 model buffer size = 490.00 MiB`).replace('I srv load_model: initializing', "T spec common_specu: adding speculative implementation 'draft-mtp'\nI srv load_model: initializing");
+  const external = parseLlamaAllocationLog(externalLog);
+  assert.equal(external.modelPath, runtime.modelPath, 'external assistant must not overwrite target identity');
+  assert.equal(external.allocations.weights.device, parsed.allocations.weights.device, 'external offload must not hide main weights');
+  assert.equal(external.allocations.kv.device, parsed.allocations.kv.device, 'external offload must not hide main KV');
+  assert.equal(external.allocations.speculativeWeights.device, 490 * 1024 ** 2);
+  assert.equal(external.allocations.speculativeWeights.host, 3 * 1024 ** 2);
+  assert.equal(external.allocations.speculativeKv.device, parsed.allocations.speculativeKv.device, 'independent assistant KV is still counted');
+  assert.equal(external.speculativeMode, 'mtp');
+  assert.deepEqual(external.unknownReasons, []);
+  const sharedLog = externalLog.replace('I llama_kv_cache: CUDA0 KV buffer size = 128.00 MiB', 'W llama_kv_cache: layer 0: sharing with layer 65. k = 0x100, v = 0x200')
+    + '\nI srv llama_server: model loaded';
+  const shared = parseLlamaAllocationLog(sharedLog);
+  assert.deepEqual(shared.allocations.speculativeKv, { host: 0, device: 0 }, 'verified alias views do not allocate duplicate KV');
+  assert.equal(shared.allocations.kv.device, parsed.allocations.kv.device);
+  assert.deepEqual(shared.unknownReasons, []);
+  assert(parseLlamaAllocationLog(sharedLog.replace('I srv llama_server: model loaded', '')).unknownReasons.length > 0, 'partial startup must not manufacture zero draft memory');
+  assert(parseLlamaAllocationLog(sharedLog.replace('layer 0: sharing with layer 65.', 'layer 0: filtered')).unknownReasons.length > 0, 'missing sharing evidence remains unknown');
+  assert.equal(parseLlamaAllocationLog(sharedLog.replaceAll('(f16)', '(q8_0)')).speculativeKvTypeK, 'q8_0', 'shared KV still verifies its precision');
   assert.ok(Math.abs(parsed.allocations.weights.device! - 15_339.44 * 1024 ** 2) <= 1);
   assert.equal(parsed.allocations.weights.host, Math.ceil(682.03 * 1024 ** 2) + Math.ceil(887.99 * 1024 ** 2));
   assert.equal(parsed.allocations.kv.device, 2048 * 1024 ** 2, 'zero-sized dry-run cache must not replace final allocation');
@@ -141,8 +213,46 @@ I srv llama_server: model loaded
   assert.equal(kvOnly.visionPresent, false, 'actual no-projector arguments must establish text-only runtime');
   assert.deepEqual(kvOnly.allocations.ssm, { host: 0, device: 0 });
   assert.deepEqual(kvOnly.unknownReasons, [], 'complete non-recurrent/non-vision allocation evidence was rejected');
+  // A backend can split one context into independent full/SWA caches. Do not
+  // treat the smaller allocation as a repeated summary of the larger one.
+  const partitionedLog = kvOnlyLog.replace(
+    'I llama_kv_cache: CUDA0 KV buffer size = 1692.00 MiB\nI llama_kv_cache: size = 1692.00 MiB (32768 cells, 47 layers, 1/1 seqs), K (f16): 1692.00 MiB, V (f16): 0.00 MiB',
+    `I llama_kv_cache_iswa: creating full KV cache, size = 32768 cells
+I llama_kv_cache: CUDA0 KV buffer size = 2560.00 MiB
+I llama_kv_cache: size = 2560.00 MiB (32768 cells, 10 layers, 1/1 seqs), K (f16): 1280 MiB, V (f16): 1280 MiB
+I llama_kv_cache_iswa: creating SWA KV cache, size = 1536 cells
+I llama_kv_cache: CUDA0 KV buffer size = 1200.00 MiB
+I llama_kv_cache: size = 1200.00 MiB (1536 cells, 50 layers, 1/1 seqs), K (f16): 600 MiB, V (f16): 600 MiB`,
+  ).replace('I srv load_model: initializing', `I clip_model_loader: has vision encoder
+I load_hparams: model size: 1143.39 MiB
+I reserve_compute_meta: CPU compute buffer size = 248.10 MiB
+I srv load_model: initializing`);
+  const partitioned = parseLlamaAllocationLog(partitionedLog, ['llama-server', '-m', '/models/target.gguf', '--mmproj', '/models/projector.gguf']);
+  assert.equal(partitioned.allocations.kv.device, 3760 * 1024 ** 2, 'independent caches must be summed');
+  assert.equal(partitioned.allocations.kv.host, 0, 'matching aggregate summaries establish absent host KV');
+  assert.deepEqual(partitioned.unknownReasons, []);
+  const partitionedEstimate = await collectRuntimeContextEstimate({ backend: 'llama-cpp', modelId: runtime.modelId,
+    configuredMaxTokens: 262_144, contextPresets: [16_384, 32_768], hardware, runtime,
+    runtimeArguments: ['llama-server', '--mmproj', '/models/projector.gguf'],
+    hostReserveBytes: defaultContextHostReserveBytes, deviceReserveBytes: defaultContextDeviceReserveBytes }, async () => ({ text: partitionedLog }));
+  assert.equal(partitionedEstimate.status, 'estimated', 'a projector and partitioned KV must not disable discovery');
+  const missingVisionCompute = await collectRuntimeContextEstimate({ backend: 'llama-cpp', modelId: runtime.modelId,
+    configuredMaxTokens: 262_144, contextPresets: [16_384, 32_768], hardware, runtime,
+    runtimeArguments: ['llama-server', '--mmproj', '/models/projector.gguf'],
+    hostReserveBytes: defaultContextHostReserveBytes, deviceReserveBytes: defaultContextDeviceReserveBytes },
+  async () => ({ text: partitionedLog.replace('I reserve_compute_meta: CPU compute buffer size = 248.10 MiB', '') }));
+  assert.equal(missingVisionCompute.status, 'observed', 'missing projector allocation must remain unsafe, not invented');
+  assert(missingVisionCompute.unknownReasons.some((reason) => reason.includes('проектора')));
+  const repeatedPartitions = partitionedLog.replace('I srv load_model: initializing',
+    partitionedLog.slice(partitionedLog.indexOf('I llama_kv_cache_iswa:'), partitionedLog.indexOf('I sched_reserve:')) + '\nI srv load_model: initializing');
+  assert.equal(parseLlamaAllocationLog(repeatedPartitions).allocations.kv.device, 3760 * 1024 ** 2, 'repeat summaries must not double count');
+  const mixedCacheTypes = partitionedLog.replace('K (f16): 600 MiB', 'K (q8_0): 600 MiB');
+  const mixedEstimate = await collectRuntimeContextEstimate({ backend: 'llama-cpp', modelId: runtime.modelId,
+    configuredMaxTokens: 262_144, contextPresets: [16_384, 32_768], hardware, runtime,
+    hostReserveBytes: defaultContextHostReserveBytes, deviceReserveBytes: defaultContextDeviceReserveBytes }, async () => ({ text: mixedCacheTypes }));
+  assert.equal(mixedEstimate.status, 'observed', 'conflicting partition precision cannot validate one KV mode');
   const partialKvOnly = parseLlamaAllocationLog(kvOnlyLog.replace('I srv llama_server: model loaded', ''), ['llama-server']);
-  assert(partialKvOnly.unknownReasons.some((reason) => reason.includes('recurrent-state')), 'partial startup must not manufacture an absent recurrent allocation');
+  assert(partialKvOnly.unknownReasons.some((reason) => reason.includes('рекуррентному состоянию')), 'partial startup must not manufacture an absent recurrent allocation');
   const q8Response = await collectRuntimeContextEstimate({
     backend: 'llama-cpp',
     modelId: runtime.modelId,
@@ -208,7 +318,7 @@ I common_speculative_init_result: creating MTP draft context
   assert.equal(observedOnly.status, 'observed', 'a working runtime is useful evidence even when projection data is missing');
   assert.equal(observedOnly.observedContextTokens, 32_768);
   assert.equal(observedOnly.hardwareSafeTokens, null, 'minimal logs must not be extrapolated');
-  assert(observedOnly.unknownReasons.some((reason) => reason.includes('K/V cache precisions')));
+  assert(observedOnly.unknownReasons.some((reason) => reason.includes('точность K/V-кэша')));
 
   const oldLogForOtherContext = await collectRuntimeContextEstimate({
     backend: 'llama-cpp',
@@ -244,7 +354,7 @@ I common_speculative_init_result: creating MTP draft context
     deviceReserveBytes: 4 * 1024 ** 3,
   }, async () => ({ text: allocationLog }));
   assert.equal(unavailableHardware.hardwareSafeTokens, null, 'stale hardware snapshot was used for a safe estimate');
-  assert(unavailableHardware.unknownReasons.some((reason) => reason.includes('memory snapshot is unavailable')));
+  assert(unavailableHardware.unknownReasons.some((reason) => reason.includes('снимок системной памяти недоступен')));
   const missingFreeMemory = await collectRuntimeContextEstimate({
     backend: 'llama-cpp', modelId: runtime.modelId, configuredMaxTokens: 131072,
     contextPresets: [32768], hardware: { ...hardware, vramAvailableBytes: null }, runtime,
@@ -277,7 +387,7 @@ I common_speculative_init_result: creating MTP draft context
   });
   assert.equal(noRuntime.status, 'unknown');
   assert.equal(noRuntime.observedContextTokens, null);
-  assert(noRuntime.unknownReasons.some((reason) => reason.includes('active runtime context is not reported')));
+  assert(noRuntime.unknownReasons.some((reason) => reason.includes('не сообщён активный контекст')));
 }
 
 if (require.main === module) void runContextEstimateRegression();

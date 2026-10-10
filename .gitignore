@@ -1,5 +1,6 @@
 node_modules/
 dist/
+release/
 local-cache/
 # Local application data. These are created by Electron/SQLite/launchers and
 # are intentionally not source-controlled.
@@ -22,6 +23,7 @@ local-cache/
 
 # Local agent/runtime generated state
 .ai-framework/
+.ai-research/
 .jan/
 
 # Rust build artifacts

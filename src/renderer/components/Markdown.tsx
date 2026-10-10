@@ -1,11 +1,14 @@
+import { useLocale } from '../use-locale';
+import { t } from '../../shared/locale';
 import { memo, useEffect, useId, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
-import { mermaidLabelColorForContrast, mermaidThemeVariables } from '../../shared/mermaid-theme';
+import { mermaidGitThemeVariables, mermaidLabelColorForContrast, mermaidThemeVariables } from '../../shared/mermaid-theme';
 
-// Mermaid configuration is global; serialize themed renders from different messages.
-let mermaidQueue = Promise.resolve();
+import { downloadSvg } from '../svg-export';
+import { layoutGitLabels } from '../git-label-layout';
+import { queueMermaidTask } from '../mermaid-validation';
 
 function correctRenderedLabelContrast(svg: SVGSVGElement, underlayColor: string) {
   const surfaces = [
@@ -47,6 +50,8 @@ function correctRenderedLabelContrast(svg: SVGSVGElement, underlayColor: string)
 }
 
 function MermaidBlock({ source }: { source: string }) {
+  useLocale();
+  const gitGraph = /^\s*gitGraph\b/.test(source);
   const id = useId().replace(/[^a-zA-Z0-9]/g, '');
   const block = useRef<HTMLDivElement>(null);
   const viewport = useRef<HTMLDivElement>(null);
@@ -55,6 +60,7 @@ function MermaidBlock({ source }: { source: string }) {
   const [theme, setTheme] = useState<'dark' | 'light'>('dark');
   const [svg, setSvg] = useState('');
   const [naturalWidth, setNaturalWidth] = useState(0);
+  const [gitDescriptions, setGitDescriptions] = useState<string[]>([]);
   const [error, setError] = useState('');
   const [zoom, setZoom] = useState(1);
   const [copied, setCopied] = useState(false);
@@ -91,7 +97,7 @@ function MermaidBlock({ source }: { source: string }) {
     setNaturalWidth(0);
     setError('');
     setZoom(1);
-    mermaidQueue = mermaidQueue.then(async () => {
+    void queueMermaidTask(async () => {
       if (cancelled) return;
       const scratch = document.createElement('div');
       scratch.style.cssText = 'position:fixed;left:0;top:0;opacity:0;pointer-events:none;z-index:-1';
@@ -105,14 +111,15 @@ function MermaidBlock({ source }: { source: string }) {
           securityLevel: 'strict',
           suppressErrorRendering: true,
           theme: 'base',
-          themeVariables: mermaidThemeVariables(theme),
+          themeVariables: { ...mermaidThemeVariables(theme), ...(gitGraph ? mermaidGitThemeVariables(theme) : {}) },
+          gitGraph: { rotateCommitLabel: false, diagramPadding: 12, parallelCommits: false },
           fontFamily: 'Inter, ui-sans-serif, system-ui, sans-serif',
           flowchart: { htmlLabels: true },
         });
         const result = await mermaid.render(`mermaid-${id}`, source, scratch);
         if (!cancelled) {
           const preview = document.createElement('div');
-          preview.className = `mermaid-block mermaid-${theme}`;
+          preview.className = `mermaid-block mermaid-${theme}${gitGraph ? ' mermaid-git' : ''}`;
           preview.style.cssText = 'position:fixed;left:-10000px;top:0;visibility:hidden;width:1000px';
           const canvas = document.createElement('div');
           canvas.className = 'mermaid-canvas';
@@ -122,7 +129,15 @@ function MermaidBlock({ source }: { source: string }) {
           try {
             const rendered = canvas.querySelector('svg');
             if (!rendered) throw new Error('Mermaid returned SVG without a root element');
+            if (gitGraph) {
+              const colors = mermaidGitThemeVariables(theme) as Record<string, string>;
+              for (const lane of rendered.querySelectorAll<SVGElement>('.branch')) {
+                const index = [...lane.classList].map(value => /^branch(\d+)$/.exec(value)?.[1]).find(value => value !== undefined);
+                if (index !== undefined) lane.style.setProperty('stroke', colors[`git${Number(index) % 8}`], 'important');
+              }
+            }
             correctRenderedLabelContrast(rendered, getComputedStyle(preview).backgroundColor);
+            setGitDescriptions(gitGraph ? layoutGitLabels(rendered) : []);
             const width = Number(rendered.getAttribute('viewBox')?.trim().split(/\s+/)[2]);
             setNaturalWidth(Number.isFinite(width) && width > 0 ? width : 0);
             setSvg(rendered.outerHTML);
@@ -131,13 +146,13 @@ function MermaidBlock({ source }: { source: string }) {
           }
         }
       } catch {
-        if (!cancelled) setError('Не удалось отобразить диаграмму. Проверьте исходный Mermaid-код.');
+        if (!cancelled) setError(t("Не удалось отобразить диаграмму. Проверьте исходный Mermaid-код."));
       } finally {
         scratch.remove();
       }
     });
     return () => { cancelled = true; };
-  }, [id, source, theme]);
+  }, [id, source, theme, gitGraph]);
 
   const reset = () => {
     setZoom(1);
@@ -155,18 +170,19 @@ function MermaidBlock({ source }: { source: string }) {
     }
   };
 
-  return <div className={`mermaid-block mermaid-${theme}${expanded ? ' mermaid-expanded' : ''}`} ref={block}>
+  return <div className={`mermaid-block mermaid-${theme}${gitGraph ? ' mermaid-git' : ''}${expanded ? ' mermaid-expanded' : ''}`} ref={block}>
     <div className="mermaid-toolbar">
-      <span className="mermaid-title">Диаграмма</span>
-      <div className="mermaid-controls" role="group" aria-label="Управление диаграммой">
-        <button type="button" aria-label="Уменьшить диаграмму" disabled={!svg || zoom <= .5} onClick={() => setZoom(value => Math.max(.5, value - .25))}>−</button>
-        <output aria-label="Масштаб">{Math.round(zoom * 100)}%</output>
-        <button type="button" aria-label="Увеличить диаграмму" disabled={!svg || zoom >= 3} onClick={() => setZoom(value => Math.min(3, value + .25))}>+</button>
-        <button type="button" disabled={!svg} onClick={reset}>Сбросить</button>
-        <button type="button" aria-expanded={expanded} onClick={() => setExpanded(value => !value)}>{expanded ? 'Свернуть' : 'Развернуть'}</button>
+      <span className="mermaid-title">{t("Диаграмма")}</span>
+      <div className="mermaid-controls" role="group" aria-label={t("Управление диаграммой")}>
+        <button type="button" aria-label={t("Уменьшить диаграмму")} disabled={!svg || zoom <= .5} onClick={() => setZoom(value => Math.max(.5, value - .25))}>−</button>
+        <output aria-label={t("Масштаб")}>{Math.round(zoom * 100)}%</output>
+        <button type="button" aria-label={t("Увеличить диаграмму")} disabled={!svg || zoom >= 3} onClick={() => setZoom(value => Math.min(3, value + .25))}>+</button>
+        <button type="button" disabled={!svg} onClick={() => { const rendered = viewport.current?.querySelector('svg'); if (rendered) downloadSvg(rendered, t('Диаграмма'), gitDescriptions.map((label, index) => ({ label: `${index + 1} — ${label}` }))); }}>{t('Экспорт SVG')}</button>
+        <button type="button" disabled={!svg} onClick={reset}>{t("Сбросить")}</button>
+        <button type="button" aria-expanded={expanded} onClick={() => setExpanded(value => !value)}>{expanded ? t("Свернуть") : t("Развернуть")}</button>
       </div>
     </div>
-    <div className="mermaid-viewport" ref={viewport} tabIndex={0} role="region" aria-label="Диаграмма Mermaid. Для перемещения используйте прокрутку или перетаскивание." aria-busy={!svg && !error}
+    <div className="mermaid-viewport" ref={viewport} tabIndex={0} role="region" aria-label={t("Диаграмма Mermaid. Для перемещения используйте прокрутку или перетаскивание.")} aria-busy={!svg && !error}
       onPointerDown={event => {
         if (event.button !== 0 || event.pointerType !== 'mouse' || !svg) return;
         drag.current = { x: event.clientX, y: event.clientY, left: event.currentTarget.scrollLeft, top: event.currentTarget.scrollTop };
@@ -183,14 +199,15 @@ function MermaidBlock({ source }: { source: string }) {
       }}
       onPointerCancel={() => { drag.current = null; }}
       onLostPointerCapture={() => { drag.current = null; }}>
-      {svg ? <div className="mermaid-canvas" style={{ width: `${zoom * 100}%`, minWidth: naturalWidth ? `${naturalWidth * zoom}px` : undefined }} dangerouslySetInnerHTML={{ __html: svg }} />
-        : <p className="mermaid-status" role="status">{error || 'Отрисовка диаграммы…'}</p>}
+      {svg ? <div className="mermaid-canvas" style={{ width: gitGraph && naturalWidth ? `${naturalWidth * zoom}px` : `${zoom * 100}%`, minWidth: naturalWidth ? `${naturalWidth * zoom}px` : undefined }} dangerouslySetInnerHTML={{ __html: svg }} />
+        : <p className="mermaid-status" role="status">{error || t("Отрисовка диаграммы…")}</p>}
     </div>
+    {gitDescriptions.length > 0 && <details className="git-commit-descriptions" open><summary>{t('Описания коммитов')}</summary><ol>{gitDescriptions.map((description, index) => <li key={index}>{description}</li>)}</ol></details>}
     <details className="mermaid-source" open={error ? true : undefined}>
-      <summary>Исходный Mermaid-код</summary>
+      <summary>{t("Исходный Mermaid-код")}</summary>
       <div className="mermaid-source-actions">
-        <button type="button" onClick={copy}>{copied ? 'Скопировано' : 'Копировать код'}</button>
-        {copyError && <span role="status">Не удалось скопировать. Выделите код ниже.</span>}
+        <button type="button" onClick={copy}>{copied ? t("Скопировано") : t("Копировать код")}</button>
+        {copyError && <span role="status">{t("Не удалось скопировать. Выделите код ниже.")}</span>}
       </div>
       <pre><code>{source}</code></pre>
     </details>
@@ -209,11 +226,12 @@ function extractText(node: React.ReactNode): string {
 }
 
 function CodeBlock({ children, className }: { children?: React.ReactNode; className?: string }) {
+  useLocale();
   const [copied, setCopied] = useState(false);
   const text = extractText(children).replace(/\n$/, '');
-  const language = className?.replace('language-', '') ?? 'код';
+  const language = className?.replace('language-', '') ?? t("код");
   const copy = async () => { await navigator.clipboard.writeText(text); setCopied(true); window.setTimeout(() => setCopied(false), 1500); };
-  return <div className="code-block"><div className="code-title"><span>{language}</span><button onClick={copy}>{copied ? 'Скопировано' : 'Копировать'}</button></div><pre><code className={className}>{children}</code></pre></div>;
+  return <div className="code-block"><div className="code-title"><span>{language}</span><button onClick={copy}>{copied ? t("Скопировано") : t("Копировать")}</button></div><pre><code className={className}>{children}</code></pre></div>;
 }
 
 function streamingSections(source: string): string[] {
@@ -228,6 +246,7 @@ function streamingSections(source: string): string[] {
 }
 
 const MarkdownDocument = memo(function MarkdownDocument({ children }: { children: string }) {
+  useLocale();
   return <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]} components={{
     pre: ({ children: child }) => <>{child}</>,
     code: ({ className, children: child, ...props }) => className?.split(/\s+/).includes('language-mermaid')
@@ -237,9 +256,31 @@ const MarkdownDocument = memo(function MarkdownDocument({ children }: { children
   }}>{children}</ReactMarkdown>;
 });
 
+/**
+ * Finished text far from the viewport is shown as plain text and parsed into Markdown only when it comes near. Mounting
+ * a long run means parsing and highlighting every paragraph of it; doing that for what nobody is looking at made the
+ * end of a run, and reopening one, cost time proportional to its length. The text is in the DOM either way, so
+ * selection and find-in-page behave the same, and once upgraded it stays upgraded.
+ */
+const NEAR_VIEWPORT = '1500px 0px';
+const LazyMarkdown = memo(function LazyMarkdown({ children }: { children: string }) {
+  useLocale();
+  const host = useRef<HTMLDivElement>(null);
+  const [near, setNear] = useState(() => typeof IntersectionObserver === 'undefined');
+  useEffect(() => {
+    const element = host.current;
+    if (near || !element) return undefined;
+    const observer = new IntersectionObserver((entries) => { if (entries.some((entry) => entry.isIntersecting)) { setNear(true); observer.disconnect(); } }, { rootMargin: NEAR_VIEWPORT });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [near]);
+  return <div ref={host}>{near ? <MarkdownDocument>{children}</MarkdownDocument> : <div className="lazy-markdown">{children}</div>}</div>;
+});
+
 /** Completed Markdown sections remain mounted; only the live tail is reparsed and revealed. */
-export function Markdown({ children, streaming = false }: { children: string; streaming?: boolean }) {
-  if (!streaming) return <MarkdownDocument>{children}</MarkdownDocument>;
+export function Markdown({ children, streaming = false, lazy = false }: { children: string; streaming?: boolean; lazy?: boolean }) {
+  useLocale();
+  if (!streaming) return lazy ? <LazyMarkdown>{children}</LazyMarkdown> : <MarkdownDocument>{children}</MarkdownDocument>;
   const sections = streamingSections(children);
   return <div className="markdown-stream">{sections.map((section, index) => {
     const live = index === sections.length - 1;

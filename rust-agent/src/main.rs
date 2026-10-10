@@ -15,8 +15,10 @@ use std::{
 
 #[derive(Clone)]
 struct Control {
+    external: Arc<local_ai_agent_runtime::tools::web::HostTools>,
     cancelled: Arc<AtomicBool>,
     steering: Arc<Mutex<Vec<String>>>,
+    pause_requested: Arc<AtomicBool>,
     finished: Arc<AtomicBool>,
     steering_closed: Arc<AtomicBool>,
 }
@@ -53,19 +55,26 @@ fn main() {
                 endpoint,
                 model,
                 system,
+                ui_language,
                 user,
+                user_images,
+                user_image_refs,
+                web_tools,
+                artifact_tools,
+                attachment_tools,
                 project_root,
                 secondary_project_root,
                 context_limit,
                 reasoning_mode,
                 supports_reasoning,
                 reasoning_options,
-                web_mode: _,
+                web_mode,
                 policy,
                 history,
                 evidence_dir,
                 task_memory,
                 provider_max_output,
+                workspace_roots,
             } => {
                 if !controls.is_empty() {
                     local_ai_agent_runtime::protocol::emit(
@@ -78,8 +87,10 @@ fn main() {
                     continue;
                 }
                 let control = Control {
+                    external: Arc::new(Default::default()),
                     cancelled: Arc::new(AtomicBool::new(false)),
                     steering: Arc::new(Mutex::new(Vec::new())),
+                    pause_requested: Arc::new(AtomicBool::new(false)),
                     finished: Arc::new(AtomicBool::new(false)),
                     steering_closed: Arc::new(AtomicBool::new(false)),
                 };
@@ -90,9 +101,17 @@ fn main() {
                         endpoint,
                         model,
                         system,
+                        ui_language,
                         user,
+                        user_images,
+                        user_image_refs,
+                        web_tools: if web_mode == "auto" { web_tools } else { Vec::new() },
+                        artifact_tools,
+                        attachment_tools,
+                        host_tools: Some(control.external),
                         root: project_root,
                         secondary_root: secondary_project_root,
+                        workspace_roots,
                         context_limit,
                         reasoning_mode,
                         supports_reasoning,
@@ -106,19 +125,28 @@ fn main() {
                         evidence_dir,
                         task_memory,
                         provider_max_output,
+                        browser_capability: None,
                         cancelled: control.cancelled,
                         steering: control.steering,
+                        pause_requested: control.pause_requested,
                         steering_closed: control.steering_closed,
                     });
                     control.finished.store(true, Ordering::Relaxed);
                 });
+            }
+            Request::HostToolResult { run_id, id, result } => {
+                if let Some(control) = controls.get(&run_id) { control.external.reply(&id, result); }
             }
             Request::Cancel { run_id } => {
                 if let Some(control) = controls.get(&run_id) {
                     control.cancelled.store(true, Ordering::Relaxed);
                 }
             }
-            Request::Steer { run_id, content } => {
+            Request::Steer {
+                run_id,
+                content,
+                intent,
+            } => {
                 if let Some(control) = controls.get(&run_id) {
                     let mut queue = control.steering.lock().expect("steering lock");
                     if control.steering_closed.load(Ordering::Relaxed)
@@ -137,6 +165,9 @@ fn main() {
                         );
                     } else {
                         queue.push(content.clone());
+                        if intent.as_deref() == Some("pause") {
+                            control.pause_requested.store(true, Ordering::Relaxed);
+                        }
                         local_ai_agent_runtime::protocol::emit(
                             &run_id,
                             local_ai_agent_runtime::agent::events::Event::SteeringAccepted {

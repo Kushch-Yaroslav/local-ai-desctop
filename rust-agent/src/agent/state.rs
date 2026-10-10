@@ -10,12 +10,29 @@ use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Default)]
 pub struct AgentState {
+    pub work_budget: super::work_budget::WorkBudget,
     /// Durable semantic findings for the current task. This is not a plan.
     pub task_memory: TaskMemory,
-    pub workspace_mutated_since_validation: bool,
     /// Count of successful project mutations, used to refresh derived views.
     pub mutations: usize,
-    pub verification_nudged: bool,
+    /// Completion reviews already sent because the work was changed but not
+    /// shown to work. Bounded per mode, so they can never deadlock a final.
+    pub verification_reviews: usize,
+    /// The failing check the gate already sent the model back for: one failure
+    /// is reviewed once, so repeating the same answer cannot loop.
+    pub reviewed_failure: Option<String>,
+    /// Evidence-producing commands run since the first such review.
+    pub checks_since_review: usize,
+    /// The verification budget is spent: the final answer is accepted and
+    /// must say what was not verified.
+    pub verification_closed: bool,
+    /// The run can execute commands, so "run something to check it" is possible.
+    pub can_verify: bool,
+    /// A real browser (or a driver for one) exists here, so a page can be
+    /// checked in one.
+    pub browser_available: bool,
+    /// The project's own test command, looked up in Deep runs only.
+    pub project_test_command: Option<String>,
     /// The single reminder about unopened requested local files was already
     /// given for this run; it never repeats.
     pub request_review_given: bool,
@@ -28,28 +45,81 @@ pub struct AgentState {
     /// The single convergence review for unresolved Task Memory items was
     /// already given for this run; it never repeats.
     pub convergence_review_given: bool,
+    /// Reviews already given for recorded deliverables that were still
+    /// unfinished when the model tried to end the run. Bounded per mode, so a
+    /// review can never deadlock a final answer.
+    pub deliverable_reviews: usize,
+    /// Zero-based provider turn currently being prepared, for budget notices.
+    pub turn: usize,
+    /// Project files this run created and has not deleted since, so scratch
+    /// files stay visible instead of being forgotten.
+    pub created_files: Vec<String>,
+    /// Revision (content hash) of each project file as this run last read or
+    /// wrote it, so a write over a file that changed since can be refused.
+    pub file_revisions: BTreeMap<std::path::PathBuf, String>,
+    /// Failed executions keyed by their exact tool and JSON arguments. Two
+    /// unchanged failures are allowed; another identical request closes the
+    /// tool loop instead of redoing work with the same known-bad input.
+    pub failed_tool_calls: BTreeMap<String, usize>,
     /// Observability for optional `.ai-framework` virtual context access.
     pub knowledge_reads: usize,
     pub knowledge_writes: usize,
     pub knowledge_cache_hits: usize,
     pub knowledge_missing_paths: BTreeMap<String, u64>,
+    /// Graceful pause lifecycle (`None` while the run is simply running).
+    pub pause: Option<PauseState>,
+    /// A steering message was applied this turn, so the model may classify it
+    /// as a pause request by calling `pause_run`.
+    pub pause_offered: bool,
+}
+
+/// Bounded checkpoint that follows a pause request. Tools other than the
+/// checkpoint tools are withdrawn, runtime guidance that would resume work is
+/// suppressed, and the run ends with a short summary instead of completing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PauseState {
+    pub checkpoint_turns_left: usize,
+}
+
+impl PauseState {
+    pub const CHECKPOINT_TURNS: usize = 3;
 }
 
 impl AgentState {
     pub fn record_mutation(&mut self) {
         self.mutations = self.mutations.saturating_add(1);
-        self.workspace_mutated_since_validation = true;
-        self.verification_nudged = false;
+    }
+
+    pub fn note_file_revision(&mut self, path: std::path::PathBuf, revision: String) {
+        self.file_revisions.insert(path, revision);
+    }
+
+    /// `true` when this run saw the file at another revision than `current`.
+    pub fn file_changed_since_seen(&self, path: &std::path::Path, current: &str) -> bool {
+        self.file_revisions
+            .get(path)
+            .is_some_and(|seen| seen != current)
+    }
+
+    pub fn record_created_file(&mut self, path: &str) {
+        const LIMIT: usize = 64;
+        if path.is_empty() || self.created_files.iter().any(|known| known == path) {
+            return;
+        }
+        if self.created_files.len() >= LIMIT {
+            self.created_files.remove(0);
+        }
+        self.created_files.push(path.to_owned());
+    }
+
+    pub fn record_deleted_file(&mut self, path: &str) {
+        self.created_files.retain(|known| known != path);
     }
 
     pub fn record_tool_call(&mut self, tool: &str) {
-        if tool != "task_memory" {
+        if !matches!(tool, "task_memory" | "deliverables" | "plan") {
             self.calls_since_memory = self.calls_since_memory.saturating_add(1);
         }
-    }
-
-    pub fn record_validation(&mut self) {
-        self.workspace_mutated_since_validation = false;
     }
 
     pub fn record_knowledge_read(&mut self) {
@@ -77,13 +147,49 @@ mod tests {
     }
 
     #[test]
-    fn validation_only_tracks_the_latest_mutation() {
+    fn bookkeeping_tools_are_not_work_calls() {
+        let mut state = AgentState::default();
+        state.record_tool_call("deliverables");
+        state.record_tool_call("task_memory");
+        assert_eq!(state.calls_since_memory, 0);
+    }
+
+    #[test]
+    fn created_files_are_listed_once_and_forgotten_when_deleted() {
+        let mut state = AgentState::default();
+        state.record_created_file("a.js");
+        state.record_created_file("a.js");
+        state.record_created_file("b.js");
+        assert_eq!(state.created_files, ["a.js", "b.js"]);
+        state.record_deleted_file("a.js");
+        assert_eq!(state.created_files, ["b.js"]);
+        for index in 0..100 {
+            state.record_created_file(&format!("f{index}.js"));
+        }
+        assert_eq!(state.created_files.len(), 64);
+        assert_eq!(state.created_files.last().unwrap(), "f99.js");
+    }
+
+    #[test]
+    fn a_file_is_stale_only_when_a_different_revision_was_seen() {
+        let mut state = AgentState::default();
+        let path = std::path::PathBuf::from("/p/a.txt");
+        assert!(
+            !state.file_changed_since_seen(&path, "x"),
+            "unknown is not stale"
+        );
+        state.note_file_revision(path.clone(), "x".into());
+        assert!(!state.file_changed_since_seen(&path, "x"));
+        assert!(state.file_changed_since_seen(&path, "y"));
+    }
+
+    #[test]
+    fn mutations_are_counted_and_verification_starts_unreviewed() {
         let mut state = AgentState::default();
         state.record_mutation();
-        assert!(state.workspace_mutated_since_validation);
-        state.record_validation();
-        assert!(!state.workspace_mutated_since_validation);
         state.record_mutation();
-        assert!(state.workspace_mutated_since_validation);
+        assert_eq!(state.mutations, 2);
+        assert_eq!(state.verification_reviews, 0);
+        assert!(!state.verification_closed);
     }
 }

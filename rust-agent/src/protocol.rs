@@ -9,9 +9,25 @@ pub enum Request {
         endpoint: String,
         model: String,
         system: String,
+        #[serde(default)]
+        ui_language: Option<String>,
         user: String,
+        #[serde(default)]
+        user_images: Vec<String>,
+        #[serde(default)]
+        user_image_refs: Vec<String>,
+        #[serde(default)]
+        web_tools: Vec<Value>,
+        #[serde(default)]
+        artifact_tools: Vec<Value>,
+        #[serde(default)]
+        attachment_tools: Vec<Value>,
         project_root: Option<String>,
         secondary_project_root: Option<String>,
+        /// Directories the user named explicitly (absolute, canonical). They
+        /// extend file-tool scope and, without a project, give the terminal a cwd.
+        #[serde(default)]
+        workspace_roots: Vec<String>,
         context_limit: usize,
         reasoning_mode: String,
         #[serde(default = "default_supports_reasoning")]
@@ -33,12 +49,17 @@ pub enum Request {
         #[serde(default)]
         provider_max_output: Option<usize>,
     },
+    HostToolResult { run_id: String, id: String, result: Value },
     Cancel {
         run_id: String,
     },
     Steer {
         run_id: String,
         content: String,
+        /// Structured intent chosen by a UI control. `"pause"` asks for a
+        /// graceful pause; absent means an ordinary clarification.
+        #[serde(default)]
+        intent: Option<String>,
     },
     Shutdown,
 }

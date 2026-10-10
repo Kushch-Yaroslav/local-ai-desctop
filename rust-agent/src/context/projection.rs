@@ -1,4 +1,4 @@
-use crate::agent::transcript::{project_accepted_message, prompt_tail_message, Entry, Transcript};
+use crate::agent::transcript::{project_accepted_message, Entry, Transcript};
 use serde_json::{json, Value};
 
 /// A pure request projection. The first system message is byte-stable within a
@@ -36,13 +36,7 @@ pub fn project(transcript: &Transcript, stable_prefix: &str, dynamic_tail: &str)
             _ => None,
         });
     let mut included_run_user = false;
-    let latest_tail = transcript
-        .entries()
-        .iter()
-        .enumerate()
-        .skip(start.max(transcript.finalization_index().unwrap_or(0)))
-        .rfind(|(_, entry)| matches!(entry, Entry::PromptTail(_)))
-        .map(|(index, _)| index);
+    let mut previous_state: Option<&str> = None;
     if let Some((index, message)) = &run_user {
         if *index < start {
             // The summary may cover the original prompt, but tool-result tail
@@ -62,14 +56,18 @@ pub fn project(transcript: &Transcript, stable_prefix: &str, dynamic_tail: &str)
                 messages.push(project_accepted_message(message))
             }
             Entry::RunUser(message) => {
+                previous_state = None;
                 messages.push(message.clone());
                 included_run_user = true;
             }
             Entry::Steering(content) => messages.push(json!({"role":"user", "content":format!("[RUNTIME STEERING — NOT USER CONTENT]\n{content}"), "metadata":{"steering":true}})),
-            Entry::PromptTail(content) if dynamic_tail.trim().is_empty() && latest_tail == Some(index) => {
-                messages.push(prompt_tail_message(content));
+            Entry::PromptTail(content) if index >= transcript.finalization_index().unwrap_or(0) => {
+                if let Some(message) = super::runtime_state::message(previous_state, content) {
+                    messages.push(message);
+                }
+                previous_state = Some(content);
             }
-            Entry::Compaction { .. } | Entry::Reminder(_) | Entry::ClearReminders | Entry::Finalizing | Entry::CloseoutRequested | Entry::RunComplete | Entry::LanguagePreference(_) | Entry::Evidence(_) | Entry::EvidenceRejection { .. } | Entry::Frontier(_) | Entry::FrontierDisposition(_) | Entry::Message(_) | Entry::PromptTail(_) => {}
+            Entry::Compaction { .. } | Entry::Reminder(_) | Entry::ClearReminders | Entry::Finalizing | Entry::CloseoutRequested | Entry::RunComplete | Entry::LanguagePreference(_) | Entry::Evidence(_) | Entry::EvidenceRejection { .. } | Entry::Frontier(_) | Entry::FrontierDisposition(_) | Entry::Message(_) | Entry::PromptTail(_) | Entry::WorkBudget(_) => {}
         }
     }
     // Retain an exact current prompt even if an unusually small context made
@@ -83,7 +81,9 @@ pub fn project(transcript: &Transcript, stable_prefix: &str, dynamic_tail: &str)
         // Dynamic data belongs after accepted conversation so cache providers
         // can reuse the leading system/history prefix. The run records it only
         // after the provider accepts this exact request.
-        messages.push(prompt_tail_message(dynamic_tail));
+        if let Some(message) = super::runtime_state::message(previous_state, dynamic_tail) {
+            messages.push(message);
+        }
     }
     messages
 }
@@ -94,6 +94,37 @@ mod tests {
     use crate::agent::transcript::Transcript;
 
     #[test]
+    fn accepted_runtime_updates_preserve_wire_prefix_and_unchanged_state_is_not_recorded() {
+        let mut transcript = Transcript::default();
+        transcript.push_run_user(json!({"role":"user","content":"implement"}));
+        let state = "<plan>\ns1 active\n</plan>\n<deliverables>\nd1 pending\n</deliverables>";
+        let first = super::super::message_sequence::normalize(&project(&transcript, "stable", state));
+        transcript.record_prompt_tail(state);
+        for n in 0..3 {
+            transcript.push_message(json!({"role":"assistant","tool_calls":[{"id":format!("call-{n}"),"type":"function","function":{"name":"read_file","arguments":"{}"}}]}));
+            transcript.tool_result(&format!("call-{n}"), "read_file", "read result".into());
+            transcript.record_prompt_tail(state);
+        }
+        assert_eq!(transcript.entries().iter().filter(|e| matches!(e, Entry::PromptTail(_))).count(), 1);
+        let before = super::super::message_sequence::normalize(&project(&transcript, "stable", ""));
+        assert_eq!(&before[..first.len()], first.as_slice());
+        let changed = state.replace("s1 active", "s1 done");
+        let request = super::super::message_sequence::normalize(&project(&transcript, "stable", &changed));
+        let tool = request.last().unwrap();
+        assert_eq!(tool["role"], "tool");
+        let text = tool["content"].as_str().unwrap();
+        assert!(text.contains("s1 done"));
+        assert!(!text.contains("d1 pending"));
+        assert!(!text.contains("CONTINUED USER TURN"));
+        assert_eq!(request.iter().filter(|m| m["role"] == "user").count(), 1);
+        transcript.record_prompt_tail(&changed);
+        transcript.push_message(json!({"role":"assistant","tool_calls":[{"id":"next","function":{"name":"read_file","arguments":"{}"}}]}));
+        transcript.tool_result("next", "read_file", "next result".into());
+        let next = super::super::message_sequence::normalize(&project(&transcript, "stable", ""));
+        assert_eq!(&next[..request.len()], request.as_slice(), "accepted state remains at the same boundary");
+    }
+
+    #[test]
     fn dynamic_reminder_stays_outside_stable_prefix() {
         let mut transcript = Transcript::default();
         transcript.push_run_user(json!({"role":"user","content":"audit"}));
@@ -101,7 +132,7 @@ mod tests {
         let tail = transcript.pending_tail("active plan");
         let projected = project(&transcript, "stable", &tail);
         assert_eq!(projected[0]["content"], "stable");
-        assert_eq!(projected.last().unwrap()["role"], "user");
+        assert_eq!(projected.last().unwrap()["role"], "runtime");
         assert!(projected.last().unwrap()["content"]
             .as_str()
             .unwrap()
@@ -126,7 +157,7 @@ mod tests {
     }
 
     #[test]
-    fn changing_evidence_tail_replaces_stale_projection_without_erasing_events() {
+    fn changed_evidence_is_appended_without_rewriting_accepted_history() {
         let mut transcript = Transcript::default();
         transcript.push_run_user(json!({"role":"user","content":"audit"}));
         transcript.record_prompt_tail("old evidence receipt");
@@ -135,7 +166,7 @@ mod tests {
         assert!(!transcript.has_active_prompt_tail("old evidence receipt"));
         assert!(transcript.has_active_prompt_tail("new established evidence"));
         let messages = project(&transcript, "system", "");
-        assert!(!messages.iter().any(|m| m["content"]
+        assert!(messages.iter().any(|m| m["content"]
             .as_str()
             .is_some_and(|s| s.contains("old evidence receipt"))));
         assert!(messages.iter().any(|m| m["content"]
@@ -299,10 +330,10 @@ mod tests {
             && message["content"].as_str().is_some_and(
                 |content| content.contains("[RUNTIME COMPACTION SUMMARY — NOT USER CONTENT]")
             )));
-        assert!(projected.iter().any(|message| message["role"] == "user"
+        assert!(projected.iter().any(|message| message["role"] == "runtime"
             && message["content"]
                 .as_str()
-                .is_some_and(|content| content.contains("[RUNTIME GUIDANCE — NOT USER CONTENT]"))));
+                .is_some_and(|content| content.contains("[AGENT RUNTIME STATE — NOT A USER MESSAGE]"))));
     }
 
     #[test]

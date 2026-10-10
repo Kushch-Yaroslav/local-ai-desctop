@@ -1,0 +1,11 @@
+import assert from 'node:assert/strict';
+import { modelLanguageDirective } from './model-language';
+import { setLanguage } from './locale';
+import { chatSystemContext } from '../main/services/capabilities';
+setLanguage('ru');
+assert.match(modelLanguageDirective(), /русский/);
+assert.match(chatSystemContext({ webAvailable: false }), /Явная просьба пользователя о другом языке имеет приоритет/);
+setLanguage('en');
+assert.match(chatSystemContext({ webAvailable: false }), /Interface language: English/);
+assert.match(modelLanguageDirective(), /explicit user request for another language takes priority/);
+setLanguage('ru');

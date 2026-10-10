@@ -1,0 +1,25 @@
+import assert from 'node:assert/strict';
+import { applicationMenu } from './application-menu';
+import { getLanguage, setLanguage } from '../../shared/locale';
+let selected = '';
+const build = () => applicationMenu((language) => { selected = language; setLanguage(language); }, () => {});
+assert.equal(getLanguage(), 'en');
+setLanguage('ru');
+const russian = build();
+assert.deepEqual(russian.map(item => item.label), ['Файл', 'Правка', 'Вид', 'Окно', 'Справка', 'Язык', 'Обработка изображений']);
+const options = russian.at(-2)!.submenu as import('electron').MenuItemConstructorOptions[];
+assert.deepEqual(options.map(item => [item.label, item.checked]), [['Русский', true], ['English', false]]);
+options[1].click!(null as never, null as never, null as never);
+assert.equal(selected, 'en'); assert.equal(getLanguage(), 'en');
+assert.deepEqual(build().map(item => item.label), ['File', 'Edit', 'View', 'Window', 'Help', 'Language', 'Image Processing']);
+setLanguage('ru');
+
+let device = 'cpu';
+const menu = applicationMenu(() => {}, () => {}, 'gpu', value => { device = value; });
+const devices = menu.at(-1)!.submenu as import('electron').MenuItemConstructorOptions[];
+assert.deepEqual(devices.map(item => [item.label, item.checked]), [['Процессор (CPU)', false], ['Видеокарта (GPU)', true]]);
+devices[0].click!(null as never, null as never, null as never);
+assert.equal(device, 'cpu');
+setLanguage('en');
+assert.deepEqual((applicationMenu(() => {}, () => {}, 'gpu').at(-1)!.submenu as import('electron').MenuItemConstructorOptions[]).map(item => [item.label, item.checked]), [['CPU', false], ['GPU', true]]);
+setLanguage('ru');

@@ -1,3 +1,4 @@
+import { modelLanguageDirective } from '../../shared/model-language';
 import type { ChatMessage } from '../../shared/types';
 
 export type RuntimeCapabilities = {
@@ -17,7 +18,7 @@ export function chatCompletionGuidance(mode: 'fast' | 'deep' = 'deep'): string {
 
 /** Complete system context for ordinary Chat mode. */
 export function chatSystemContext(capabilities: RuntimeCapabilities, mode: 'fast' | 'deep' = 'deep'): string {
-  return `${chatCompletionGuidance(mode)}\n${capabilitySystemContext(capabilities)}`;
+  return `${chatCompletionGuidance(mode)}\n${capabilitySystemContext(capabilities)}\n${modelLanguageDirective()}`;
 }
 
 /**
@@ -35,7 +36,7 @@ export function chatMessagesWithSystemPrefix(history: ChatMessage[], fragments: 
 /** One capability-aware instruction shared by Chat and Agent tool loops. */
 export function capabilitySystemContext(capabilities: RuntimeCapabilities): string {
   const web = capabilities.webAvailable
-    ? 'Доступен live web через инструменты web_search, web_open, web_read, web_follow_link и web_back. Для вопросов о сегодняшних событиях, текущих версиях, ценах, погоде, новостях и актуальной документации используй web-инструменты, а не память модели. Не говори, что у тебя нет доступа к интернету: он доступен через эти инструменты. При важных выводах используй несколько качественных, предпочтительно официальных источников. Доступ к web только для чтения и ограничен политикой безопасности приложения.'
+    ? 'Доступен live web через инструменты web_search, web_image_search, web_open, web_read, web_follow_link и web_back. Для вопросов о сегодняшних событиях, текущих версиях, ценах, погоде, новостях и актуальной документации используй web-инструменты, а не память модели. Не говори, что у тебя нет доступа к интернету: он доступен через эти инструменты. Для запроса реальных изображений используй web_image_search и передавай только returned discovery IDs в галерею; не выдумывай image URL. При важных выводах используй несколько качественных, предпочтительно официальных источников. Доступ к web только для чтения и ограничен политикой безопасности приложения.'
     : 'Live web сейчас недоступен. Не утверждай, что проверил актуальные данные в интернете; если это критично для вывода, отметь ограничение один раз.';
   const project = capabilities.projectRoot && capabilities.projectWriteAvailable
     ? ` Выбрана рабочая папка проекта: ${capabilities.projectRoot}. Project filesystem tools доступны только внутри неё: чтение и поиск файлов, apply_patch, создание, удаление файла с подтверждением, git status/diff. Сначала изучай файлы, затем меняй минимально, запускай проверки и читай результат.`
