@@ -208,6 +208,10 @@ export interface HardwareStats {
   available: boolean;
 }
 
+export type ExecutableValidation = { status: 'not-configured' | 'valid' | 'missing' | 'not-executable' | 'unsupported' | 'failed'; path?: string };
+export type RuntimeDraftAvailability = { folderExists: boolean; models: Array<{ id: string; installed: boolean; projectorMissing: boolean }> };
+export type ExecutableResolution = { status: ExecutableValidation['status'] | 'multiple' | 'not-found' | 'incomplete' | 'cancelled'; path?: string; candidates: string[]; kind?: 'file' | 'directory'; incomplete?: boolean; selectedMissing?: boolean; reasons?: string[] };
+
 export interface RuntimeConfiguration {
   searchProvider?: import('./search-settings').SearchPreference;
   allowBingFallback?: boolean;
@@ -216,6 +220,8 @@ export interface RuntimeConfiguration {
   imageProcessingDevice?: 'cpu' | 'gpu';
   schemaVersion: 2;
   llamaServerPath: string | null;
+  /** User-entered file/folder; llamaServerPath always stores the resolved executable. */
+  llamaServerInput?: string;
   modelsPath: string;
   gpuLayers: number;
   setupDismissed: boolean;
@@ -412,7 +418,7 @@ export interface LocalAiApi {
   analysis: { list(conversationId: string): Promise<AnalysisRun[]> };
   models: { list(): Promise<ModelInfo[]> };
   runtime: { state(): Promise<NonNullable<AppSettings['llamaRuntime']>> };
-  settings: { onLanguageChanged(listener: (language: 'ru' | 'en') => void): () => void; get(): Promise<AppSettings>; save(config: RuntimeConfiguration): Promise<AppSettings>; dismissSetup(): Promise<AppSettings> };
+  settings: { setLanguage(language: 'en' | 'ru'): Promise<void>; validateDraft(config: Pick<RuntimeConfiguration, 'modelsPath' | 'models'>): Promise<RuntimeDraftAvailability>; resolveExecutable(path: string, selected?: string): Promise<ExecutableResolution>; cancelResolution(): Promise<void>; onLanguageChanged(listener: (language: 'ru' | 'en') => void): () => void; get(): Promise<AppSettings>; save(config: RuntimeConfiguration): Promise<AppSettings>; dismissSetup(): Promise<AppSettings> };
   hardware: { get(): Promise<HardwareStats> };
   contextEstimate(modelId: string): Promise<RuntimeContextEstimate>;
   contextDiscover(modelId: string): Promise<ContextDiscoveryResult>;

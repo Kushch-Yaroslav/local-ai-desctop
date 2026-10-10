@@ -3,7 +3,7 @@
 //! The runtime owns transport, capability safety, durable evidence and bounded
 //! recovery. It does not certify evidence, decide exploration coverage, or make
 //! semantic completion decisions for the model; see
-//! `docs/architecture/agent-investigation-state.md`.
+//! `.ai-research/architecture/agent-investigation-state.md`.
 
 use crate::agent::{
     deliverables,
@@ -168,6 +168,14 @@ const AGENT_GUIDANCE: &str = r#"
 
 const SUMMARY_GUIDANCE: &str = r#"Create an AGENT CONTINUATION CHECKPOINT, not a generic conversation summary. Use these concise headings: Established work; Current focus; Findings and evidence (cite obs-… IDs); Blocked or failed operations; Not yet inspected or unresolved; Next useful intent. Preserve explicit user constraints and distinguish verified facts from hypotheses. Do not invent a plan, task IDs, lifecycle, or checklist. Do not repeat raw tool output, token counts, runtime mechanics, generic encouragement, or an activity log."#;
 
+// Context-compaction policy adapted from Jan (Menlo Research), compaction.rs
+// and loop.rs at revision 9925f8b6d9fab968284b4dd11566b9435229b690:
+// reserve-over-ratio budgeting, 80% default, 48,000-character summary input,
+// and ordinary 8 -> 4 -> 2 overflow recovery. Copyright 2025 Menlo Research;
+// Apache-2.0 applies to these adapted portions. Local modifications include
+// checkpoint instructions, dynamic output ceilings and emergency fitting.
+// See THIRD_PARTY_NOTICES.md and licenses/; unrelated runtime code is not covered
+// by this adaptation notice.
 #[derive(Clone, Copy, Debug)]
 pub struct CompactionBudget {
     pub context_window: usize,

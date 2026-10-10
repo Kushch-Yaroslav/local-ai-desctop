@@ -5,7 +5,7 @@ import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 
 // Identify the application honestly to public services; no browser impersonation.
-export const publicWebUserAgent = 'Local-AI-Desktop/0.1.0 (https://github.com/Kushch-Yaroslav/local-ai-desctop)';
+export const publicWebUserAgent = 'Local-AI-Desktop/0.1.0 (https://github.com/Kushch-Yaroslav/local-ai-desktop)';
 
 export function isPublicAddress(address: string): boolean {
   if (isIP(address) === 4) {

@@ -1,6 +1,6 @@
 import { accessSync, constants, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
-import type { RuntimeConfiguration, RuntimeModelConfiguration } from '../../shared/types';
+import type { RuntimeConfiguration, RuntimeModelConfiguration, RuntimeDraftAvailability } from '../../shared/types';
 import { searchPreference } from '../../shared/search-settings';
 import { expandPath, paths } from './paths';
 import { builtinModelCatalog } from '../models/model-catalog';
@@ -66,7 +66,6 @@ export function normalizeConfiguration(raw: unknown): RuntimeConfiguration {
   if (!Number.isInteger(value.gpuLayers) || Number(value.gpuLayers) < 0 || Number(value.gpuLayers) > 999) throw new Error('Число GPU-слоёв должно быть целым от 0 до 999 (0 — CPU).');
   if (value.setupDismissed !== undefined && typeof value.setupDismissed !== 'boolean') throw new Error('Некорректное состояние окна первой настройки.');
   if (value.imageProcessingDevice !== undefined && value.imageProcessingDevice !== 'cpu' && value.imageProcessingDevice !== 'gpu') throw new Error('Invalid image processing device');
-  if (value.language !== undefined && value.language !== 'ru' && value.language !== 'en') throw new Error('Invalid language');
   const modelsPath = expandPath(value.modelsPath);
   let models: RuntimeModelConfiguration[];
   if (Array.isArray(value.models)) {
@@ -87,11 +86,13 @@ export function normalizeConfiguration(raw: unknown): RuntimeConfiguration {
     for (const id of Object.keys(old)) if (!builtins.has(id)) throw new Error(`Неизвестная модель в старых настройках: ${id}.`);
   } else if (value.models === undefined) models = seededModels(modelsPath);
   else throw new Error('Некорректный список моделей.');
+  if (value.llamaServerInput !== undefined && (typeof value.llamaServerInput !== 'string' || value.llamaServerInput.length > 4096 || /[\0\r\n]/.test(value.llamaServerInput))) throw new Error('Некорректный путь к llama-server или папке.');
   const server = typeof value.llamaServerPath === 'string' ? value.llamaServerPath.trim() : '';
   return { llamaServerPath: server ? (server.includes('/') || server.startsWith('~') ? expandPath(server) : server) : null,
+    ...(typeof value.llamaServerInput === 'string' ? { llamaServerInput: value.llamaServerInput.trim() } : {}),
     modelsPath, gpuLayers: Number(value.gpuLayers), setupDismissed: value.setupDismissed === true,
     searchProvider: searchPreference(value.searchProvider), allowBingFallback: value.allowBingFallback === true,
-    schemaVersion: 2, language: value.language ?? 'ru', ...(value.imageProcessingDevice ? { imageProcessingDevice: value.imageProcessingDevice } : {}), models } as RuntimeConfiguration;
+    schemaVersion: 2, language: value.language === 'ru' ? 'ru' : 'en', ...(value.imageProcessingDevice ? { imageProcessingDevice: value.imageProcessingDevice } : {}), models } as RuntimeConfiguration;
 }
 
 export function loadRuntimeConfiguration(file = settingsFile): RuntimeConfiguration {
@@ -126,6 +127,28 @@ export function isValidGgufModel(path: string): boolean {
   } catch { return false; }
 }
 const validGguf = isValidGgufModel;
+
+/** Inspect draft paths without persisting or requiring a complete valid form. */
+export function runtimeDraftAvailability(raw: unknown): RuntimeDraftAvailability {
+  if (!raw || typeof raw !== 'object') throw new Error('Некорректные настройки моделей.');
+  const value = raw as Record<string, unknown>;
+  if (typeof value.modelsPath !== 'string' || value.modelsPath.length > 4096 || !Array.isArray(value.models) || value.models.length > 64) throw new Error('Некорректные настройки моделей.');
+  let base: string | undefined;
+  try { base = expandPath(value.modelsPath); } catch { /* An incomplete folder is normal while typing. */ }
+  const check = (path: unknown) => {
+    if (typeof path !== 'string' || !path || path.length > 4096) return false;
+    // Absolute paths stay independent of an incomplete/changed base folder.
+    if (!base && !path.startsWith('/') && !path.startsWith('~')) return false;
+    try { return validGguf(expandPath(path, base)); } catch { return false; }
+  };
+  let folderExists = false;
+  try { folderExists = Boolean(base && statSync(base, { throwIfNoEntry: false })?.isDirectory()); } catch { /* Unreadable folder. */ }
+  return { folderExists, models: value.models.map((entry) => {
+    if (!entry || typeof entry !== 'object' || typeof entry.id !== 'string') throw new Error('Некорректные настройки моделей.');
+    return { id: entry.id, installed: check(entry.modelPath), projectorMissing: Boolean(entry.mmprojPath && !check(entry.mmprojPath)) };
+  }) };
+}
+
 
 export function runtimeSetup(file = settingsFile) {
   let config: RuntimeConfiguration;
@@ -195,7 +218,7 @@ if (require.main === module) {
   try {
     const config = loadRuntimeConfiguration();
     let server = config.llamaServerPath ?? 'llama-server';
-    try { server = executablePath(server); } catch { /* Idle UI must open before setup. */ }
+    try { server = executablePath(server); } catch { server = ''; /* Never pass an unresolved directory/command to the supervisor. */ }
     process.stdout.write(Object.entries({ LLAMA_BIN: server, STATE_DIR: paths.dataRoot, LOG_DIR: paths.logs, GPU_LAYERS: String(config.gpuLayers) }).map(([key, value]) => `${key}=${quote(value)}`).join('\n') + '\n');
   } catch (error) { process.stderr.write(`${(error as Error).message}\n`); process.exitCode = 1; }
 }

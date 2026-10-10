@@ -1,7 +1,7 @@
 import { applicationMenu } from './services/application-menu';
 import { setLanguage, t, localizeMessage } from '../shared/locale';
 import { effectiveRuntimeConfiguration, saveLanguage } from './services/runtime-settings';
-import { app, BrowserWindow, dialog, Menu } from 'electron';
+import { app, BrowserWindow, dialog, Menu, ipcMain } from 'electron';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { ensureAppDirectories, paths } from './services/paths';
@@ -24,9 +24,16 @@ app.on('second-instance', () => { mainWindow?.show(); mainWindow?.focus(); });
 process.env.LOCAL_AI_LLAMA_CPP_URL ??= `http://127.0.0.1:${process.env.LOCAL_AI_LLAMA_PORT ?? '8081'}`;
 
 let menuDevice: 'cpu' | 'gpu' = 'cpu';
+// Both language controls persist through the same preference and notification.
+function selectLanguage(language: 'ru' | 'en'): void {
+  saveLanguage(language);
+  setLanguage(language);
+  updateMenu();
+  BrowserWindow.getAllWindows().forEach((window) => window.webContents.send('settings:language', language));
+}
 function updateMenu(): void {
   Menu.setApplicationMenu(Menu.buildFromTemplate(applicationMenu((language) => {
-    try { saveLanguage(language); setLanguage(language); updateMenu(); BrowserWindow.getAllWindows().forEach((window) => window.webContents.send('settings:language', language)); }
+    try { selectLanguage(language); }
     catch (error) { dialog.showErrorBox('Local AI Desktop', localizeMessage(String(error))); }
   }, () => { void dialog.showMessageBox({ title: 'Local AI Desktop', message: 'Local AI Desktop', detail: t('Локальный AI-клиент для Linux') }); }, menuDevice, device => {
     void import('./ipc/register-ipc').then(ipc => ipc.selectImageProcessingDevice(device)).catch(error => dialog.showErrorBox('Local AI Desktop', localizeMessage(String(error))));
@@ -71,7 +78,11 @@ function createWindow(): void {
 }
 
 app.whenReady().then(async () => {
-  setLanguage(effectiveRuntimeConfiguration().language ?? 'ru'); updateMenu();
+  setLanguage(effectiveRuntimeConfiguration().language ?? 'en'); updateMenu();
+  ipcMain.handle('settings:setLanguage', (_event, language: unknown) => {
+    if (language !== 'en' && language !== 'ru') throw new Error('Invalid language');
+    selectLanguage(language);
+  });
   await startRuntimeSupervisor();
   const { registerIpc } = await import('./ipc/register-ipc');
   registerIpc();

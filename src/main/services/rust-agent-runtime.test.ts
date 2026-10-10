@@ -15,6 +15,8 @@ const message = (role: ChatMessage['role'], content: string): ChatMessage => ({
  * sequence the current prompt must remain a real user node, never an adjacent
  * project/system/assistant record. */
 export function runRustAgentRuntimeRegression(): void {
+  // The timeline fixtures below verify Russian localized labels.
+  setLanguage('ru');
   const scenarios = [
     [message('system', 'Project 1'), message('user', 'first prompt')],
     [message('user', 'old prompt'), message('assistant', 'old answer'), message('user', 'next prompt')],

@@ -174,6 +174,12 @@ launch_server() {
   local model_id="$1" context="$2" kv_type="${3:-f16}" kv_offload="${4:-1}"
   local REQUESTED_PROJECTOR_DEVICE="${5:-}"
   LAUNCH_ERROR=""; REQUEST_CONTEXT_FOR_ERROR="$context"
+  # Settings may have changed since this long-lived supervisor started.
+  # Reload only at a launch boundary; saving unrelated settings never interrupts
+  # an already-running server. The helper emits fixed names and quoted values.
+  local runtime_config
+  runtime_config="$(ELECTRON_RUN_AS_NODE=1 "$ELECTRON_BIN" "$APP_DIR/dist/main/services/runtime-settings.js" 2>&1)" || { LAUNCH_ERROR="$runtime_config"; return 1; }
+  eval "$runtime_config"
   select_variant "$model_id" --verify || return 1
   valid_context "$context" || { LAUNCH_ERROR="Неподдерживаемый размер контекста llama.cpp: $context"; return 1; }
   [[ "$kv_type" == "f16" || "$kv_type" == "q8_0" ]] || { LAUNCH_ERROR="Неподдерживаемый тип KV-cache: $kv_type"; return 1; }

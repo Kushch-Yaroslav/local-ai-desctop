@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
+import { setLanguage } from './locale';
 import { boundaryReasonLabel, formatCount, formatDuration, localizeProjectLabel, pluralRu, tokensWord } from './localization';
 
 export function runLocalizationRegression(): void {
+  setLanguage('ru');
   assert.deepEqual([1, 2, 5, 11, 12, 21, 22, 25, 111, 0].map(tokensWord), ['токен', 'токена', 'токенов', 'токенов', 'токенов', 'токен', 'токена', 'токенов', 'токенов', 'токенов']);
   assert.equal(pluralRu(3, 'запись', 'записи', 'записей'), 'записи');
   assert.equal(formatDuration(0), '0 с');

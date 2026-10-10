@@ -3,6 +3,8 @@ import { applicationMenu } from './application-menu';
 import { getLanguage, setLanguage } from '../../shared/locale';
 let selected = '';
 const build = () => applicationMenu((language) => { selected = language; setLanguage(language); }, () => {});
+assert.equal(getLanguage(), 'en');
+setLanguage('ru');
 const russian = build();
 assert.deepEqual(russian.map(item => item.label), ['Файл', 'Правка', 'Вид', 'Окно', 'Справка', 'Язык', 'Обработка изображений']);
 const options = russian.at(-2)!.submenu as import('electron').MenuItemConstructorOptions[];

@@ -23,6 +23,7 @@ local-cache/
 
 # Local agent/runtime generated state
 .ai-framework/
+.ai-research/
 .jan/
 
 # Rust build artifacts

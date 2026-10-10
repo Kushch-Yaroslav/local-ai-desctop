@@ -20,7 +20,7 @@ const api: LocalAiApi = {
   analysis: { list: (conversationId) => ipcRenderer.invoke('analysis:list', conversationId) },
   models: { list: () => ipcRenderer.invoke('models:list') },
   runtime: { state: () => ipcRenderer.invoke('runtime:state') },
-  settings: { onLanguageChanged: (listener) => { const callback = (_: unknown, language: 'ru' | 'en') => listener(language); ipcRenderer.on('settings:language', callback); return () => ipcRenderer.removeListener('settings:language', callback); }, get: () => ipcRenderer.invoke('settings:get'), save: (config) => ipcRenderer.invoke('settings:save', config), dismissSetup: () => ipcRenderer.invoke('settings:dismissSetup') },
+  settings: { setLanguage: (language) => ipcRenderer.invoke('settings:setLanguage', language), validateDraft: (config) => ipcRenderer.invoke('settings:validateDraft', config), resolveExecutable: (path, selected) => ipcRenderer.invoke('settings:resolveExecutable', path, selected), cancelResolution: () => ipcRenderer.invoke('settings:cancelResolution'), onLanguageChanged: (listener) => { const callback = (_: unknown, language: 'ru' | 'en') => listener(language); ipcRenderer.on('settings:language', callback); return () => ipcRenderer.removeListener('settings:language', callback); }, get: () => ipcRenderer.invoke('settings:get'), save: (config) => ipcRenderer.invoke('settings:save', config), dismissSetup: () => ipcRenderer.invoke('settings:dismissSetup') },
   hardware: { get: () => ipcRenderer.invoke('hardware:get') },
   contextEstimate: (modelId) => ipcRenderer.invoke('context:estimate', modelId),
   contextDiscover: (modelId) => ipcRenderer.invoke('context:discover', modelId),

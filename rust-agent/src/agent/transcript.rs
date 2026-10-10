@@ -547,6 +547,11 @@ impl Transcript {
     /// This is deliberately separate from the append-only record: a later
     /// compaction must summarize the latest summary and its tail, never count
     /// covered raw history again.
+    // Adapted from Jan (Menlo Research), transcript.rs::conversation and
+    // ::compaction_plan at revision 9925f8b6d9fab968284b4dd11566b9435229b690.
+    // Copyright 2025 Menlo Research; Apache-2.0 applies to these adapted portions.
+    // Modified for Local AI Desktop: run-user/steering entries, accepted-message
+    // projection and runtime-state deltas. See THIRD_PARTY_NOTICES.md and licenses/.
     fn conversation(&self) -> (Vec<Value>, Vec<usize>) {
         let boundary = self.compaction_boundary().unwrap_or(0);
         let mut messages = Vec::new();
@@ -607,6 +612,9 @@ impl Transcript {
     /// tool-result batch so the dropped span is as large as possible; when a
     /// batch reaches the end, move back to its owning assistant call instead.
     /// Either choice keeps every projected assistant/tool relationship valid.
+    // Adapted from Jan compaction.rs::tail_start and transcript.rs::compaction_plan
+    // at the revision above (Copyright 2025 Menlo Research, Apache-2.0).
+    // Modified for Local AI Desktop's plan type and current-run user exclusion.
     pub fn compaction_plan(&self, keep_recent: usize) -> Option<CompactionPlan> {
         let (messages, sources) = self.conversation();
         if messages.len() <= keep_recent {

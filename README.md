@@ -1,149 +1,69 @@
-# Local AI Desktop
+# Local AI Desktop — Local LLM Chat & Coding Agent for Linux
 
-Локальный AI-клиент для Linux. Русскоязычный интерфейс чата и локального агента на launcher-managed llama.cpp; облачное API не требуется, весь инференс выполняется на собственной машине.
+[English](README.md) · [Русский](README.ru.md)
 
-## Запуск
+Local AI Desktop is an experimental Linux AI desktop application for chatting with local LLMs and working with code through an AI Agent. It provides local inference for GGUF models through llama.cpp, with an Electron interface and a Rust coding Agent runtime.
 
-```bash
-cd /media/yaroslav/DATA/local-ai-desktop
-env NPM_CONFIG_CACHE="$PWD/local-cache/npm" npm run dev
-```
+**Download:** Get the Linux x86_64 `.deb` for **v0.1.0 — Experimental Alpha (Pre-release)** from [GitHub Releases](https://github.com/Kushch-Yaroslav/local-ai-desktop/releases). See the [Getting Started guide](docs/en/GETTING_STARTED.md) for installation and the required external `llama-server` and GGUF model files.
 
-Для собранной версии:
+![Local AI Desktop main interface](docs/img/interface/1-e.png)
 
-```bash
-env NPM_CONFIG_CACHE="$PWD/local-cache/npm" npm run build
-env NPM_CONFIG_CACHE="$PWD/local-cache/npm" npm start
-```
+Use **Chat** for everyday questions and **Agent** for project-aware research and coding tasks. Choose up to two projects, reference files with `@`, manage context, attach documents or images, and optionally enable read-only web search. For a one-off location, you can provide an absolute path in chat; eligible paths add a filtered Agent file-tool scope but do not become a selected project or gain `@` suggestions. Agent tools can inspect files and Git state, propose changes, and run commands under runtime scope and approval policies.
 
-На рабочем столе доступен стандартный ярлык, который запускает управляемый приложением `llama-server`. Запускной скрипт также доступен напрямую:
+## Screenshots
 
-- **Local AI Desktop** — один launcher-managed `llama-server`; Qwen использует MTP, а модель выбирается внутри приложения. Скрипт: `run-local-ai-desktop.sh`.
+**Chat and model controls**
 
-GGUF для llama.cpp располагаются в `/media/yaroslav/DATA/llama-models`; установленная модель и контекст выбираются внутри приложения. Qwen обрабатывает изображения нативно; выбранная модель без vision capability возвращает контролируемую ошибку без скрытой fallback-модели.
+![Chat interface, selected model and toolbar](docs/img/interface/2-e.png)
 
-## Что реализовано
+**Rich Responses with cards and an interactive chart**
 
-- Тёмный интерфейс на русском: список чатов сгруппирован по дате создания, у каждого диалога показана выбранная модель; доступны создание, переименование и удаление.
-- История чатов в SQLite, Markdown, подсветка синтаксиса и копирование блоков кода. Для каждого диалога сохраняются дата создания, модель и последнее фактическое использование контекста.
-- Реестр локальных GGUF-моделей для llama.cpp: обычный Qwen3.8-27B, отдельный Huihui Qwen3.8-27B (abliterated), Devstral Small 2 24B и Gemma 4 31B IT. Native thinking/effort управляются возможностями модели, стратегия агента выбирается независимо. См. [аудит и статическую проверку моделей](docs/validation/local-model-refresh-2026-10-05.md).
-- Потоковая выдача, отмена генерации, выгрузка предыдущей модели при переключении, запоминание модели, режима и рабочей папки для каждого чата.
-- Один inference run принадлежит main process, а не открытому чату. Переход в другой чат или создание нового не останавливает Agent; sidebar отмечает выполняющийся чат, а возврат восстанавливает текущие reasoning/tool/answer события. Второй запуск блокируется до завершения первого; настройки runtime, Edit/Regenerate и удаление активного чата также защищены.
-- Во время Agent run текстовое «Уточнить» принимается без отмены inference и передаётся на следующей границе model turn. UI различает принятие и передачу модели; SQLite сохраняет пользовательское уточнение, а canonical Rust journal — его точное место среди tools/model turns. В Chat уточнения, вложения и @-ссылки во время генерации не принимаются: дождитесь ответа или остановите его.
-- Project 1 и optional Project 2 сохраняют независимые identities и message-owned @-ссылки. Rust tools принимают `project: 1 | 2` и выполняются в соответствующем корне; отсутствие Project 2 или выход за выбранный файловый scope возвращает ошибку.
-- Финальные ответы показывают пути/описания вместо известных observation/Task Memory IDs. Canonical transcript и evidence references остаются неизменными; fenced source examples и похожие имена файлов не переписываются.
-- Стандартные Mermaid-блоки рендерятся локальной bundled-зависимостью: адаптивная схема, light/dark, zoom, drag-pan и expanded view. Исходный текст и копирование остаются вторичными действиями.
-- Круговой индикатор рядом с полем ввода показывает фактическое заполнение контекста из `prompt_eval_count`, его максимум и оставшийся запас. Цвет меняется при 60%, 80% и 90%.
-- Режимы рассуждения `Fast / Deep` для моделей, которые их поддерживают. Процесс размышления отображается в таймлайне вперемешку с действиями инструментов: видно, когда модель думает, а когда вызывает инструменты.
-- Переключатель «Чат / Агент»: в агентском режиме с рабочей папкой доступны чтение и поиск файлов, `apply_patch`, создание файлов, git inspection и контролируемый terminal. Диагностические команды запускаются сразу; рискованные получают явное подтверждение в приложении.
-- Планирование: агент составляет план из шагов, отслеживает статус каждого и показывает план в интерфейсе.
-- Task Notes: агент ведёт краткую рабочую заметку задачи — цель, найденные факты, решения, следующий шаг — и обновляет её по ходу работы. Заметка переживает компакцию контекста.
-- Оптимизация контекста: при заполнении 60–90% выбранного контекста менеджер контекста сжимает историю и результаты инструментов в чекпоинт working memory, чтобы агент не терял нить задачи. В интерфейсе показывается фактическая экономия токенов.
-- Вложения: локальное извлечение текста из docx, xlsx и pdf; изображения передаются в нативный vision выбранной модели. Модель без vision capability возвращает контролируемую ошибку без скрытой fallback-модели.
-- Переключатель `Web: Off / Auto` настраивается для каждого диалога. В Auto локальная модель получает read-only web-инструменты: поиск, открытие и чтение страниц, переход по ссылкам и возврат назад.
-- Каждая генерация имеет собственный ID и AbortController. Stop отменяет inference, web-session, agent loop и terminal process group; запоздалые события старой генерации игнорируются. Пользовательские сообщения можно редактировать: downstream история удаляется и ответ создаётся заново.
-- Обновление RAM и показателей NVIDIA через лёгкий опрос `nvidia-smi` каждые две секунды. Когда драйвер или `nvidia-smi` недоступны, остаётся мониторинг RAM и понятный статус GPU.
-- Верхняя панель разделяет вторичный runtime monitoring (RAM, VRAM, GPU и скорость generation) и основные controls. Скорость ответа после завершения берётся из метрик llama.cpp; tooltip показывает доступные prompt/eval counters и TTFT. Во время streaming приложение не оценивает tokens по символам и ждёт authoritative runtime metric.
-- Изолированный Electron renderer: `contextIsolation`, отключённый `nodeIntegration`, типизированный preload IPC. Доступ к SQLite, выбору папки, процессам и мониторингу остаётся в main process.
+![Rich response example](docs/img/interface/4-e.png)
 
-## Версии и этапы развития
+**Agent progress and context details**
 
-| Версия | Git anchor | Архитектура / этап | Что умеет | Ограничения | Статус |
-| --- | --- | --- | --- | --- | --- |
-| V1 / v0.1 | `1c13d0954c22bad493516177e9f75d31cb533321` — `Harden terminal command classification` | Первая стабильная генерация | Сильный локальный Chat, локальные LLM, контекст проекта и инструменты; Agent решает небольшие задачи и делает простые правки; удобный общий UX чата | Агент слабее на крупных автономных coding-задачах: ограничены планирование, оркестрация и длительный workflow | Завершена, историческая стабильная версия |
-| V2 / v0.2.0 | `44f2c6ba4dd63fb6d620a08956f013e8df5a7751` — merge V2 migration | Ядро Agent runtime перенесено в Rust | Гораздо более глубокий анализ репозиториев, усиленные lifecycle/context handling и архитектура агента; Deep может выпускать подробные технические и продуктовые аудиты | После миграции проявились регрессии: в некоторых сценариях Agent становился фактически read-only, глубокий анализ был чрезмерно долгим, а saturation/closeout мог преждевременно вести к synthesis/final | Основа влита; стабилизация продолжается |
-| V2 stabilization / планируемая v0.2.1 | Локальная незакоммиченная работа | Доводка Rust runtime и UX длительного запуска | Сохраняет глубину и доказательность лучшего V2 Deep-анализа, сокращая повторные исследования; возвращает надёжные write/patch и проверку через tools/tests; развивает timeline, краткие progress narration, сворачиваемые Thought/reasoning, inline actions и корректный live auto-scroll | Нужны реальные длительные benchmark-прогоны | В работе |
+![Active Agent run](docs/img/interface/6-e.png)
 
-V2 будет считаться завершённой, когда Deep остаётся действительно глубоким без преждевременного synthesis и повторных обходов, Agent надёжно анализирует и изменяет проекты, проверяет результат tools/tests, а длительный запуск остаётся понятным в UI.
+## Recommended settings
 
-### V3 / future
+- **Model:** Start with **Qwen3.8-27B Q4_K_M**. It is the author's primary development and testing model, not a universal best choice.
+- **Context:** For complex Agent work, a larger window can keep more history, source files, and tool results in view. That can reduce repeated investigation and compaction, but it does not increase token generation speed. It uses more RAM/VRAM and can take longer to process prompts. Pick the largest practical size that remains stable for your hardware and workload. **Find Maximum Context** can measure a bounded, safe configuration; see the [User Guide](docs/en/USER_GUIDE.md#find-maximum-context).
+- **Reasoning:** Start with moderate Thinking / Reasoning effort where the model supports it, and use the Agent's **Fast** strategy for routine work. Thinking controls model-specific behavior; Fast/Deep controls a separate part of Agent execution. Increase effort or choose Deep when a task needs it; maximum effort is not necessary every time.
 
-V3 — следующий шаг к автономной оркестрации, а не просто редизайн интерфейса. Текущий эксперимент проверяет работу без внешнего Todo/Task Planning протокола: модель самостоятельно выбирает ход работы, а runtime сохраняет возможности, семантическую компакцию, Task Memory и Project Knowledge. Автоматическое продолжение между model turns и при output limits, background jobs и устойчивое resume/recovery остаются отдельными направлениями развития.
+> **Qwen3.8 xHigh note:** The author has seen Qwen3.8-27B with Thinking and xHigh reasoning spend a very long time reasoning; complex tasks have taken about an hour in some cases. This is an observation, not a benchmark or expected duration. Long reasoning alone does not mean the app is frozen, but check progress, tool activity, and runtime status. xHigh does not guarantee a better answer. Use lower or medium effort for ordinary requests. [Details](docs/en/USER_GUIDE.md#qwen38-and-xhigh-reasoning).
 
-Long-term Experience / Memory рассматривается позже как отдельная возможность. Inference/prompt cache не является долгосрочной памятью: он ускоряет или удерживает контекст текущего запуска, но не хранит опыт агента между задачами.
+## Model testing and limitations
 
-## Локальные модели
+Development and Agent optimization have focused most heavily on Qwen3.8-27B. Basic text chat has also worked with other supported models since before Rich Responses, but not every model has been retested against recent changes.
 
-| Интерфейс | Бэкенд | Идентификатор | Точность | Контексты в UI |
-| --- | --- | --- | --- | --- |
-| Qwen3.8-27B | llama.cpp | `qwen3.8:27b-q4_K_M` | Q4_K_M | 16K, 32K, 64K, 128K, 256K |
-| Huihui Qwen3.8-27B (abliterated) | llama.cpp | `huihui-qwen3.8:27b-ud-dw-q4_k_m` | UD-DW-Q4_K_M | 16K, 32K, 64K, 128K, 256K |
-| Devstral Small 2 24B | llama.cpp | `devstral-small-2:24b-q4_k_m` | Q4_K_M | 16K, 32K, 64K, 128K, 256K |
-| Gemma 4 31B IT | llama.cpp | `gemma4:31b-it-q4_k_m` | Q4_K_M | 16K, 32K, 64K, 128K, 256K |
+Agent reliability varies with model capability, tool-call compatibility, prompt template, runtime settings, and how extensively the app has been tuned for that model. Rich Responses is newer: the renderer supports charts, KPI cards, tables, Mermaid diagrams, and image galleries, but the author has not tested every format with every listed model. Rendering support does not guarantee that a model will produce valid structured content. Generation speed figures do not measure Agent reliability or reasoning quality. See [model observations](docs/en/MODELS.md) and [feature details](docs/en/FEATURES.md).
 
-Обычный Qwen и Huihui используют общий профиль: «Размышления» Вкл/Выкл и «Глубина рассуждений» Низкая/Средняя/Максимальная (`low`/`medium`/`xhigh`). Gemma имеет переключатель размышлений без нативных уровней глубины. Devstral не предоставляет этих нативных controls. «Стратегия агента» Быстрая/Глубокая доступна независимо для всех моделей. Projector-файлы подключаются для image input; MTP включён только для Qwen и Huihui. Новые модели проверены статически и не запускались. GPT-OSS/GLM удалены из локального списка; generic family support и исторические отчёты сохранены. Подробности, источники, SHA-256 и ограничения: [model refresh](docs/validation/local-model-refresh-2026-10-05.md).
+Agent is not fully isolated: file changes and approved terminal commands can affect real data. Use version control and backups. Local models and web content can also be inaccurate or malicious.
 
-Контекст приложения сверяется с `n_ctx`, который сообщает активный `llama-server`. Output budget не зависит от Reasoning: для каждого запроса он составляет до 32K токенов и ограничивается фактически оставшимся местом context window с запасом 512 токенов; llama.cpp tokenizer preflight и backend usage метрики учитываются до и после генерации. UI независимо показывает доступные нативные «Размышления» и «Глубина рассуждений», а также модель-независимую «Стратегию агента» Быстрая/Глубокая; профили передают реальные reasoning/template параметры и параметры итогового ответа, включая Agent synthesis. Для каждой генерации SQLite сохраняет reasoning mode, запрошенный и effective output, context/input tokens, число agent steps и finish reason.
+## Requirements and quick start
 
-Agent action budget — это soft budget на один generationId: базовый лимит 100 действий. Если задача продолжает продвигаться и не упирается в застой, бюджет расширяется шагами по 50, до абсолютного потолка 250 действий. При завершении плана или отсутствии прогресса у границы лимита агент не расширяет бюджет, а переходит к завершению работы.
+**Verified:** The Local AI Desktop v0.1.0 Linux amd64 `.deb` was successfully installed and first-run smoke-tested on the developer's Ubuntu 24.04 x86_64 machine. After setup and UI fixes, the installed application was repeatedly tested with fresh, isolated XDG configuration, data, and cache profiles. The final test confirmed installation and launch, initial configuration, selecting and validating the `llama-server` executable, model selection, and successful application startup.
 
-## Web-доступ
+**Not verified:** Installation on a completely fresh operating system, other Linux distributions, other hardware configurations, or general compatibility. A compatible `llama-server` and local GGUF weights are required; neither is bundled with the package. If a model does not fit in VRAM, configured CPU/RAM offloading may let it run more slowly. Total memory exhaustion can instead cause a model or runtime failure; recovery is not guaranteed.
 
-Web работает через `playwright-core` и установленный Google Chrome в headless-режиме. На время одного ответа создаётся новый временный BrowserContext: он не использует профиль пользователя, аккаунты, cookies, историю, пароли или расширения; после ответа context и browser закрываются.
+The author's development and test machine is an NVIDIA RTX 3090 (24 GB VRAM), AMD Ryzen 7 5700X3D, and 64 GB DDR4 RAM on Linux with llama.cpp. This is not a minimum hardware requirement.
 
-Поиск выполняет DuckDuckGo с SafeSearch=Strict через заменяемый интерфейс `SearchProvider`. Сервис разрешает только HTTP(S) навигацию методом GET/HEAD, блокирует скачивания, формы и все модели ввода/click. До навигации и после чтения применяются URL/domain и content-проверки adult, gambling и malicious/phishing; результат блокировки возвращается модели как структурированная ошибка. CAPTCHA, DNS/SSL, timeout и browser errors также возвращаются как ошибки инструмента, чтобы модель могла выбрать другой источник или честно сообщить о недоступности.
+[Getting started](docs/en/GETTING_STARTED.md) · [User guide](docs/en/USER_GUIDE.md) · [Features](docs/en/FEATURES.md) · [Models](docs/en/MODELS.md) · [Roadmap](docs/en/ROADMAP.md)
 
-## Демонстрация
+## Project status
 
-Скриншоты лежат в `assets/content`. Номера файлов соответствуют порядку сценария.
+Local AI Desktop is an actively developed personal project that I use and test on my own computer. The core workflows work in my tested setup, where Qwen3.8-27B is my primary development and testing model. I have tested other models too, but less extensively. Compatibility and stability across other models, hardware setups, and Linux distributions still need broader testing, and bugs or unexpected behavior are possible. Some newer features, especially Rich Responses across different models, need more testing. Feedback is welcome.
 
-![Схема приложения и roadmap](assets/content/1.png)
+Found a bug or have an idea for improvement? Feel free to open a [GitHub Issue](https://github.com/Kushch-Yaroslav/local-ai-desktop/issues).
 
-**1 — Схема приложения и roadmap.** Стек от UI к инференсу: Request/Context Builder → Working Memory/Context Manager → Agent Orchestrator (Planning, Task Notes, Control Logic) → Tools (Files, Terminal, Web, Safety) → Multimodal → llama.cpp, плюс SQLite и planned-компоненты (MCP, Long-term Memory).
+## Acknowledgements
 
-![Пустой чат, общий интерфейс](assets/content/2.png)
+Parts of Local AI Desktop's transcript and context-compaction implementation were adapted from [Jan](https://github.com/janhq/jan) by Menlo Research (Apache-2.0). [Qwen-Agent](https://github.com/QwenLM/Qwen-Agent) was also studied as a reference for agent and tool-calling behavior. Local AI Desktop is an independent project and is not affiliated with or endorsed by either project. See [third-party notices](THIRD_PARTY_NOTICES.md).
 
-**2 — Общий вид приложения с пустым чатом.** Тёмная тема: слева список диалогов, сверху панель с моделью, контекстом и мониторингом RAM/VRAM/GPU, в центре приветствие.
+## Author
 
-![Планирование](assets/content/3.png)
+**Yaroslav Kushch** — Independent Developer, Zaporizhzhia, Ukraine. · [LinkedIn](https://www.linkedin.com/in/yaroslav-kushch-5b937b378) · [Telegram](https://t.me/fivElemen) · [Email](mailto:malborodo123@gmail.com)
 
-**3 — Планирование.** Агент составляет план из шагов и показывает его статус; здесь — завершённый план и первый шаг.
+## License
 
-![Task Notes](assets/content/4.png)
-
-**4 — Task Notes.** Агент обновляет рабочую заметку задачи (цель, факты, следующий шаг) и запускает terminal-команду в рамках её выполнения.
-
-![Оптимизация контекста](assets/content/5.png)
-
-**5 — Оптимизация контекста.** Менеджер контекста сжал историю: `40 034 → 33 308` токенов, сохранив ключевое в working memory.
-
-![Начало аудита](assets/content/6.png)
-
-**6 — Начало аудита.** Старт генерации в режиме «Глубоко»: метрики (скорость, backend), режим Агент и начало структурированного ответа со списком рисков.
-
-![Конец аудита](assets/content/7.png)
-
-**7 — Конец аудита.** Финал ответа: общий вердикт и блок рекомендуемых доработок; счётчик показывает ~7500 токенов итогового ответа.
-
-## Расположение файлов
-
-Проект, `node_modules`, npm-кэш и сборка находятся в `/media/yaroslav/DATA/local-ai-desktop`.
-
-Так как текущая точка монтирования DATA позволяет писать только в созданную рабочую папку, runtime-данные приложения находятся в её дочернем каталоге, а не в sibling-директории:
-
-| Данные | Путь |
-| --- | --- |
-| SQLite | `runtime/sqlite/local-ai-desktop.db` |
-| Electron user data | `runtime/app-data` |
-| Кэш Electron | `runtime/cache` |
-| Логи | `runtime/logs/application.log` |
-| npm cache | `local-cache/npm` |
-| GGUF-модели (llama.cpp) | `/media/yaroslav/DATA/llama-models` |
-
-Таким образом, приложение не создаёт свои данные в `~/.config`, `~/.cache`, `~/.local`, `~/.npm` или на системном диске.
-
-## Архитектура
-
-`src/main` содержит Electron main process, SQLite, безопасный IPC, мониторинг и адаптеры LLM. `src/preload` предоставляет рендереру только явный API. `src/renderer` содержит React-интерфейс и Zustand-store. Общие типы находятся в `src/shared`.
-
-Для изолированных проверок `LOCAL_AI_RUNTIME_ROOT=/absolute/test/runtime` переопределяет SQLite, attachments, logs и Electron user data, не затрагивая runtime основного checkout. Rust executable по умолчанию выбирается относительно текущего worktree; `LOCAL_AI_AGENT_RUNTIME` позволяет указать его явно. Навигация не является Stop; закрытие приложения по-прежнему отменяет активный run.
-
-Интерфейс `LlmBackend` подключён к единственному inference runtime — launcher-managed `llama-server`. Ярлык запускает выбранную модель, ждёт health check и завершает только собственный PID. Qwen использует `draft-mtp`; GLM и GPT-OSS запускаются без speculative-моделей.
-
-GPT-OSS использует официальный MXFP4 GGUF с embedded Jinja chat template, llama.cpp reasoning parsing и OpenAI-compatible tool calling. Qwen сохраняет vision и MTP; GLM сохраняет свой нативный Jinja template и reasoning controls.
-
-SQLite хранит полную историю, а не KV-кэш модели. Поэтому сессии не создают отдельных постоянных контекстов в VRAM: при переключении чата для запроса передаётся сохранённая история активного чата. Это позволяет в дальнейшем держать загруженным только один inference context/model одновременно.
-
-## Следующие этапы
-
-Дальнейшая дорожная карта описана в разделе «V3 / future» выше; туда входят MCP-подключения, автономная оркестрация и позднее отдельная возможность Long-term Experience / Memory.
+Original Local AI Desktop code is licensed under the [MIT License](LICENSE). Adapted Jan portions are subject to Apache-2.0; see [third-party notices](THIRD_PARTY_NOTICES.md). Third-party components may have separate terms; see [attribution](assets/ATTRIBUTION.md) and their respective license notices.

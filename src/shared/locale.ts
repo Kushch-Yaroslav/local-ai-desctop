@@ -1,7 +1,7 @@
 import { english } from './translations';
 
 export type Language = 'ru' | 'en';
-let language: Language = 'ru';
+let language: Language = 'en';
 const listeners = new Set<() => void>();
 export const getLanguage = () => language;
 export function setLanguage(value: Language): void {

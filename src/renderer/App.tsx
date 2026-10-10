@@ -86,7 +86,9 @@ export function App() {
   useEffect(() => { if (settings?.setup?.config.language) { setLanguage(settings.setup.config.language); document.documentElement.lang = settings.setup.config.language; } }, [settings?.setup?.config.language]);
   useEffect(() => window.localAi.settings.onLanguageChanged?.((language) => {
     setLanguage(language); document.documentElement.lang = language;
-
+    useAppStore.setState((state) => state.settings?.setup ? {
+      settings: { ...state.settings, setup: { ...state.settings.setup, config: { ...state.settings.setup.config, language } } },
+    } : {});
   }), []);
   const endRef = useRef<HTMLDivElement>(null); const conversationRef = useRef<HTMLElement>(null); const followStream = useRef(true);
   const [editingId, setEditingId] = useState<string | null>(null); const [editingText, setEditingText] = useState('');

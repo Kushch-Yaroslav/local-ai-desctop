@@ -3,7 +3,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSyn
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { applicationPaths, expandPath } from './paths';
-import { saveImageProcessingDevice, saveLanguage, dismissRuntimeSetup, loadRuntimeConfiguration, modelPaths, normalizeConfiguration, runtimeSetup, saveRuntimeConfiguration } from './runtime-settings';
+import { runtimeDraftAvailability, saveImageProcessingDevice, saveLanguage, dismissRuntimeSetup, loadRuntimeConfiguration, modelPaths, normalizeConfiguration, runtimeSetup, saveRuntimeConfiguration } from './runtime-settings';
 import { getModelProfile, registeredModelProfiles } from '../models/model-registry';
 import { llamaRuntimeProfilesList } from '../models/llama-runtime-policy';
 import { builtinModelCatalog } from '../models/model-catalog';
@@ -157,12 +157,42 @@ try {
   const cpuConfig = loadRuntimeConfiguration(freshFile);
   cpuConfig.models[0].projectorDevice = 'cpu'; saveRuntimeConfiguration(cpuConfig, freshFile);
   assert.equal(loadRuntimeConfiguration(freshFile).models[0].projectorDevice, 'cpu');
-  assert.equal(loadRuntimeConfiguration(freshFile).language, 'ru');
+  assert.equal(loadRuntimeConfiguration(freshFile).language, 'en');
   const beforeLanguage = loadRuntimeConfiguration(legacyFile);
   saveLanguage('en', legacyFile);
   assert.equal(loadRuntimeConfiguration(legacyFile).language, 'en');
   assert.deepEqual(loadRuntimeConfiguration(legacyFile).models, beforeLanguage.models);
   saveLanguage('ru', legacyFile); assert.equal(loadRuntimeConfiguration(legacyFile).language, 'ru');
-  assert.throws(() => normalizeConfiguration({ ...beforeLanguage, language: 'other' }), /language/);
+  for (const language of [undefined, null, 'other', 42, {}]) {
+    assert.equal(normalizeConfiguration({ ...beforeLanguage, language }).language, 'en');
+  }
+  assert.equal(normalizeConfiguration({ ...beforeLanguage, language: 'ru' }).language, 'ru');
+  assert.equal(normalizeConfiguration({ ...beforeLanguage, language: 'en' }).language, 'en');
+  const invalidLanguageFile = join(root, 'invalid-language.json');
+  writeFileSync(invalidLanguageFile, JSON.stringify({ ...beforeLanguage, language: 'invalid' }));
+  const fallback = loadRuntimeConfiguration(invalidLanguageFile);
+  assert.equal(fallback.language, 'en');
+  assert.deepEqual(fallback.models, beforeLanguage.models, 'invalid language must not discard configured models');
+  assert.equal(fallback.llamaServerPath, beforeLanguage.llamaServerPath);
+  assert.equal(fallback.modelsPath, beforeLanguage.modelsPath);
+  assert.equal(JSON.parse(readFileSync(invalidLanguageFile, 'utf8')).language, 'invalid', 'loading must not rewrite preferences');
+  assert.equal(loadRuntimeConfiguration(join(root, 'new-profile.json')).language, 'en');
+  const relative = normalizeConfiguration({ ...beforeLanguage, modelsPath: weights,
+    models: [{ ...custom, modelPath: 'chosen model.gguf' }] });
+  assert.equal(relative.models[0].modelPath, original, 'relative GGUF resolves against models folder');
+  const otherBase = saveRuntimeConfiguration({ ...relative, modelsPath: root }, legacyFile);
+  assert.equal(otherBase.models[0].modelPath, original, 'changing the base folder preserves absolute model paths');
+  const draft = { modelsPath: weights, models: [{ id: customId, modelPath: 'chosen model.gguf', mmprojPath: '' }] };
+  assert.deepEqual(runtimeDraftAvailability(draft), { folderExists: true, models: [{ id: customId, installed: true, projectorMissing: false }] });
+  assert.equal(runtimeDraftAvailability({ ...draft, models: [{ id: customId, modelPath: 'absent.gguf' }] }).models[0].installed, false);
+  assert.equal(runtimeDraftAvailability({ modelsPath: '', models: [{ id: customId, modelPath: original }] }).models[0].installed, true, 'absolute GGUF is available even with incomplete base');
+  assert.equal(runtimeDraftAvailability({ ...draft, modelsPath: root }).models[0].installed, false, 'relative draft paths follow changed base');
+  assert.equal(runtimeDraftAvailability({ ...draft, models: [{ id: customId, modelPath: original, mmprojPath: 'absent.gguf' }] }).models[0].projectorMissing, true);
+  assert.throws(() => runtimeDraftAvailability({ modelsPath: weights, models: Array(65).fill(draft.models[0]) }));
+  assert.equal(loadRuntimeConfiguration(legacyFile).llamaServerInput, undefined, 'legacy executable-only configuration remains compatible');
+  const folderConfig = saveRuntimeConfiguration({ ...otherBase, llamaServerInput: root, llamaServerPath: server }, legacyFile);
+  assert.equal(folderConfig.llamaServerInput, root);
+  assert.equal(loadRuntimeConfiguration(legacyFile).llamaServerInput, root);
+  assert.equal(loadRuntimeConfiguration(legacyFile).llamaServerPath, server);
   console.log('Linux model registry: first-run defaults, legacy migration/idempotence, known identities/capabilities, custom add/edit/delete, readiness, invalid GGUF, corruption backup, dismissal, XDG/tilde/spaces and persistence passed');
 } finally { rmSync(root, { recursive: true, force: true }); }

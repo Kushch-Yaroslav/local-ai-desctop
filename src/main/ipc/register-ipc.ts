@@ -1,3 +1,4 @@
+import { resolveLlamaExecutable } from '../services/llama-executable';
 import { DiagramValidationBridge } from '../services/diagram-validation';
 import { VisionDeviceController, type VisionDevice } from '../services/vision-device-controller';
 import { t } from '../../shared/locale';
@@ -15,7 +16,7 @@ import { LlamaCppBackend } from '../backends/llama-cpp-backend';
 import { LlamaRuntimeController, type LlamaRuntimeState } from '../services/llama-runtime-controller';
 import { RustAgentRuntime, taskPlan, type AgentProject } from '../services/rust-agent-runtime';
 import { paths } from '../services/paths';
-import { effectiveRuntimeConfiguration, dismissRuntimeSetup, saveImageProcessingDevice, normalizeConfiguration, runtimeSetup, saveRuntimeConfiguration } from '../services/runtime-settings';
+import { runtimeDraftAvailability, effectiveRuntimeConfiguration, dismissRuntimeSetup, saveImageProcessingDevice, normalizeConfiguration, runtimeSetup, saveRuntimeConfiguration } from '../services/runtime-settings';
 import { archiveAgentEvidence, discardAgentEvidence } from '../services/agent-evidence';
 import { log } from '../services/logger';
 import { getModelProfile } from '../models/model-registry';
@@ -612,11 +613,31 @@ export function registerIpc(): void {
     return { llamaServerPath: setup.server, llamaRuntimeModelId: llama.modelId ?? undefined, llamaRuntime: llama, modelsPath: setup.config.modelsPath, setup };
   };
   ipcMain.handle('settings:get', getSettings);
+  ipcMain.handle('settings:validateDraft', (_event, config: unknown) => runtimeDraftAvailability(config));
+  const resolutionJobs = new Map<number, AbortController>();
+  ipcMain.handle('settings:cancelResolution', (event) => { resolutionJobs.get(event.sender.id)?.abort(); });
+  ipcMain.handle('settings:resolveExecutable', async (event, input: unknown, selected: unknown) => {
+    if (typeof input !== 'string' || input.length > 4096 || selected !== undefined && (typeof selected !== 'string' || selected.length > 4096)) throw new Error(t('Некорректный путь к исполняемому файлу'));
+    const id = event.sender.id;
+    resolutionJobs.get(id)?.abort();
+    const controller = new AbortController(); resolutionJobs.set(id, controller);
+    const cancel = () => controller.abort(); event.sender.once('destroyed', cancel);
+    try { return await resolveLlamaExecutable(input, selected as string | undefined, { signal: controller.signal }); }
+    finally { event.sender.removeListener('destroyed', cancel); if (resolutionJobs.get(id) === controller) resolutionJobs.delete(id); }
+  });
   ipcMain.handle('settings:save', async (_event, config: unknown) => {
     if (activeGenerations.size || contextDiscoveryBusy || runtimeSelectionBusy) throw new Error('Дождитесь завершения генерации, выбора модели или поиска контекста.');
+    runtimeSelectionBusy = true;
+    try {
     const next = normalizeConfiguration(config);
     // Native menu owns this preference; an older open setup form must not revert it.
     next.imageProcessingDevice = effectiveRuntimeConfiguration().imageProcessingDevice;
+    const input = next.llamaServerInput ?? next.llamaServerPath ?? '';
+    if (input.trim()) {
+      const resolution = await resolveLlamaExecutable(input, next.llamaServerPath ?? undefined);
+      if (resolution.status !== 'valid' || !resolution.path) throw new Error(t('Выберите корректный исполняемый файл llama-server.'));
+      next.llamaServerPath = resolution.path;
+    } else next.llamaServerPath = null;
     const active = await llamaRuntime.state();
     if (active.status === 'ready' && active.modelId) {
       const prior = runtimeSetup().config;
@@ -629,7 +650,8 @@ export function registerIpc(): void {
       }
     }
     saveRuntimeConfiguration(next);
-    return getSettings();
+    return await getSettings();
+    } finally { runtimeSelectionBusy = false; void visionDevice.flush(); }
   });
   ipcMain.handle('settings:dismissSetup', async () => { dismissRuntimeSetup(); return getSettings(); });
   ipcMain.handle('hardware:get', getHardwareStats);
